@@ -1,0 +1,163 @@
+project:
+  name: sgnav_isaac_interioragent
+  seed: 123
+  output_dir: data/isaac_bench_runs
+
+paths:
+  sgnav_repo: /home/echo/SG-Nav
+  interioragent_root: /home/echo/InteriorAgent
+  isaac_sim_root: /home/echo/isaac-sim-standalone-5.1.0-linux-x86_64
+  yolo_world_model: data/models/yolov8s-worldv2.pt
+
+repo:
+  backend: isaac
+  detector: yolo_world
+  planner: astar
+  use_original_scenegraph: false
+
+visualization:
+  sgnav_popup: auto
+  sgnav_popup_every_steps: 20
+  sgnav_popup_save_dir:
+  sgnav_popup_save_every_steps: 10
+  sgnav_popup_width: 960
+  sgnav_popup_height: 540
+  sgnav_popup_jpeg_quality: 75
+
+isaac:
+  headless: true
+  control_dt: 0.2
+  perception_every_steps: 5
+  observed_radius_m: 3.0
+  render_updates_per_step: 1
+  read_depth: true
+  camera_annotator_device: cuda
+
+dataset:
+  root: /home/echo/InteriorAgent
+  scene_glob: "kujiale_*"
+  preprocessed_dir: data/interioragent_preprocessed
+  episodes_dir: data/interioragent_episodes
+  rooms_json_name: rooms.json
+  top_level_usd_pattern: "*.usd*"
+
+scene_preprocess:
+  map_resolution_m: 0.05
+  robot_radius_m: 0.28
+  inflation_radius_m: 0.0
+  min_object_bbox_diag_m: 0.05
+  include_large_furniture_as_goals: true
+  exclude_categories:
+    - wall
+    - floor
+    - ceiling
+    - roof
+    - door
+    - window
+    - other
+    - baseboard
+    - light_switch
+    - outlet
+
+episodes:
+  episodes_per_scene: 100
+  min_start_goal_distance_m: 1.5
+  max_start_goal_distance_m: 25.0
+  min_start_object_clearance_m: 0.80
+  min_start_goal_bbox_distance_m: 1.5
+  min_goal_clearance_m: 0.80
+  min_planning_clearance_m: 0.0
+  success_distance_m: 1.0
+  success_requires_stop: true
+  success_requires_visible: false
+  max_steps: 500
+  max_time_s: 300
+  max_path_length_m: 80.0
+  max_attempts_per_episode: 2000
+  yaw_sampling: uniform
+  balance_goal_categories: true
+
+robot:
+  name: kaya
+  usd_path: "${ISAAC_ASSETS}/Isaac/Robots/NVIDIA/Kaya/kaya.usd"
+  base_frame: base_link
+  camera_frame: camera_rgbd
+  spawn_height_m: 0.05
+  max_vx_mps: 0.15
+  max_vy_mps: 0.15
+  max_wz_radps: 0.35
+  cmd_hz: 10
+  footprint_radius_m: 0.28
+
+camera:
+  width: 640
+  height: 480
+  hfov_deg: 110.0
+  mast_height_m: 1.35
+  forward_offset_m: 0.0
+  pitch_deg: 0.0
+  near_m: 0.02
+  far_m: 80.0
+  publish_hz: 5
+
+mapping:
+  online_resolution_m: 0.05
+  map_size_m: 40.0
+  depth_max_m: 6.0
+  depth_min_m: 0.20
+  depth_stride_px: 8
+  obstacle_min_height_m: 0.05
+  obstacle_max_height_m: 1.50
+  inflation_radius_m: 0.0
+  free_ray_stride_px: 4
+  frontier_min_cluster_size: 3
+  frontier_min_distance_m: 1.0
+  frontier_max_count: 64
+  room_map_mode: observed_rooms_json
+
+perception:
+  yolo_world_model: data/models/yolov8s-worldv2.pt
+  use_ultralytics: true
+  detection_localization: depth
+  segmenter: auto
+  sam2_checkpoint:
+  sam2_model_cfg: facebook/sam2.1-hiera-tiny
+  sam2_device: cuda
+  confidence_threshold: 0.5
+  nms_iou_threshold: 0.5
+  prompt_mode: global_dataset_vocab
+  max_detections_per_frame: 100
+  object_merge_radius_m: 0.5
+  object_forget_after_steps: 100
+  min_depth_points_per_detection: 20
+
+sgnav:
+  seed_gt_object_memory: false
+  allow_gt_goal_fallback: false
+  frontier_distance_weight: 2.0
+  candidate_min_detector_hits: 2
+  candidate_start_min_confidence: 0.20
+  candidate_stop_distance_m: 1.0
+  candidate_standoff_min_m: 0.65
+  candidate_standoff_max_m: 1.80
+
+astar:
+  allow_diagonal: true
+  unknown_is_obstacle: true
+  goal_tolerance_m: 0.20
+  waypoint_lookahead_m: 0.15
+  replan_every_steps: 5
+  runtime_planning_clearance_m: 0.0
+  stuck_timeout_steps: 30
+
+nav2:
+  use_nav2: false
+  map_yaml_dir: data/interioragent_nav2_maps
+  action_name: /navigate_to_pose
+
+metrics:
+  actual_path_from_gt_pose: true
+  distance_to_goal_mode: astar_to_nearest_goal_region
+  spl_shortest_path_mode: astar_full_map
+  softspl_enabled: true
+  log_every_step: true

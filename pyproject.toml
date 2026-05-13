@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sgnav-isaac-bench"
+version = "0.1.0"
+description = "SG-Nav Isaac/InteriorAgent benchmark wrapper"
+requires-python = ">=3.9"
+dependencies = [
+  "numpy",
+  "pyyaml",
+  "pillow",
+]
+
+[tool.setuptools.packages.find]
+include = ["isaac_bench*"]
+
+[tool.pytest.ini_options]
+testpaths = ["isaac_bench/tests"]
+pythonpath = ["."]

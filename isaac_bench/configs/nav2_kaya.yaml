@@ -1,0 +1,22 @@
+planner_server:
+  ros__parameters:
+    expected_planner_frequency: 5.0
+    planner_plugins: ["GridBased"]
+    GridBased:
+      plugin: "nav2_smac_planner/SmacPlanner2D"
+      tolerance: 0.25
+      allow_unknown: false
+controller_server:
+  ros__parameters:
+    controller_frequency: 10.0
+    controller_plugins: ["FollowPath"]
+    FollowPath:
+      plugin: "dwb_core::DWBLocalPlanner"
+      min_vel_x: -0.45
+      max_vel_x: 0.45
+      min_vel_y: -0.45
+      max_vel_y: 0.45
+      max_vel_theta: 1.0
+      xy_goal_tolerance: 0.25
+      yaw_goal_tolerance: 0.5
+

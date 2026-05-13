@@ -1,0 +1,24 @@
+# Python/cache artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Local generated benchmark data and outputs
+data/
+debug/
+
+# Local environments and editor files
+.mamba/
+.conda/
+.venv/
+venv/
+.env
+.env.*
+.vscode/
+.idea/
+
+# Logs and temporary files
+*.log
+*.tmp
+*.swp
