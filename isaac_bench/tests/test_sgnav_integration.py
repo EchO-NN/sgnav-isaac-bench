@@ -36,14 +36,15 @@ def test_sgnav_decision_prefers_detected_goal_candidate():
     map_info = MapInfo(resolution_m=1.0, min_x=0.0, max_x=10.0, min_y=0.0, max_y=10.0, width=10, height=10)
     traversible = np.ones((10, 10), dtype=bool)
     memory = ObjectMemory(merge_radius_m=0.5)
-    memory.update([Detection3D("table", "table", 0.9, (5.0, 5.0, 0.5), (0, 0, 10, 10))], step_id=1, map_info=map_info)
+    for step in range(1, 4):
+        memory.update([Detection3D("table", "table", 0.9, (5.0, 5.0, 0.5), (0, 0, 10, 10))], step_id=step, map_info=map_info)
 
     scenegraph = SGNavSceneGraphAdapter(use_original=False)
     scenegraph.reset("table")
     scenegraph.update(memory)
     decision = SGNavDecision(scenegraph, candidate_min_hits=1)
     planner = GridAStarPlanner(traversible, resolution_m=1.0, allow_diagonal=True)
-    target = decision.choose_navigation_target(memory, "table", (8, 1), [], planner, map_info, (1.0, 1.0, 0.0, 0.0))
+    target = decision.choose_navigation_target(memory, "table", (8, 1), [], planner, map_info, (1.0, 1.0, 0.0, 0.0), current_step=3)
 
     assert target.mode == "candidate"
     assert target.selected_candidate is memory.nodes[0]
@@ -54,7 +55,8 @@ def test_sgnav_can_score_frontiers_before_candidate():
     map_info = MapInfo(resolution_m=1.0, min_x=0.0, max_x=10.0, min_y=0.0, max_y=10.0, width=10, height=10)
     traversible = np.ones((10, 10), dtype=bool)
     memory = ObjectMemory(merge_radius_m=0.5)
-    memory.update([Detection3D("table", "table", 0.9, (5.0, 5.0, 0.5), (0, 0, 10, 10))], step_id=1, map_info=map_info)
+    for step in range(1, 4):
+        memory.update([Detection3D("table", "table", 0.9, (5.0, 5.0, 0.5), (0, 0, 10, 10))], step_id=step, map_info=map_info)
 
     scenegraph = SGNavSceneGraphAdapter(use_original=False)
     scenegraph.reset("table")
@@ -70,7 +72,7 @@ def test_sgnav_can_score_frontiers_before_candidate():
     planner = GridAStarPlanner(traversible, resolution_m=1.0, allow_diagonal=True)
     frontiers = [FrontierCluster((2, 2), (2.0, 2.0), [(2, 2), (2, 3), (3, 2)], 3, 2.0)]
 
-    target = decision.choose_navigation_target(memory, "table", (8, 1), frontiers, planner, map_info, (1.0, 1.0, 0.0, 0.0))
+    target = decision.choose_navigation_target(memory, "table", (8, 1), frontiers, planner, map_info, (1.0, 1.0, 0.0, 0.0), current_step=3)
 
     assert target.mode == "candidate"
     assert calls
@@ -87,7 +89,13 @@ def test_sgnav_candidate_uses_nearest_reachable_cell_when_standoff_unknown():
     scenegraph = SGNavSceneGraphAdapter(use_original=False)
     scenegraph.reset("mirror")
     scenegraph.update(memory)
-    decision = SGNavDecision(scenegraph, candidate_min_hits=1, candidate_standoff_max_m=1.0)
+    decision = SGNavDecision(
+        scenegraph,
+        candidate_min_hits=1,
+        candidate_start_min_hits=1,
+        candidate_accept_requires_reperception=False,
+        candidate_standoff_max_m=1.0,
+    )
     planner = GridAStarPlanner(traversible, resolution_m=1.0, allow_diagonal=True)
     target = decision.choose_navigation_target(memory, "mirror", (1, 1), [], planner, map_info, (1.0, 1.0, 0.0, 0.0))
 
@@ -107,7 +115,13 @@ def test_sgnav_tiny_candidate_progress_falls_back_to_frontier():
     scenegraph = SGNavSceneGraphAdapter(use_original=False)
     scenegraph.reset("mirror")
     scenegraph.update(memory)
-    decision = SGNavDecision(scenegraph, candidate_min_hits=1, candidate_standoff_max_m=1.0)
+    decision = SGNavDecision(
+        scenegraph,
+        candidate_min_hits=1,
+        candidate_start_min_hits=1,
+        candidate_accept_requires_reperception=False,
+        candidate_standoff_max_m=1.0,
+    )
     planner = GridAStarPlanner(traversible, resolution_m=0.05, allow_diagonal=True)
     frontiers = [FrontierCluster((2, 3), (0.15, 0.10), [(2, 3)], 1, 0.05)]
     target = decision.choose_navigation_target(memory, "mirror", (2, 2), frontiers, planner, map_info, (0.1, 0.1, 0.0, 0.0))
@@ -232,6 +246,7 @@ def test_sgnav_decision_reperception_then_verified_stop():
     decision = SGNavDecision(
         scenegraph,
         candidate_min_hits=2,
+        candidate_start_min_hits=1,
         reperception_min_observations=3,
         stop_verification_steps=1,
         found_goal_stop_distance_m=0.5,
@@ -244,6 +259,49 @@ def test_sgnav_decision_reperception_then_verified_stop():
     second = decision.choose_navigation_target(memory, "mirror", (1, 1), [], planner, map_info, (1.0, 1.0, 0.0, 0.0))
     assert second.mode == "stop"
     assert second.reason == "stop_verification_confirmed"
+
+
+def test_one_hit_candidate_does_not_override_frontier():
+    map_info = MapInfo(resolution_m=1.0, min_x=0.0, max_x=10.0, min_y=0.0, max_y=10.0, width=10, height=10)
+    traversible = np.ones((10, 10), dtype=bool)
+    memory = ObjectMemory(merge_radius_m=0.5)
+    memory.nodes = [
+        ObjectNode(1, "mirror", (5.0, 5.0, 0.5), (5, 5), 0.79, 1, 35, "mirror"),
+    ]
+    scenegraph = SGNavSceneGraphAdapter(use_original=False)
+    scenegraph.reset("mirror")
+    scenegraph.update(memory)
+    planner = GridAStarPlanner(traversible, resolution_m=1.0, allow_diagonal=True)
+    frontiers = [FrontierCluster((2, 3), (3.0, 2.0), [(2, 3)], 1, 2.0)]
+    decision = SGNavDecision(scenegraph)
+
+    target = decision.choose_navigation_target(
+        memory,
+        "mirror",
+        (2, 2),
+        frontiers,
+        planner,
+        map_info,
+        (2.0, 2.0, 0.0, 0.0),
+        current_step=35,
+    )
+
+    assert target.mode == "frontier"
+    assert target.selected_candidate is None
+    assert target.target_cells == [(2, 3)]
+
+
+def test_candidate_standoff_cells_are_capped():
+    map_info = MapInfo(resolution_m=0.25, min_x=0.0, max_x=10.0, min_y=0.0, max_y=10.0, width=40, height=40)
+    traversible = np.ones((40, 40), dtype=bool)
+    candidate = ObjectNode(3, "mirror", (5.0, 5.0, 0.5), (20, 20), 0.9, 3, 3, "mirror")
+    scenegraph = SGNavSceneGraphAdapter(use_original=False)
+    decision = SGNavDecision(scenegraph, candidate_standoff_max_cells=5)
+
+    cells = decision.candidate_standoff_cells(candidate, traversible, map_info, current_grid=(4, 4))
+
+    assert cells
+    assert len(cells) <= 5
 
 
 def test_vllm_frontier_scorer_encodes_cpu_rgb_image():
@@ -260,7 +318,7 @@ def test_vllm_frontier_scorer_encodes_cpu_rgb_image():
 def test_low_confidence_2d_detections_are_filtered():
     detections = [
         Detection2D("table", "table", 0.49, (0, 0, 10, 10)),
-        Detection2D("chair", "chair", 0.50, (0, 0, 10, 10)),
+        Detection2D("chair", "chair", 0.51, (0, 0, 10, 10)),
     ]
 
     kept = filter_detections_by_confidence(detections, 0.5)

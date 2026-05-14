@@ -70,6 +70,26 @@ def test_observed_nonfree_nonoccupied_cell_is_not_unknown():
     assert implicit_frontiers[3, 3]
 
 
+def test_frontier_debug_layers_use_observed_unknown_semantics():
+    free = np.zeros((5, 5), dtype=bool)
+    observed = np.zeros_like(free)
+    occupancy = np.zeros_like(free)
+    observed[1:4, 1:4] = True
+    free[2, 2] = True
+
+    layers = frontier_debug_layers(
+        free,
+        observed=observed,
+        occupancy=occupancy,
+        obstacle_dilation_radius_cells=0,
+        unknown_dilation_radius_cells=1,
+        unknown_source="observed",
+    )
+
+    assert not layers["unknown"][1:4, 1:4].any()
+    assert layers["unknown"][0, 0]
+
+
 def test_extract_frontiers_returns_sgnav_fbe_cells_without_projection():
     free = np.zeros((7, 7), dtype=bool)
     observed = np.zeros_like(free)

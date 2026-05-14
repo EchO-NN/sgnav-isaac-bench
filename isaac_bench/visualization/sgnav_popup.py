@@ -389,17 +389,28 @@ class SGNavPopupVisualizer:
 
         self._draw_cells(draw, goal_cells, xy, (30, 220, 80), radius=2, max_cells=500)
         self._draw_cells(draw, full_path, xy, (80, 130, 255), radius=1, max_cells=1200)
-        self._draw_cells(draw, current_path, xy, (40, 190, 255), radius=2, max_cells=500)
+        self._draw_cells(draw, current_path, xy, (245, 245, 245), radius=2, max_cells=500)
+        frontier_raw_cells: List[GridCell] = []
         for frontier in frontiers[:64]:
-            self._dot(draw, xy(frontier.center_grid), (0, 225, 255), radius=3)
+            frontier_raw_cells.extend(frontier.members)
+        self._draw_cells(draw, frontier_raw_cells, xy, (0, 180, 220), radius=1, max_cells=500)
+        for frontier in frontiers[:64]:
+            self._triangle(draw, xy(frontier.center_grid), (0, 225, 255), radius=5)
 
         selected_frontier = None
         if nav_decision and nav_decision.frontier_decision:
             selected_frontier = nav_decision.frontier_decision.selected_frontier
         if selected_frontier is not None:
-            self._dot(draw, xy(selected_frontier.center_grid), (255, 225, 40), radius=7)
-        if nav_decision and nav_decision.target_cells:
-            self._draw_cells(draw, nav_decision.target_cells, xy, (220, 70, 255), radius=2, max_cells=400)
+            self._star(draw, xy(selected_frontier.center_grid), (255, 225, 40), radius=8)
+        if nav_decision and nav_decision.target_cells and nav_decision.mode == "candidate":
+            self._draw_crosses(draw, nav_decision.target_cells, xy, (220, 70, 255), radius=5, max_cells=16)
+        planner_target = None
+        if current_path:
+            planner_target = current_path[-1]
+        elif nav_decision and nav_decision.target_cells:
+            planner_target = nav_decision.target_cells[0]
+        if planner_target is not None:
+            self._star(draw, xy(planner_target), (255, 150, 40), radius=7)
         selected_id = self._selected_candidate_id(nav_decision)
         for node in self._visible_map_nodes(object_memory, goal_category, nav_decision)[:300]:
             radius = 8 if selected_id is not None and int(node.node_id) == selected_id else 5
@@ -407,8 +418,9 @@ class SGNavPopupVisualizer:
 
         self._draw_agent(draw, xy(current_grid), float(pose[3]) if len(pose) > 3 else 0.0, scale)
         zoom = max(1.0, min(w / max(crop_w, 1), h / max(crop_h, 1)))
-        self._label(draw, (10, 8), "Map / frontiers / A* / goal candidates  zoom %.1fx" % zoom, (255, 255, 255))
-        self._legend(draw, (10, height - 76))
+        target_count = len(nav_decision.target_cells) if nav_decision is not None else 0
+        self._label(draw, (10, 8), "Map / frontiers / A* / goal candidates  zoom %.1fx target_cells=%d" % (zoom, target_count), (255, 255, 255))
+        self._legend(draw, (10, height - 96))
         return image
 
     def _map_crop_bounds(
@@ -449,7 +461,10 @@ class SGNavPopupVisualizer:
         for frontier in frontiers[:128]:
             add_cell(frontier.center_grid)
         if nav_decision is not None:
-            for cell in nav_decision.target_cells:
+            target_cells = nav_decision.target_cells
+            if nav_decision.mode != "candidate":
+                target_cells = target_cells[:1]
+            for cell in target_cells[:32]:
                 add_cell(cell)
             if nav_decision.frontier_decision is not None and nav_decision.frontier_decision.selected_frontier is not None:
                 add_cell(nav_decision.frontier_decision.selected_frontier.center_grid)
@@ -533,6 +548,29 @@ class SGNavPopupVisualizer:
                 "candidate id=%d cat=%s conf=%.2f hits=%d grid=%s"
                 % (node.node_id, node.category, node.confidence, node.observed_count, tuple(node.center_grid))
             )
+        if nav_decision:
+            meta = nav_decision.metadata or {}
+            lines.append(
+                "selected_frontier=%s selected_candidate=%s target_cells=%d"
+                % (
+                    nav_decision.frontier_decision.selected_index
+                    if nav_decision.frontier_decision is not None
+                    else None,
+                    self._selected_candidate_id(nav_decision),
+                    len(nav_decision.target_cells),
+                )
+            )
+            if meta:
+                lines.append(
+                    "candidate credibility=%s track_obs=%s rep_steps=%s accepted=%s rejected=%s"
+                    % (
+                        self._short(meta.get("candidate_credibility", "n/a")),
+                        self._short(meta.get("candidate_track_observation_count", "n/a")),
+                        self._short(meta.get("candidate_reperception_steps", "n/a")),
+                        self._short(meta.get("candidate_accepted", "n/a")),
+                        self._short(meta.get("candidate_rejected", "n/a")),
+                    )
+                )
         if nav_decision and nav_decision.frontier_decision is not None:
             fd = nav_decision.frontier_decision
             lines.append("frontier selected=%s" % (fd.selected_index,))
@@ -586,6 +624,38 @@ class SGNavPopupVisualizer:
         x, y = int(xy[0]), int(xy[1])
         draw.ellipse([x - radius, y - radius, x + radius, y + radius], fill=color)
 
+    def _triangle(self, draw: ImageDraw.ImageDraw, xy: Tuple[int, int], color: Tuple[int, int, int], radius: int = 4) -> None:
+        x, y = int(xy[0]), int(xy[1])
+        pts = [(x, y - radius), (x - radius, y + radius), (x + radius, y + radius)]
+        draw.polygon(pts, fill=color)
+
+    def _cross(self, draw: ImageDraw.ImageDraw, xy: Tuple[int, int], color: Tuple[int, int, int], radius: int = 4) -> None:
+        x, y = int(xy[0]), int(xy[1])
+        draw.line([(x - radius, y - radius), (x + radius, y + radius)], fill=color, width=2)
+        draw.line([(x - radius, y + radius), (x + radius, y - radius)], fill=color, width=2)
+
+    def _star(self, draw: ImageDraw.ImageDraw, xy: Tuple[int, int], color: Tuple[int, int, int], radius: int = 6) -> None:
+        x, y = int(xy[0]), int(xy[1])
+        draw.line([(x - radius, y), (x + radius, y)], fill=color, width=2)
+        draw.line([(x, y - radius), (x, y + radius)], fill=color, width=2)
+        draw.line([(x - radius, y - radius), (x + radius, y + radius)], fill=color, width=1)
+        draw.line([(x - radius, y + radius), (x + radius, y - radius)], fill=color, width=1)
+
+    def _draw_crosses(
+        self,
+        draw: ImageDraw.ImageDraw,
+        cells: Iterable[GridCell],
+        xy_func,
+        color: Tuple[int, int, int],
+        radius: int,
+        max_cells: int,
+    ) -> None:
+        cells_list = list(cells)
+        if not cells_list:
+            return
+        for cell in cells_list[: max(1, int(max_cells))]:
+            self._cross(draw, xy_func(cell), color, radius=radius)
+
     def _label(self, draw: ImageDraw.ImageDraw, xy: Tuple[int, int], text: str, color: Tuple[int, int, int]) -> None:
         x, y = int(xy[0]), int(xy[1])
         bbox = draw.textbbox((x, y), text, font=self._font)
@@ -596,11 +666,12 @@ class SGNavPopupVisualizer:
         x, y = xy
         items = [
             ((255, 60, 60), "agent"),
-            ((40, 190, 255), "A*"),
-            ((0, 225, 255), "frontier"),
-            ((255, 225, 40), "chosen"),
+            ((245, 245, 245), "A*"),
+            ((0, 225, 255), "frontier center"),
+            ((255, 225, 40), "chosen frontier"),
             ((255, 60, 60), "goal cand"),
-            ((220, 70, 255), "target"),
+            ((220, 70, 255), "standoff"),
+            ((255, 150, 40), "planner target"),
         ]
         for color, label in items:
             self._dot(draw, (x + 6, y + 8), color, radius=5)

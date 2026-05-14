@@ -428,9 +428,17 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
         frontier_distance_weight=float(args.frontier_distance_weight),
         candidate_min_hits=int(args.candidate_min_detector_hits),
         candidate_start_min_confidence=float(args.candidate_start_min_confidence),
+        candidate_start_min_hits=int(args.candidate_start_min_hits),
+        candidate_recent_max_age_steps=int(args.candidate_recent_max_age_steps),
+        candidate_match_substring=bool(args.candidate_match_substring),
+        candidate_accept_requires_reperception=bool(args.candidate_accept_requires_reperception),
+        candidate_reject_ttl_steps=int(args.candidate_reject_ttl_steps),
+        candidate_accept_threshold=float(args.candidate_accept_threshold),
         candidate_stop_distance_m=float(args.candidate_stop_distance_m),
         candidate_standoff_min_m=float(args.candidate_standoff_min_m),
         candidate_standoff_max_m=float(args.candidate_standoff_max_m),
+        candidate_standoff_max_cells=int(args.candidate_standoff_max_cells),
+        candidate_standoff_ideal_m=float(args.candidate_standoff_ideal_m),
         reperception_enabled=bool(args.reperception_enabled),
         reperception_min_observations=int(args.reperception_min_observations),
         reperception_max_steps=int(args.reperception_max_steps),
@@ -910,8 +918,9 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
                     needs_replan = True
 
             if needs_replan:
-                frontier_free = free & navigable
-                distance_traversible = mapper.traversible(unknown_is_obstacle=True).astype(bool) & frontier_free.astype(bool)
+                frontier_free = free.astype(bool) & navigable.astype(bool)
+                dynamic_traversible = mapper.traversible(unknown_is_obstacle=True).astype(bool)
+                distance_traversible = dynamic_traversible & navigable.astype(bool)
                 rr, cc = int(current_grid[0]), int(current_grid[1])
                 if 0 <= rr < distance_traversible.shape[0] and 0 <= cc < distance_traversible.shape[1]:
                     distance_traversible[rr, cc] = True
@@ -930,6 +939,9 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
                     exclude_mask=static_only_nearfield,
                     unknown_source=str(args.frontier_unknown_source),
                 )
+                if bool(getattr(args, "frontier_debug_dump", False)):
+                    assert frontier_free.shape == observed.shape == occupancy.shape == distance_traversible.shape
+                    assert int(np.count_nonzero(frontier_layers["frontier"] & ~frontier_free)) == 0
                 last_frontier_raw_cells = int(np.count_nonzero(frontier_layers["frontier"]))
                 frontiers = extract_frontiers(
                     free=frontier_free,
@@ -959,6 +971,7 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
                     dynamic_map_info,
                     pose,
                     allow_frontier=True,
+                    current_step=step,
                 )
                 last_nav_decision = nav_decision
                 evaluator.num_frontier_decisions += 1
@@ -987,6 +1000,18 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
                         agent_grid=current_grid,
                         clusters=frontiers,
                         selected_frontier=selected_frontier_cell,
+                        candidate_centers=[
+                            node.center_grid
+                            for node in object_memory.nodes
+                            if category_matches_goal(node.category)
+                        ],
+                        candidate_target_cells=nav_decision.target_cells if nav_decision.mode == "candidate" else [],
+                        selected_candidate=(
+                            nav_decision.selected_candidate.center_grid
+                            if nav_decision.selected_candidate is not None
+                            else None
+                        ),
+                        decision_mode=nav_decision.mode,
                     )
                 if nav_decision.selected_candidate is not None:
                     last_selected_candidate = nav_decision.selected_candidate
@@ -1292,6 +1317,23 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
         row["sgnav_decision_reason"] = last_decision_reason
         row["scenegraph_backend"] = "original" if scenegraph.scenegraph is not None else "fallback"
         row["sgnav_state"] = getattr(decision_policy, "state", last_decision_mode)
+        decision_metadata = dict(getattr(last_nav_decision, "metadata", {}) or {})
+        row["sgnav_decision_metadata"] = decision_metadata
+        row["target_cells_count"] = int(len(getattr(last_nav_decision, "target_cells", []) or []))
+        row["selected_frontier_index"] = (
+            int(last_nav_decision.frontier_decision.selected_index)
+            if last_nav_decision is not None
+            and last_nav_decision.frontier_decision is not None
+            and last_nav_decision.frontier_decision.selected_index is not None
+            else None
+        )
+        row["candidate_credibility"] = decision_metadata.get("candidate_credibility")
+        row["candidate_reperception_steps"] = decision_metadata.get("candidate_reperception_steps")
+        row["candidate_rejected"] = bool(decision_metadata.get("candidate_rejected", False))
+        row["candidate_accepted"] = bool(decision_metadata.get("candidate_accepted", False))
+        row["candidate_start_min_confidence"] = float(args.candidate_start_min_confidence)
+        row["candidate_start_min_hits"] = int(args.candidate_start_min_hits)
+        row["candidate_standoff_max_cells"] = int(args.candidate_standoff_max_cells)
         row["detected_category_counts"] = {
             str(key): int(value)
             for key, value in sorted(detection_category_counts.items(), key=lambda item: (-item[1], item[0]))
@@ -1536,9 +1578,22 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--runtime-planning-clearance-m", type=float, default=None)
     parser.add_argument("--candidate-min-detector-hits", type=int, default=None)
     parser.add_argument("--candidate-start-min-confidence", type=float, default=None)
+    parser.add_argument("--candidate-start-min-hits", "--candidate_start_min_hits", type=int, default=None)
+    parser.add_argument("--candidate-recent-max-age-steps", "--candidate_recent_max_age_steps", type=int, default=None)
+    parser.add_argument("--candidate-match-substring", "--candidate_match_substring", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument(
+        "--candidate-accept-requires-reperception",
+        "--candidate_accept_requires_reperception",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
+    parser.add_argument("--candidate-reject-ttl-steps", "--candidate_reject_ttl_steps", type=int, default=None)
+    parser.add_argument("--candidate-accept-threshold", "--candidate_accept_threshold", type=float, default=None)
     parser.add_argument("--candidate-stop-distance-m", type=float, default=None)
     parser.add_argument("--candidate-standoff-min-m", type=float, default=None)
     parser.add_argument("--candidate-standoff-max-m", type=float, default=None)
+    parser.add_argument("--candidate-standoff-max-cells", "--candidate_standoff_max_cells", type=int, default=None)
+    parser.add_argument("--candidate-standoff-ideal-m", "--candidate_standoff_ideal_m", type=float, default=None)
     parser.add_argument("--reperception-enabled", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--reperception-min-observations", type=int, default=None)
     parser.add_argument("--reperception-max-steps", type=int, default=None)
@@ -1712,10 +1767,46 @@ def main(argv: Optional[List[str]] = None) -> int:
     args.frontier_distance_weight = float(args.frontier_distance_weight if args.frontier_distance_weight is not None else get_nested(cfg, "sgnav.frontier_distance_weight", 2.0))
     args.runtime_planning_clearance_m = float(args.runtime_planning_clearance_m if args.runtime_planning_clearance_m is not None else get_nested(cfg, "astar.runtime_planning_clearance_m", 0.0))
     args.candidate_min_detector_hits = int(args.candidate_min_detector_hits if args.candidate_min_detector_hits is not None else get_nested(cfg, "sgnav.candidate_min_detector_hits", 2))
-    args.candidate_start_min_confidence = float(args.candidate_start_min_confidence if args.candidate_start_min_confidence is not None else get_nested(cfg, "sgnav.candidate_start_min_confidence", 0.20))
+    args.candidate_start_min_confidence = float(args.candidate_start_min_confidence if args.candidate_start_min_confidence is not None else get_nested(cfg, "sgnav.candidate_start_min_confidence", 0.55))
+    args.candidate_start_min_hits = int(args.candidate_start_min_hits if args.candidate_start_min_hits is not None else get_nested(cfg, "sgnav.candidate_start_min_hits", 2))
+    args.candidate_recent_max_age_steps = int(
+        args.candidate_recent_max_age_steps
+        if args.candidate_recent_max_age_steps is not None
+        else get_nested(cfg, "sgnav.candidate_recent_max_age_steps", 30)
+    )
+    args.candidate_match_substring = bool(
+        args.candidate_match_substring
+        if args.candidate_match_substring is not None
+        else get_nested(cfg, "sgnav.candidate_match_substring", False)
+    )
+    args.candidate_accept_requires_reperception = bool(
+        args.candidate_accept_requires_reperception
+        if args.candidate_accept_requires_reperception is not None
+        else get_nested(cfg, "sgnav.candidate_accept_requires_reperception", True)
+    )
+    args.candidate_reject_ttl_steps = int(
+        args.candidate_reject_ttl_steps
+        if args.candidate_reject_ttl_steps is not None
+        else get_nested(cfg, "sgnav.candidate_reject_ttl_steps", 80)
+    )
+    args.candidate_accept_threshold = float(
+        args.candidate_accept_threshold
+        if args.candidate_accept_threshold is not None
+        else get_nested(cfg, "sgnav.candidate_accept_threshold", 0.65)
+    )
     args.candidate_stop_distance_m = float(args.candidate_stop_distance_m if args.candidate_stop_distance_m is not None else get_nested(cfg, "sgnav.candidate_stop_distance_m", get_nested(cfg, "episodes.success_distance_m", 1.0)))
     args.candidate_standoff_min_m = float(args.candidate_standoff_min_m if args.candidate_standoff_min_m is not None else get_nested(cfg, "sgnav.candidate_standoff_min_m", 0.65))
     args.candidate_standoff_max_m = float(args.candidate_standoff_max_m if args.candidate_standoff_max_m is not None else get_nested(cfg, "sgnav.candidate_standoff_max_m", 1.80))
+    args.candidate_standoff_max_cells = int(
+        args.candidate_standoff_max_cells
+        if args.candidate_standoff_max_cells is not None
+        else get_nested(cfg, "sgnav.candidate_standoff_max_cells", 16)
+    )
+    args.candidate_standoff_ideal_m = float(
+        args.candidate_standoff_ideal_m
+        if args.candidate_standoff_ideal_m is not None
+        else get_nested(cfg, "sgnav.candidate_standoff_ideal_m", 1.0)
+    )
     args.reperception_enabled = bool(args.reperception_enabled if args.reperception_enabled is not None else get_nested(cfg, "sgnav.reperception_enabled", True))
     args.reperception_min_observations = int(args.reperception_min_observations if args.reperception_min_observations is not None else get_nested(cfg, "sgnav.reperception_min_observations", 3))
     args.reperception_max_steps = int(args.reperception_max_steps if args.reperception_max_steps is not None else get_nested(cfg, "sgnav.reperception_max_steps", 10))

@@ -35,16 +35,36 @@ class NavigationDecision:
     metadata: Dict[str, object] = field(default_factory=dict)
 
 
+@dataclass
+class CandidateTrack:
+    node_id: int
+    score_sum: float = 0.0
+    observation_count: int = 0
+    steps: int = 0
+    accepted: bool = False
+    rejected: bool = False
+    last_counted_observed_count: int = 0
+    last_seen_step: int = -1
+
+
 class SGNavDecision:
     def __init__(
         self,
         scenegraph: SGNavSceneGraphAdapter,
         frontier_distance_weight: float = 2.0,
         candidate_min_hits: int = 2,
-        candidate_start_min_confidence: float = 0.20,
+        candidate_start_min_confidence: float = 0.55,
+        candidate_start_min_hits: int = 2,
+        candidate_recent_max_age_steps: int = 30,
+        candidate_match_substring: bool = False,
+        candidate_accept_requires_reperception: bool = True,
+        candidate_reject_ttl_steps: int = 80,
+        candidate_accept_threshold: float = 0.65,
         candidate_stop_distance_m: float = 1.0,
         candidate_standoff_min_m: float = 0.65,
         candidate_standoff_max_m: float = 1.80,
+        candidate_standoff_max_cells: int = 16,
+        candidate_standoff_ideal_m: float = 1.0,
         reperception_enabled: bool = True,
         reperception_min_observations: int = 3,
         reperception_max_steps: int = 10,
@@ -58,9 +78,17 @@ class SGNavDecision:
         self.frontier_distance_weight = float(frontier_distance_weight)
         self.candidate_min_hits = max(1, int(candidate_min_hits))
         self.candidate_start_min_confidence = float(candidate_start_min_confidence)
+        self.candidate_start_min_hits = max(1, int(candidate_start_min_hits))
+        self.candidate_recent_max_age_steps = max(0, int(candidate_recent_max_age_steps))
+        self.candidate_match_substring = bool(candidate_match_substring)
+        self.candidate_accept_requires_reperception = bool(candidate_accept_requires_reperception)
+        self.candidate_reject_ttl_steps = max(0, int(candidate_reject_ttl_steps))
+        self.candidate_accept_threshold = float(candidate_accept_threshold)
         self.candidate_stop_distance_m = float(candidate_stop_distance_m)
         self.candidate_standoff_min_m = float(candidate_standoff_min_m)
         self.candidate_standoff_max_m = max(float(candidate_standoff_max_m), self.candidate_standoff_min_m)
+        self.candidate_standoff_max_cells = max(1, int(candidate_standoff_max_cells))
+        self.candidate_standoff_ideal_m = float(candidate_standoff_ideal_m)
         self.reperception_enabled = bool(reperception_enabled)
         self.reperception_min_observations = max(1, int(reperception_min_observations))
         self.reperception_max_steps = max(0, int(reperception_max_steps))
@@ -74,6 +102,8 @@ class SGNavDecision:
         self.reperception_steps = 0
         self.stop_candidate_id: Optional[int] = None
         self.stop_verification_steps_taken = 0
+        self.active_candidate_track: Optional[CandidateTrack] = None
+        self.rejected_candidates: Dict[int, int] = {}
         self.last_reason = ""
 
     def choose_frontier(self, frontier_clusters: List[FrontierCluster]) -> DecisionResult:
@@ -107,12 +137,14 @@ class SGNavDecision:
         map_info: MapInfo,
         current_pose: Sequence[float],
         allow_frontier: bool = True,
+        current_step: Optional[int] = None,
     ) -> NavigationDecision:
         prefetched_frontier_decision: Optional[DecisionResult] = None
         if allow_frontier and self.score_frontiers_before_candidate and frontiers:
             prefetched_frontier_decision = self.choose_frontier(frontiers)
 
-        candidate = self.select_goal_candidate(object_memory, goal_category, current_pose)
+        rejected_metadata: Dict[str, object] = {}
+        candidate = self.select_goal_candidate(object_memory, goal_category, current_pose, current_step=current_step)
         if candidate is not None:
             distance_to_candidate = float(
                 np.linalg.norm(
@@ -120,6 +152,42 @@ class SGNavDecision:
                     - np.asarray([float(current_pose[0]), float(current_pose[1])], dtype=np.float32)
                 )
             )
+            track = self._get_or_create_candidate_track(candidate)
+            credibility = self._update_candidate_track(track, candidate, current_pose, current_step)
+            candidate_metadata = self._candidate_metadata(candidate, track, credibility, distance_to_candidate)
+
+            if self.reperception_enabled and self.candidate_accept_requires_reperception and not track.accepted:
+                enough_observations = (
+                    int(candidate.observed_count) >= self.reperception_min_observations
+                    and int(track.observation_count) >= self.reperception_min_observations
+                )
+                if enough_observations and credibility >= self.candidate_accept_threshold:
+                    track.accepted = True
+                    candidate_metadata["candidate_accepted"] = True
+                elif track.steps >= self.reperception_max_steps:
+                    self._reject_candidate(candidate, current_step)
+                    rejected_metadata = dict(candidate_metadata)
+                    rejected_metadata["candidate_rejected"] = True
+                    rejected_metadata["candidate_reject_until_step"] = self.rejected_candidates.get(int(candidate.node_id))
+                    self._clear_candidate_track(candidate.node_id)
+                    candidate = None
+                    self.state = "frontier" if allow_frontier else "none"
+                    self.last_reason = "candidate_rejected_after_reperception"
+                else:
+                    self.state = "reperception"
+                    self.last_reason = "reperception_collecting" if not enough_observations else "reperception_scanning"
+                    return NavigationDecision(
+                        "reperception",
+                        [current_grid],
+                        False,
+                        candidate,
+                        prefetched_frontier_decision,
+                        self.last_reason,
+                        state=self.state,
+                        metadata=candidate_metadata,
+                    )
+
+        if candidate is not None:
             close_for_stop = distance_to_candidate <= self.candidate_stop_distance_m
             very_close = distance_to_candidate <= self.found_goal_stop_distance_m
             enough_candidate_hits = candidate.observed_count >= self.candidate_min_hits
@@ -144,6 +212,7 @@ class SGNavDecision:
                         "stop_verification_confirmed",
                         state=self.state,
                         metadata={
+                            **candidate_metadata,
                             "candidate_distance_m": distance_to_candidate,
                             "candidate_observed_count": int(candidate.observed_count),
                             "stop_verification_steps_taken": int(self.stop_verification_steps_taken),
@@ -161,6 +230,7 @@ class SGNavDecision:
                     "stop_verification_scanning",
                     state=self.state,
                     metadata={
+                        **candidate_metadata,
                         "candidate_distance_m": distance_to_candidate,
                         "candidate_observed_count": int(candidate.observed_count),
                         "stop_verification_steps_taken": int(self.stop_verification_steps_taken),
@@ -168,6 +238,7 @@ class SGNavDecision:
                 )
             if (
                 self.reperception_enabled
+                and not self.candidate_accept_requires_reperception
                 and distance_to_candidate <= self.reperception_same_goal_radius_m
                 and candidate.observed_count < self.reperception_min_observations
                 and self.reperception_steps < self.reperception_max_steps
@@ -187,6 +258,7 @@ class SGNavDecision:
                     "reperception_scanning",
                     state=self.state,
                     metadata={
+                        **candidate_metadata,
                         "candidate_distance_m": distance_to_candidate,
                         "candidate_observed_count": int(candidate.observed_count),
                         "reperception_steps": int(self.reperception_steps),
@@ -206,14 +278,17 @@ class SGNavDecision:
                     "navigate_to_goal_candidate",
                     state=self.state,
                     metadata={
+                        **candidate_metadata,
                         "candidate_distance_m": distance_to_candidate,
                         "candidate_observed_count": int(candidate.observed_count),
+                        "target_cells_count": int(len(standoff)),
                     },
                 )
 
         if allow_frontier:
-            self.reperception_candidate_id = None
-            self.reperception_steps = 0
+            if not rejected_metadata:
+                self.reperception_candidate_id = None
+                self.reperception_steps = 0
             self.stop_candidate_id = None
             self.stop_verification_steps_taken = 0
             frontier_decision = prefetched_frontier_decision or self.choose_frontier(frontiers)
@@ -228,28 +303,48 @@ class SGNavDecision:
                     frontier_decision,
                     frontier_decision.reason,
                     state=self.state,
+                    metadata={
+                        **rejected_metadata,
+                        "target_cells_count": int(len(frontier_decision.selected_frontier.members)),
+                    },
                 )
             self.state = "none"
             self.last_reason = frontier_decision.reason
-            return NavigationDecision("none", [], False, None, frontier_decision, frontier_decision.reason, state=self.state)
+            return NavigationDecision(
+                "none",
+                [],
+                False,
+                None,
+                frontier_decision,
+                frontier_decision.reason,
+                state=self.state,
+                metadata=rejected_metadata,
+            )
         self.state = "none"
         self.last_reason = "no_candidate"
-        return NavigationDecision("none", [], False, None, None, "no_candidate", state=self.state)
+        return NavigationDecision("none", [], False, None, None, "no_candidate", state=self.state, metadata=rejected_metadata)
 
     def select_goal_candidate(
         self,
         object_memory: ObjectMemory,
         goal_category: str,
         current_pose: Sequence[float],
+        current_step: Optional[int] = None,
     ) -> Optional[ObjectNode]:
-        goal = normalize_category(goal_category)
         candidates = []
         agent_xy = np.asarray([float(current_pose[0]), float(current_pose[1])], dtype=np.float32)
         for node in object_memory.nodes:
-            cat = normalize_category(node.category)
-            if cat != goal and not (goal and (goal in cat or cat in goal)):
+            if not self._category_matches_goal(node.category, goal_category):
                 continue
             if float(node.confidence) < self.candidate_start_min_confidence:
+                continue
+            if int(node.observed_count) < self.candidate_start_min_hits:
+                continue
+            if current_step is not None:
+                age = int(current_step) - int(getattr(node, "last_seen_step", current_step))
+                if age > self.candidate_recent_max_age_steps:
+                    continue
+            if self._is_candidate_rejected(node, current_step):
                 continue
             dist = float(np.linalg.norm(np.asarray(node.center_world[:2], dtype=np.float32) - agent_xy))
             score = float(node.confidence) + 0.25 * min(float(node.observed_count), 5.0) - 0.05 * dist
@@ -276,7 +371,7 @@ class SGNavDecision:
             reachable = np.isfinite(dist_map)
             if not np.any(reachable):
                 return []
-        cells: List[Tuple[int, int]] = []
+        cells: List[Tuple[float, Tuple[int, int]]] = []
         nearest: List[Tuple[float, Tuple[int, int]]] = []
         h, w = traversible_bool.shape
         for r in range(max(0, r0 - max_radius_cells), min(h, r0 + max_radius_cells + 1)):
@@ -287,13 +382,36 @@ class SGNavDecision:
                 dist = float(np.hypot(wx - cx, wy - cy))
                 nearest.append((dist, (int(r), int(c))))
                 if self.candidate_standoff_min_m <= dist <= self.candidate_standoff_max_m:
-                    cells.append((int(r), int(c)))
+                    path_dist = 0.0
+                    if current_grid is not None:
+                        if dist_map is None:
+                            dist_map = astar_distance_map(
+                                traversible_bool,
+                                current_grid,
+                                map_info.resolution_m,
+                                allow_diagonal=True,
+                            )
+                        path_dist = float(dist_map[r, c])
+                        if not np.isfinite(path_dist):
+                            continue
+                    ideal = self.candidate_standoff_ideal_m
+                    if ideal <= 0.0:
+                        ideal = 0.5 * (self.candidate_standoff_min_m + self.candidate_standoff_max_m)
+                    cost = float(path_dist) + 0.25 * abs(dist - ideal)
+                    cells.append((cost, (int(r), int(c))))
         if cells:
-            return cells
+            cells.sort(key=lambda item: item[0])
+            return [cell for _cost, cell in cells[: self.candidate_standoff_max_cells]]
         nearest.sort(key=lambda item: item[0])
         if nearest:
-            return [cell for _dist, cell in nearest[:16]]
-        return self.nearest_reachable_cells_to_candidate(candidate, traversible, map_info, current_grid=current_grid)
+            return [cell for _dist, cell in nearest[: self.candidate_standoff_max_cells]]
+        return self.nearest_reachable_cells_to_candidate(
+            candidate,
+            traversible,
+            map_info,
+            current_grid=current_grid,
+            max_cells=self.candidate_standoff_max_cells,
+        )
 
     def nearest_reachable_cells_to_candidate(
         self,
@@ -328,8 +446,8 @@ class SGNavDecision:
         ranked.sort(key=lambda item: item[0])
         return [cell for _dist, cell in ranked[: max(1, int(max_cells))]]
 
-    @staticmethod
     def _targets_with_min_progress(
+        self,
         targets: Sequence[Tuple[int, int]],
         planner: GridAStarPlanner,
         current_grid: Tuple[int, int],
@@ -349,4 +467,104 @@ class SGNavDecision:
             dist = float(dist_map[cell])
             if np.isfinite(dist) and dist >= min_progress_m:
                 filtered.append(cell)
+                if len(filtered) >= self.candidate_standoff_max_cells:
+                    break
         return filtered
+
+    def _category_matches_goal(self, category: str, goal_category: str) -> bool:
+        cat = normalize_category(category)
+        goal = normalize_category(goal_category)
+        if not goal or not cat:
+            return False
+        if cat == goal:
+            return True
+        if self.candidate_match_substring:
+            return goal in cat or cat in goal
+        return False
+
+    def _get_or_create_candidate_track(self, candidate: ObjectNode) -> CandidateTrack:
+        node_id = int(candidate.node_id)
+        if self.active_candidate_track is None or int(self.active_candidate_track.node_id) != node_id:
+            self.active_candidate_track = CandidateTrack(node_id=node_id)
+            self.reperception_candidate_id = node_id
+            self.reperception_steps = 0
+        return self.active_candidate_track
+
+    def _clear_candidate_track(self, node_id: Optional[int] = None) -> None:
+        if node_id is None or self.active_candidate_track is None or int(self.active_candidate_track.node_id) == int(node_id):
+            self.active_candidate_track = None
+            self.reperception_candidate_id = None
+            self.reperception_steps = 0
+
+    def _candidate_observation_score(
+        self,
+        candidate: ObjectNode,
+        current_pose: Sequence[float],
+        frontier_decision: Optional[DecisionResult] = None,
+    ) -> float:
+        _ = current_pose, frontier_decision
+        conf = float(candidate.confidence)
+        hit_term = min(float(candidate.observed_count), 5.0) / 5.0
+        return float(np.clip(conf * (0.5 + 0.5 * hit_term), 0.0, 1.0))
+
+    def _update_candidate_track(
+        self,
+        track: CandidateTrack,
+        candidate: ObjectNode,
+        current_pose: Sequence[float],
+        current_step: Optional[int],
+    ) -> float:
+        track.steps += 1
+        self.reperception_steps = track.steps
+        observed_count = max(0, int(candidate.observed_count))
+        delta = max(0, observed_count - int(track.last_counted_observed_count))
+        last_seen_step = int(getattr(candidate, "last_seen_step", current_step if current_step is not None else -1))
+        if delta > 0:
+            score = self._candidate_observation_score(candidate, current_pose)
+            track.score_sum += float(score) * float(delta)
+            track.observation_count += int(delta)
+            track.last_counted_observed_count = observed_count
+            track.last_seen_step = last_seen_step
+        if track.observation_count <= 0:
+            return 0.0
+        return float(track.score_sum / max(1, track.observation_count))
+
+    def _candidate_metadata(
+        self,
+        candidate: ObjectNode,
+        track: CandidateTrack,
+        credibility: float,
+        distance_to_candidate: float,
+    ) -> Dict[str, object]:
+        return {
+            "candidate_credibility": float(credibility),
+            "candidate_observed_count": int(candidate.observed_count),
+            "candidate_track_observation_count": int(track.observation_count),
+            "candidate_reperception_steps": int(track.steps),
+            "candidate_rejected": bool(track.rejected),
+            "candidate_accepted": bool(track.accepted),
+            "candidate_distance_m": float(distance_to_candidate),
+            "selected_candidate_id": int(candidate.node_id),
+        }
+
+    def _is_candidate_rejected(self, candidate: ObjectNode, current_step: Optional[int]) -> bool:
+        node_id = int(candidate.node_id)
+        if node_id not in self.rejected_candidates:
+            return False
+        reject_until = int(self.rejected_candidates[node_id])
+        if current_step is None:
+            return True
+        if int(current_step) <= reject_until:
+            return True
+        self.rejected_candidates.pop(node_id, None)
+        return False
+
+    def _reject_candidate(self, candidate: ObjectNode, current_step: Optional[int]) -> None:
+        node_id = int(candidate.node_id)
+        if current_step is None:
+            reject_until = 2**31 - 1
+        else:
+            reject_until = int(current_step) + self.candidate_reject_ttl_steps
+        self.rejected_candidates[node_id] = int(reject_until)
+        if self.active_candidate_track is not None and int(self.active_candidate_track.node_id) == node_id:
+            self.active_candidate_track.rejected = True
