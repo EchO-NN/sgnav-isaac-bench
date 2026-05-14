@@ -2,12 +2,12 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import numpy as np
 
 from isaac_bench.mapping.coordinate_transform import MapInfo, grid_to_world_xy
-from isaac_bench.navigation.astar import GridAStarPlanner
+from isaac_bench.navigation.astar import astar_distance_map
 
 GridCell = Tuple[int, int]
 
@@ -21,43 +21,104 @@ class FrontierCluster:
     path_distance_from_agent: float
 
 
-def frontier_cells(free: np.ndarray, observed: np.ndarray) -> np.ndarray:
-    free = free.astype(bool)
-    observed = observed.astype(bool)
-    unknown = ~observed.astype(bool)
-    out = np.zeros_like(free, dtype=bool)
-    h, w = free.shape
-    for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
-        shifted = np.zeros_like(free, dtype=bool)
-        r0s, r1s = max(0, dr), h + min(0, dr)
-        c0s, c1s = max(0, dc), w + min(0, dc)
-        r0d, r1d = max(0, -dr), h + min(0, -dr)
-        c0d, c1d = max(0, -dc), w + min(0, -dc)
-        shifted[r0d:r1d, c0d:c1d] = unknown[r0s:r1s, c0s:c1s]
-        out |= free & observed & shifted
-    return out
+def _disk_dilate(mask: np.ndarray, radius_cells: int) -> np.ndarray:
+    mask_bool = np.asarray(mask).astype(bool)
+    radius = max(0, int(radius_cells))
+    if radius <= 0 or not np.any(mask_bool):
+        return mask_bool
+    try:
+        import skimage.morphology
+
+        return skimage.morphology.binary_dilation(mask_bool, skimage.morphology.disk(radius)).astype(bool)
+    except Exception:
+        out = np.array(mask_bool, copy=True)
+        rows, cols = np.nonzero(mask_bool)
+        h, w = mask_bool.shape
+        offsets = [
+            (dr, dc)
+            for dr in range(-radius, radius + 1)
+            for dc in range(-radius, radius + 1)
+            if dr * dr + dc * dc <= radius * radius
+        ]
+        for row, col in zip(rows, cols):
+            for dr, dc in offsets:
+                rr, cc = int(row + dr), int(col + dc)
+                if 0 <= rr < h and 0 <= cc < w:
+                    out[rr, cc] = True
+        return out
 
 
-def connected_components(mask: np.ndarray) -> List[List[GridCell]]:
-    h, w = mask.shape
-    seen = np.zeros_like(mask, dtype=bool)
-    comps: List[List[GridCell]] = []
-    for r, c in zip(*np.nonzero(mask)):
-        if seen[r, c]:
+def frontier_cells(
+    free: np.ndarray,
+    observed: Optional[np.ndarray] = None,
+    occupancy: Optional[np.ndarray] = None,
+    obstacle_dilation_radius_cells: int = 4,
+    unknown_dilation_radius_cells: int = 1,
+    exclude_mask: Optional[np.ndarray] = None,
+) -> np.ndarray:
+    """SG-Nav FBE frontier map.
+
+    Mirrors /home/echo/SG-Nav/SG_Nav.py::fbe:
+      free cells are 1, obstacle-dilated cells are 3, unknown cells are 0;
+      frontier cells are free cells intersecting the 1-cell dilation of unknown.
+    `observed` is retained for older callers; the SG-Nav definition uses
+    `free` and `occupancy`, where cells not in either are unknown.
+    """
+    free_bool = np.asarray(free).astype(bool)
+    occ_bool = np.zeros_like(free_bool, dtype=bool) if occupancy is None else np.asarray(occupancy).astype(bool)
+    if occ_bool.shape != free_bool.shape:
+        raise ValueError("occupancy and free must have the same shape")
+
+    fbe_map = np.zeros_like(free_bool, dtype=np.int8)
+    fbe_map[free_bool] = 1
+    dilated_obstacles = _disk_dilate(occ_bool, obstacle_dilation_radius_cells)
+    fbe_map[dilated_obstacles] = 3
+
+    unknown = fbe_map == 0
+    unknown_dilated = _disk_dilate(unknown, unknown_dilation_radius_cells)
+    fbe_cpp = np.array(fbe_map, copy=True)
+    fbe_cpp[unknown_dilated] = 0
+    frontiers = (fbe_map - fbe_cpp) == 1
+    if exclude_mask is not None:
+        excluded = np.asarray(exclude_mask).astype(bool)
+        if excluded.shape != free_bool.shape:
+            raise ValueError("exclude_mask and free must have the same shape")
+        frontiers &= ~excluded
+    return frontiers
+
+
+def _connected_components(mask: np.ndarray) -> List[List[GridCell]]:
+    src = np.asarray(mask).astype(bool)
+    if not np.any(src):
+        return []
+    visited = np.zeros_like(src, dtype=bool)
+    h, w = src.shape
+    components: List[List[GridCell]] = []
+    offsets = [
+        (-1, -1), (-1, 0), (-1, 1),
+        (0, -1), (0, 1),
+        (1, -1), (1, 0), (1, 1),
+    ]
+    for start_row, start_col in zip(*np.nonzero(src)):
+        start = (int(start_row), int(start_col))
+        if visited[start]:
             continue
-        q = deque([(int(r), int(c))])
-        seen[r, c] = True
-        comp: List[GridCell] = []
-        while q:
-            cell = q.popleft()
-            comp.append(cell)
-            for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
-                rr, cc = cell[0] + dr, cell[1] + dc
-                if 0 <= rr < h and 0 <= cc < w and mask[rr, cc] and not seen[rr, cc]:
-                    seen[rr, cc] = True
-                    q.append((rr, cc))
-        comps.append(comp)
-    return comps
+        visited[start] = True
+        queue: deque[GridCell] = deque([start])
+        members: List[GridCell] = []
+        while queue:
+            row, col = queue.popleft()
+            members.append((row, col))
+            for dr, dc in offsets:
+                rr, cc = row + dr, col + dc
+                if rr < 0 or rr >= h or cc < 0 or cc >= w:
+                    continue
+                if visited[rr, cc] or not src[rr, cc]:
+                    continue
+                visited[rr, cc] = True
+                queue.append((rr, cc))
+        components.append(members)
+    return components
 
 
 def extract_frontiers(
@@ -69,19 +130,40 @@ def extract_frontiers(
     min_cluster_size: int = 3,
     min_distance_m: float = 1.0,
     max_count: int = 64,
+    occupancy: Optional[np.ndarray] = None,
+    obstacle_dilation_radius_cells: int = 4,
+    unknown_dilation_radius_cells: int = 1,
+    exclude_mask: Optional[np.ndarray] = None,
 ) -> List[FrontierCluster]:
-    cells = frontier_cells(free, observed)
-    planner = GridAStarPlanner(traversible, map_info.resolution_m, allow_diagonal=True)
+    _ = observed
+    cells = frontier_cells(
+        free,
+        occupancy=occupancy,
+        obstacle_dilation_radius_cells=obstacle_dilation_radius_cells,
+        unknown_dilation_radius_cells=unknown_dilation_radius_cells,
+        exclude_mask=exclude_mask,
+    )
+    dist_map = astar_distance_map(traversible, agent_grid, map_info.resolution_m, allow_diagonal=True)
     clusters: List[FrontierCluster] = []
-    for comp in connected_components(cells):
-        if len(comp) < min_cluster_size:
+    near_clusters: List[FrontierCluster] = []
+    for members in _connected_components(cells):
+        finite_members = [(row, col) for row, col in members if np.isfinite(float(dist_map[row, col]))]
+        if len(finite_members) < max(1, int(min_cluster_size)):
             continue
-        arr = np.asarray(comp, dtype=np.float32)
-        center = tuple(int(round(v)) for v in arr.mean(axis=0))
-        dist = planner.distance(agent_grid, comp)
-        if not np.isfinite(dist) or dist < min_distance_m:
-            continue
+        member_arr = np.asarray(finite_members, dtype=np.float32)
+        centroid = np.mean(member_arr, axis=0)
+        center_idx = int(np.argmin(np.sum((member_arr - centroid) ** 2, axis=1)))
+        center = tuple(int(v) for v in member_arr[center_idx])
+        dist = float(dist_map[center])
         wx, wy = grid_to_world_xy(center[0], center[1], map_info)
-        clusters.append(FrontierCluster(center, (wx, wy), comp, len(comp), float(dist)))
-    clusters.sort(key=lambda f: (-f.size, f.path_distance_from_agent))
-    return clusters[:max_count]
+        cluster = FrontierCluster(center, (wx, wy), finite_members, len(finite_members), dist)
+        if dist < min_distance_m:
+            near_clusters.append(cluster)
+            continue
+        clusters.append(cluster)
+    if not clusters and near_clusters:
+        clusters = near_clusters
+    clusters.sort(key=lambda cluster: (-int(cluster.size), float(cluster.path_distance_from_agent)))
+    if int(max_count) > 0:
+        return clusters[: int(max_count)]
+    return clusters

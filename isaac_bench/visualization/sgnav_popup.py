@@ -29,7 +29,7 @@ class SGNavPopupVisualizer:
         enabled: bool = True,
         window_name: str = "SG-Nav Isaac Debug",
         save_dir: Optional[str] = None,
-        panel_size: Tuple[int, int] = (960, 540),
+        panel_size: Tuple[int, int] = (1440, 900),
         save_every_steps: int = 10,
         ipc_jpeg_quality: int = 75,
     ) -> None:
@@ -243,13 +243,19 @@ class SGNavPopupVisualizer:
         failure_reason: Optional[str] = None,
     ) -> np.ndarray:
         panel_w, panel_h = self.panel_size
-        left_w = panel_w // 2
-        right_w = panel_w - left_w
-        rgb_h = int(panel_h * 0.67)
+        right_w = max(1, int(panel_w * 0.60))
+        left_w = panel_w - right_w
+        rgb_h = int(panel_h * 0.62)
         text_h = panel_h - rgb_h
 
         panel = Image.new("RGB", (panel_w, panel_h), (18, 20, 24))
-        rgb_panel = self._render_rgb(rgb, detections_2d, (left_w, rgb_h))
+        rgb_panel = self._render_rgb(
+            rgb,
+            detections_2d,
+            (left_w, rgb_h),
+            goal_category=goal_category,
+            nav_decision=nav_decision,
+        )
         map_panel = self._render_map(
             occupancy=occupancy,
             navigable=navigable,
@@ -287,7 +293,14 @@ class SGNavPopupVisualizer:
         draw.line([(0, rgb_h), (left_w, rgb_h)], fill=(70, 74, 80), width=2)
         return np.asarray(panel, dtype=np.uint8)
 
-    def _render_rgb(self, rgb: np.ndarray, detections: Sequence[Detection2D], size: Tuple[int, int]) -> Image.Image:
+    def _render_rgb(
+        self,
+        rgb: np.ndarray,
+        detections: Sequence[Detection2D],
+        size: Tuple[int, int],
+        goal_category: str = "",
+        nav_decision: Optional[NavigationDecision] = None,
+    ) -> Image.Image:
         width, height = size
         arr = np.asarray(rgb)
         if arr.dtype != np.uint8:
@@ -295,17 +308,29 @@ class SGNavPopupVisualizer:
         if arr.ndim != 3 or arr.shape[2] < 3:
             arr = np.zeros((height, width, 3), dtype=np.uint8)
         src_h, src_w = arr.shape[:2]
-        image = Image.fromarray(arr[:, :, :3], mode="RGB").resize((width, height), Image.BILINEAR)
+        image = Image.new("RGB", (width, height), (12, 14, 18))
+        scale = min(width / max(src_w, 1), height / max(src_h, 1))
+        render_w = max(1, int(round(src_w * scale)))
+        render_h = max(1, int(round(src_h * scale)))
+        offset_x = (width - render_w) // 2
+        offset_y = (height - render_h) // 2
+        rgb_image = Image.fromarray(arr[:, :, :3]).resize((render_w, render_h), Image.BILINEAR)
+        image.paste(rgb_image, (offset_x, offset_y))
         draw = ImageDraw.Draw(image)
-        sx, sy = width / max(src_w, 1), height / max(src_h, 1)
+        sx, sy = render_w / max(src_w, 1), render_h / max(src_h, 1)
         for det in detections[:30]:
             x1, y1, x2, y2 = det.bbox_xyxy
-            box = [int(x1 * sx), int(y1 * sy), int(x2 * sx), int(y2 * sy)]
-            color = (80, 230, 120)
+            box = [
+                int(offset_x + x1 * sx),
+                int(offset_y + y1 * sy),
+                int(offset_x + x2 * sx),
+                int(offset_y + y2 * sy),
+            ]
+            color = self._bbox_color(det, goal_category, nav_decision)
             draw.rectangle(box, outline=color, width=2)
             label = "%s %.2f" % (det.category, float(det.confidence))
             self._label(draw, (box[0], max(0, box[1] - 14)), label, color)
-        self._label(draw, (8, 8), "RGB / YOLO detections: %d" % len(detections), (255, 255, 255))
+        self._label(draw, (8, 8), "RGB / YOLO detections: %d  green=normal red=goal" % len(detections), (255, 255, 255))
         return image
 
     def _render_map(
@@ -335,18 +360,32 @@ class SGNavPopupVisualizer:
         base[occupancy.astype(bool)] = (24, 24, 24)
         base[~obs] = (base[~obs].astype(np.float32) * 0.45 + np.array([20, 24, 34], dtype=np.float32)).astype(np.uint8)
 
+        r0, r1, c0, c1 = self._map_crop_bounds(
+            occupancy=occupancy,
+            navigable=navigable,
+            observed=observed,
+            current_grid=current_grid,
+            frontiers=frontiers,
+            nav_decision=nav_decision,
+            current_path=current_path,
+            full_path=full_path,
+            object_memory=object_memory,
+            goal_category=goal_category,
+        )
+        crop = base[r0:r1, c0:c1]
+        crop_h, crop_w = crop.shape[:2]
         margin = 12
-        scale = min((width - 2 * margin) / max(w, 1), (height - 2 * margin) / max(h, 1))
-        map_w, map_h = max(1, int(w * scale)), max(1, int(h * scale))
+        scale = min((width - 2 * margin) / max(crop_w, 1), (height - 2 * margin) / max(crop_h, 1))
+        map_w, map_h = max(1, int(crop_w * scale)), max(1, int(crop_h * scale))
         ox, oy = (width - map_w) // 2, (height - map_h) // 2
         image = Image.new("RGB", (width, height), (18, 20, 24))
-        map_img = Image.fromarray(base, mode="RGB").resize((map_w, map_h), Image.NEAREST)
+        map_img = Image.fromarray(crop).resize((map_w, map_h), Image.NEAREST)
         image.paste(map_img, (ox, oy))
         draw = ImageDraw.Draw(image)
 
         def xy(cell: GridCell) -> Tuple[int, int]:
             r, c = int(cell[0]), int(cell[1])
-            return int(ox + (c + 0.5) * scale), int(oy + (r + 0.5) * scale)
+            return int(ox + (c - c0 + 0.5) * scale), int(oy + (r - r0 + 0.5) * scale)
 
         self._draw_cells(draw, goal_cells, xy, (30, 220, 80), radius=2, max_cells=500)
         self._draw_cells(draw, full_path, xy, (80, 130, 255), radius=1, max_cells=1200)
@@ -361,21 +400,88 @@ class SGNavPopupVisualizer:
             self._dot(draw, xy(selected_frontier.center_grid), (255, 225, 40), radius=7)
         if nav_decision and nav_decision.target_cells:
             self._draw_cells(draw, nav_decision.target_cells, xy, (220, 70, 255), radius=2, max_cells=400)
-        if nav_decision and nav_decision.selected_candidate is not None:
-            self._dot(draw, xy(nav_decision.selected_candidate.center_grid), (255, 80, 220), radius=8)
-
-        goal_norm = normalize_category(goal_category)
-        for node in object_memory.nodes[:300]:
-            cat = normalize_category(node.category)
-            color = (255, 178, 50)
-            if cat == goal_norm or (goal_norm and (goal_norm in cat or cat in goal_norm)):
-                color = (45, 245, 95)
-            self._dot(draw, xy(node.center_grid), color, radius=3)
+        selected_id = self._selected_candidate_id(nav_decision)
+        for node in self._visible_map_nodes(object_memory, goal_category, nav_decision)[:300]:
+            radius = 8 if selected_id is not None and int(node.node_id) == selected_id else 5
+            self._dot(draw, xy(node.center_grid), (255, 60, 60), radius=radius)
 
         self._draw_agent(draw, xy(current_grid), float(pose[3]) if len(pose) > 3 else 0.0, scale)
-        self._label(draw, (10, 8), "Map / frontiers / A* / object memory", (255, 255, 255))
+        zoom = max(1.0, min(w / max(crop_w, 1), h / max(crop_h, 1)))
+        self._label(draw, (10, 8), "Map / frontiers / A* / goal candidates  zoom %.1fx" % zoom, (255, 255, 255))
         self._legend(draw, (10, height - 76))
         return image
+
+    def _map_crop_bounds(
+        self,
+        *,
+        occupancy: np.ndarray,
+        navigable: np.ndarray,
+        observed: np.ndarray,
+        current_grid: GridCell,
+        frontiers: Sequence[FrontierCluster],
+        nav_decision: Optional[NavigationDecision],
+        current_path: Sequence[GridCell],
+        full_path: Sequence[GridCell],
+        object_memory: ObjectMemory,
+        goal_category: str,
+    ) -> Tuple[int, int, int, int]:
+        h, w = occupancy.shape
+        rows: List[int] = []
+        cols: List[int] = []
+
+        active = observed.astype(bool) | occupancy.astype(bool) | navigable.astype(bool)
+        rr, cc = np.nonzero(active)
+        if rr.size:
+            rows.extend(int(v) for v in rr)
+            cols.extend(int(v) for v in cc)
+
+        def add_cell(cell: GridCell) -> None:
+            r, c = int(cell[0]), int(cell[1])
+            if 0 <= r < h and 0 <= c < w:
+                rows.append(r)
+                cols.append(c)
+
+        add_cell(current_grid)
+        for cell in current_path:
+            add_cell(cell)
+        for cell in full_path:
+            add_cell(cell)
+        for frontier in frontiers[:128]:
+            add_cell(frontier.center_grid)
+        if nav_decision is not None:
+            for cell in nav_decision.target_cells:
+                add_cell(cell)
+            if nav_decision.frontier_decision is not None and nav_decision.frontier_decision.selected_frontier is not None:
+                add_cell(nav_decision.frontier_decision.selected_frontier.center_grid)
+            if nav_decision.selected_candidate is not None:
+                add_cell(nav_decision.selected_candidate.center_grid)
+        for node in self._visible_map_nodes(object_memory, goal_category, nav_decision)[:500]:
+            add_cell(node.center_grid)
+
+        if not rows or not cols:
+            return 0, h, 0, w
+
+        min_r, max_r = min(rows), max(rows)
+        min_c, max_c = min(cols), max(cols)
+        padding = max(24, int(round(min(h, w) * 0.04)))
+        min_r = max(0, min_r - padding)
+        max_r = min(h - 1, max_r + padding)
+        min_c = max(0, min_c - padding)
+        max_c = min(w - 1, max_c + padding)
+
+        crop_h = max_r - min_r + 1
+        crop_w = max_c - min_c + 1
+        min_crop = min(max(h, w), 160)
+        if crop_h < min_crop:
+            extra = min_crop - crop_h
+            min_r = max(0, min_r - extra // 2)
+            max_r = min(h - 1, max_r + extra - extra // 2)
+        if crop_w < min_crop:
+            extra = min_crop - crop_w
+            min_c = max(0, min_c - extra // 2)
+            max_c = min(w - 1, max_c + extra - extra // 2)
+
+        return min_r, max_r + 1, min_c, max_c + 1
 
     def _render_text(
         self,
@@ -493,13 +599,59 @@ class SGNavPopupVisualizer:
             ((40, 190, 255), "A*"),
             ((0, 225, 255), "frontier"),
             ((255, 225, 40), "chosen"),
-            ((45, 245, 95), "goal/object"),
+            ((255, 60, 60), "goal cand"),
             ((220, 70, 255), "target"),
         ]
         for color, label in items:
             self._dot(draw, (x + 6, y + 8), color, radius=5)
             draw.text((x + 16, y), label, fill=(230, 232, 235), font=self._font)
             y += 12
+
+    @classmethod
+    def _bbox_color(
+        cls,
+        det: Detection2D,
+        goal_category: str,
+        nav_decision: Optional[NavigationDecision],
+    ) -> Tuple[int, int, int]:
+        if cls._category_matches_goal(det.category, goal_category):
+            return (255, 60, 60)
+        candidate = nav_decision.selected_candidate if nav_decision and nav_decision.selected_candidate is not None else None
+        if candidate is not None and cls._category_matches_goal(det.category, candidate.category):
+            return (255, 60, 60)
+        return (80, 230, 120)
+
+    @classmethod
+    def _visible_map_nodes(
+        cls,
+        object_memory: ObjectMemory,
+        goal_category: str,
+        nav_decision: Optional[NavigationDecision],
+    ) -> List[object]:
+        selected_id = cls._selected_candidate_id(nav_decision)
+        visible: List[object] = []
+        seen_ids = set()
+        for node in object_memory.nodes:
+            node_id = int(node.node_id)
+            if node_id == selected_id or cls._category_matches_goal(node.category, goal_category):
+                visible.append(node)
+                seen_ids.add(node_id)
+        candidate = nav_decision.selected_candidate if nav_decision and nav_decision.selected_candidate is not None else None
+        if candidate is not None and int(candidate.node_id) not in seen_ids:
+            visible.append(candidate)
+        return visible
+
+    @staticmethod
+    def _selected_candidate_id(nav_decision: Optional[NavigationDecision]) -> Optional[int]:
+        if nav_decision is None or nav_decision.selected_candidate is None:
+            return None
+        return int(nav_decision.selected_candidate.node_id)
+
+    @staticmethod
+    def _category_matches_goal(category: str, goal_category: str) -> bool:
+        cat = normalize_category(category)
+        goal = normalize_category(goal_category)
+        return bool(goal and cat and (cat == goal or goal in cat or cat in goal))
 
     @staticmethod
     def _short(value) -> str:

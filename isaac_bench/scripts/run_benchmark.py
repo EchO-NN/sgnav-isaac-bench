@@ -35,7 +35,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     args.headless = bool(get_nested(cfg, "isaac.headless", True) if args.headless is None else args.headless)
     args.output = args.output or str(Path(get_nested(cfg, "project.output_dir", "data/isaac_bench_runs")) / "astar_yoloworld" / "results.jsonl")
     args.sgnav_repo = args.sgnav_repo or get_nested(cfg, "paths.sgnav_repo", "/home/echo/SG-Nav")
-    args.yolo_world_model = args.yolo_world_model or get_nested(cfg, "paths.yolo_world_model", get_nested(cfg, "perception.yolo_world_model", "data/models/yolov8s-worldv2.pt"))
+    args.yolo_world_model = args.yolo_world_model or get_nested(cfg, "paths.yolo_world_model", get_nested(cfg, "perception.yolo_world_model", "data/models/yolov8l-worldv2.pt"))
     if args.use_original_scenegraph is None:
         args.use_original_scenegraph = bool(get_nested(cfg, "repo.use_original_scenegraph", False))
 

@@ -22,8 +22,8 @@ def _write_error(message: str) -> None:
 def main(argv: List[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--detector", default="yolo_world", choices=["dry_run", "yolo_world", "none"])
-    parser.add_argument("--model", default="data/models/yolov8s-worldv2.pt")
-    parser.add_argument("--conf", type=float, default=0.08)
+    parser.add_argument("--model", default="data/models/yolov8l-worldv2.pt")
+    parser.add_argument("--conf", type=float, default=0.7)
     parser.add_argument("--iou", type=float, default=0.5)
     parser.add_argument("--categories-json", default="[]")
     parser.add_argument("--segmenter", default="none", choices=["none", "auto", "sam2"])

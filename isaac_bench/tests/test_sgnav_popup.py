@@ -49,3 +49,45 @@ def test_sgnav_popup_render_panel():
     assert panel.shape == (360, 640, 3)
     assert panel.dtype == np.uint8
     assert int(panel.sum()) > 0
+
+
+def test_sgnav_popup_bbox_colors_goal_red_normal_green():
+    viz = SGNavPopupVisualizer(enabled=False, panel_size=(320, 240))
+    image = viz._render_rgb(
+        np.zeros((80, 100, 3), dtype=np.uint8),
+        [
+            Detection2D("chair", "chair", 0.8, (20, 20, 40, 40), 0),
+            Detection2D("mirror", "mirror", 0.9, (60, 20, 80, 40), 1),
+        ],
+        (100, 80),
+        goal_category="mirror",
+        nav_decision=None,
+    )
+    arr = np.asarray(image)
+    assert tuple(arr[40, 30]) == (80, 230, 120)
+    assert tuple(arr[40, 70]) == (255, 60, 60)
+
+
+def test_sgnav_popup_map_nodes_only_goal_or_selected_candidate():
+    memory = ObjectMemory()
+    memory.update(
+        [
+            Detection3D("chair", "chair", 0.9, (0.0, 0.0, 0.5), (0, 0, 10, 10)),
+            Detection3D("mirror", "mirror", 0.9, (1.0, 0.0, 0.5), (0, 0, 10, 10)),
+            Detection3D("table", "table", 0.9, (2.0, 0.0, 0.5), (0, 0, 10, 10)),
+        ],
+        step_id=1,
+    )
+    for idx, node in enumerate(memory.nodes):
+        node.center_grid = (10, 10 + idx)
+
+    decision = NavigationDecision(
+        mode="candidate",
+        target_cells=[],
+        stop=False,
+        selected_candidate=memory.nodes[2],
+        frontier_decision=None,
+        reason="navigate_to_goal_candidate",
+    )
+    visible = SGNavPopupVisualizer._visible_map_nodes(memory, "mirror", decision)
+    assert [node.category for node in visible] == ["mirror", "table"]

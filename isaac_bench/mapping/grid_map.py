@@ -50,4 +50,3 @@ class OnlineGridMap:
 
     def world_to_grid(self, x: float, y: float) -> Tuple[int, int]:
         return world_xy_to_grid(x, y, self.map_info)
-

@@ -95,7 +95,7 @@ class SubprocessDetector(DetectorBase):
         self,
         detector_name: str,
         model_name: str,
-        conf: float = 0.08,
+        conf: float = 0.7,
         iou: float = 0.5,
         python_executable: Optional[str] = None,
         startup_timeout_s: float = 180.0,

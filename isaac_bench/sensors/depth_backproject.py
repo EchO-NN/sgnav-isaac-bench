@@ -63,6 +63,10 @@ def detection_to_world_points(
     if int(valid.sum()) < min_points:
         return None
     pixels = pixels[valid]
+    z = z[valid]
+    if det.mask is None:
+        foreground = _foreground_depth_mask(z, min_points=min_points)
+        pixels = pixels[foreground]
     points_cam = backproject_pixels(depth, pixels, intr)
     return transform_points(points_cam, camera_pose_world)
 
@@ -91,3 +95,23 @@ def detections_to_3d(
             )
         )
     return out
+
+
+def _foreground_depth_mask(depth_values: np.ndarray, min_points: int = 20) -> np.ndarray:
+    """Prefer foreground depth inside a bbox when no SAM mask is available.
+
+    Raw YOLO boxes often include background wall/floor. SG-Nav's original path
+    relies on masks before point-cloud projection; for bbox-only fallback we
+    keep a near-depth band so object centers are not pulled behind the object.
+    """
+    z = np.asarray(depth_values, dtype=np.float32).reshape(-1)
+    if len(z) == 0:
+        return np.zeros((0,), dtype=bool)
+    if len(z) <= max(4, int(min_points)):
+        return np.ones_like(z, dtype=bool)
+    near = float(np.percentile(z, 20.0))
+    band = max(0.20, 0.15 * max(near, 0.0))
+    keep = z <= near + band
+    if int(np.count_nonzero(keep)) >= int(min_points):
+        return keep
+    return np.ones_like(z, dtype=bool)

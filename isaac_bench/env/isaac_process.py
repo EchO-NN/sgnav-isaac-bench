@@ -14,6 +14,21 @@ def yaw_to_quat_wxyz(yaw: float) -> np.ndarray:
     return np.asarray([math.cos(yaw * 0.5), 0.0, 0.0, math.sin(yaw * 0.5)], dtype=np.float32)
 
 
+def _hashable_frame_value(value):
+    if isinstance(value, np.ndarray):
+        if value.size == 1:
+            return value.reshape(-1)[0].item()
+        return tuple(value.reshape(-1).tolist())
+    if hasattr(value, "item"):
+        try:
+            return value.item()
+        except Exception:
+            pass
+    if isinstance(value, (list, tuple)):
+        return tuple(_hashable_frame_value(v) for v in value)
+    return value
+
+
 class IsaacSimServer:
     def __init__(
         self,
@@ -26,9 +41,16 @@ class IsaacSimServer:
         forward_offset_m: float = 0.0,
         camera_pitch_deg: float = 0.0,
         camera_near_m: float = 0.02,
-        camera_far_m: float = 80.0,
+        camera_far_m: float = 5.0,
         enable_depth: bool = False,
         camera_annotator_device: str = "cuda",
+        enable_nearfield_depth: bool = False,
+        nearfield_width: int = 192,
+        nearfield_height: int = 192,
+        nearfield_hfov_deg: float = 115.0,
+        nearfield_height_m: float = 1.15,
+        nearfield_near_m: float = 0.02,
+        nearfield_far_m: float = 1.8,
     ):
         self.headless = bool(headless)
         self.width = int(width)
@@ -41,6 +63,13 @@ class IsaacSimServer:
         self.camera_near_m = float(camera_near_m)
         self.camera_far_m = float(camera_far_m)
         self.enable_depth = bool(enable_depth)
+        self.enable_nearfield_depth = bool(enable_nearfield_depth)
+        self.nearfield_width = int(nearfield_width)
+        self.nearfield_height = int(nearfield_height)
+        self.nearfield_hfov_deg = float(nearfield_hfov_deg)
+        self.nearfield_height_m = float(nearfield_height_m)
+        self.nearfield_near_m = float(nearfield_near_m)
+        self.nearfield_far_m = float(nearfield_far_m)
         device = str(camera_annotator_device or "cpu").strip().lower()
         self.camera_annotator_device = device if device in {"cpu", "cuda"} else "cpu"
         self.app = None
@@ -48,12 +77,19 @@ class IsaacSimServer:
         self.robot = None
         self.controller = None
         self.camera = None
+        self.nearfield_camera = None
         self.camera_prim_path = "/World/Kaya/camera_rgbd"
+        self.nearfield_camera_prim_path = "/World/Kaya/camera_nearfield_depth"
         self.kinematic_pose: Optional[Tuple[float, float, float, float]] = None
         self.last_rgb = np.zeros((self.height, self.width, 3), dtype=np.uint8)
         self.last_rgb_gpu = None
         self.last_rgb_device = "cpu"
         self.last_depth = np.zeros((self.height, self.width), dtype=np.float32)
+        self.last_depth_source = "none"
+        self.last_nearfield_depth = np.zeros((self.nearfield_height, self.nearfield_width), dtype=np.float32)
+        self.last_nearfield_depth_source = "none"
+        self.last_camera_frame_token = None
+        self.last_camera_frame_sync_updates = 0
         self._logged_cuda_rgb_fallback = False
 
     def log(self, message: str) -> None:
@@ -145,6 +181,10 @@ class IsaacSimServer:
         cam_z = z + self.mast_height_m
         return cam_x, cam_y, cam_z, yaw
 
+    def nearfield_camera_pose_from_base(self, pose_world: Tuple[float, float, float, float]) -> Tuple[float, float, float, float]:
+        x, y, z, yaw = [float(v) for v in pose_world]
+        return x, y, z + self.nearfield_height_m, yaw
+
     def camera_orientation(self, yaw: float):
         from isaacsim.core.utils import rotations as rot_utils
 
@@ -152,6 +192,17 @@ class IsaacSimServer:
             np.asarray([self.camera_pitch_deg, 0.0, math.degrees(float(yaw))], dtype=np.float32),
             degrees=True,
         )
+
+    def nearfield_camera_orientation(self, pose_world: Tuple[float, float, float, float]):
+        from isaacsim.core.utils import rotations as rot_utils
+        from pxr import Gf
+
+        cam_x, cam_y, cam_z, yaw = self.nearfield_camera_pose_from_base(pose_world)
+        camera = Gf.Vec3f(float(cam_x), float(cam_y), float(cam_z))
+        target = Gf.Vec3f(float(cam_x), float(cam_y), float(cam_z - 1.0))
+        up = Gf.Vec3f(float(math.cos(yaw)), float(math.sin(yaw)), 0.0)
+        quat = rot_utils.lookat_to_quatf(camera, target, up)
+        return rot_utils.gf_quat_to_np_array(quat).astype(np.float32)
 
     def configure_camera_intrinsics(self) -> None:
         if self.camera is None:
@@ -193,6 +244,41 @@ class IsaacSimServer:
         if applied:
             self.log("[isaac] camera clipping %.3f..%.1f m" % (near, far))
 
+    def configure_nearfield_camera_intrinsics(self) -> None:
+        if self.nearfield_camera is None:
+            return
+        hfov = min(max(float(self.nearfield_hfov_deg), 30.0), 150.0)
+        aperture = 20.955
+        focal_length = aperture / (2.0 * math.tan(math.radians(hfov) * 0.5))
+        try:
+            self.nearfield_camera.set_horizontal_aperture(aperture)
+            self.nearfield_camera.set_focal_length(focal_length)
+            self.log("[isaac] nearfield camera hfov %.1f deg, focal %.2f" % (hfov, focal_length))
+        except Exception as exc:
+            self.log("[isaac] nearfield camera intrinsics fallback: %s" % exc)
+        near = max(0.001, float(self.nearfield_near_m))
+        far = max(near + 0.1, float(self.nearfield_far_m))
+        applied = False
+        try:
+            self.nearfield_camera.set_clipping_range(near, far)
+            applied = True
+        except Exception:
+            pass
+        try:
+            import omni.usd
+            from pxr import Gf, UsdGeom
+
+            stage = omni.usd.get_context().get_stage()
+            prim = stage.GetPrimAtPath(self.nearfield_camera_prim_path) if stage is not None else None
+            if prim is not None and prim.IsValid():
+                UsdGeom.Camera(prim).GetClippingRangeAttr().Set(Gf.Vec2f(near, far))
+                applied = True
+        except Exception as exc:
+            if not applied:
+                self.log("[isaac] nearfield camera clipping fallback: %s" % exc)
+        if applied:
+            self.log("[isaac] nearfield camera clipping %.3f..%.1f m" % (near, far))
+
     def attach_camera(self, pose_world: Tuple[float, float, float, float]) -> None:
         from isaacsim.sensors.camera import Camera
 
@@ -214,6 +300,28 @@ class IsaacSimServer:
             self.camera = Camera(**camera_kwargs)
         self.configure_camera_intrinsics()
         self.bind_viewport_to_robot_camera()
+        if self.enable_nearfield_depth:
+            self.attach_nearfield_depth_camera(pose_world)
+
+    def attach_nearfield_depth_camera(self, pose_world: Tuple[float, float, float, float]) -> None:
+        from isaacsim.sensors.camera import Camera
+
+        self.log("[isaac] attaching nearfield top-down depth camera")
+        cam_x, cam_y, cam_z, _yaw = self.nearfield_camera_pose_from_base(pose_world)
+        camera_kwargs = {
+            "prim_path": self.nearfield_camera_prim_path,
+            "position": np.asarray([cam_x, cam_y, cam_z], dtype=np.float32),
+            "frequency": 20,
+            "resolution": (self.nearfield_width, self.nearfield_height),
+            "orientation": self.nearfield_camera_orientation(pose_world),
+            "annotator_device": self.camera_annotator_device,
+        }
+        try:
+            self.nearfield_camera = Camera(**camera_kwargs)
+        except TypeError:
+            camera_kwargs.pop("annotator_device", None)
+            self.nearfield_camera = Camera(**camera_kwargs)
+        self.configure_nearfield_camera_intrinsics()
 
     def bind_viewport_to_robot_camera(self) -> None:
         if self.headless:
@@ -259,6 +367,15 @@ class IsaacSimServer:
                 )
             except Exception:
                 pass
+        if self.nearfield_camera is not None:
+            near_x, near_y, near_z, _ = self.nearfield_camera_pose_from_base((x, y, z, yaw))
+            try:
+                self.nearfield_camera.set_world_pose(
+                    position=np.asarray([near_x, near_y, near_z], dtype=np.float32),
+                    orientation=self.nearfield_camera_orientation((x, y, z, yaw)),
+                )
+            except Exception:
+                pass
 
     def reset_episode(
         self,
@@ -276,6 +393,10 @@ class IsaacSimServer:
         self.log("[isaac] initializing camera")
         self.camera.initialize()
         self.configure_camera_intrinsics()
+        if self.nearfield_camera is not None:
+            self.log("[isaac] initializing nearfield depth camera")
+            self.nearfield_camera.initialize()
+            self.configure_nearfield_camera_intrinsics()
         self.bind_viewport_to_robot_camera()
         if self.enable_depth:
             try:
@@ -283,6 +404,11 @@ class IsaacSimServer:
                 self.camera.add_distance_to_image_plane_to_frame()
             except Exception as exc:
                 self.log("[isaac] camera annotator fallback: %s" % exc)
+        if self.enable_nearfield_depth and self.nearfield_camera is not None:
+            try:
+                self.nearfield_camera.add_distance_to_image_plane_to_frame()
+            except Exception as exc:
+                self.log("[isaac] nearfield camera annotator fallback: %s" % exc)
         self.log("[isaac] rendering warmup frames")
         for _ in range(60):
             self.app.update()
@@ -298,10 +424,12 @@ class IsaacSimServer:
         read_depth: Optional[bool] = None,
         rgb_device: Optional[str] = None,
     ) -> dict:
+        previous_frame_token = self._camera_frame_token()
         if self.robot is not None and self.controller is not None:
             self.robot.apply_wheel_actions(self.controller.forward(command=[float(vx), float(vy), float(wz)]))
         for _ in range(int(frames)):
             self.world.step(render=True)
+        self._wait_for_fresh_camera_frame(previous_frame_token, read_depth=self.enable_depth if read_depth is None else bool(read_depth))
         return self.get_observation(
             read_rgb=read_rgb,
             read_depth=self.enable_depth if read_depth is None else bool(read_depth),
@@ -319,6 +447,7 @@ class IsaacSimServer:
         read_depth: Optional[bool] = None,
         rgb_device: Optional[str] = None,
     ) -> dict:
+        previous_frame_token = self._camera_frame_token()
         x, y, z, yaw = self.get_pose_world()
         dx = math.cos(yaw) * float(vx) - math.sin(yaw) * float(vy)
         dy = math.sin(yaw) * float(vx) + math.cos(yaw) * float(vy)
@@ -330,11 +459,52 @@ class IsaacSimServer:
         self.set_pose_world((x + dx * float(dt), y + dy * float(dt), z, yaw))
         for _ in range(int(render_updates)):
             self.app.update()
+        self._wait_for_fresh_camera_frame(previous_frame_token, read_depth=self.enable_depth if read_depth is None else bool(read_depth))
         return self.get_observation(
             read_rgb=read_rgb,
             read_depth=self.enable_depth if read_depth is None else bool(read_depth),
             rgb_device=rgb_device,
         )
+
+    def _camera_frame_token(self):
+        if self.camera is None:
+            return None
+        try:
+            frame = self.camera.get_current_frame() or {}
+        except Exception:
+            return None
+        token = frame.get("rendering_frame")
+        if isinstance(token, dict):
+            return tuple(sorted((str(key), _hashable_frame_value(value)) for key, value in token.items()))
+        if token is not None:
+            return _hashable_frame_value(token)
+        return _hashable_frame_value(frame.get("rendering_time"))
+
+    def _wait_for_fresh_camera_frame(
+        self,
+        previous_token,
+        read_depth: bool = True,
+        max_updates: int = 10,
+        min_fresh_frames: int = 2,
+    ) -> None:
+        """Avoid pairing a stale RGB-D frame with a newly-updated pose."""
+        self.last_camera_frame_sync_updates = 0
+        if self.app is None or self.camera is None or previous_token is None:
+            return
+        fresh_frames = 0
+        last_token = previous_token
+        for idx in range(int(max_updates) + 1):
+            token = self._camera_frame_token()
+            if token is not None and token != last_token:
+                fresh_frames += 1
+                last_token = token
+            if fresh_frames >= max(1, int(min_fresh_frames)):
+                self.last_camera_frame_token = last_token
+                self.last_camera_frame_sync_updates = idx
+                return
+            self.app.update()
+        self.last_camera_frame_token = self._camera_frame_token()
+        self.last_camera_frame_sync_updates = int(max_updates)
 
     def get_pose_world(self) -> Tuple[float, float, float, float]:
         if self.kinematic_pose is not None:
@@ -351,6 +521,7 @@ class IsaacSimServer:
         rgb = self.last_rgb
         rgb_gpu = self.last_rgb_gpu
         depth = self.last_depth
+        nearfield_depth = self.last_nearfield_depth
         frame = {}
         requested_rgb_device = str(rgb_device or self.camera_annotator_device).strip().lower()
         if requested_rgb_device not in {"cpu", "cuda"}:
@@ -384,12 +555,15 @@ class IsaacSimServer:
                         rgb = rgb_frame[:, :, :3].astype(np.uint8)
                         self.last_rgb = rgb
             if read_depth and self.enable_depth:
-                depth_value = frame.get("distance_to_camera")
+                depth_value = frame.get("distance_to_image_plane")
+                depth_source = "distance_to_image_plane"
                 if not isinstance(depth_value, np.ndarray):
-                    depth_value = frame.get("distance_to_image_plane")
+                    depth_value = frame.get("distance_to_camera")
+                    depth_source = "distance_to_camera"
                 if not isinstance(depth_value, np.ndarray):
                     try:
                         depth_value = self.camera.get_depth(device="cpu")
+                        depth_source = "camera_get_depth"
                     except Exception:
                         depth_value = None
                 if isinstance(depth_value, np.ndarray):
@@ -397,16 +571,48 @@ class IsaacSimServer:
                     if depth_frame.ndim == 2:
                         depth = depth_frame
                         self.last_depth = depth
+                        self.last_depth_source = depth_source
+            if read_depth and self.enable_nearfield_depth and self.nearfield_camera is not None:
+                nearfield_depth_value = None
+                nearfield_depth_source = "nearfield_distance_to_image_plane"
+                try:
+                    nearfield_frame = self.nearfield_camera.get_current_frame() or {}
+                    nearfield_depth_value = nearfield_frame.get("distance_to_image_plane")
+                except Exception:
+                    nearfield_depth_value = None
+                if not isinstance(nearfield_depth_value, np.ndarray):
+                    try:
+                        nearfield_depth_value = self.nearfield_camera.get_depth(device="cpu")
+                        nearfield_depth_source = "nearfield_camera_get_depth"
+                    except Exception:
+                        nearfield_depth_value = None
+                if isinstance(nearfield_depth_value, np.ndarray):
+                    nearfield_depth_frame = np.asarray(nearfield_depth_value, dtype=np.float32)
+                    if nearfield_depth_frame.ndim == 2:
+                        nearfield_depth = nearfield_depth_frame
+                        self.last_nearfield_depth = nearfield_depth
+                        self.last_nearfield_depth_source = nearfield_depth_source
         pose = self.get_pose_world()
+        camera_frame_token = self._camera_frame_token()
+        if camera_frame_token is not None:
+            self.last_camera_frame_token = camera_frame_token
         return {
             "rgb": rgb,
             "rgb_gpu": rgb_gpu,
             "rgb_device": self.last_rgb_device,
             "depth": depth,
+            "depth_source": self.last_depth_source,
+            "nearfield_depth": nearfield_depth,
+            "nearfield_depth_source": self.last_nearfield_depth_source,
             "has_rgb": bool(read_rgb),
             "has_depth": bool(read_depth and self.enable_depth),
+            "has_nearfield_depth": bool(read_depth and self.enable_nearfield_depth),
             "pose_world": pose,
             "camera_pose_world": self.camera_pose_from_base(pose),
+            "nearfield_camera_pose_world": self.nearfield_camera_pose_from_base(pose),
+            "camera_rendering_frame": frame.get("rendering_frame") if isinstance(frame, dict) else None,
+            "camera_rendering_time": frame.get("rendering_time") if isinstance(frame, dict) else None,
+            "camera_frame_sync_updates": int(self.last_camera_frame_sync_updates),
             "sim_time": 0.0,
             "collided": False,
         }
@@ -429,9 +635,14 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--camera-forward-offset-m", type=float, default=0.0)
     parser.add_argument("--camera-pitch-deg", type=float, default=0.0)
     parser.add_argument("--camera-near-m", type=float, default=0.02)
-    parser.add_argument("--camera-far-m", type=float, default=80.0)
+    parser.add_argument("--camera-far-m", type=float, default=5.0)
     parser.add_argument("--camera-annotator-device", choices=["cpu", "cuda"], default="cuda")
     parser.add_argument("--read-depth", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--nearfield-depth", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--nearfield-width", type=int, default=192)
+    parser.add_argument("--nearfield-height", type=int, default=192)
+    parser.add_argument("--nearfield-hfov-deg", type=float, default=115.0)
+    parser.add_argument("--nearfield-height-m", type=float, default=1.15)
     args = parser.parse_args(argv)
     server = IsaacSimServer(
         headless=args.headless,
@@ -444,6 +655,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         camera_far_m=args.camera_far_m,
         enable_depth=args.read_depth,
         camera_annotator_device=args.camera_annotator_device,
+        enable_nearfield_depth=args.nearfield_depth,
+        nearfield_width=args.nearfield_width,
+        nearfield_height=args.nearfield_height,
+        nearfield_hfov_deg=args.nearfield_hfov_deg,
+        nearfield_height_m=args.nearfield_height_m,
     )
     try:
         print("[isaac] reset episode", flush=True)

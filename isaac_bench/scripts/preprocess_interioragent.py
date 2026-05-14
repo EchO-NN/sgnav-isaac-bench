@@ -101,8 +101,13 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--scene-id", action="append", default=None)
     parser.add_argument("--scene-glob", default="kujiale_*")
     parser.add_argument("--resolution", type=float, default=0.05)
-    parser.add_argument("--robot-radius-m", type=float, default=0.28)
-    parser.add_argument("--inflation-radius-m", type=float, default=0.0)
+    parser.add_argument("--robot-radius-m", type=float, default=0.14)
+    parser.add_argument(
+        "--inflation-radius-m",
+        type=float,
+        default=0.0,
+        help="Deprecated compatibility option; navigability inflation is footprint-only.",
+    )
     parser.add_argument("--min-object-bbox-diag-m", type=float, default=0.05)
     parser.add_argument("--obstacle-min-height-m", type=float, default=0.05)
     parser.add_argument("--obstacle-max-height-m", type=float, default=1.50)

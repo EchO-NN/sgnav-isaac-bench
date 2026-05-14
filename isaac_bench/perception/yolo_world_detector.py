@@ -11,7 +11,7 @@ from isaac_bench.perception.detector_base import DetectorBase, DryRunDetector
 
 
 class YOLOWorldDetector(DetectorBase):
-    def __init__(self, model_name: str = "data/models/yolov8s-worldv2.pt", conf: float = 0.08, iou: float = 0.5):
+    def __init__(self, model_name: str = "data/models/yolov8l-worldv2.pt", conf: float = 0.7, iou: float = 0.5):
         try:
             from ultralytics import YOLOWorld
         except Exception as exc:
@@ -104,7 +104,7 @@ class YOLOWorldDetector(DetectorBase):
         return out
 
 
-def build_detector(name: str, model: str, conf: float = 0.08, iou: float = 0.5) -> DetectorBase:
+def build_detector(name: str, model: str, conf: float = 0.7, iou: float = 0.5) -> DetectorBase:
     if name in ("dry_run", "none"):
         return DryRunDetector()
     if name == "yolo_world":

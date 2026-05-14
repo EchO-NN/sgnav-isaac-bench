@@ -11,6 +11,7 @@ from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 
+from isaac_bench.dataset.category_normalizer import normalize_category
 from isaac_bench.mapping.coordinate_transform import MapInfo, grid_to_world_xy, is_inside_grid, world_xy_to_grid
 from isaac_bench.navigation.astar import GridAStarPlanner
 
@@ -21,9 +22,14 @@ START_CLEARANCE_EXCLUDE_CATEGORIES = {
     "roof",
     "light_switch",
     "outlet",
-    "door",
+    "door_frame",
+    "doorway",
     "doorsill",
     "door_handle",
+    "entrance",
+    "entryway",
+    "opening",
+    "passage",
 }
 
 
@@ -66,7 +72,7 @@ def min_bbox_2d_distance(x: float, y: float, objects: Sequence[Mapping]) -> floa
 def filter_start_clearance_objects(objects: Sequence[Mapping], min_z: float = 0.05, max_z: float = 1.50) -> List[Mapping]:
     filtered = []
     for obj in objects:
-        category = str(obj.get("category", "unknown"))
+        category = normalize_category(obj.get("category", "unknown"))
         if category in START_CLEARANCE_EXCLUDE_CATEGORIES:
             continue
         bbox_min = obj.get("bbox_min_world")

@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+from collections import Counter
 from pathlib import Path
 from typing import Iterable, List, Optional, Tuple
 
@@ -15,7 +16,7 @@ from isaac_bench.env.habitat_like_env import MapSimHabitatLikeEnv
 from isaac_bench.graph.decision import SGNavDecision
 from isaac_bench.graph.sgnav_scenegraph_adapter import SGNAV_ROOM_NAMES, SGNavSceneGraphAdapter
 from isaac_bench.mapping.coordinate_transform import MapInfo, grid_to_world_xy, is_inside_grid, world_xy_to_grid
-from isaac_bench.mapping.frontier import extract_frontiers
+from isaac_bench.mapping.frontier import extract_frontiers, frontier_cells
 from isaac_bench.mapping.online_mapper import OnlineMapper
 from isaac_bench.mapping.room_map_from_rooms_json import build_room_index_map, load_rooms
 from isaac_bench.metrics.episode_logger import JsonlEpisodeLogger
@@ -40,6 +41,22 @@ def load_preprocessed_for_episode(episode: dict):
     occupancy = np.load(scene_dir / "occupancy.npy")
     navigable = np.load(scene_dir / "navigable.npy").astype(bool)
     return scene_dir, map_info, occupancy, navigable
+
+
+def load_passable_opening_mask(scene_dir: Path, map_info: MapInfo) -> np.ndarray:
+    objects_path = scene_dir / "objects_all.json"
+    if objects_path.exists():
+        from isaac_bench.dataset.occupancy_builder import rasterize_passable_openings
+
+        with open(objects_path, "r", encoding="utf-8") as handle:
+            objects_all = json.load(handle)
+        return rasterize_passable_openings(objects_all, map_info).astype(bool)
+    mask_path = scene_dir / "passable_openings.npy"
+    if mask_path.exists():
+        mask = np.load(mask_path).astype(bool)
+        if mask.shape == (int(map_info.height), int(map_info.width)):
+            return mask
+    return np.zeros((int(map_info.height), int(map_info.width)), dtype=bool)
 
 
 def apply_episode_planning_clearance(
@@ -69,7 +86,7 @@ def maybe_build_detector(
     detector_name: str,
     model_path: str,
     categories: List[str],
-    conf: float = 0.08,
+    conf: float = 0.7,
     iou: float = 0.5,
     allow_ipc_fallback: bool = False,
 ):
@@ -103,7 +120,7 @@ def ensure_detector_loaded(args, scene_dir: Path, allow_ipc_fallback: bool = Fal
         args._detector_key = None
         return
     categories = load_scene_categories(scene_dir)
-    conf = float(getattr(args, "detector_conf", 0.08))
+    conf = float(getattr(args, "detector_conf", 0.7))
     iou = float(getattr(args, "detector_iou", 0.5))
     key = (str(args.detector), str(args.yolo_world_model), conf, iou, bool(allow_ipc_fallback), tuple(categories))
     if getattr(args, "_detector_key", None) == key:
@@ -350,7 +367,8 @@ def detector_can_use_cuda_rgb(detector, detector_name: str, camera_annotator_dev
 def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
     from isaac_bench.env.isaac_process import IsaacSimServer
 
-    scene_dir, static_map_info, _static_occupancy, static_navigable = load_preprocessed_for_episode(episode)
+    scene_dir, static_map_info, static_occupancy, static_navigable = load_preprocessed_for_episode(episode)
+    static_openings = load_passable_opening_mask(scene_dir, static_map_info)
     static_navigable = apply_episode_planning_clearance(
         scene_dir,
         static_map_info,
@@ -360,7 +378,7 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
     )
     ensure_detector_loaded(args, scene_dir, allow_ipc_fallback=True)
     detector = getattr(args, "_detector_instance", None)
-    if detector is not None:
+    if detector_requires_rgb(detector, args.detector):
         ensure_segmenter_loaded(args)
         segmenter = getattr(args, "_segmenter_instance", None)
     else:
@@ -375,7 +393,31 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
     if args.seed_gt_object_memory:
         print("[sgnav-loop] seed_gt_object_memory ignored for depth-online mapping", flush=True)
     seeded = 0
-    scenegraph = SGNavSceneGraphAdapter(args.sgnav_repo, use_original=args.use_original_scenegraph)
+    scenegraph = SGNavSceneGraphAdapter(
+        args.sgnav_repo,
+        use_original=args.use_original_scenegraph,
+        vllm_config={
+            "enabled": bool(getattr(args, "vllm_frontier_scoring", False)),
+            "base_url": getattr(args, "vllm_base_url", None),
+            "model": getattr(args, "vllm_model", None),
+            "timeout_s": float(getattr(args, "vllm_timeout_s", 8.0)),
+            "temperature": float(getattr(args, "vllm_temperature", 0.0)),
+            "max_frontiers": int(getattr(args, "vllm_max_frontiers", 32)),
+            "include_image": bool(getattr(args, "vllm_image_scoring", True)),
+            "image_max_width": int(getattr(args, "vllm_image_max_width", 640)),
+            "image_jpeg_quality": int(getattr(args, "vllm_image_jpeg_quality", 75)),
+        },
+    )
+    if bool(getattr(args, "vllm_frontier_scoring", False)):
+        print(
+            "[sgnav-vllm] frontier scoring enabled: base_url=%s model=%s image=%s"
+            % (
+                getattr(args, "vllm_base_url", "http://127.0.0.1:8000/v1"),
+                getattr(args, "vllm_model", "qwen3-vl-8b-instruct"),
+                bool(getattr(args, "vllm_image_scoring", True)),
+            ),
+            flush=True,
+        )
     scenegraph.reset(episode["goal_category"])
     full_room_map = None
     scenegraph.update(object_memory, room_map=full_room_map)
@@ -388,6 +430,14 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
         candidate_stop_distance_m=float(args.candidate_stop_distance_m),
         candidate_standoff_min_m=float(args.candidate_standoff_min_m),
         candidate_standoff_max_m=float(args.candidate_standoff_max_m),
+        reperception_enabled=bool(args.reperception_enabled),
+        reperception_min_observations=int(args.reperception_min_observations),
+        reperception_max_steps=int(args.reperception_max_steps),
+        reperception_same_goal_radius_m=float(args.reperception_same_goal_radius_m),
+        stop_verification_steps=int(args.stop_verification_steps),
+        stop_verification_min_hits=int(args.stop_verification_min_hits),
+        found_goal_stop_distance_m=float(args.found_goal_stop_distance_m),
+        score_frontiers_before_candidate=bool(args.score_frontiers_before_candidate),
     )
     follower = HolonomicWaypointFollower(
         max_vx=float(args.max_vx_mps),
@@ -403,6 +453,10 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
         depth_stride_px=int(args.depth_stride_px),
         obstacle_min_height_m=float(args.obstacle_min_height_m),
         obstacle_max_height_m=float(args.obstacle_max_height_m),
+        free_min_height_m=float(args.free_min_height_m),
+        free_max_height_m=float(args.free_max_height_m),
+        splat_point_threshold=int(args.splat_point_threshold),
+        free_splat_point_threshold=int(args.free_splat_point_threshold),
         robot_radius_m=float(args.robot_radius_m),
         inflation_radius_m=float(args.online_inflation_radius_m),
     )
@@ -410,6 +464,10 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
     start_pose = tuple(float(v) for v in episode["start_pose_world"])
     mapper.reset((float(start_pose[0]), float(start_pose[1])))
     dynamic_map_info = mapper.grid.map_info
+    room_map_mode = str(getattr(args, "room_map_mode", "observed_rooms_json") or "none").strip().lower()
+    if room_map_mode in {"observed_rooms_json", "rooms_json", "observed"}:
+        full_room_map = build_sgnav_room_map(scene_dir, dynamic_map_info)
+        scenegraph.update(object_memory, room_map=full_room_map)
     goal_cells = []
     for goal_r, goal_c in static_goal_cells:
         gx, gy = grid_to_world_xy(goal_r, goal_c, static_map_info)
@@ -425,11 +483,18 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
     failure_reason = None
     stop_called = False
     last_detections_2d: List[Detection2D] = []
+    detection_category_counts = Counter()
+    goal_detection_history = []
     last_frontiers = []
     last_nav_decision = None
+    last_selected_candidate = None
+    logged_selected_candidate_id = None
     last_dynamic_occupancy = mapper.grid.occupied.astype(bool)
+    last_dynamic_free = mapper.grid.free.astype(bool)
     last_dynamic_navigable = mapper.traversible(unknown_is_obstacle=True)
     last_dynamic_observed = mapper.grid.observed.astype(bool)
+    last_frontier_raw_cells = 0
+    last_frontier_clusters = 0
     sgnav_viz_enabled = bool(getattr(args, "sgnav_viz", False))
     sgnav_viz_save_dir = getattr(args, "sgnav_viz_save_dir", None)
     detection_localization = str(getattr(args, "detection_localization", "static_map_ray")).strip().lower()
@@ -441,6 +506,7 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
     viz_requested = bool(sgnav_viz_enabled or sgnav_viz_save_dir)
     viz_every = max(1, int(getattr(args, "sgnav_viz_every_steps", 1)))
     detector_cuda_rgb = detector_can_use_cuda_rgb(detector, args.detector, camera_annotator_device)
+    vllm_needs_cpu_rgb = bool(getattr(args, "vllm_frontier_scoring", False) and getattr(args, "vllm_image_scoring", True))
     logged_detector_rgb_device = False
 
     def needs_viz_frame(step_idx: int) -> bool:
@@ -467,6 +533,13 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
         camera_far_m=float(args.camera_far_m),
         enable_depth=bool(getattr(args, "read_depth", False)),
         camera_annotator_device=camera_annotator_device,
+        enable_nearfield_depth=bool(getattr(args, "nearfield_depth", False)),
+        nearfield_width=int(args.nearfield_width),
+        nearfield_height=int(args.nearfield_height),
+        nearfield_hfov_deg=float(args.nearfield_hfov_deg),
+        nearfield_height_m=float(args.nearfield_height_m),
+        nearfield_near_m=float(args.nearfield_near_m),
+        nearfield_far_m=float(args.nearfield_far_m),
     )
     try:
         first_rgb_device = rgb_request_device(0)
@@ -485,6 +558,11 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
             ipc_jpeg_quality=int(args.sgnav_viz_jpeg_quality),
         ) if (sgnav_viz_enabled or sgnav_viz_save_dir) else None
         intr = CameraIntrinsics.from_hfov(int(args.isaac_width), int(args.isaac_height), float(args.camera_hfov_deg))
+        nearfield_intr = CameraIntrinsics.from_hfov(
+            int(args.nearfield_width),
+            int(args.nearfield_height),
+            float(args.nearfield_hfov_deg),
+        )
 
         def viz_rgb(current_obs: dict) -> np.ndarray:
             if current_obs.get("has_rgb") and current_obs.get("rgb_device") == "cpu":
@@ -495,31 +573,314 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
         last_decision_reason = ""
         goal_candidate_count = 0
         sam2_failure_logged = False
-        for step in range(max_steps):
-            pose = obs["pose_world"]
-            if not obs.get("has_depth"):
+        force_perception_step = False
+        panorama_frames = 0
+
+        goal_norm = normalize_category(episode["goal_category"])
+
+        def category_matches_goal(category: str) -> bool:
+            cat_norm = normalize_category(category)
+            return cat_norm == goal_norm or (goal_norm and (goal_norm in cat_norm or cat_norm in goal_norm))
+
+        def summarize_detection(det: Detection2D, step_idx: int) -> dict:
+            return {
+                "step": int(step_idx),
+                "category": normalize_category(det.category),
+                "raw_label": str(det.raw_label),
+                "confidence": float(det.confidence),
+                "bbox_xyxy": [float(v) for v in det.bbox_xyxy],
+            }
+
+        def update_mapper_state(current_obs: dict, step_idx: int | None = None):
+            nonlocal dynamic_map_info, last_dynamic_occupancy, last_dynamic_free, last_dynamic_navigable, last_dynamic_observed
+            pose_local = current_obs["pose_world"]
+            if not current_obs.get("has_depth"):
+                return None
+            mapper.update(current_obs["depth"], intr, pose_local, current_obs["camera_pose_world"])
+            mapper.last_debug_stats["depth_source"] = str(current_obs.get("depth_source", "unknown"))
+            mapper.last_debug_stats["camera_frame_sync_updates"] = int(current_obs.get("camera_frame_sync_updates", 0) or 0)
+            mapper.last_debug_stats["camera_rendering_time"] = current_obs.get("camera_rendering_time")
+            if bool(getattr(args, "nearfield_depth", False)) and current_obs.get("has_nearfield_depth"):
+                nearfield_stats = mapper.update_nearfield_topdown(
+                    current_obs["nearfield_depth"],
+                    nearfield_intr,
+                    pose_local,
+                    current_obs["nearfield_camera_pose_world"],
+                    radius_m=float(args.nearfield_radius_m),
+                    ignore_radius_m=float(args.nearfield_ignore_radius_m),
+                    depth_stride_px=int(args.nearfield_depth_stride_px),
+                    floor_tolerance_m=float(args.nearfield_floor_tolerance_m),
+                    obstacle_min_height_m=float(args.nearfield_obstacle_min_height_m),
+                    obstacle_max_height_m=float(args.nearfield_obstacle_max_height_m),
+                    splat_point_threshold=int(args.nearfield_splat_point_threshold),
+                    free_splat_point_threshold=int(args.nearfield_free_splat_point_threshold),
+                )
+                nearfield_stats["depth_source"] = str(current_obs.get("nearfield_depth_source", "unknown"))
+                mapper.last_debug_stats["nearfield"] = nearfield_stats
+            if bool(getattr(args, "static_nearfield_map", False)):
+                static_nearfield_stats = mapper.update_static_nearfield(
+                    static_occupancy,
+                    static_navigable,
+                    static_map_info,
+                    pose_local,
+                    radius_m=float(args.static_nearfield_radius_m),
+                    static_openings=static_openings,
+                )
+                mapper.last_debug_stats["static_nearfield"] = static_nearfield_stats
+            if bool(getattr(args, "mapping_debug", False)):
+                stats = mapper.last_debug_stats
+                rel = stats.get("rel_z_m_percentiles", {})
+                bands = stats.get("image_bands", {})
+                near = stats.get("nearfield", {})
+                static_near = stats.get("static_nearfield", {})
+                print(
+                    "[mapping-debug] step=%s depth=%s sync=%s mode=%s valid=%s rays=%s skip_h=%s free_ray=%s occ_end=%s free_pts=%s obs_pts=%s "
+                    "rel_z_p5/50/95=%s/%s/%s top_obs=%s mid_obs=%s bottom_obs=%s ceiling=%s negative=%s "
+                    "nearfield=%s/%s/%s static_near=%s/%s/%s"
+                    % (
+                        "?" if step_idx is None else int(step_idx),
+                        stats.get("depth_source", "unknown"),
+                        stats.get("camera_frame_sync_updates", 0),
+                        stats.get("mapping_mode", "unknown"),
+                        stats.get("valid_points", 0),
+                        stats.get("ray_count", 0),
+                        stats.get("skipped_height_rays", 0),
+                        stats.get("free_ray_cells", stats.get("free_splat_cells", 0)),
+                        stats.get("occupied_endpoint_cells", stats.get("obstacle_splat_cells", 0)),
+                        stats.get("free_band_points", 0),
+                        stats.get("obstacle_band_points", 0),
+                        rel.get("p5"),
+                        rel.get("p50"),
+                        rel.get("p95"),
+                        (bands.get("top") or {}).get("obstacle_band_points", 0),
+                        (bands.get("middle") or {}).get("obstacle_band_points", 0),
+                        (bands.get("bottom") or {}).get("obstacle_band_points", 0),
+                        stats.get("ceiling_like_points", 0),
+                        stats.get("negative_height_points", 0),
+                        near.get("reason", "off"),
+                        near.get("free_splat_cells", 0),
+                        near.get("obstacle_splat_cells", 0),
+                        static_near.get("reason", "off"),
+                        static_near.get("free_cells", 0),
+                        static_near.get("occupied_cells", 0),
+                    ),
+                    flush=True,
+                )
+            dynamic_map_info = mapper.grid.map_info
+            occupancy_local = mapper.grid.occupied.astype(bool)
+            free_local = mapper.grid.free.astype(bool)
+            observed_local = mapper.grid.observed.astype(bool)
+            navigable_local = mapper.traversible(unknown_is_obstacle=True)
+            nav_planner_local = GridAStarPlanner(navigable_local, dynamic_map_info.resolution_m, allow_diagonal=True)
+            current_grid_local = nav_planner_local.snap_to_free(
+                world_xy_to_grid(float(pose_local[0]), float(pose_local[1]), dynamic_map_info)
+            )
+            if current_grid_local is None:
+                mapper.update_simple_radius(pose_local, radius_m=max(float(args.robot_radius_m), float(args.online_resolution_m)))
+                occupancy_local = mapper.grid.occupied.astype(bool)
+                free_local = mapper.grid.free.astype(bool)
+                observed_local = mapper.grid.observed.astype(bool)
+                navigable_local = mapper.traversible(unknown_is_obstacle=True)
+                nav_planner_local = GridAStarPlanner(navigable_local, dynamic_map_info.resolution_m, allow_diagonal=True)
+                current_grid_local = nav_planner_local.snap_to_free(
+                    world_xy_to_grid(float(pose_local[0]), float(pose_local[1]), dynamic_map_info)
+                )
+            last_dynamic_occupancy = occupancy_local
+            last_dynamic_free = free_local
+            last_dynamic_navigable = navigable_local
+            last_dynamic_observed = observed_local
+            return {
+                "pose": pose_local,
+                "map_info": dynamic_map_info,
+                "occupancy": occupancy_local,
+                "free": free_local,
+                "observed": observed_local,
+                "navigable": navigable_local,
+                "nav_planner": nav_planner_local,
+                "current_grid": current_grid_local,
+            }
+
+        def run_detector_update(
+            current_obs: dict,
+            step_idx: int,
+            map_info_local: MapInfo,
+            occupancy_local: np.ndarray,
+            navigable_local: np.ndarray,
+        ) -> dict:
+            nonlocal detector_cuda_rgb, logged_detector_rgb_device, segmenter, sam2_failure_logged, last_detections_2d
+            if detector is None:
+                last_detections_2d = []
+                return current_obs
+            obs_local = current_obs
+            detector_rgb = obs_local["rgb"]
+            used_cuda_rgb = False
+            if detector_cuda_rgb:
+                if not (
+                    obs_local.get("has_rgb")
+                    and obs_local.get("rgb_device") == "cuda"
+                    and obs_local.get("rgb_gpu") is not None
+                ):
+                    obs_local = server.get_observation(read_rgb=True, read_depth=False, rgb_device="cuda")
+                if obs_local.get("has_rgb") and obs_local.get("rgb_device") == "cuda" and obs_local.get("rgb_gpu") is not None:
+                    detector_rgb = obs_local["rgb_gpu"]
+                    used_cuda_rgb = True
+                else:
+                    detector_cuda_rgb = False
+                    detector_rgb = obs_local["rgb"]
+            if used_cuda_rgb:
+                if not logged_detector_rgb_device:
+                    print("[sgnav-loop] detector RGB input: Isaac CUDA annotator -> YOLO tensor", flush=True)
+                    logged_detector_rgb_device = True
+            elif detector_requires_rgb(detector, args.detector) and not logged_detector_rgb_device:
+                print("[sgnav-loop] detector RGB input: CPU fallback", flush=True)
+                logged_detector_rgb_device = True
+            detections_2d = detector.detect(detector_rgb)
+            detections_2d = filter_detections_by_confidence(detections_2d, float(args.detector_conf))
+            if int(args.max_detections_per_frame) > 0:
+                detections_2d = detections_2d[: int(args.max_detections_per_frame)]
+            if segmenter is not None and detections_2d:
+                try:
+                    segment_rgb = obs_local["rgb"] if obs_local.get("rgb_device") == "cpu" else viz_rgb(obs_local)
+                    detections_2d = segmenter.segment(segment_rgb, list(detections_2d))
+                except Exception as exc:
+                    if str(getattr(args, "segmenter", "none")).strip().lower() == "sam2":
+                        raise
+                    if not sam2_failure_logged:
+                        print("[sam2] segmentation failed; continuing with YOLO boxes only: %s" % exc, flush=True)
+                        sam2_failure_logged = True
+                    segmenter = None
+            last_detections_2d = list(detections_2d)
+            for det in detections_2d:
+                cat_norm = normalize_category(det.category)
+                detection_category_counts[cat_norm] += 1
+                if cat_norm == goal_norm:
+                    goal_detection_history.append(summarize_detection(det, step_idx))
+            if goal_detection_history and goal_detection_history[-1]["step"] == int(step_idx):
+                recent = [row for row in goal_detection_history if row["step"] == int(step_idx)]
+                print(
+                    "[sgnav-loop] YOLO goal detections step=%s: %s"
+                    % (
+                        step_idx,
+                        ", ".join(
+                            "%s raw=%s conf=%.3f"
+                            % (row["category"], row["raw_label"], row["confidence"])
+                            for row in recent
+                        ),
+                    ),
+                    flush=True,
+                )
+            if detection_localization == "depth":
+                detections_3d = detections_to_3d(
+                    detections_2d,
+                    obs_local["depth"],
+                    intr,
+                    obs_local["camera_pose_world"],
+                    depth_max_m=float(args.depth_max_m),
+                    min_points=int(args.min_depth_points_per_detection),
+                )
+            elif detection_localization in {"static_map_ray", "map_ray", "rgb_map_ray"}:
+                detections_3d = detections_to_3d_static_map_ray(
+                    detections_2d,
+                    obs_local["camera_pose_world"],
+                    int(args.isaac_width),
+                    float(args.camera_hfov_deg),
+                    map_info_local,
+                    occupancy_local,
+                    navigable_local,
+                    max_range_m=float(args.depth_max_m),
+                )
+            elif detection_localization == "none":
+                detections_3d = []
+            else:
+                raise ValueError("Unsupported detection localization mode: %s" % detection_localization)
+            object_memory.update(detections_3d, step_id=step_idx, map_info=map_info_local)
+            evaluator.num_yolo_calls += 1
+            return obs_local
+
+        def update_scenegraph_frame(current_obs: dict, step_idx: int, map_state: dict) -> None:
+            room_map = None if full_room_map is None else observed_room_map(full_room_map, map_state["observed"])
+            rgb_for_graph = current_obs["rgb"] if current_obs.get("has_rgb") and current_obs.get("rgb_device") == "cpu" else None
+            if rgb_for_graph is None and vllm_needs_cpu_rgb:
+                rgb_for_graph = viz_rgb(current_obs)
+            scenegraph.update_from_frame(
+                object_memory,
+                room_map=room_map,
+                rgb=rgb_for_graph,
+                depth=current_obs.get("depth"),
+                detections_2d=last_detections_2d,
+                map_info=map_state["map_info"],
+                occupancy=map_state["occupancy"],
+                free=map_state["free"],
+                navigable=map_state["navigable"],
+                observed=map_state["observed"],
+                pose_world=map_state["pose"],
+                camera_pose_world=current_obs.get("camera_pose_world"),
+                step_id=step_idx,
+            )
+            evaluator.num_scenegraph_updates += 1
+
+        panorama_steps = max(0, int(getattr(args, "panorama_steps", 0)))
+        if panorama_steps > 0:
+            print("[sgnav-loop] opening panorama: %d RGB-D views" % panorama_steps, flush=True)
+        for pano_idx in range(panorama_steps):
+            map_state = update_mapper_state(obs, -panorama_steps + pano_idx)
+            if map_state is None or map_state["current_grid"] is None:
+                failure_reason = "panorama_agent_off_navigable_map"
+                break
+            obs = run_detector_update(obs, -panorama_steps + pano_idx, map_state["map_info"], map_state["occupancy"], map_state["navigable"])
+            update_scenegraph_frame(obs, -panorama_steps + pano_idx, map_state)
+            panorama_frames += 1
+            pano_step = -panorama_steps + pano_idx
+            has_goal_detection = any(row["step"] == int(pano_step) for row in goal_detection_history)
+            if viz is not None and (has_goal_detection or pano_idx + 1 == panorama_steps):
+                viz.update(
+                    step=pano_step,
+                    rgb=viz_rgb(obs),
+                    detections_2d=last_detections_2d,
+                    occupancy=map_state["occupancy"],
+                    navigable=map_state["navigable"],
+                    observed=map_state["observed"],
+                    goal_cells=goal_cells,
+                    current_grid=map_state["current_grid"],
+                    pose=map_state["pose"],
+                    frontiers=last_frontiers,
+                    nav_decision=last_nav_decision,
+                    current_path=current_path,
+                    full_path=full_path,
+                    object_memory=object_memory,
+                    goal_category=episode["goal_category"],
+                    distance_to_goal=evaluator.final_distance_to_goal,
+                    path_length=float(evaluator.path_accum.total_m),
+                    scenegraph_backend="original" if scenegraph.scenegraph is not None else "fallback",
+                    score_debug=scenegraph.last_score_debug,
+                    failure_reason=failure_reason,
+                )
+            if pano_idx + 1 < panorama_steps:
+                yaw_delta = (2.0 * math.pi) / float(panorama_steps)
+                pano_wz = max(1e-3, abs(float(args.panorama_wz_radps)))
+                obs = server.step_kinematic_velocity(
+                    0.0,
+                    0.0,
+                    pano_wz,
+                    dt=yaw_delta / pano_wz,
+                    render_updates=int(args.panorama_render_updates_per_step),
+                    read_rgb=detector_requires_rgb(detector, args.detector),
+                    read_depth=True,
+                    rgb_device="cuda" if detector_cuda_rgb else "cpu",
+                )
+        for step in range(0 if failure_reason is not None else max_steps):
+            map_state = update_mapper_state(obs, step)
+            if map_state is None:
                 failure_reason = "depth_unavailable_for_online_mapping"
                 break
-            mapper.update(obs["depth"], intr, pose, obs["camera_pose_world"])
-            dynamic_map_info = mapper.grid.map_info
-            occupancy = mapper.grid.occupied.astype(bool)
-            observed = mapper.grid.observed.astype(bool)
-            navigable = mapper.traversible(unknown_is_obstacle=True)
-            last_dynamic_occupancy = occupancy
-            last_dynamic_navigable = navigable
-            last_dynamic_observed = observed
-            nav_planner = GridAStarPlanner(navigable, dynamic_map_info.resolution_m, allow_diagonal=True)
-            current_grid = nav_planner.snap_to_free(world_xy_to_grid(float(pose[0]), float(pose[1]), dynamic_map_info))
-            if current_grid is None:
-                mapper.update_simple_radius(pose, radius_m=max(float(args.robot_radius_m) * 2.0, 0.8))
-                occupancy = mapper.grid.occupied.astype(bool)
-                observed = mapper.grid.observed.astype(bool)
-                navigable = mapper.traversible(unknown_is_obstacle=True)
-                last_dynamic_occupancy = occupancy
-                last_dynamic_navigable = navigable
-                last_dynamic_observed = observed
-                nav_planner = GridAStarPlanner(navigable, dynamic_map_info.resolution_m, allow_diagonal=True)
-                current_grid = nav_planner.snap_to_free(world_xy_to_grid(float(pose[0]), float(pose[1]), dynamic_map_info))
+            pose = map_state["pose"]
+            dynamic_map_info = map_state["map_info"]
+            occupancy = map_state["occupancy"]
+            free = map_state["free"]
+            observed = map_state["observed"]
+            navigable = map_state["navigable"]
+            nav_planner = map_state["nav_planner"]
+            current_grid = map_state["current_grid"]
             if current_grid is None:
                 failure_reason = "agent_off_navigable_map"
                 break
@@ -528,74 +889,16 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
                 failure_reason = "agent_off_static_metric_map"
                 break
             evaluator.update_pose(pose, metric_grid, collided=bool(obs.get("collided", False)))
-            if evaluator.final_distance_to_goal <= success_distance:
+            if evaluator.final_distance_to_goal <= success_distance and not bool(args.require_sgnav_stop):
                 stop_called = True
                 break
 
-            if detector is not None and step % perception_every == 0:
-                detector_rgb = obs["rgb"]
-                used_cuda_rgb = False
-                if detector_cuda_rgb:
-                    if not (obs.get("has_rgb") and obs.get("rgb_device") == "cuda" and obs.get("rgb_gpu") is not None):
-                        obs = server.get_observation(read_rgb=True, read_depth=False, rgb_device="cuda")
-                    if obs.get("has_rgb") and obs.get("rgb_device") == "cuda" and obs.get("rgb_gpu") is not None:
-                        detector_rgb = obs["rgb_gpu"]
-                        used_cuda_rgb = True
-                    else:
-                        detector_cuda_rgb = False
-                        detector_rgb = obs["rgb"]
-                if used_cuda_rgb:
-                    if not logged_detector_rgb_device:
-                        print("[sgnav-loop] detector RGB input: Isaac CUDA annotator -> YOLO tensor", flush=True)
-                        logged_detector_rgb_device = True
-                elif detector_requires_rgb(detector, args.detector) and not logged_detector_rgb_device:
-                    print("[sgnav-loop] detector RGB input: CPU fallback", flush=True)
-                    logged_detector_rgb_device = True
-                detections_2d = detector.detect(detector_rgb)
-                detections_2d = filter_detections_by_confidence(detections_2d, float(args.detector_conf))
-                if int(args.max_detections_per_frame) > 0:
-                    detections_2d = detections_2d[: int(args.max_detections_per_frame)]
-                if segmenter is not None and detections_2d:
-                    try:
-                        segment_rgb = obs["rgb"] if obs.get("rgb_device") == "cpu" else viz_rgb(obs)
-                        detections_2d = segmenter.segment(segment_rgb, list(detections_2d))
-                    except Exception as exc:
-                        if str(getattr(args, "segmenter", "none")).strip().lower() == "sam2":
-                            raise
-                        if not sam2_failure_logged:
-                            print("[sam2] segmentation failed; continuing with YOLO boxes only: %s" % exc, flush=True)
-                            sam2_failure_logged = True
-                        segmenter = None
-                last_detections_2d = list(detections_2d)
-                if detection_localization == "depth":
-                    detections_3d = detections_to_3d(
-                        detections_2d,
-                        obs["depth"],
-                        intr,
-                        obs["camera_pose_world"],
-                        depth_max_m=float(args.depth_max_m),
-                        min_points=int(args.min_depth_points_per_detection),
-                    )
-                elif detection_localization in {"static_map_ray", "map_ray", "rgb_map_ray"}:
-                    detections_3d = detections_to_3d_static_map_ray(
-                        detections_2d,
-                        obs["camera_pose_world"],
-                        int(args.isaac_width),
-                        float(args.camera_hfov_deg),
-                        dynamic_map_info,
-                        occupancy,
-                        navigable,
-                        max_range_m=float(args.depth_max_m),
-                    )
-                elif detection_localization == "none":
-                    detections_3d = []
-                else:
-                    raise ValueError("Unsupported detection localization mode: %s" % detection_localization)
-                object_memory.update(detections_3d, step_id=step, map_info=dynamic_map_info)
-                evaluator.num_yolo_calls += 1
-            if step % perception_every == 0:
-                scenegraph.update(object_memory, room_map=None if full_room_map is None else observed_room_map(full_room_map, observed))
-                evaluator.num_scenegraph_updates += 1
+            perception_due = detector is not None and (step % perception_every == 0 or force_perception_step)
+            if perception_due:
+                obs = run_detector_update(obs, step, dynamic_map_info, occupancy, navigable)
+                force_perception_step = False
+            if step % perception_every == 0 or perception_due:
+                update_scenegraph_frame(obs, step, map_state)
 
             needs_replan = not current_path or step % replan_every == 0
             if current_path:
@@ -606,16 +909,39 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
                     needs_replan = True
 
             if needs_replan:
+                frontier_free = free & navigable
+                static_only_nearfield = getattr(mapper, "static_nearfield_mask", None)
+                depth_free_mask = getattr(mapper, "depth_free_mask", None)
+                if bool(getattr(args, "static_nearfield_map", False)) and static_only_nearfield is not None and depth_free_mask is not None:
+                    static_only_nearfield = np.asarray(static_only_nearfield).astype(bool) & ~np.asarray(depth_free_mask).astype(bool)
+                else:
+                    static_only_nearfield = None
+                last_frontier_raw_cells = int(
+                    np.count_nonzero(
+                        frontier_cells(
+                            frontier_free,
+                            occupancy=occupancy,
+                            obstacle_dilation_radius_cells=int(args.frontier_obstacle_dilation_radius_cells),
+                            unknown_dilation_radius_cells=int(args.frontier_unknown_dilation_radius_cells),
+                            exclude_mask=static_only_nearfield,
+                        )
+                    )
+                )
                 frontiers = extract_frontiers(
-                    free=navigable,
+                    free=frontier_free,
                     observed=observed,
                     traversible=navigable,
                     map_info=dynamic_map_info,
                     agent_grid=current_grid,
-                    min_cluster_size=3,
-                    min_distance_m=0.5,
-                    max_count=32,
+                    min_cluster_size=int(args.frontier_min_cluster_size),
+                    min_distance_m=float(args.frontier_min_distance_m),
+                    max_count=int(args.frontier_max_count),
+                    occupancy=occupancy,
+                    obstacle_dilation_radius_cells=int(args.frontier_obstacle_dilation_radius_cells),
+                    unknown_dilation_radius_cells=int(args.frontier_unknown_dilation_radius_cells),
+                    exclude_mask=static_only_nearfield,
                 )
+                last_frontier_clusters = len(frontiers)
                 last_frontiers = list(frontiers)
                 nav_decision = decision_policy.choose_navigation_target(
                     object_memory,
@@ -631,14 +957,28 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
                 evaluator.num_frontier_decisions += 1
                 last_decision_mode = nav_decision.mode
                 last_decision_reason = nav_decision.reason
-                goal_norm = normalize_category(episode["goal_category"])
+                if nav_decision.selected_candidate is not None:
+                    last_selected_candidate = nav_decision.selected_candidate
+                    candidate_id = int(last_selected_candidate.node_id)
+                    if logged_selected_candidate_id != candidate_id:
+                        logged_selected_candidate_id = candidate_id
+                        print(
+                            "[sgnav-loop] selected candidate id=%d category=%s raw=%s conf=%.3f observed=%d center=%s"
+                            % (
+                                candidate_id,
+                                normalize_category(last_selected_candidate.category),
+                                str(last_selected_candidate.raw_label),
+                                float(last_selected_candidate.confidence),
+                                int(last_selected_candidate.observed_count),
+                                tuple(float(v) for v in last_selected_candidate.center_world),
+                            ),
+                            flush=True,
+                        )
                 goal_candidate_count = len(
                     [
                         node
                         for node in object_memory.nodes
-                        if normalize_category(node.category) == goal_norm
-                        or goal_norm in normalize_category(node.category)
-                        or normalize_category(node.category) in goal_norm
+                        if category_matches_goal(node.category)
                     ]
                 )
                 if nav_decision.stop:
@@ -670,6 +1010,43 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
                             failure_reason=failure_reason,
                         )
                     break
+                if nav_decision.mode == "reperception":
+                    current_path = []
+                    full_path.append(tuple(int(v) for v in current_grid))
+                    if viz is not None and step % viz_every == 0:
+                        viz.update(
+                            step=step,
+                            rgb=viz_rgb(obs),
+                            detections_2d=last_detections_2d,
+                            occupancy=occupancy,
+                            navigable=navigable,
+                            observed=observed,
+                            goal_cells=goal_cells,
+                            current_grid=current_grid,
+                            pose=pose,
+                            frontiers=last_frontiers,
+                            nav_decision=last_nav_decision,
+                            current_path=current_path,
+                            full_path=full_path,
+                            object_memory=object_memory,
+                            goal_category=episode["goal_category"],
+                            distance_to_goal=evaluator.final_distance_to_goal,
+                            path_length=float(evaluator.path_accum.total_m),
+                            scenegraph_backend="original" if scenegraph.scenegraph is not None else "fallback",
+                            score_debug=scenegraph.last_score_debug,
+                        )
+                    force_perception_step = True
+                    obs = server.step_kinematic_velocity(
+                        0.0,
+                        0.0,
+                        float(args.reperception_turn_wz_radps),
+                        dt=float(args.control_dt),
+                        render_updates=int(args.render_updates_per_step),
+                        read_rgb=detector_requires_rgb(detector, args.detector),
+                        read_depth=True,
+                        rgb_device="cuda" if detector_cuda_rgb else "cpu",
+                    )
+                    continue
                 nav_goals = nav_decision.target_cells
                 if not nav_goals and args.allow_gt_goal_fallback:
                     nav_goals = goal_cells
@@ -758,10 +1135,67 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
             if not path_world:
                 if evaluator.final_distance_to_goal <= success_distance:
                     stop_called = True
-                elif last_decision_mode == "candidate":
-                    failure_reason = "candidate_standoff_reached_without_success"
-                elif last_decision_mode == "frontier":
-                    failure_reason = "frontier_reached_without_success"
+                    if viz is not None:
+                        viz.update(
+                            step=step,
+                            rgb=viz_rgb(obs),
+                            detections_2d=last_detections_2d,
+                            occupancy=occupancy,
+                            navigable=navigable,
+                            observed=observed,
+                            goal_cells=goal_cells,
+                            current_grid=current_grid,
+                            pose=pose,
+                            frontiers=last_frontiers,
+                            nav_decision=last_nav_decision,
+                            current_path=current_path,
+                            full_path=full_path,
+                            object_memory=object_memory,
+                            goal_category=episode["goal_category"],
+                            distance_to_goal=evaluator.final_distance_to_goal,
+                            path_length=float(evaluator.path_accum.total_m),
+                            scenegraph_backend="original" if scenegraph.scenegraph is not None else "fallback",
+                            score_debug=scenegraph.last_score_debug,
+                            failure_reason=failure_reason,
+                        )
+                    break
+                if last_decision_mode in {"candidate", "frontier"}:
+                    current_path = []
+                    force_perception_step = True
+                    full_path.append(tuple(int(v) for v in current_grid))
+                    if viz is not None:
+                        viz.update(
+                            step=step,
+                            rgb=viz_rgb(obs),
+                            detections_2d=last_detections_2d,
+                            occupancy=occupancy,
+                            navigable=navigable,
+                            observed=observed,
+                            goal_cells=goal_cells,
+                            current_grid=current_grid,
+                            pose=pose,
+                            frontiers=last_frontiers,
+                            nav_decision=last_nav_decision,
+                            current_path=current_path,
+                            full_path=full_path,
+                            object_memory=object_memory,
+                            goal_category=episode["goal_category"],
+                            distance_to_goal=evaluator.final_distance_to_goal,
+                            path_length=float(evaluator.path_accum.total_m),
+                            scenegraph_backend="original" if scenegraph.scenegraph is not None else "fallback",
+                            score_debug=scenegraph.last_score_debug,
+                        )
+                    obs = server.step_kinematic_velocity(
+                        0.0,
+                        0.0,
+                        float(args.reperception_turn_wz_radps),
+                        dt=float(args.control_dt),
+                        render_updates=int(args.render_updates_per_step),
+                        read_rgb=detector_requires_rgb(detector, args.detector),
+                        read_depth=True,
+                        rgb_device="cuda" if detector_cuda_rgb else "cpu",
+                    )
+                    continue
                 else:
                     failure_reason = "path_exhausted_without_success"
                 if viz is not None:
@@ -813,7 +1247,8 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
                 rgb_device=next_rgb_device,
             )
         else:
-            failure_reason = "max_control_steps"
+            if failure_reason is None:
+                failure_reason = "max_control_steps"
 
         row = evaluator.finish(stop_called=stop_called, planner=args.planner, detector=args.detector, failure_reason=failure_reason)
         row["sim_backend"] = "isaac"
@@ -825,13 +1260,58 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
         row["sgnav_decision_mode"] = last_decision_mode
         row["sgnav_decision_reason"] = last_decision_reason
         row["scenegraph_backend"] = "original" if scenegraph.scenegraph is not None else "fallback"
+        row["sgnav_state"] = getattr(decision_policy, "state", last_decision_mode)
+        row["detected_category_counts"] = {
+            str(key): int(value)
+            for key, value in sorted(detection_category_counts.items(), key=lambda item: (-item[1], item[0]))
+        }
+        row["goal_detection_history"] = list(goal_detection_history)
+        row["selected_candidate"] = last_selected_candidate.to_dict() if last_selected_candidate is not None else None
+        row["object_memory_goal_candidates"] = [
+            node.to_dict()
+            for node in object_memory.nodes
+            if category_matches_goal(node.category)
+        ]
+        row["panorama_frames"] = int(panorama_frames)
+        row["graph_object_nodes"] = int(len(getattr(scenegraph, "runtime_nodes", {})))
+        row["graph_group_nodes"] = int(len(getattr(scenegraph, "runtime_groups", [])))
+        row["graph_room_nodes"] = int(len(getattr(scenegraph, "runtime_rooms", {})))
+        row["graph_edges"] = int(len(getattr(scenegraph, "runtime_edges", [])))
+        row["vllm_frontier_scoring"] = bool(getattr(args, "vllm_frontier_scoring", False))
+        row["vllm_image_scoring"] = bool(getattr(args, "vllm_image_scoring", True))
+        row["score_frontiers_before_candidate"] = bool(getattr(args, "score_frontiers_before_candidate", False))
+        vllm_scorer = getattr(scenegraph, "vllm_scorer", None)
+        row["vllm_last_used_image"] = bool(getattr(vllm_scorer, "last_used_image", False))
+        row["vllm_num_requests"] = int(getattr(vllm_scorer, "request_count", 0))
+        row["vllm_cache_hits"] = int(getattr(vllm_scorer, "cache_hit_count", 0))
+        row["vllm_last_skip_reason"] = getattr(vllm_scorer, "last_skip_reason", None)
+        row["vllm_last_request_frontiers"] = int(getattr(vllm_scorer, "last_request_frontiers", 0))
+        row["vllm_last_response_chars"] = int(getattr(vllm_scorer, "last_response_chars", 0))
+        row["vllm_disabled_reason"] = getattr(vllm_scorer, "disabled_reason", None)
         row["detection_localization"] = detection_localization
         row["read_depth"] = bool(getattr(args, "read_depth", False))
-        row["mapping_source"] = "depth_online"
+        row["mapping_source"] = (
+            "depth_ray_online+static_nearfield"
+            if bool(getattr(args, "static_nearfield_map", False))
+            else "depth_ray_online"
+        )
         row["online_map_resolution_m"] = float(dynamic_map_info.resolution_m)
+        row["robot_radius_m"] = float(args.robot_radius_m)
+        row["robot_width_m"] = float(args.robot_radius_m) * 2.0
+        row["online_effective_obstacle_inflation_m"] = float(args.robot_radius_m)
+        row["online_extra_inflation_radius_m_requested"] = float(args.online_inflation_radius_m)
         row["online_observed_cells"] = int(np.count_nonzero(last_dynamic_observed))
+        row["online_raw_free_cells"] = int(np.count_nonzero(last_dynamic_free))
         row["online_free_cells"] = int(np.count_nonzero(last_dynamic_navigable))
         row["online_occupied_cells"] = int(np.count_nonzero(last_dynamic_occupancy))
+        row["online_mapper_debug"] = dict(getattr(mapper, "last_debug_stats", {}))
+        row["nearfield_depth"] = bool(getattr(args, "nearfield_depth", False))
+        row["nearfield_mapper_debug"] = dict(getattr(mapper, "last_nearfield_debug_stats", {}))
+        row["static_nearfield_map"] = bool(getattr(args, "static_nearfield_map", False))
+        row["static_nearfield_radius_m"] = float(getattr(args, "static_nearfield_radius_m", 1.0))
+        row["static_nearfield_mapper_debug"] = dict(getattr(mapper, "last_static_nearfield_debug_stats", {}))
+        row["frontier_raw_cells"] = int(last_frontier_raw_cells)
+        row["frontier_clusters"] = int(last_frontier_clusters)
         row["segmenter"] = str(getattr(args, "segmenter", "none") or "none")
         row["camera_annotator_device"] = camera_annotator_device
         row["detector_cuda_rgb"] = bool(detector_cuda_rgb)
@@ -952,6 +1432,26 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--camera-far-m", type=float, default=None)
     parser.add_argument("--camera-annotator-device", default=None, choices=["cpu", "cuda"])
     parser.add_argument("--read-depth", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--nearfield-depth", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--nearfield-width", type=int, default=None)
+    parser.add_argument("--nearfield-height", type=int, default=None)
+    parser.add_argument("--nearfield-hfov-deg", type=float, default=None)
+    parser.add_argument("--nearfield-height-m", type=float, default=None)
+    parser.add_argument("--nearfield-near-m", type=float, default=None)
+    parser.add_argument("--nearfield-far-m", type=float, default=None)
+    parser.add_argument("--nearfield-radius-m", type=float, default=None)
+    parser.add_argument("--nearfield-ignore-radius-m", type=float, default=None)
+    parser.add_argument("--nearfield-depth-stride-px", type=int, default=None)
+    parser.add_argument("--nearfield-floor-tolerance-m", type=float, default=None)
+    parser.add_argument("--nearfield-obstacle-min-height-m", type=float, default=None)
+    parser.add_argument("--nearfield-obstacle-max-height-m", type=float, default=None)
+    parser.add_argument("--nearfield-splat-point-threshold", type=int, default=None)
+    parser.add_argument("--nearfield-free-splat-point-threshold", type=int, default=None)
+    parser.add_argument("--static-nearfield-map", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--static-nearfield-radius-m", type=float, default=None)
+    parser.add_argument("--panorama-steps", type=int, default=None)
+    parser.add_argument("--panorama-wz-radps", type=float, default=None)
+    parser.add_argument("--panorama-render-updates-per-step", type=int, default=None)
     parser.add_argument("--depth-max-m", type=float, default=None)
     parser.add_argument("--depth-min-m", type=float, default=None)
     parser.add_argument("--depth-stride-px", type=int, default=None)
@@ -959,8 +1459,24 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--online-resolution-m", type=float, default=None)
     parser.add_argument("--obstacle-min-height-m", type=float, default=None)
     parser.add_argument("--obstacle-max-height-m", type=float, default=None)
+    parser.add_argument("--free-min-height-m", type=float, default=None)
+    parser.add_argument("--free-max-height-m", type=float, default=None)
+    parser.add_argument("--splat-point-threshold", type=int, default=None)
+    parser.add_argument("--free-splat-point-threshold", type=int, default=None)
+    parser.add_argument("--mapping-debug", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--frontier-min-cluster-size", type=int, default=None, help="Deprecated; original SG-Nav FBE uses per-cell frontiers without clustering.")
+    parser.add_argument("--frontier-min-distance-m", type=float, default=None)
+    parser.add_argument("--frontier-max-count", type=int, default=None)
+    parser.add_argument("--frontier-obstacle-dilation-radius-cells", type=int, default=None)
+    parser.add_argument("--frontier-unknown-dilation-radius-cells", type=int, default=None)
     parser.add_argument("--robot-radius-m", type=float, default=None)
-    parser.add_argument("--online-inflation-radius-m", type=float, default=None)
+    parser.add_argument(
+        "--online-inflation-radius-m",
+        type=float,
+        default=None,
+        help="Deprecated compatibility option; online traversal inflation is footprint-only.",
+    )
+    parser.add_argument("--room-map-mode", default=None)
     parser.add_argument("--detection-localization", default=None, choices=["static_map_ray", "map_ray", "rgb_map_ray", "depth", "none"])
     parser.add_argument("--min-depth-points-per-detection", type=int, default=None)
     parser.add_argument("--segmenter", default=None, choices=["none", "auto", "sam2"])
@@ -976,6 +1492,25 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--candidate-stop-distance-m", type=float, default=None)
     parser.add_argument("--candidate-standoff-min-m", type=float, default=None)
     parser.add_argument("--candidate-standoff-max-m", type=float, default=None)
+    parser.add_argument("--reperception-enabled", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--reperception-min-observations", type=int, default=None)
+    parser.add_argument("--reperception-max-steps", type=int, default=None)
+    parser.add_argument("--reperception-same-goal-radius-m", type=float, default=None)
+    parser.add_argument("--reperception-turn-wz-radps", type=float, default=None)
+    parser.add_argument("--stop-verification-steps", type=int, default=None)
+    parser.add_argument("--stop-verification-min-hits", type=int, default=None)
+    parser.add_argument("--found-goal-stop-distance-m", type=float, default=None)
+    parser.add_argument("--require-sgnav-stop", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--vllm-frontier-scoring", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--vllm-base-url", default=None)
+    parser.add_argument("--vllm-model", default=None)
+    parser.add_argument("--vllm-timeout-s", type=float, default=None)
+    parser.add_argument("--vllm-temperature", type=float, default=None)
+    parser.add_argument("--vllm-max-frontiers", type=int, default=None)
+    parser.add_argument("--vllm-image-scoring", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--vllm-image-max-width", type=int, default=None)
+    parser.add_argument("--vllm-image-jpeg-quality", type=int, default=None)
+    parser.add_argument("--score-frontiers-before-candidate", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--seed-gt-object-memory", action="store_true", default=None)
     parser.add_argument("--no-seed-gt-object-memory", dest="seed_gt_object_memory", action="store_false")
     parser.add_argument("--allow-gt-goal-fallback", action="store_true", default=None)
@@ -994,8 +1529,8 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     args.planner = args.planner or get_nested(cfg, "repo.planner", "astar")
     args.detector = args.detector or get_nested(cfg, "repo.detector", "dry_run")
-    args.yolo_world_model = args.yolo_world_model or get_nested(cfg, "paths.yolo_world_model", get_nested(cfg, "perception.yolo_world_model", "data/models/yolov8s-worldv2.pt"))
-    args.detector_conf = float(args.detector_conf if args.detector_conf is not None else get_nested(cfg, "perception.confidence_threshold", 0.08))
+    args.yolo_world_model = args.yolo_world_model or get_nested(cfg, "paths.yolo_world_model", get_nested(cfg, "perception.yolo_world_model", "data/models/yolov8l-worldv2.pt"))
+    args.detector_conf = float(args.detector_conf if args.detector_conf is not None else get_nested(cfg, "perception.confidence_threshold", 0.7))
     args.detector_iou = float(args.detector_iou if args.detector_iou is not None else get_nested(cfg, "perception.nms_iou_threshold", 0.5))
     args.headless = bool(get_nested(cfg, "isaac.headless", True) if args.headless is None else args.headless)
     viz_cfg = get_nested(cfg, "visualization.sgnav_popup", "auto")
@@ -1007,8 +1542,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     args.sgnav_viz_every_steps = int(args.sgnav_viz_every_steps or get_nested(cfg, "visualization.sgnav_popup_every_steps", 20))
     args.sgnav_viz_save_dir = args.sgnav_viz_save_dir or get_nested(cfg, "visualization.sgnav_popup_save_dir", None)
     args.sgnav_viz_save_every_steps = int(args.sgnav_viz_save_every_steps or get_nested(cfg, "visualization.sgnav_popup_save_every_steps", 10))
-    args.sgnav_viz_width = int(args.sgnav_viz_width or get_nested(cfg, "visualization.sgnav_popup_width", 960))
-    args.sgnav_viz_height = int(args.sgnav_viz_height or get_nested(cfg, "visualization.sgnav_popup_height", 540))
+    args.sgnav_viz_width = int(args.sgnav_viz_width or get_nested(cfg, "visualization.sgnav_popup_width", 1440))
+    args.sgnav_viz_height = int(args.sgnav_viz_height or get_nested(cfg, "visualization.sgnav_popup_height", 900))
     args.sgnav_viz_jpeg_quality = int(args.sgnav_viz_jpeg_quality or get_nested(cfg, "visualization.sgnav_popup_jpeg_quality", 75))
     args.sim_backend = args.sim_backend or "map"
     args.output = args.output or str(Path(get_nested(cfg, "project.output_dir", "data/isaac_bench_runs")) / "run_one_episode" / "results.jsonl")
@@ -1032,23 +1567,79 @@ def main(argv: Optional[List[str]] = None) -> int:
     args.camera_forward_offset_m = float(args.camera_forward_offset_m if args.camera_forward_offset_m is not None else get_nested(cfg, "camera.forward_offset_m", 0.0))
     args.camera_pitch_deg = float(args.camera_pitch_deg if args.camera_pitch_deg is not None else get_nested(cfg, "camera.pitch_deg", 0.0))
     args.camera_near_m = float(args.camera_near_m if args.camera_near_m is not None else get_nested(cfg, "camera.near_m", 0.02))
-    args.camera_far_m = float(args.camera_far_m if args.camera_far_m is not None else get_nested(cfg, "camera.far_m", 80.0))
+    args.camera_far_m = float(args.camera_far_m if args.camera_far_m is not None else get_nested(cfg, "camera.far_m", 5.0))
     args.camera_annotator_device = str(args.camera_annotator_device or get_nested(cfg, "isaac.camera_annotator_device", "cuda")).strip().lower()
     args.read_depth = bool(args.read_depth if args.read_depth is not None else get_nested(cfg, "isaac.read_depth", False))
-    args.depth_max_m = float(args.depth_max_m if args.depth_max_m is not None else get_nested(cfg, "mapping.depth_max_m", 6.0))
+    args.nearfield_depth = bool(args.nearfield_depth if args.nearfield_depth is not None else get_nested(cfg, "nearfield_depth.enabled", False))
+    args.nearfield_width = int(args.nearfield_width if args.nearfield_width is not None else get_nested(cfg, "nearfield_depth.width", 192))
+    args.nearfield_height = int(args.nearfield_height if args.nearfield_height is not None else get_nested(cfg, "nearfield_depth.height", 192))
+    args.nearfield_hfov_deg = float(args.nearfield_hfov_deg if args.nearfield_hfov_deg is not None else get_nested(cfg, "nearfield_depth.hfov_deg", 115.0))
+    args.nearfield_height_m = float(args.nearfield_height_m if args.nearfield_height_m is not None else get_nested(cfg, "nearfield_depth.height_m", 1.15))
+    args.nearfield_near_m = float(args.nearfield_near_m if args.nearfield_near_m is not None else get_nested(cfg, "nearfield_depth.near_m", 0.02))
+    args.nearfield_far_m = float(args.nearfield_far_m if args.nearfield_far_m is not None else get_nested(cfg, "nearfield_depth.far_m", 1.8))
+    args.nearfield_radius_m = float(args.nearfield_radius_m if args.nearfield_radius_m is not None else get_nested(cfg, "nearfield_depth.radius_m", 1.2))
+    args.nearfield_ignore_radius_m = float(args.nearfield_ignore_radius_m if args.nearfield_ignore_radius_m is not None else get_nested(cfg, "nearfield_depth.ignore_radius_m", 0.14))
+    args.nearfield_depth_stride_px = int(args.nearfield_depth_stride_px if args.nearfield_depth_stride_px is not None else get_nested(cfg, "nearfield_depth.depth_stride_px", 3))
+    args.nearfield_floor_tolerance_m = float(args.nearfield_floor_tolerance_m if args.nearfield_floor_tolerance_m is not None else get_nested(cfg, "nearfield_depth.floor_tolerance_m", 0.12))
+    args.nearfield_obstacle_min_height_m = float(args.nearfield_obstacle_min_height_m if args.nearfield_obstacle_min_height_m is not None else get_nested(cfg, "nearfield_depth.obstacle_min_height_m", 0.18))
+    args.nearfield_obstacle_max_height_m = float(args.nearfield_obstacle_max_height_m if args.nearfield_obstacle_max_height_m is not None else get_nested(cfg, "nearfield_depth.obstacle_max_height_m", 0.90))
+    args.nearfield_splat_point_threshold = int(args.nearfield_splat_point_threshold if args.nearfield_splat_point_threshold is not None else get_nested(cfg, "nearfield_depth.splat_point_threshold", 2))
+    args.nearfield_free_splat_point_threshold = int(args.nearfield_free_splat_point_threshold if args.nearfield_free_splat_point_threshold is not None else get_nested(cfg, "nearfield_depth.free_splat_point_threshold", 1))
+    args.static_nearfield_map = bool(
+        args.static_nearfield_map
+        if args.static_nearfield_map is not None
+        else get_nested(cfg, "nearfield_static_map.enabled", False)
+    )
+    args.static_nearfield_radius_m = float(
+        args.static_nearfield_radius_m
+        if args.static_nearfield_radius_m is not None
+        else get_nested(cfg, "nearfield_static_map.radius_m", 1.0)
+    )
+    args.panorama_steps = int(args.panorama_steps if args.panorama_steps is not None else get_nested(cfg, "sgnav.panorama_steps", 8))
+    args.panorama_wz_radps = float(args.panorama_wz_radps if args.panorama_wz_radps is not None else get_nested(cfg, "sgnav.panorama_wz_radps", 0.8))
+    args.panorama_render_updates_per_step = int(args.panorama_render_updates_per_step if args.panorama_render_updates_per_step is not None else get_nested(cfg, "sgnav.panorama_render_updates_per_step", get_nested(cfg, "isaac.render_updates_per_step", 1)))
+    args.depth_max_m = float(args.depth_max_m if args.depth_max_m is not None else get_nested(cfg, "mapping.depth_max_m", 5.0))
     args.depth_min_m = float(args.depth_min_m if args.depth_min_m is not None else get_nested(cfg, "mapping.depth_min_m", 0.20))
     args.depth_stride_px = int(args.depth_stride_px if args.depth_stride_px is not None else get_nested(cfg, "mapping.depth_stride_px", 8))
     args.online_map_size_m = float(args.online_map_size_m if args.online_map_size_m is not None else get_nested(cfg, "mapping.map_size_m", 40.0))
     args.online_resolution_m = float(args.online_resolution_m if args.online_resolution_m is not None else get_nested(cfg, "mapping.online_resolution_m", get_nested(cfg, "scene_preprocess.map_resolution_m", 0.05)))
-    args.obstacle_min_height_m = float(args.obstacle_min_height_m if args.obstacle_min_height_m is not None else get_nested(cfg, "mapping.obstacle_min_height_m", 0.05))
+    args.obstacle_min_height_m = float(args.obstacle_min_height_m if args.obstacle_min_height_m is not None else get_nested(cfg, "mapping.obstacle_min_height_m", 0.20))
     args.obstacle_max_height_m = float(args.obstacle_max_height_m if args.obstacle_max_height_m is not None else get_nested(cfg, "mapping.obstacle_max_height_m", 1.50))
-    args.robot_radius_m = float(args.robot_radius_m if args.robot_radius_m is not None else get_nested(cfg, "robot.footprint_radius_m", 0.28))
+    args.free_min_height_m = float(args.free_min_height_m if args.free_min_height_m is not None else get_nested(cfg, "mapping.free_min_height_m", -1.50))
+    args.free_max_height_m = float(args.free_max_height_m if args.free_max_height_m is not None else get_nested(cfg, "mapping.free_max_height_m", 0.10))
+    args.splat_point_threshold = int(args.splat_point_threshold if args.splat_point_threshold is not None else get_nested(cfg, "mapping.splat_point_threshold", 6))
+    args.free_splat_point_threshold = int(
+        args.free_splat_point_threshold
+        if args.free_splat_point_threshold is not None
+        else get_nested(cfg, "mapping.free_splat_point_threshold", 1)
+    )
+    args.mapping_debug = bool(args.mapping_debug if args.mapping_debug is not None else get_nested(cfg, "mapping.debug", False))
+    args.frontier_min_cluster_size = int(args.frontier_min_cluster_size if args.frontier_min_cluster_size is not None else get_nested(cfg, "mapping.frontier_min_cluster_size", 1))
+    args.frontier_min_distance_m = float(args.frontier_min_distance_m if args.frontier_min_distance_m is not None else get_nested(cfg, "mapping.frontier_min_distance_m", 1.2))
+    args.frontier_max_count = int(args.frontier_max_count if args.frontier_max_count is not None else get_nested(cfg, "mapping.frontier_max_count", 0))
+    args.frontier_obstacle_dilation_radius_cells = int(
+        args.frontier_obstacle_dilation_radius_cells
+        if args.frontier_obstacle_dilation_radius_cells is not None
+        else get_nested(cfg, "mapping.frontier_obstacle_dilation_radius_cells", 4)
+    )
+    args.frontier_unknown_dilation_radius_cells = int(
+        args.frontier_unknown_dilation_radius_cells
+        if args.frontier_unknown_dilation_radius_cells is not None
+        else get_nested(cfg, "mapping.frontier_unknown_dilation_radius_cells", 1)
+    )
+    default_robot_radius_m = get_nested(cfg, "robot.footprint_radius_m", None)
+    if default_robot_radius_m is None:
+        default_robot_radius_m = 0.5 * float(get_nested(cfg, "robot.footprint_width_m", 0.28))
+    args.robot_radius_m = float(args.robot_radius_m if args.robot_radius_m is not None else default_robot_radius_m)
     args.online_inflation_radius_m = float(args.online_inflation_radius_m if args.online_inflation_radius_m is not None else get_nested(cfg, "mapping.inflation_radius_m", 0.0))
+    args.room_map_mode = str(args.room_map_mode or get_nested(cfg, "mapping.room_map_mode", "observed_rooms_json"))
     args.detection_localization = str(args.detection_localization or get_nested(cfg, "perception.detection_localization", "static_map_ray"))
     args.min_depth_points_per_detection = int(args.min_depth_points_per_detection if args.min_depth_points_per_detection is not None else get_nested(cfg, "perception.min_depth_points_per_detection", 20))
     args.segmenter = str(args.segmenter or get_nested(cfg, "perception.segmenter", "none"))
-    args.sam2_checkpoint = str(args.sam2_checkpoint if args.sam2_checkpoint is not None else get_nested(cfg, "perception.sam2_checkpoint", ""))
-    args.sam2_model_cfg = str(args.sam2_model_cfg if args.sam2_model_cfg is not None else get_nested(cfg, "perception.sam2_model_cfg", "facebook/sam2.1-hiera-tiny"))
+    sam2_checkpoint_value = args.sam2_checkpoint if args.sam2_checkpoint is not None else get_nested(cfg, "perception.sam2_checkpoint", "")
+    sam2_model_cfg_value = args.sam2_model_cfg if args.sam2_model_cfg is not None else get_nested(cfg, "perception.sam2_model_cfg", "facebook/sam2.1-hiera-tiny")
+    args.sam2_checkpoint = "" if sam2_checkpoint_value is None else str(sam2_checkpoint_value)
+    args.sam2_model_cfg = "facebook/sam2.1-hiera-tiny" if sam2_model_cfg_value is None else str(sam2_model_cfg_value)
     args.sam2_device = str(args.sam2_device or get_nested(cfg, "perception.sam2_device", "cuda"))
     args.max_detections_per_frame = int(args.max_detections_per_frame if args.max_detections_per_frame is not None else get_nested(cfg, "perception.max_detections_per_frame", 100))
     args.object_merge_radius_m = float(args.object_merge_radius_m if args.object_merge_radius_m is not None else get_nested(cfg, "perception.object_merge_radius_m", 0.5))
@@ -1059,6 +1650,29 @@ def main(argv: Optional[List[str]] = None) -> int:
     args.candidate_stop_distance_m = float(args.candidate_stop_distance_m if args.candidate_stop_distance_m is not None else get_nested(cfg, "sgnav.candidate_stop_distance_m", get_nested(cfg, "episodes.success_distance_m", 1.0)))
     args.candidate_standoff_min_m = float(args.candidate_standoff_min_m if args.candidate_standoff_min_m is not None else get_nested(cfg, "sgnav.candidate_standoff_min_m", 0.65))
     args.candidate_standoff_max_m = float(args.candidate_standoff_max_m if args.candidate_standoff_max_m is not None else get_nested(cfg, "sgnav.candidate_standoff_max_m", 1.80))
+    args.reperception_enabled = bool(args.reperception_enabled if args.reperception_enabled is not None else get_nested(cfg, "sgnav.reperception_enabled", True))
+    args.reperception_min_observations = int(args.reperception_min_observations if args.reperception_min_observations is not None else get_nested(cfg, "sgnav.reperception_min_observations", 3))
+    args.reperception_max_steps = int(args.reperception_max_steps if args.reperception_max_steps is not None else get_nested(cfg, "sgnav.reperception_max_steps", 10))
+    args.reperception_same_goal_radius_m = float(args.reperception_same_goal_radius_m if args.reperception_same_goal_radius_m is not None else get_nested(cfg, "sgnav.reperception_same_goal_radius_m", 0.8))
+    args.reperception_turn_wz_radps = float(args.reperception_turn_wz_radps if args.reperception_turn_wz_radps is not None else get_nested(cfg, "sgnav.reperception_turn_wz_radps", 0.5))
+    args.stop_verification_steps = int(args.stop_verification_steps if args.stop_verification_steps is not None else get_nested(cfg, "sgnav.stop_verification_steps", 4))
+    args.stop_verification_min_hits = int(args.stop_verification_min_hits if args.stop_verification_min_hits is not None else get_nested(cfg, "sgnav.stop_verification_min_hits", 2))
+    args.found_goal_stop_distance_m = float(args.found_goal_stop_distance_m if args.found_goal_stop_distance_m is not None else get_nested(cfg, "sgnav.found_goal_stop_distance_m", 0.35))
+    args.require_sgnav_stop = bool(args.require_sgnav_stop if args.require_sgnav_stop is not None else get_nested(cfg, "episodes.success_requires_stop", True))
+    args.vllm_frontier_scoring = bool(args.vllm_frontier_scoring if args.vllm_frontier_scoring is not None else get_nested(cfg, "vllm.frontier_scoring", False))
+    args.vllm_base_url = str(args.vllm_base_url or get_nested(cfg, "vllm.base_url", "http://127.0.0.1:8000/v1"))
+    args.vllm_model = str(args.vllm_model or get_nested(cfg, "vllm.model", "qwen3-vl-8b-instruct"))
+    args.vllm_timeout_s = float(args.vllm_timeout_s if args.vllm_timeout_s is not None else get_nested(cfg, "vllm.timeout_s", 8.0))
+    args.vllm_temperature = float(args.vllm_temperature if args.vllm_temperature is not None else get_nested(cfg, "vllm.temperature", 0.0))
+    args.vllm_max_frontiers = int(args.vllm_max_frontiers if args.vllm_max_frontiers is not None else get_nested(cfg, "vllm.max_frontiers", 32))
+    args.vllm_image_scoring = bool(args.vllm_image_scoring if args.vllm_image_scoring is not None else get_nested(cfg, "vllm.image_scoring", True))
+    args.vllm_image_max_width = int(args.vllm_image_max_width if args.vllm_image_max_width is not None else get_nested(cfg, "vllm.image_max_width", 640))
+    args.vllm_image_jpeg_quality = int(args.vllm_image_jpeg_quality if args.vllm_image_jpeg_quality is not None else get_nested(cfg, "vllm.image_jpeg_quality", 75))
+    args.score_frontiers_before_candidate = bool(
+        args.score_frontiers_before_candidate
+        if args.score_frontiers_before_candidate is not None
+        else get_nested(cfg, "vllm.score_frontiers_before_candidate", args.vllm_frontier_scoring)
+    )
     args.seed_gt_object_memory = bool(get_nested(cfg, "sgnav.seed_gt_object_memory", False) if args.seed_gt_object_memory is None else args.seed_gt_object_memory)
     args.allow_gt_goal_fallback = bool(get_nested(cfg, "sgnav.allow_gt_goal_fallback", False) if args.allow_gt_goal_fallback is None else args.allow_gt_goal_fallback)
 

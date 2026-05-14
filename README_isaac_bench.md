@@ -33,8 +33,10 @@ chmod +x run_isaac_bench.sh
 ./run_isaac_bench.sh -m pip install -r requirements-isaac-bench.txt
 ```
 
-YOLO-World uses `data/models/yolov8s-worldv2.pt` by default. If the file is not
-present, Ultralytics will try to resolve `yolov8s-worldv2.pt` on first load.
+YOLO-World uses `data/models/yolov8l-worldv2.pt` by default. If the file is not
+present, Ultralytics will try to resolve `yolov8l-worldv2.pt` on first load.
+SAM2 uses the local checkpoint `data/models/sam2.1_hiera_small.pt` and packaged
+config `configs/sam2.1/sam2.1_hiera_s.yaml` by default.
 
 ## Preprocess InteriorAgent
 
@@ -54,10 +56,13 @@ parsing and writes:
 `navigable.npy`, `inflated_obstacles.npy`, `map_info.json`, `nav2_map.png`,
 `nav2_map.yaml`, and `debug_topdown.png`.
 
-`robot_radius_m` is the only default obstacle inflation used for navigability;
-the extra `--inflation-radius-m` defaults to `0.0`. Door-like categories
-(`door`, `doorsill`, `door_handle`) are treated as passable for occupancy and
-planning clearance so doorway cells remain usable.
+`robot_radius_m` is the only obstacle inflation used for navigability. The
+default is now `0.14 m`, i.e. half of the configured `0.28 m` Kaya footprint
+width. The legacy `--inflation-radius-m` argument is accepted for old commands
+but no longer adds an extra boundary band. Structural doorway categories such as
+`doorsill` and `doorway` are treated as passable openings; `door`/`door_panel`
+meshes are only skipped when their bbox looks open instead of covering the
+opening.
 
 ## Generate Episodes
 
@@ -110,8 +115,8 @@ JSONL for stress-testing A*.
 Run this inside the `sgnav-isaac` Python 3.11 env. This is the full Isaac SG-Nav
 loop: RGB-D observation, online depth occupancy/free-space mapping,
 YOLO-World/dry detector, optional SAM2 masks, object memory, SG-Nav scene graph
-scoring, candidate/frontier/STOP policy, A* replanning, and holonomic Kaya
-control.
+scoring, candidate/frontier/re-perception/STOP policy, A* replanning, and
+holonomic Kaya control.
 
 ```bash
 ./scripts/run_sgnav_isaac_env.sh \
@@ -127,15 +132,79 @@ control.
   --debug-map debug/isaac_closed_loop.png
 ```
 
-Use `--headless true` for non-GUI runs. The Isaac backend now keeps the
-preprocessed static map only for benchmark GT distance/SPL reporting. A*,
-frontiers, collision guarding, YOLO/SAM2 object projection, and the popup map use
-the live Isaac depth image instead: depth points mark obstacles by height, rays
-mark observed free cells, and frontiers are reachable observed-free boundary
-cells next to unknown space. Tune this with `mapping.depth_max_m`,
+Use `--headless true` for non-GUI runs. A*, frontiers, collision guarding,
+YOLO/SAM2 object projection, and the popup map use the live Isaac RGB-D stream.
+The online occupancy map now uses depth ray casting: every sampled depth pixel
+forms a 2D grid ray from the camera center to the depth endpoint, cells crossed
+by that ray are marked free, endpoints inside the robot-height obstacle band are
+marked occupied, and cells never crossed by a ray remain unknown. Rays whose
+endpoints are above the configured robot obstacle slice are ignored for 2D free
+clearing, so ceiling and high-wall pixels do not smear free space across the
+map. The old
+benchmark-only static near-field fill is disabled by default; enable it only
+explicitly with `--static-nearfield-map` if you need a temporary simulator blind
+spot patch. Frontiers are reachable free-boundary cells next to unknown space.
+Tune this with
+`mapping.depth_max_m`,
 `mapping.depth_stride_px`, `mapping.obstacle_min_height_m`,
-`mapping.obstacle_max_height_m`, and `mapping.map_size_m` in
-`isaac_bench/configs/isaac_bench.yaml`.
+`mapping.obstacle_max_height_m`, `mapping.free_min_height_m`,
+`mapping.free_max_height_m`, and
+`mapping.map_size_m` in
+`isaac_bench/configs/isaac_bench.yaml`. Obstacle inflation uses
+`robot.footprint_radius_m` only; the default `0.14 m` is half the robot width,
+which is about 3 cells at 0.05 m resolution. Frontier extraction now follows
+the original `SG_Nav.py::fbe()` construction: free cells are marked as 1,
+obstacles are dilated with a disk radius of 4 cells and marked as 3, unknown
+space is dilated with a disk radius of 1 cell, and frontiers are free cells on
+that unknown boundary. It does not cluster or project frontier cells to nearby
+targets. Tune this with `mapping.frontier_min_distance_m`,
+`mapping.frontier_max_count`, `mapping.frontier_obstacle_dilation_radius_cells`,
+and `mapping.frontier_unknown_dilation_radius_cells`.
+
+At reset, Kaya performs an SG-Nav-style opening panorama before normal
+planning. Each panorama view updates the depth map, YOLO/SAM2 detections,
+object memory, and scene graph. Tune it with `sgnav.panorama_steps`,
+`sgnav.panorama_wz_radps`, or CLI flags `--panorama-steps` and
+`--panorama-wz-radps`. Runtime graph rows now include object, room, group, and
+edge counts; the adapter builds object-room, related-object, and group
+relationships from Isaac RGB-D detections and the observed online map.
+
+Frontier scoring defaults to the local graph fallback, but you can route it to
+an OpenAI-compatible vLLM server. Run vLLM in a separate terminal and its own
+`sg-nav-vllm` environment:
+
+```bash
+cd /home/echo/sgnav
+./scripts/run_vllm_server.sh
+```
+
+Then run Isaac/YOLO/SAM2 from the `sgnav-isaac` terminal:
+
+```bash
+./scripts/run_sgnav_isaac_env.sh -m isaac_bench.scripts.run_one_episode \
+  --config isaac_bench/configs/isaac_bench.yaml \
+  --episode-file data/interioragent_episodes/debug.jsonl \
+  --episode-index 0 \
+  --planner astar \
+  --detector yolo_world \
+  --sim-backend isaac \
+  --vllm-frontier-scoring \
+  --vllm-base-url http://127.0.0.1:8000/v1
+```
+
+If vLLM is unreachable or returns malformed scores, the run records
+`vllm_disabled_reason` and falls back to deterministic graph scoring instead of
+crashing. Because the server API accepts images as HTTP payloads, this path
+uses a CPU JPEG copy of the latest Isaac camera frame by default. Disable image
+context with `--no-vllm-image-scoring`, or tune transfer size with
+`--vllm-image-max-width` and `--vllm-image-jpeg-quality`.
+When vLLM frontier scoring is enabled, frontiers are scored before the
+candidate shortcut as well, so the terminal should print `[sgnav-vllm] POST ...`
+even if the high-level policy later decides to move to a detected object
+candidate. Disable that probe with `--no-score-frontiers-before-candidate`.
+The result JSONL records `vllm_num_requests`, `vllm_last_skip_reason`, and
+`vllm_disabled_reason` so it is clear whether the policy entered frontier
+scoring.
 
 The Isaac backend currently uses
 kinematic holonomic control to keep Kaya from falling through InteriorAgent
@@ -160,8 +229,9 @@ USD camera clipping `near=0.02 m`, `far=80.0 m`; override with
 The SG-Nav debug popup opens automatically when `--headless false` is used. It
 runs in a separate SG-Nav-env UI worker so OpenCV GUI calls do not run inside
 Isaac's `SimulationApp` process. It shows RGB detections, object memory,
-observed map, frontiers, selected candidate/frontier, A* path, and the latest
-scene-graph scores. Force it with `--sgnav-viz`, disable it with
+zoomed observed map, frontiers, selected candidate/frontier, A* path, and the
+latest scene-graph scores. The default popup is `1440x900`, with most of the
+width allocated to the map. Force it with `--sgnav-viz`, disable it with
 `--no-sgnav-viz`, and optionally save panels with
 `--sgnav-viz-save-dir debug/sgnav_viz`. The popup now refreshes every 20 control
 steps by default and saves panels every 10 popup updates to avoid dragging down
@@ -170,7 +240,7 @@ Isaac; override with `--sgnav-viz-every-steps` and
 The default Kaya command limits are now intentionally slower:
 `max_vx=max_vy=0.15 m/s`, `max_wz=0.35 rad/s`; override them with
 `--max-vx-mps`, `--max-vy-mps`, and `--max-wz-radps`.
-YOLO detections below confidence `0.5` are filtered before depth backprojection
+YOLO detections below confidence `0.7` are filtered before depth backprojection
 and object-memory updates; override with `--detector-conf` if needed. When
 `perception.segmenter: auto|sam2` is enabled, SAM2 is prompted with YOLO boxes
 and the mask pixels, not the whole box, are backprojected into object memory.
