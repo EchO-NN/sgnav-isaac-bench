@@ -2,7 +2,8 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+import math
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -19,6 +20,24 @@ class FrontierCluster:
     members: List[GridCell]
     size: int
     path_distance_from_agent: float
+    min_path_distance: float = math.nan
+    mean_path_distance: float = math.nan
+    max_path_distance: float = math.nan
+    center_path_distance: float = math.nan
+    distance_inverse: float = math.nan
+
+    def __post_init__(self) -> None:
+        dist = float(self.path_distance_from_agent)
+        if not math.isfinite(float(self.min_path_distance)):
+            self.min_path_distance = dist
+        if not math.isfinite(float(self.mean_path_distance)):
+            self.mean_path_distance = dist
+        if not math.isfinite(float(self.max_path_distance)):
+            self.max_path_distance = dist
+        if not math.isfinite(float(self.center_path_distance)):
+            self.center_path_distance = dist
+        if not math.isfinite(float(self.distance_inverse)):
+            self.distance_inverse = _distance_inverse(dist)
 
 
 def _disk_dilate(mask: np.ndarray, radius_cells: int) -> np.ndarray:
@@ -48,6 +67,65 @@ def _disk_dilate(mask: np.ndarray, radius_cells: int) -> np.ndarray:
         return out
 
 
+def _distance_inverse(dist_m: float) -> float:
+    if not np.isfinite(float(dist_m)):
+        return 0.0
+    return float(1.0 - (np.clip(float(dist_m), 1.6, 11.6) - 1.6) / 10.0)
+
+
+def frontier_debug_layers(
+    free: np.ndarray,
+    observed: Optional[np.ndarray] = None,
+    occupancy: Optional[np.ndarray] = None,
+    obstacle_dilation_radius_cells: int = 4,
+    unknown_dilation_radius_cells: int = 1,
+    exclude_mask: Optional[np.ndarray] = None,
+    unknown_source: str = "observed",
+) -> Dict[str, np.ndarray]:
+    """Return the SG-Nav FBE masks used to build frontier cells."""
+    free_bool = np.asarray(free).astype(bool)
+    occ_bool = np.zeros_like(free_bool, dtype=bool) if occupancy is None else np.asarray(occupancy).astype(bool)
+    if occ_bool.shape != free_bool.shape:
+        raise ValueError("occupancy and free must have the same shape")
+    if unknown_source not in {"observed", "implicit"}:
+        raise ValueError(f"unknown_source must be 'observed' or 'implicit', got {unknown_source!r}")
+
+    fbe_map = np.zeros_like(free_bool, dtype=np.int8)
+    fbe_map[free_bool] = 1
+    dilated_obstacles = _disk_dilate(occ_bool, obstacle_dilation_radius_cells)
+    fbe_map[dilated_obstacles] = 3
+
+    if unknown_source == "observed" and observed is not None:
+        obs_bool = np.asarray(observed).astype(bool)
+        if obs_bool.shape != free_bool.shape:
+            raise ValueError("observed and free must have the same shape")
+        unknown = (~obs_bool) & (~free_bool) & (~occ_bool)
+    else:
+        obs_bool = np.asarray(observed).astype(bool) if observed is not None else np.zeros_like(free_bool, dtype=bool)
+        if obs_bool.shape != free_bool.shape:
+            raise ValueError("observed and free must have the same shape")
+        unknown = fbe_map == 0
+
+    unknown_dilated = _disk_dilate(unknown, unknown_dilation_radius_cells)
+    frontiers = (fbe_map == 1) & unknown_dilated
+    if exclude_mask is not None:
+        excluded = np.asarray(exclude_mask).astype(bool)
+        if excluded.shape != free_bool.shape:
+            raise ValueError("exclude_mask and free must have the same shape")
+        frontiers &= ~excluded
+
+    return {
+        "free": free_bool,
+        "occupied": occ_bool,
+        "observed": obs_bool,
+        "dilated_obstacles": dilated_obstacles,
+        "unknown": unknown,
+        "unknown_dilated": unknown_dilated,
+        "frontier": frontiers,
+        "fbe_map": fbe_map,
+    }
+
+
 def frontier_cells(
     free: np.ndarray,
     observed: Optional[np.ndarray] = None,
@@ -55,36 +133,27 @@ def frontier_cells(
     obstacle_dilation_radius_cells: int = 4,
     unknown_dilation_radius_cells: int = 1,
     exclude_mask: Optional[np.ndarray] = None,
+    unknown_source: str = "observed",
 ) -> np.ndarray:
     """SG-Nav FBE frontier map.
 
     Mirrors /home/echo/SG-Nav/SG_Nav.py::fbe:
       free cells are 1, obstacle-dilated cells are 3, unknown cells are 0;
       frontier cells are free cells intersecting the 1-cell dilation of unknown.
-    `observed` is retained for older callers; the SG-Nav definition uses
-    `free` and `occupancy`, where cells not in either are unknown.
+    unknown_source="observed" uses the mapper's explicit observed mask so
+    observed but non-free clearance cells do not become fake unknown.
+    unknown_source="implicit" keeps the original tensor-map behavior where
+    cells not in free or occupancy are unknown.
     """
-    free_bool = np.asarray(free).astype(bool)
-    occ_bool = np.zeros_like(free_bool, dtype=bool) if occupancy is None else np.asarray(occupancy).astype(bool)
-    if occ_bool.shape != free_bool.shape:
-        raise ValueError("occupancy and free must have the same shape")
-
-    fbe_map = np.zeros_like(free_bool, dtype=np.int8)
-    fbe_map[free_bool] = 1
-    dilated_obstacles = _disk_dilate(occ_bool, obstacle_dilation_radius_cells)
-    fbe_map[dilated_obstacles] = 3
-
-    unknown = fbe_map == 0
-    unknown_dilated = _disk_dilate(unknown, unknown_dilation_radius_cells)
-    fbe_cpp = np.array(fbe_map, copy=True)
-    fbe_cpp[unknown_dilated] = 0
-    frontiers = (fbe_map - fbe_cpp) == 1
-    if exclude_mask is not None:
-        excluded = np.asarray(exclude_mask).astype(bool)
-        if excluded.shape != free_bool.shape:
-            raise ValueError("exclude_mask and free must have the same shape")
-        frontiers &= ~excluded
-    return frontiers
+    return frontier_debug_layers(
+        free=free,
+        observed=observed,
+        occupancy=occupancy,
+        obstacle_dilation_radius_cells=obstacle_dilation_radius_cells,
+        unknown_dilation_radius_cells=unknown_dilation_radius_cells,
+        exclude_mask=exclude_mask,
+        unknown_source=unknown_source,
+    )["frontier"]
 
 
 def _connected_components(mask: np.ndarray) -> List[List[GridCell]]:
@@ -128,20 +197,28 @@ def extract_frontiers(
     map_info: MapInfo,
     agent_grid: GridCell,
     min_cluster_size: int = 3,
-    min_distance_m: float = 1.0,
+    min_distance_m: float = 1.6,
     max_count: int = 64,
     occupancy: Optional[np.ndarray] = None,
     obstacle_dilation_radius_cells: int = 4,
     unknown_dilation_radius_cells: int = 1,
     exclude_mask: Optional[np.ndarray] = None,
+    unknown_source: str = "observed",
+    cluster_distance_mode: str = "mean",
+    allow_near_frontier_fallback: bool = False,
 ) -> List[FrontierCluster]:
-    _ = observed
+    if cluster_distance_mode not in {"mean", "min", "center"}:
+        raise ValueError(
+            f"cluster_distance_mode must be 'mean', 'min', or 'center', got {cluster_distance_mode!r}"
+        )
     cells = frontier_cells(
-        free,
+        free=free,
+        observed=observed,
         occupancy=occupancy,
         obstacle_dilation_radius_cells=obstacle_dilation_radius_cells,
         unknown_dilation_radius_cells=unknown_dilation_radius_cells,
         exclude_mask=exclude_mask,
+        unknown_source=unknown_source,
     )
     dist_map = astar_distance_map(traversible, agent_grid, map_info.resolution_m, allow_diagonal=True)
     clusters: List[FrontierCluster] = []
@@ -151,17 +228,42 @@ def extract_frontiers(
         if len(finite_members) < max(1, int(min_cluster_size)):
             continue
         member_arr = np.asarray(finite_members, dtype=np.float32)
+        member_dists = np.asarray([float(dist_map[row, col]) for row, col in finite_members], dtype=np.float32)
         centroid = np.mean(member_arr, axis=0)
         center_idx = int(np.argmin(np.sum((member_arr - centroid) ** 2, axis=1)))
         center = tuple(int(v) for v in member_arr[center_idx])
-        dist = float(dist_map[center])
+        center_dist = float(dist_map[center])
+        if not np.isfinite(center_dist):
+            center_idx = int(np.argmin(member_dists))
+            center = tuple(int(v) for v in member_arr[center_idx])
+            center_dist = float(dist_map[center])
+        min_dist = float(np.min(member_dists))
+        mean_dist = float(np.mean(member_dists))
+        max_dist = float(np.max(member_dists))
+        if cluster_distance_mode == "min":
+            cluster_dist = min_dist
+        elif cluster_distance_mode == "center":
+            cluster_dist = center_dist
+        else:
+            cluster_dist = mean_dist
         wx, wy = grid_to_world_xy(center[0], center[1], map_info)
-        cluster = FrontierCluster(center, (wx, wy), finite_members, len(finite_members), dist)
-        if dist < min_distance_m:
+        cluster = FrontierCluster(
+            center_grid=center,
+            center_world=(wx, wy),
+            members=finite_members,
+            size=len(finite_members),
+            path_distance_from_agent=cluster_dist,
+            min_path_distance=min_dist,
+            mean_path_distance=mean_dist,
+            max_path_distance=max_dist,
+            center_path_distance=center_dist,
+            distance_inverse=_distance_inverse(cluster_dist),
+        )
+        if cluster_dist < min_distance_m:
             near_clusters.append(cluster)
             continue
         clusters.append(cluster)
-    if not clusters and near_clusters:
+    if not clusters and bool(allow_near_frontier_fallback):
         clusters = near_clusters
     clusters.sort(key=lambda cluster: (-int(cluster.size), float(cluster.path_distance_from_agent)))
     if int(max_count) > 0:

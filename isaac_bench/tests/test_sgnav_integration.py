@@ -80,7 +80,7 @@ def test_sgnav_can_score_frontiers_before_candidate():
 def test_sgnav_candidate_uses_nearest_reachable_cell_when_standoff_unknown():
     map_info = MapInfo(resolution_m=1.0, min_x=0.0, max_x=10.0, min_y=0.0, max_y=10.0, width=10, height=10)
     traversible = np.zeros((10, 10), dtype=bool)
-    traversible[1:4, 1:4] = True
+    traversible[1:7, 1:7] = True
     memory = ObjectMemory(merge_radius_m=0.5)
     memory.update([Detection3D("mirror", "mirror", 0.9, (8.0, 8.0, 0.5), (0, 0, 10, 10))], step_id=1, map_info=map_info)
 

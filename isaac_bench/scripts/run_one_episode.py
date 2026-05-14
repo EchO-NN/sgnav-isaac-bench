@@ -16,12 +16,13 @@ from isaac_bench.env.habitat_like_env import MapSimHabitatLikeEnv
 from isaac_bench.graph.decision import SGNavDecision
 from isaac_bench.graph.sgnav_scenegraph_adapter import SGNAV_ROOM_NAMES, SGNavSceneGraphAdapter
 from isaac_bench.mapping.coordinate_transform import MapInfo, grid_to_world_xy, is_inside_grid, world_xy_to_grid
-from isaac_bench.mapping.frontier import extract_frontiers, frontier_cells
+from isaac_bench.mapping.frontier import extract_frontiers, frontier_debug_layers
+from isaac_bench.mapping.frontier_debug import save_frontier_debug_snapshot
 from isaac_bench.mapping.online_mapper import OnlineMapper
 from isaac_bench.mapping.room_map_from_rooms_json import build_room_index_map, load_rooms
 from isaac_bench.metrics.episode_logger import JsonlEpisodeLogger
 from isaac_bench.metrics.evaluator import EpisodeEvaluator
-from isaac_bench.navigation.astar import GridAStarPlanner
+from isaac_bench.navigation.astar import GridAStarPlanner, astar_distance_map
 from isaac_bench.navigation.waypoint_follower import HolonomicWaypointFollower
 from isaac_bench.perception.detection_types import Detection2D, Detection3D
 from isaac_bench.perception.detector_ipc import SubprocessDetector
@@ -910,27 +911,30 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
 
             if needs_replan:
                 frontier_free = free & navigable
+                distance_traversible = mapper.traversible(unknown_is_obstacle=True).astype(bool) & frontier_free.astype(bool)
+                rr, cc = int(current_grid[0]), int(current_grid[1])
+                if 0 <= rr < distance_traversible.shape[0] and 0 <= cc < distance_traversible.shape[1]:
+                    distance_traversible[rr, cc] = True
                 static_only_nearfield = getattr(mapper, "static_nearfield_mask", None)
                 depth_free_mask = getattr(mapper, "depth_free_mask", None)
                 if bool(getattr(args, "static_nearfield_map", False)) and static_only_nearfield is not None and depth_free_mask is not None:
                     static_only_nearfield = np.asarray(static_only_nearfield).astype(bool) & ~np.asarray(depth_free_mask).astype(bool)
                 else:
                     static_only_nearfield = None
-                last_frontier_raw_cells = int(
-                    np.count_nonzero(
-                        frontier_cells(
-                            frontier_free,
-                            occupancy=occupancy,
-                            obstacle_dilation_radius_cells=int(args.frontier_obstacle_dilation_radius_cells),
-                            unknown_dilation_radius_cells=int(args.frontier_unknown_dilation_radius_cells),
-                            exclude_mask=static_only_nearfield,
-                        )
-                    )
+                frontier_layers = frontier_debug_layers(
+                    frontier_free,
+                    observed=observed,
+                    occupancy=occupancy,
+                    obstacle_dilation_radius_cells=int(args.frontier_obstacle_dilation_radius_cells),
+                    unknown_dilation_radius_cells=int(args.frontier_unknown_dilation_radius_cells),
+                    exclude_mask=static_only_nearfield,
+                    unknown_source=str(args.frontier_unknown_source),
                 )
+                last_frontier_raw_cells = int(np.count_nonzero(frontier_layers["frontier"]))
                 frontiers = extract_frontiers(
                     free=frontier_free,
                     observed=observed,
-                    traversible=navigable,
+                    traversible=distance_traversible,
                     map_info=dynamic_map_info,
                     agent_grid=current_grid,
                     min_cluster_size=int(args.frontier_min_cluster_size),
@@ -940,6 +944,9 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
                     obstacle_dilation_radius_cells=int(args.frontier_obstacle_dilation_radius_cells),
                     unknown_dilation_radius_cells=int(args.frontier_unknown_dilation_radius_cells),
                     exclude_mask=static_only_nearfield,
+                    unknown_source=str(args.frontier_unknown_source),
+                    cluster_distance_mode=str(args.frontier_cluster_distance_mode),
+                    allow_near_frontier_fallback=bool(args.frontier_allow_near_fallback),
                 )
                 last_frontier_clusters = len(frontiers)
                 last_frontiers = list(frontiers)
@@ -957,6 +964,30 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
                 evaluator.num_frontier_decisions += 1
                 last_decision_mode = nav_decision.mode
                 last_decision_reason = nav_decision.reason
+                if bool(getattr(args, "frontier_debug_dump", False)):
+                    selected_frontier_cell = None
+                    if nav_decision.frontier_decision is not None and nav_decision.frontier_decision.selected_frontier is not None:
+                        selected_frontier_cell = nav_decision.frontier_decision.selected_frontier.center_grid
+                    save_frontier_debug_snapshot(
+                        args.frontier_debug_dir,
+                        step,
+                        free=frontier_free,
+                        occupied=occupancy,
+                        observed=observed,
+                        unknown=frontier_layers["unknown"],
+                        unknown_dilated=frontier_layers["unknown_dilated"],
+                        frontier=frontier_layers["frontier"],
+                        traversible=distance_traversible,
+                        dist_map=astar_distance_map(
+                            distance_traversible,
+                            current_grid,
+                            dynamic_map_info.resolution_m,
+                            allow_diagonal=True,
+                        ),
+                        agent_grid=current_grid,
+                        clusters=frontiers,
+                        selected_frontier=selected_frontier_cell,
+                    )
                 if nav_decision.selected_candidate is not None:
                     last_selected_candidate = nav_decision.selected_candidate
                     candidate_id = int(last_selected_candidate.node_id)
@@ -1312,6 +1343,12 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
         row["static_nearfield_mapper_debug"] = dict(getattr(mapper, "last_static_nearfield_debug_stats", {}))
         row["frontier_raw_cells"] = int(last_frontier_raw_cells)
         row["frontier_clusters"] = int(last_frontier_clusters)
+        row["frontier_unknown_source"] = str(args.frontier_unknown_source)
+        row["frontier_cluster_distance_mode"] = str(args.frontier_cluster_distance_mode)
+        row["frontier_allow_near_fallback"] = bool(args.frontier_allow_near_fallback)
+        row["frontier_min_distance_m"] = float(args.frontier_min_distance_m)
+        row["frontier_debug_dump"] = bool(args.frontier_debug_dump)
+        row["frontier_debug_dir"] = str(args.frontier_debug_dir)
         row["segmenter"] = str(getattr(args, "segmenter", "none") or "none")
         row["camera_annotator_device"] = camera_annotator_device
         row["detector_cuda_rgb"] = bool(detector_cuda_rgb)
@@ -1469,6 +1506,16 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--frontier-max-count", type=int, default=None)
     parser.add_argument("--frontier-obstacle-dilation-radius-cells", type=int, default=None)
     parser.add_argument("--frontier-unknown-dilation-radius-cells", type=int, default=None)
+    parser.add_argument("--frontier-unknown-source", "--frontier_unknown_source", default=None, choices=["observed", "implicit"])
+    parser.add_argument(
+        "--frontier-cluster-distance-mode",
+        "--frontier_cluster_distance_mode",
+        default=None,
+        choices=["mean", "min", "center"],
+    )
+    parser.add_argument("--frontier-allow-near-fallback", "--frontier_allow_near_fallback", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--frontier-debug-dump", "--frontier_debug_dump", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--frontier-debug-dir", "--frontier_debug_dir", default=None)
     parser.add_argument("--robot-radius-m", type=float, default=None)
     parser.add_argument(
         "--online-inflation-radius-m",
@@ -1615,7 +1662,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     )
     args.mapping_debug = bool(args.mapping_debug if args.mapping_debug is not None else get_nested(cfg, "mapping.debug", False))
     args.frontier_min_cluster_size = int(args.frontier_min_cluster_size if args.frontier_min_cluster_size is not None else get_nested(cfg, "mapping.frontier_min_cluster_size", 1))
-    args.frontier_min_distance_m = float(args.frontier_min_distance_m if args.frontier_min_distance_m is not None else get_nested(cfg, "mapping.frontier_min_distance_m", 1.2))
+    args.frontier_min_distance_m = float(args.frontier_min_distance_m if args.frontier_min_distance_m is not None else get_nested(cfg, "mapping.frontier_min_distance_m", 1.6))
     args.frontier_max_count = int(args.frontier_max_count if args.frontier_max_count is not None else get_nested(cfg, "mapping.frontier_max_count", 0))
     args.frontier_obstacle_dilation_radius_cells = int(
         args.frontier_obstacle_dilation_radius_cells
@@ -1627,6 +1674,25 @@ def main(argv: Optional[List[str]] = None) -> int:
         if args.frontier_unknown_dilation_radius_cells is not None
         else get_nested(cfg, "mapping.frontier_unknown_dilation_radius_cells", 1)
     )
+    args.frontier_unknown_source = str(args.frontier_unknown_source or get_nested(cfg, "mapping.frontier_unknown_source", "observed"))
+    if args.frontier_unknown_source not in {"observed", "implicit"}:
+        raise ValueError("mapping.frontier_unknown_source must be 'observed' or 'implicit'")
+    args.frontier_cluster_distance_mode = str(
+        args.frontier_cluster_distance_mode or get_nested(cfg, "mapping.frontier_cluster_distance_mode", "mean")
+    )
+    if args.frontier_cluster_distance_mode not in {"mean", "min", "center"}:
+        raise ValueError("mapping.frontier_cluster_distance_mode must be 'mean', 'min', or 'center'")
+    args.frontier_allow_near_fallback = bool(
+        args.frontier_allow_near_fallback
+        if args.frontier_allow_near_fallback is not None
+        else get_nested(cfg, "mapping.frontier_allow_near_fallback", False)
+    )
+    args.frontier_debug_dump = bool(
+        args.frontier_debug_dump
+        if args.frontier_debug_dump is not None
+        else get_nested(cfg, "mapping.frontier_debug_dump", False)
+    )
+    args.frontier_debug_dir = str(args.frontier_debug_dir or get_nested(cfg, "mapping.frontier_debug_dir", "data/debug_frontier"))
     default_robot_radius_m = get_nested(cfg, "robot.footprint_radius_m", None)
     if default_robot_radius_m is None:
         default_robot_radius_m = 0.5 * float(get_nested(cfg, "robot.footprint_width_m", 0.28))

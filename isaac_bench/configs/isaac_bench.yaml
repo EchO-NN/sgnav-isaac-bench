@@ -137,10 +137,15 @@ mapping:
   debug: false
   inflation_radius_m: 0.0
   frontier_min_cluster_size: 1
-  frontier_min_distance_m: 1.2
+  frontier_min_distance_m: 1.6
   frontier_max_count: 0
   frontier_obstacle_dilation_radius_cells: 4
   frontier_unknown_dilation_radius_cells: 1
+  frontier_unknown_source: observed
+  frontier_cluster_distance_mode: mean
+  frontier_allow_near_fallback: false
+  frontier_debug_dump: false
+  frontier_debug_dir: data/debug_frontier
   room_map_mode: observed_rooms_json
 
 perception:

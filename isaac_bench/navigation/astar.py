@@ -140,14 +140,14 @@ class GridAStarPlanner:
 def astar_distance_map(traversible: np.ndarray, start: GridCell, resolution_m: float, allow_diagonal: bool = True) -> np.ndarray:
     planner = GridAStarPlanner(traversible, resolution_m, allow_diagonal=allow_diagonal)
     start_free = planner.snap_to_free(start)
-    dist = np.full(planner.traversible.shape, np.inf, dtype=np.float32)
+    dist = np.full(planner.traversible.shape, np.inf, dtype=np.float64)
     if start_free is None:
         return dist
     heap: List[Tuple[float, GridCell]] = [(0.0, start_free)]
     dist[start_free] = 0.0
     while heap:
         cur_dist, cell = heapq.heappop(heap)
-        if cur_dist > dist[cell]:
+        if cur_dist > float(dist[cell]) + 1e-9:
             continue
         for dr, dc, step_cost in planner.neighbors:
             nbr = (cell[0] + dr, cell[1] + dc)
@@ -162,7 +162,7 @@ def astar_distance_map(traversible: np.ndarray, start: GridCell, resolution_m: f
 
 def astar_distance_from_region_map(traversible: np.ndarray, goals: Iterable[GridCell], resolution_m: float, allow_diagonal: bool = True) -> np.ndarray:
     planner = GridAStarPlanner(traversible, resolution_m, allow_diagonal=allow_diagonal)
-    dist = np.full(planner.traversible.shape, np.inf, dtype=np.float32)
+    dist = np.full(planner.traversible.shape, np.inf, dtype=np.float64)
     heap: List[Tuple[float, GridCell]] = []
     for goal in goals:
         cell = (int(goal[0]), int(goal[1]))
@@ -174,7 +174,7 @@ def astar_distance_from_region_map(traversible: np.ndarray, goals: Iterable[Grid
         heapq.heappush(heap, (0.0, cell))
     while heap:
         cur_dist, cell = heapq.heappop(heap)
-        if cur_dist > dist[cell]:
+        if cur_dist > float(dist[cell]) + 1e-9:
             continue
         for dr, dc, step_cost in planner.neighbors:
             nbr = (cell[0] + dr, cell[1] + dc)

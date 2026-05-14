@@ -81,10 +81,9 @@ class SGNavDecision:
             return DecisionResult(None, None, [], [], [], "no_frontiers")
         locs = np.asarray([f.center_grid for f in frontier_clusters], dtype=np.int32)
         sg_scores = self.scenegraph.score(locs, len(frontier_clusters))
-        dists = np.asarray([f.path_distance_from_agent for f in frontier_clusters], dtype=np.float32)
-        if len(dists) == 0:
-            dist_scores = np.zeros((0,), dtype=np.float32)
-        else:
+        dist_scores = np.asarray([getattr(f, "distance_inverse", 0.0) for f in frontier_clusters], dtype=np.float32)
+        if len(dist_scores) != len(frontier_clusters) or not np.all(np.isfinite(dist_scores)):
+            dists = np.asarray([f.path_distance_from_agent for f in frontier_clusters], dtype=np.float32)
             clipped = np.clip(dists, 1.6, 11.6)
             dist_scores = 1.0 - (clipped - 1.6) / 10.0
         total = sg_scores + self.frontier_distance_weight * dist_scores
