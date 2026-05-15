@@ -22,3 +22,7 @@ venv/
 *.log
 *.tmp
 *.swp
+
+# Orchestrator runtime worktrees
+orchestrator/worktrees/*
+!orchestrator/worktrees/.gitkeep

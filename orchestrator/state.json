@@ -1,0 +1,15 @@
+{
+  "contract_version": "orchestrator-v2",
+  "roadmap_style": "strategy-backlog",
+  "base_branch": "dev2",
+  "roadmap_id": "2026-05-16-00-sgnav-isaac-benchmark-completion",
+  "roadmap_revision": "rev-001",
+  "roadmap_dir": "orchestrator/roadmaps/2026-05-16-00-sgnav-isaac-benchmark-completion/rev-001",
+  "controller_stage": "dispatch-rounds",
+  "max_parallel_rounds": 1,
+  "active_rounds": [],
+  "roadmap_update": null,
+  "last_completed_round": null,
+  "resume_errors": {},
+  "retry": null
+}
