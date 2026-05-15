@@ -184,6 +184,55 @@ def test_dump_sgnav_step_writes_contract_artifact(tmp_path):
     assert payload["contract_version"] == "sgnav_step_dump_v1"
 
 
+def test_dump_sgnav_step_can_convert_runtime_debug_artifacts(tmp_path):
+    graph_debug = tmp_path / "graph_step_000001.json"
+    result_row = tmp_path / "results.jsonl"
+    out = tmp_path / "step.json"
+    graph_debug.write_text(
+        json.dumps(
+            {
+                "objects": [{"id": "object:1", "cat": "chair"}],
+                "groups": [{"id": "group:1", "members": ["object:1"]}],
+                "rooms": [{"id": "room:kitchen", "caption": "kitchen"}],
+                "edges": [{"src": "object:1", "dst": "room:kitchen", "rel": "in"}],
+                "frontiers": [{"index": 0, "selected": True, "center": [4, 5], "total": 1.2}],
+                "decision": {"mode": "frontier", "reason": "selected_new_frontier", "target_cells": [[4, 5]]},
+                "score_debug": {
+                    "mode": "paper_subgraph_interpolation",
+                    "selected_frontier_id": "frontier_0",
+                    "frontier_scores": [{"frontier_id": "frontier_0", "score": 1.2}],
+                    "top_supporting_subgraphs": [
+                        {"subgraph_id": "sg_object_1", "central_object_id": "object:1", "p_sub": 0.8}
+                    ],
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    result_row.write_text(
+        json.dumps(
+            {
+                "object_memory_goal_candidates": [{"node_id": 1, "category": "chair"}],
+                "candidate_accepted": False,
+                "stop_reason": "max_control_steps",
+                "success": False,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    assert dump_sgnav_step_main(["--output", str(out), "--graph-debug-dump", str(graph_debug), "--result-row", str(result_row)]) == 0
+    payload = json.loads(out.read_text(encoding="utf-8"))
+
+    assert payload["metadata"]["schema_only"] is False
+    assert payload["objects"][0]["cat"] == "chair"
+    assert payload["subgraph_probabilities"][0]["p_sub"] == 0.8
+    assert payload["selected_frontier"]["frontier_id"] == "frontier_0"
+    assert payload["candidate_goals"][0]["category"] == "chair"
+    assert payload["stop_state"]["stop_reason"] == "max_control_steps"
+
+
 def test_check_assets_reports_required_missing_paths(tmp_path, capsys, monkeypatch):
     monkeypatch.setenv("YOLO_WORLD_MODEL", str(tmp_path / "missing-yolo.pt"))
 

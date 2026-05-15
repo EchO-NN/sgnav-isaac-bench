@@ -1,8 +1,9 @@
 # SG-Nav Decision Dump Contract
 
 `python -m isaac_bench.scripts.dump_sgnav_step ...` writes a JSON artifact that
-captures one SG-Nav decision surface. The command is a schema contract and
-debugging entrypoint; it must not be used to hide missing runtime assets.
+captures one SG-Nav decision surface. It can write an explicit schema-only
+smoke artifact, or convert a runtime `graph_step_*.json` plus an optional
+episode result row into the same contract shape.
 
 ## Required JSON Keys
 
@@ -36,3 +37,11 @@ Every dump artifact must include:
 
 Empty lists or objects are acceptable only for smoke/schema dumps that are
 explicitly not metric benchmark decisions.
+
+## Runtime Conversion
+
+Use `--graph-debug-dump debug/graphs/graph_step_000123.json` to populate the
+scene graph, subgraph, frontier, and decision fields from a real run. Use
+`--result-row data/isaac_bench_runs/.../results.jsonl` to enrich candidate,
+re-perception, and STOP state from the episode row. The dump remains a debug
+artifact; it does not make a run metric-valid.
