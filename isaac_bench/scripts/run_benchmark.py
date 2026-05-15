@@ -1,16 +1,14 @@
 from __future__ import annotations
 
 import argparse
-import json
 import sys
 from pathlib import Path
 from typing import List, Optional
 
 from isaac_bench.config import get_nested, load_config, str_to_bool
 from isaac_bench.dataset.episode_generator import read_jsonl
-from isaac_bench.metrics.episode_logger import JsonlEpisodeLogger
 from isaac_bench.metrics.result_schema import BenchmarkAssetError, validate_strict_benchmark_assets
-from isaac_bench.scripts.run_one_episode import run_episode_map_sim
+from isaac_bench.scripts.run_one_episode import main as run_one_episode_main
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -24,13 +22,14 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--output", default=None)
     parser.add_argument("--output-dir", default=None)
     parser.add_argument("--limit", type=int, default=None)
-    parser.add_argument("--strict-benchmark", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--strict-benchmark", nargs="?", const=True, default=None, type=str_to_bool)
+    parser.add_argument("--no-strict-benchmark", dest="strict_benchmark", action="store_false")
     parser.add_argument("--allow-debug-fallbacks", action="store_true", default=None)
     parser.add_argument("--policy", default=None)
     parser.add_argument("--ablation-name", default=None)
     parser.add_argument("--sgnav-repo", default=None)
     parser.add_argument("--use-original-scenegraph", action="store_true", default=None)
-    parser.add_argument("--sim-backend", default="map", choices=["map"])
+    parser.add_argument("--sim-backend", default=None, choices=["map", "isaac"])
     parser.add_argument("--yolo-world-model", default=None)
     parser.add_argument("--segmenter", default=None, choices=["none", "auto", "sam2"])
     parser.add_argument("--sam2-checkpoint", default=None)
@@ -41,6 +40,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     args.planner = args.planner or get_nested(cfg, "repo.planner", "astar")
     args.detector = args.detector or get_nested(cfg, "repo.detector", "dry_run")
+    args.sim_backend = args.sim_backend or get_nested(cfg, "repo.backend", "map")
     args.strict_benchmark = bool(
         args.strict_benchmark
         if args.strict_benchmark is not None
@@ -82,15 +82,49 @@ def main(argv: Optional[List[str]] = None) -> int:
     out = Path(args.output)
     if out.exists():
         out.unlink()
-    logger = JsonlEpisodeLogger(args.output)
     episodes = read_jsonl(args.episode_file)
     if args.limit is not None:
         episodes = episodes[: args.limit]
     for idx, episode in enumerate(episodes):
-        args.episode_index = idx
-        row = run_episode_map_sim(episode, args)
-        logger.log(row)
-        print(json.dumps(row, ensure_ascii=False), flush=True)
+        _ = episode
+        child_args = [
+            "--config",
+            args.config,
+            "--episode-file",
+            args.episode_file,
+            "--episode-index",
+            str(idx),
+            "--planner",
+            args.planner,
+            "--detector",
+            args.detector,
+            "--sim-backend",
+            args.sim_backend,
+            "--output",
+            args.output,
+            "--yolo-world-model",
+            args.yolo_world_model,
+            "--segmenter",
+            args.segmenter,
+            "--sam2-checkpoint",
+            args.sam2_checkpoint,
+            "--policy",
+            str(args.policy or ""),
+        ]
+        child_args.append("--strict-benchmark" if args.strict_benchmark else "--no-strict-benchmark")
+        if args.allow_debug_fallbacks:
+            child_args.append("--allow-debug-fallbacks")
+        if args.ablation_name:
+            child_args.extend(["--ablation-name", str(args.ablation_name)])
+        if args.headless is not None:
+            child_args.extend(["--headless", "true" if args.headless else "false"])
+        if args.debug_map:
+            child_args.extend(["--debug-map", args.debug_map])
+        if args.save_debug_video:
+            child_args.append("--save-debug-video")
+        status = run_one_episode_main(child_args)
+        if status != 0:
+            return int(status)
     return 0
 
 

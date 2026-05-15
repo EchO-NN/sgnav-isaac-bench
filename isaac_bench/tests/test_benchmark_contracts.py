@@ -114,6 +114,8 @@ def test_strict_missing_yolo_world_cli_fails_without_traceback(tmp_path, capsys)
             "sam2",
             "--sim-backend",
             "map",
+            "--strict-benchmark",
+            "true",
             "--yolo-world-model",
             str(tmp_path / "missing-yolo.pt"),
         ]
@@ -133,7 +135,9 @@ def test_strict_missing_yolo_world_batch_cli_fails_without_traceback(tmp_path, c
             "--detector",
             "yolo_world",
             "--sim-backend",
-            "map",
+            "isaac",
+            "--strict-benchmark",
+            "true",
             "--yolo-world-model",
             str(tmp_path / "missing-yolo.pt"),
         ]
