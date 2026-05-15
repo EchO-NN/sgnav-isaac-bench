@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-import sys
 import os
+import sys
 
-from isaac_bench.scripts.preprocess_interioragent import _reexec_pythonpath
+from isaac_bench.scripts.preprocess_interioragent import _reexec_pythonpath, main as preprocess_main
 
 
 def test_reexec_pythonpath_preserves_active_environment_paths(tmp_path, monkeypatch):
@@ -24,3 +24,11 @@ def test_reexec_pythonpath_preserves_active_environment_paths(tmp_path, monkeypa
     assert str(site_packages.resolve()) in parts
     assert str(existing_path) in parts
     assert parts.count(str(site_packages.resolve())) == 1
+
+
+def test_preprocess_cli_fails_clearly_for_missing_dataset_root(tmp_path, capsys):
+    status = preprocess_main(["--dataset-root", str(tmp_path / "missing"), "--out", str(tmp_path / "out")])
+    captured = capsys.readouterr()
+
+    assert status == 2
+    assert "InteriorAgent dataset root not found" in captured.err

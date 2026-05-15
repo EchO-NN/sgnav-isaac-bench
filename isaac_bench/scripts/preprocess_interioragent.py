@@ -139,10 +139,19 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--limit", type=int, default=None)
     args = parser.parse_args(argv)
 
-    ensure_pxr_or_reexec(args.isaac_sim_root)
+    dataset_root = Path(args.dataset_root).expanduser()
+    if not dataset_root.exists():
+        print("Error: InteriorAgent dataset root not found: %s" % dataset_root, file=sys.stderr)
+        return 2
     scenes = discover_scenes(args.dataset_root, args.scene_glob, args.scene_id)
     if args.limit is not None:
         scenes = scenes[: args.limit]
+    if not scenes:
+        requested = ", ".join(args.scene_id or [args.scene_glob])
+        print("Error: no InteriorAgent scenes found under %s for %s" % (dataset_root, requested), file=sys.stderr)
+        return 2
+
+    ensure_pxr_or_reexec(args.isaac_sim_root)
     out_root = Path(args.out)
     out_root.mkdir(parents=True, exist_ok=True)
     rows = []

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import sys
 from pathlib import Path
 from typing import List, Optional
 
@@ -26,10 +27,17 @@ def main(argv: Optional[List[str]] = None) -> int:
     args = parser.parse_args(argv)
 
     root = Path(args.preprocessed_dir)
+    if not root.exists():
+        print("Error: preprocessed directory not found: %s" % root, file=sys.stderr)
+        return 2
     scene_dirs = [p for p in sorted(root.glob("kujiale_*")) if p.is_dir()]
     if args.scene_id:
         wanted = set(args.scene_id)
         scene_dirs = [p for p in scene_dirs if p.name in wanted]
+    if not scene_dirs:
+        requested = ", ".join(args.scene_id or ["<all kujiale_*>"])
+        print("Error: no preprocessed scenes found in %s for %s" % (root, requested), file=sys.stderr)
+        return 2
     episodes = []
     for scene_dir in scene_dirs:
         scene_eps = generate_scene_episodes(
