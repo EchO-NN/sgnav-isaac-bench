@@ -18,7 +18,7 @@ import numpy as np
 
 from isaac_bench.config import load_yaml, repo_root
 from isaac_bench.dataset.category_normalizer import normalize_category
-from isaac_bench.graph.edge_builder import apply_edge_proposals, propose_object_edges_with_llm
+from isaac_bench.graph.edge_builder import apply_edge_proposals, propose_object_edges_with_llm, verify_long_edge_geometrically
 from isaac_bench.graph.frontier_interpolation import frontier_debug_payload, score_frontiers_by_subgraphs
 from isaac_bench.graph.hcot_scorer import HCoTSubgraphScorer, OpenAICompatibleJSONClient
 from isaac_bench.graph.paper_scene_graph import PaperSceneGraph
@@ -311,6 +311,7 @@ class SGNavSceneGraphAdapter:
         use_original: bool = False,
         semantic_priors_path: Optional[str] = None,
         vllm_config: Optional[Mapping[str, object]] = None,
+        llm_config: Optional[Mapping[str, object]] = None,
         sgnav_mode: str = "legacy",
     ):
         self.sgnav_repo = sgnav_repo
@@ -335,11 +336,18 @@ class SGNavSceneGraphAdapter:
         self.latest_rgb_image: Optional[np.ndarray] = None
         self.latest_map_info = None
         self.graph_version = 0
-        paper_llm_config = dict(vllm_config or {})
-        self.paper_llm_client = OpenAICompatibleJSONClient(paper_llm_config) if self.sgnav_mode == "paper" and bool(paper_llm_config.get("enabled", False)) else None
-        self.vllm_scorer = VLLMFrontierScorer({**paper_llm_config, "enabled": False} if self.sgnav_mode == "paper" else vllm_config)
+        paper_llm_config = dict(llm_config or {})
+        self.paper_llm_client = (
+            OpenAICompatibleJSONClient(paper_llm_config)
+            if self.sgnav_mode == "paper" and bool(paper_llm_config.get("enabled", False))
+            else None
+        )
+        self.vllm_scorer = VLLMFrontierScorer(vllm_config)
+        if self.sgnav_mode == "paper":
+            self.vllm_scorer.enabled = False
         self.paper_graph = PaperSceneGraph(related_category_pairs=self.related_category_pairs)
         self.hcot_scorer = HCoTSubgraphScorer(llm_client=self.paper_llm_client)
+        self.max_hcot_subgraphs_per_decision = int(paper_llm_config.get("max_hcot_subgraphs_per_decision", 8))
         if self.use_original:
             self._try_init_original()
 
@@ -496,7 +504,9 @@ class SGNavSceneGraphAdapter:
         }
         self._rebuild_runtime_graph(map_info=map_info)
         if self.sgnav_mode == "paper":
-            self._update_paper_graph_from_memory(object_memory)
+            if room_map is not None and map_info is not None:
+                self.paper_graph.update_room_nodes_from_room_map(room_map, map_info, self.room_names)
+            self._update_paper_graph_from_memory(object_memory, occupancy=occupancy, map_info=map_info)
         if self.scenegraph is not None:
             try:
                 with self._sgnav_cwd():
@@ -549,7 +559,7 @@ class SGNavSceneGraphAdapter:
             return vllm_scores
         return self._fallback_score(frontier_locations, num_frontiers)
 
-    def _update_paper_graph_from_memory(self, object_memory: ObjectMemory) -> None:
+    def _update_paper_graph_from_memory(self, object_memory: ObjectMemory, occupancy: Optional[np.ndarray] = None, map_info=None) -> None:
         self.paper_graph.update_from_object_memory(object_memory)
         new_ids = set(getattr(self.paper_graph, "new_object_ids", []) or [])
         if not new_ids:
@@ -558,11 +568,13 @@ class SGNavSceneGraphAdapter:
         all_objects = list(self.paper_graph.object_nodes.values())
         new_objects = [node for node in all_objects if node.id in new_ids]
         proposals = propose_object_edges_with_llm(new_objects, all_objects, llm_client=self.paper_llm_client)
+        proposals = self._prune_paper_edge_proposals(proposals, occupancy=occupancy, map_info=map_info)
         apply_edge_proposals(self.paper_graph, proposals)
         self.paper_graph.update_group_nodes()
 
     def _paper_score(self, frontier_locations: np.ndarray, num_frontiers: int) -> np.ndarray:
-        subgraphs = build_object_centered_subgraphs(self.paper_graph)
+        subgraphs_all = build_object_centered_subgraphs(self.paper_graph)
+        subgraphs = self._select_relevant_subgraphs(subgraphs_all, self.obj_goal_sg)
         subgraph_scores = self.hcot_scorer.score(subgraphs, self.obj_goal_sg, graph_version=self.paper_graph.version)
         frontiers = []
         for idx, loc in enumerate(np.asarray(frontier_locations[:num_frontiers], dtype=np.int32)):
@@ -582,10 +594,75 @@ class SGNavSceneGraphAdapter:
                 "num_group_nodes": len(self.paper_graph.group_nodes),
                 "num_object_edges": len(self.paper_graph.object_edges),
                 "num_subgraphs": len(subgraphs),
+                "num_subgraphs_total": len(subgraphs_all),
+                "num_subgraphs_scored": len(subgraphs),
+                "max_hcot_subgraphs_per_decision": self.max_hcot_subgraphs_per_decision,
             }
         )
         self.last_score_debug = payload
         return np.asarray([item.score for item in frontier_scores], dtype=np.float32)
+
+    def _select_relevant_subgraphs(self, subgraphs, goal: str):
+        max_k = max(0, int(getattr(self, "max_hcot_subgraphs_per_decision", 0)))
+        if max_k <= 0 or len(subgraphs) <= max_k:
+            return subgraphs
+        goal = self._canonical_category(goal)
+
+        def score_sg(sg) -> float:
+            central = self._canonical_category(getattr(sg, "central_object_category", ""))
+            value = 0.0
+            if central == goal:
+                value += 100.0
+            for node in getattr(sg, "nodes", []):
+                if not isinstance(node, ABCMapping):
+                    continue
+                cat = self._canonical_category(str(node.get("category", "")))
+                if cat == goal:
+                    value += 50.0
+                if tuple(sorted((cat, goal))) in self.related_category_pairs:
+                    value += 10.0
+                value += float(node.get("confidence", 0.0)) * 0.1
+            return value
+
+        return sorted(subgraphs, key=score_sg, reverse=True)[:max_k]
+
+    def _prune_paper_edge_proposals(self, proposals, occupancy: Optional[np.ndarray] = None, map_info=None):
+        pruned = []
+        for proposal in proposals:
+            if proposal.is_short_edge:
+                proposal.pruning_debug = {
+                    **dict(proposal.pruning_debug),
+                    "kept": True,
+                    "reason": "short_edge_vlm_not_enabled_kept",
+                }
+                pruned.append(proposal)
+                continue
+            if occupancy is None or map_info is None:
+                proposal.pruning_debug = {
+                    **dict(proposal.pruning_debug),
+                    "kept": True,
+                    "reason": "no_occupancy_for_long_edge_pruning",
+                }
+                pruned.append(proposal)
+                continue
+            try:
+                keep = verify_long_edge_geometrically(
+                    proposal,
+                    self.paper_graph,
+                    np.asarray(occupancy).astype(bool),
+                    resolution_m=float(map_info.resolution_m),
+                    origin_xy=(float(getattr(map_info, "min_x", 0.0)), float(getattr(map_info, "min_y", 0.0))),
+                )
+            except Exception as exc:
+                proposal.pruning_debug = {
+                    **dict(proposal.pruning_debug),
+                    "kept": False,
+                    "reason": "long_edge_pruning_error: %s" % exc,
+                }
+                keep = False
+            if keep:
+                pruned.append(proposal)
+        return pruned
 
     def _sync_original_nodes(self, map_info=None) -> None:
         if self.scenegraph is None or self.object_memory is None:

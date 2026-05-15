@@ -27,8 +27,9 @@ def test_long_term_goal_state_reuses_locked_navigation_decision():
 
     assert state.exists()
     assert locked.target_cells == [(4, 5), (4, 6)]
-    assert locked.reason == "locked_long_term_goal"
+    assert locked.reason == "selected_frontier"
     assert locked.metadata["long_term_goal_locked"] is True
+    assert locked.metadata["long_term_goal_lock_reason"] == "locked_long_term_goal"
 
 
 def test_trim_path_to_nearest_tolerates_small_tracking_error():
@@ -148,8 +149,20 @@ def test_room_dbscan_like_groups_cluster_by_distance_not_category_relation():
 def test_paper_mode_disables_direct_frontier_vllm_scorer():
     scenegraph = SGNavSceneGraphAdapter(use_original=False, sgnav_mode="paper", vllm_config={"enabled": True})
 
-    assert scenegraph.paper_llm_client is not None
+    assert scenegraph.paper_llm_client is None
     assert scenegraph.vllm_scorer.enabled is False
+
+
+def test_paper_llm_uses_separate_llm_config():
+    scenegraph = SGNavSceneGraphAdapter(
+        use_original=False,
+        sgnav_mode="paper",
+        vllm_config={"enabled": False},
+        llm_config={"enabled": True, "max_hcot_subgraphs_per_decision": 3},
+    )
+
+    assert scenegraph.paper_llm_client is not None
+    assert scenegraph.max_hcot_subgraphs_per_decision == 3
 
 
 def test_paper_reperception_metadata_accumulates_graph_credibility():
@@ -200,7 +213,8 @@ def test_final_log_row_contains_only_requested_fields():
     assert out["success"] is True
     assert out["distance_to_goal"] == 0.4
     assert out["spl"] == 0.7
-    assert out["stop_reason"] == "stop_verification_confirmed"
+    assert out["stop_reason"] == "success"
+    assert out["sgnav_decision_reason"] == "stop_verification_confirmed"
     assert out["frontier_target_mode"] == "center"
     assert out["active_long_term_goal_age"] == 3
     assert "extra_debug" not in out

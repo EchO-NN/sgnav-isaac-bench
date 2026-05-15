@@ -12,7 +12,7 @@ import numpy as np
 
 from isaac_bench.config import get_nested, load_config, str_to_bool
 from isaac_bench.dataset.category_normalizer import normalize_category
-from isaac_bench.dataset.episode_generator import filter_start_clearance_objects, point_to_bbox_2d_distance, read_jsonl
+from isaac_bench.dataset.episode_generator import point_to_bbox_2d_distance, read_jsonl
 from isaac_bench.env.habitat_like_env import MapSimHabitatLikeEnv
 from isaac_bench.debug.graph_debug_dump import save_graph_debug_dump
 from isaac_bench.graph.decision import NavigationDecision, SGNavDecision
@@ -320,10 +320,24 @@ class LongTermGoalState:
 
     def to_navigation_decision(self) -> NavigationDecision:
         if self.nav_decision is None:
-            return NavigationDecision(self.mode, list(self.target_cells), False, None, None, "locked_long_term_goal")
+            return NavigationDecision(
+                self.mode,
+                list(self.target_cells),
+                False,
+                None,
+                None,
+                "continue_long_term_goal",
+                metadata={
+                    "long_term_goal_locked": True,
+                    "long_term_goal_lock_reason": "locked_long_term_goal",
+                    "long_term_goal_selected_step": int(self.selected_step),
+                    "long_term_goal_mode": self.mode,
+                },
+            )
         metadata = {
             **dict(self.nav_decision.metadata or {}),
             "long_term_goal_locked": True,
+            "long_term_goal_lock_reason": "locked_long_term_goal",
             "long_term_goal_selected_step": int(self.selected_step),
             "long_term_goal_mode": self.mode,
         }
@@ -333,7 +347,7 @@ class LongTermGoalState:
             bool(self.nav_decision.stop),
             self.nav_decision.selected_candidate,
             self.nav_decision.frontier_decision,
-            "locked_long_term_goal",
+            self.nav_decision.reason,
             state=self.nav_decision.state,
             metadata=metadata,
         )
@@ -415,15 +429,22 @@ def candidate_center_payload(object_memory: ObjectMemory, goal_category: str, se
 
 
 def final_log_row(row: dict) -> dict:
-    stop_reason = row.get("failure_reason")
-    if not stop_reason:
-        stop_reason = row.get("sgnav_decision_reason") or ("success" if bool(row.get("success", False)) else "not_success")
+    if row.get("failure_reason"):
+        stop_reason = row["failure_reason"]
+    elif bool(row.get("success", False)):
+        stop_reason = "success"
+    elif row.get("terminal_reason"):
+        stop_reason = row["terminal_reason"]
+    else:
+        stop_reason = "not_success"
     out = {
         "goal_category": row.get("goal_category"),
         "success": bool(row.get("success", False)),
         "distance_to_goal": row.get("distance_to_goal"),
         "spl": row.get("spl"),
         "stop_reason": stop_reason,
+        "sgnav_decision_mode": row.get("sgnav_decision_mode"),
+        "sgnav_decision_reason": row.get("sgnav_decision_reason"),
     }
     for key in (
         "frontier_target_mode",
@@ -435,6 +456,16 @@ def final_log_row(row: dict) -> dict:
         "frontier_blacklisted",
         "active_long_term_goal_mode",
         "active_long_term_goal_age",
+        "long_term_goal",
+        "paper_llm_enabled",
+        "paper_llm_requests",
+        "hcot_llm_enabled",
+        "hcot_llm_attempts",
+        "hcot_llm_failures",
+        "hcot_llm_fallbacks",
+        "hcot_llm_last_error",
+        "hc_p_num_subgraphs_total",
+        "hc_p_num_subgraphs_scored",
     ):
         if key in row:
             out[key] = row.get(key)
@@ -635,6 +666,15 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
             "include_image": bool(getattr(args, "vllm_image_scoring", True)),
             "image_max_width": int(getattr(args, "vllm_image_max_width", 640)),
             "image_jpeg_quality": int(getattr(args, "vllm_image_jpeg_quality", 75)),
+        },
+        llm_config={
+            "enabled": bool(getattr(args, "llm_enabled", False)),
+            "base_url": getattr(args, "llm_base_url", None),
+            "model": getattr(args, "llm_model", None),
+            "api_key": getattr(args, "llm_api_key", None),
+            "timeout_s": float(getattr(args, "llm_timeout_s", 30.0)),
+            "temperature": float(getattr(args, "llm_temperature", 0.0)),
+            "max_hcot_subgraphs_per_decision": int(getattr(args, "max_hcot_subgraphs_per_decision", 8)),
         },
         sgnav_mode=str(getattr(args, "sgnav_mode", "legacy")),
     )
@@ -1496,6 +1536,29 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
                     )
                     continue
                 nav_goals = nav_decision.target_cells
+                if paper_mode and nav_decision.mode == "frontier" and not nav_goals:
+                    reason = str(
+                        (nav_decision.metadata or {}).get("frontier_unreachable_reason")
+                        or nav_decision.reason
+                        or "frontier_empty_target"
+                    )
+                    if frontier_commitment is not None:
+                        frontier_commitment.invalidate_active(step, reason, blacklist=True)
+                    long_term_goal.invalidate(reason)
+                    current_path = []
+                    force_perception_step = True
+                    frontier_unreachable_recovery = True
+                    frontier_unreachable_reason = reason
+                    frontier_blacklisted = True
+                    frontier_stop_at_current_grid = [int(current_grid[0]), int(current_grid[1])]
+                    last_frontier_commitment_reason = "%s_blacklisted" % reason
+                    last_frontier_commitment_metadata = {
+                        **dict(last_frontier_commitment_metadata),
+                        "frontier_commitment_reason": last_frontier_commitment_reason,
+                        "frontier_blacklisted": True,
+                        "frontier_stop_at_current_grid": frontier_stop_at_current_grid,
+                    }
+                    continue
                 if not nav_goals and args.allow_gt_goal_fallback:
                     nav_goals = goal_cells
                     last_decision_mode = "gt_goal_fallback"
@@ -1528,19 +1591,23 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
                     break
                 result = nav_planner.plan(current_grid, nav_goals)
                 if not result.path:
-                    if paper_mode:
-                        long_term_goal.invalidate("astar_no_path")
-                    if frontier_commitment is not None and nav_decision.mode == "frontier":
-                        frontier_commitment.invalidate_active(step, "astar_no_path", blacklist=True)
+                    if paper_mode and nav_decision.mode == "frontier":
+                        reason = "frontier_center_unreachable"
+                        long_term_goal.invalidate(reason)
+                        if frontier_commitment is not None:
+                            frontier_commitment.invalidate_active(step, reason, blacklist=True)
                         current_path = []
                         force_perception_step = True
                         frontier_unreachable_recovery = True
-                        frontier_unreachable_reason = "astar_no_path"
+                        frontier_unreachable_reason = reason
                         frontier_blacklisted = True
+                        frontier_stop_at_current_grid = [int(current_grid[0]), int(current_grid[1])]
+                        last_frontier_commitment_reason = "%s_blacklisted" % reason
                         last_frontier_commitment_metadata = {
                             **dict(last_frontier_commitment_metadata),
-                            "frontier_commitment_reason": "astar_no_path_blacklisted",
+                            "frontier_commitment_reason": last_frontier_commitment_reason,
                             "frontier_blacklisted": True,
+                            "frontier_stop_at_current_grid": frontier_stop_at_current_grid,
                         }
                         continue
                     failure_reason = "astar_no_path"
@@ -1698,14 +1765,15 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
             )
             if blocked_by_guard:
                 if paper_mode and last_decision_mode == "frontier":
+                    reason = "frontier_unreachable_stop_at_current_pose"
                     if frontier_commitment is not None:
-                        frontier_commitment.invalidate_active(step, "kinematic_collision_guard", blacklist=True)
-                    long_term_goal.invalidate("kinematic_collision_guard")
+                        frontier_commitment.invalidate_active(step, reason, blacklist=True)
+                    long_term_goal.invalidate(reason)
                     frontier_stop_at_current_grid = [int(current_grid[0]), int(current_grid[1])]
                     frontier_blacklisted = True
                     frontier_unreachable_recovery = True
-                    frontier_unreachable_reason = "kinematic_collision_guard"
-                    last_frontier_commitment_reason = "kinematic_collision_guard_blacklisted"
+                    frontier_unreachable_reason = reason
+                    last_frontier_commitment_reason = "%s_blacklisted" % reason
                     last_frontier_commitment_metadata = {
                         **dict(last_frontier_commitment_metadata),
                         "frontier_commitment_reason": last_frontier_commitment_reason,
@@ -1829,6 +1897,17 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
         row["vllm_last_request_frontiers"] = int(getattr(vllm_scorer, "last_request_frontiers", 0))
         row["vllm_last_response_chars"] = int(getattr(vllm_scorer, "last_response_chars", 0))
         row["vllm_disabled_reason"] = getattr(vllm_scorer, "disabled_reason", None)
+        paper_llm_client = getattr(scenegraph, "paper_llm_client", None)
+        hcot_scorer = getattr(scenegraph, "hcot_scorer", None)
+        row["paper_llm_enabled"] = paper_llm_client is not None
+        row["paper_llm_requests"] = int(getattr(paper_llm_client, "request_count", 0))
+        row["hcot_llm_enabled"] = getattr(hcot_scorer, "llm_client", None) is not None
+        row["hcot_llm_attempts"] = int(getattr(hcot_scorer, "llm_request_count", 0))
+        row["hcot_llm_failures"] = int(getattr(hcot_scorer, "llm_failure_count", 0))
+        row["hcot_llm_fallbacks"] = int(getattr(hcot_scorer, "llm_fallback_count", 0))
+        row["hcot_llm_last_error"] = getattr(hcot_scorer, "last_error", None)
+        row["hc_p_num_subgraphs_total"] = row["paper_frontier_interpolation"].get("num_subgraphs_total")
+        row["hc_p_num_subgraphs_scored"] = row["paper_frontier_interpolation"].get("num_subgraphs_scored")
         row["detection_localization"] = detection_localization
         row["read_depth"] = bool(getattr(args, "read_depth", False))
         row["mapping_source"] = (
@@ -1880,9 +1959,9 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
             start = world_xy_to_grid(float(start_pose[0]), float(start_pose[1]), dynamic_map_info)
             save_map_png(debug_map, last_dynamic_occupancy, last_dynamic_navigable, start=start, goals=goal_cells, path_cells=full_path)
         row = make_jsonable(row)
-        log_row = final_log_row(row)
-        JsonlEpisodeLogger(args.output).log(log_row)
-        print(json.dumps(log_row, ensure_ascii=False), flush=True)
+        summary_row = final_log_row(row)
+        JsonlEpisodeLogger(args.output).log(row)
+        print(json.dumps(summary_row, ensure_ascii=False), flush=True)
         args._row_already_logged = True
         if args.hold_open:
             print("[isaac-loop] episode finished; hold-open enabled, close the Isaac window or press Ctrl+C", flush=True)
@@ -1926,7 +2005,21 @@ def run_episode_map_sim(episode: dict, args) -> dict:
     env.reset()
 
     object_memory = ObjectMemory()
-    scenegraph = SGNavSceneGraphAdapter(args.sgnav_repo, use_original=args.use_original_scenegraph, sgnav_mode=str(getattr(args, "sgnav_mode", "legacy")))
+    scenegraph = SGNavSceneGraphAdapter(
+        args.sgnav_repo,
+        use_original=args.use_original_scenegraph,
+        semantic_priors_path=getattr(args, "semantic_priors_path", None),
+        llm_config={
+            "enabled": bool(getattr(args, "llm_enabled", False)),
+            "base_url": getattr(args, "llm_base_url", None),
+            "model": getattr(args, "llm_model", None),
+            "api_key": getattr(args, "llm_api_key", None),
+            "timeout_s": float(getattr(args, "llm_timeout_s", 30.0)),
+            "temperature": float(getattr(args, "llm_temperature", 0.0)),
+            "max_hcot_subgraphs_per_decision": int(getattr(args, "max_hcot_subgraphs_per_decision", 8)),
+        },
+        sgnav_mode=str(getattr(args, "sgnav_mode", "legacy")),
+    )
     scenegraph.reset(episode["goal_category"])
     scenegraph.update(object_memory)
     decision = SGNavDecision(scenegraph)
@@ -2100,6 +2193,13 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--stop-verification-min-hits", type=int, default=None)
     parser.add_argument("--found-goal-stop-distance-m", type=float, default=None)
     parser.add_argument("--require-sgnav-stop", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--llm-enabled", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--llm-base-url", default=None)
+    parser.add_argument("--llm-model", default=None)
+    parser.add_argument("--llm-api-key", default=None)
+    parser.add_argument("--llm-timeout-s", type=float, default=None)
+    parser.add_argument("--llm-temperature", type=float, default=None)
+    parser.add_argument("--max-hcot-subgraphs-per-decision", type=int, default=None)
     parser.add_argument("--vllm-frontier-scoring", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--vllm-base-url", default=None)
     parser.add_argument("--vllm-model", default=None)
@@ -2386,6 +2486,17 @@ def main(argv: Optional[List[str]] = None) -> int:
     args.stop_verification_min_hits = int(args.stop_verification_min_hits if args.stop_verification_min_hits is not None else get_nested(cfg, "sgnav.stop_verification_min_hits", 2))
     args.found_goal_stop_distance_m = float(args.found_goal_stop_distance_m if args.found_goal_stop_distance_m is not None else get_nested(cfg, "sgnav.found_goal_stop_distance_m", 0.35))
     args.require_sgnav_stop = bool(args.require_sgnav_stop if args.require_sgnav_stop is not None else get_nested(cfg, "episodes.success_requires_stop", True))
+    args.llm_enabled = bool(args.llm_enabled if args.llm_enabled is not None else get_nested(cfg, "llm.enabled", False))
+    args.llm_base_url = args.llm_base_url or get_nested(cfg, "llm.base_url", "http://127.0.0.1:8000/v1")
+    args.llm_model = args.llm_model or get_nested(cfg, "llm.model", "qwen3-vl-8b-instruct")
+    args.llm_api_key = args.llm_api_key or get_nested(cfg, "llm.api_key", "EMPTY")
+    args.llm_timeout_s = float(args.llm_timeout_s if args.llm_timeout_s is not None else get_nested(cfg, "llm.timeout_s", 30.0))
+    args.llm_temperature = float(args.llm_temperature if args.llm_temperature is not None else get_nested(cfg, "llm.temperature", 0.0))
+    args.max_hcot_subgraphs_per_decision = int(
+        args.max_hcot_subgraphs_per_decision
+        if args.max_hcot_subgraphs_per_decision is not None
+        else get_nested(cfg, "llm.max_hcot_subgraphs_per_decision", 8)
+    )
     args.vllm_frontier_scoring = bool(args.vllm_frontier_scoring if args.vllm_frontier_scoring is not None else get_nested(cfg, "vllm.frontier_scoring", False))
     args.vllm_base_url = str(args.vllm_base_url or get_nested(cfg, "vllm.base_url", "http://127.0.0.1:8000/v1"))
     args.vllm_model = str(args.vllm_model or get_nested(cfg, "vllm.model", "qwen3-vl-8b-instruct"))
@@ -2421,10 +2532,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         row = run_episode_map_sim(episode, args)
     if not getattr(args, "_row_already_logged", False):
         row = make_jsonable(row)
-        log_row = final_log_row(row)
+        summary_row = final_log_row(row)
         logger = JsonlEpisodeLogger(args.output)
-        logger.log(log_row)
-        print(json.dumps(log_row, ensure_ascii=False), flush=True)
+        logger.log(row)
+        print(json.dumps(summary_row, ensure_ascii=False), flush=True)
     return 0
 
 

@@ -30,6 +30,10 @@ class HCoTSubgraphScorer:
         self.min_distance_m = max(1e-3, float(min_distance_m))
         self.max_retries = max(0, int(max_retries))
         self._cache: Dict[str, SubgraphScore] = {}
+        self.llm_request_count = 0
+        self.llm_failure_count = 0
+        self.llm_fallback_count = 0
+        self.last_error = None
 
     def score(self, subgraphs: List[Subgraph], goal_category: str, graph_version: int = 0) -> List[SubgraphScore]:
         scores = [self.score_subgraph(subgraph, goal_category, graph_version=graph_version) for subgraph in subgraphs]
@@ -49,7 +53,19 @@ class HCoTSubgraphScorer:
         if self.llm_client is None:
             result = self._fallback_score(subgraph, goal_category)
         else:
-            result = score_subgraph_with_hcot(subgraph, goal_category, self.llm_client, self.min_distance_m, self.max_retries)
+            self.llm_request_count += 1
+            try:
+                result = score_subgraph_with_hcot(subgraph, goal_category, self.llm_client, self.min_distance_m, self.max_retries)
+            except Exception as exc:
+                self.llm_failure_count += 1
+                self.llm_fallback_count += 1
+                self.last_error = str(exc)
+                result = self._fallback_score(subgraph, goal_category)
+                result.raw_llm_response = {
+                    **dict(result.raw_llm_response or {}),
+                    "fallback": True,
+                    "llm_error": str(exc),
+                }
         self._cache[key] = result
         return result
 

@@ -259,6 +259,15 @@ vllm:
   image_max_width: 640
   image_jpeg_quality: 75
 
+llm:
+  enabled: false
+  base_url: http://127.0.0.1:8000/v1
+  model: qwen3-vl-8b-instruct
+  api_key: EMPTY
+  timeout_s: 30.0
+  temperature: 0.0
+  max_hcot_subgraphs_per_decision: 8
+
 astar:
   allow_diagonal: true
   unknown_is_obstacle: true

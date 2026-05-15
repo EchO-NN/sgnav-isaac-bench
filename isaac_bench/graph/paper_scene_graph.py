@@ -6,6 +6,7 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 import numpy as np
 
 from isaac_bench.dataset.category_normalizer import normalize_category
+from isaac_bench.mapping.coordinate_transform import grid_to_world_xy
 from isaac_bench.perception.detection_types import FusedInstance
 from isaac_bench.perception.object_memory import ObjectMemory
 
@@ -169,6 +170,41 @@ class PaperSceneGraph:
         self.update_affiliation_edges()
         self.version += 1
 
+    def update_room_nodes_from_room_map(self, room_map: np.ndarray, map_info, room_names: Sequence[str]) -> None:
+        arr = np.asarray(room_map)
+        if arr.ndim == 4:
+            arr = arr[0]
+        if arr.ndim != 3 or arr.shape[0] == 0:
+            return
+        next_rooms: Dict[str, RoomNode] = {}
+        for idx, name in enumerate(room_names):
+            if idx >= arr.shape[0]:
+                break
+            mask = np.asarray(arr[idx]) > 0.0
+            if not np.any(mask):
+                continue
+            points = []
+            for r, c in np.argwhere(mask):
+                wx, wy = grid_to_world_xy(int(r), int(c), map_info)
+                points.append([float(wx), float(wy), 0.0])
+            room_type = normalize_category(str(name)).replace("_", " ")
+            room_id = "room:%s" % room_type.replace(" ", "_")
+            next_rooms[room_id] = RoomNode(
+                id=room_id,
+                room_type=room_type,
+                confidence=1.0,
+                region_polygon_world=None,
+                point_cloud_world=np.asarray(points, dtype=np.float32),
+                contained_object_ids=[],
+            )
+        if next_rooms:
+            unknown = self.room_nodes.get("room:unknown_room")
+            self.room_nodes = next_rooms
+            if unknown is not None:
+                self.room_nodes.setdefault("room:unknown_room", unknown)
+            self.update_affiliation_edges()
+            self.version += 1
+
     def update_affiliation_edges(self) -> None:
         self.affiliation_edges = []
         for room in self.room_nodes.values():
@@ -330,6 +366,14 @@ def _group_summary(object_nodes: Dict[str, ObjectNode], object_edges: Sequence[O
 
 def _object_inside_room(obj: ObjectNode, room_bbox: np.ndarray) -> bool:
     center = np.asarray(obj.center_world, dtype=np.float32)
+    if abs(float(room_bbox[1, 2] - room_bbox[0, 2])) <= 1e-6:
+        if np.all(center[:2] >= room_bbox[0, :2]) and np.all(center[:2] <= room_bbox[1, :2]):
+            return True
+        points = np.asarray(obj.point_cloud_world, dtype=np.float32)
+        if len(points) == 0:
+            return False
+        inside_xy = np.all((points[:, :2] >= room_bbox[0, :2]) & (points[:, :2] <= room_bbox[1, :2]), axis=1)
+        return float(np.count_nonzero(inside_xy)) / float(len(points)) >= 0.5
     if np.all(center >= room_bbox[0]) and np.all(center <= room_bbox[1]):
         return True
     points = np.asarray(obj.point_cloud_world, dtype=np.float32)
