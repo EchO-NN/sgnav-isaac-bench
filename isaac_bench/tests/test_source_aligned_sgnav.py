@@ -11,6 +11,7 @@ from isaac_bench.perception.object_memory import ObjectMemory
 from isaac_bench.scripts.run_one_episode import (
     LongTermGoalState,
     candidate_center_payload,
+    final_log_row,
     goal_candidate_pair_distances,
     trim_path_to_nearest,
 )
@@ -166,3 +167,25 @@ def test_paper_reperception_metadata_accumulates_graph_credibility():
 
     assert target.metadata["candidate_credibility_method"] == "graph_based"
     assert target.metadata["reperception"]["accumulated_credibility"] > 0.0
+
+
+def test_final_log_row_contains_only_requested_fields():
+    row = {
+        "goal_category": "chair",
+        "success": True,
+        "distance_to_goal": 0.4,
+        "spl": 0.7,
+        "failure_reason": None,
+        "sgnav_decision_reason": "stop_verification_confirmed",
+        "extra_debug": "hidden",
+    }
+
+    out = final_log_row(row)
+
+    assert out == {
+        "goal_category": "chair",
+        "success": True,
+        "distance_to_goal": 0.4,
+        "spl": 0.7,
+        "stop_reason": "stop_verification_confirmed",
+    }

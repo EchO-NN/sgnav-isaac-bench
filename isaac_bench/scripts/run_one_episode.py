@@ -334,6 +334,19 @@ def candidate_center_payload(object_memory: ObjectMemory, goal_category: str, se
     return payload
 
 
+def final_log_row(row: dict) -> dict:
+    stop_reason = row.get("failure_reason")
+    if not stop_reason:
+        stop_reason = row.get("sgnav_decision_reason") or ("success" if bool(row.get("success", False)) else "not_success")
+    return {
+        "goal_category": row.get("goal_category"),
+        "success": bool(row.get("success", False)),
+        "distance_to_goal": row.get("distance_to_goal"),
+        "spl": row.get("spl"),
+        "stop_reason": stop_reason,
+    }
+
+
 def detections_to_3d_static_map_ray(
     detections: List[Detection2D],
     camera_pose_world: Tuple[float, float, float, float],
@@ -1693,8 +1706,9 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
             start = world_xy_to_grid(float(start_pose[0]), float(start_pose[1]), dynamic_map_info)
             save_map_png(debug_map, last_dynamic_occupancy, last_dynamic_navigable, start=start, goals=goal_cells, path_cells=full_path)
         row = make_jsonable(row)
-        JsonlEpisodeLogger(args.output).log(row)
-        print(json.dumps(row, ensure_ascii=False), flush=True)
+        log_row = final_log_row(row)
+        JsonlEpisodeLogger(args.output).log(log_row)
+        print(json.dumps(log_row, ensure_ascii=False), flush=True)
         args._row_already_logged = True
         if args.hold_open:
             print("[isaac-loop] episode finished; hold-open enabled, close the Isaac window or press Ctrl+C", flush=True)
@@ -2226,9 +2240,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         row = run_episode_map_sim(episode, args)
     if not getattr(args, "_row_already_logged", False):
         row = make_jsonable(row)
+        log_row = final_log_row(row)
         logger = JsonlEpisodeLogger(args.output)
-        logger.log(row)
-        print(json.dumps(row, ensure_ascii=False), flush=True)
+        logger.log(log_row)
+        print(json.dumps(log_row, ensure_ascii=False), flush=True)
     return 0
 
 

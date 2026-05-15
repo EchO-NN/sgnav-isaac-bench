@@ -265,7 +265,7 @@ astar:
   goal_tolerance_m: 0.20
   waypoint_lookahead_m: 0.15
   replan_every_steps: 5
-  runtime_planning_clearance_m: 0.0
+  runtime_planning_clearance_m: 0.10
   stuck_timeout_steps: 30
 
 nav2:
