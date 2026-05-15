@@ -561,6 +561,17 @@ class SGNavPopupVisualizer:
                 )
             )
             if meta:
+                commit = meta.get("frontier_commitment", {}) if isinstance(meta, dict) else {}
+                if isinstance(commit, dict) and commit:
+                    lines.append(
+                        "frontier_commit id=%s age=%s dist=%s reason=%s"
+                        % (
+                            self._short(commit.get("active_frontier_id", "n/a")),
+                            self._short(commit.get("active_frontier_age", "n/a")),
+                            self._short(commit.get("active_frontier_distance_m", "n/a")),
+                            self._short(commit.get("frontier_commitment_reason", "n/a")),
+                        )
+                    )
                 lines.append(
                     "candidate credibility=%s track_obs=%s rep_steps=%s accepted=%s rejected=%s"
                     % (

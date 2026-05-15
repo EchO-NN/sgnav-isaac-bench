@@ -13,6 +13,7 @@ from isaac_bench.config import get_nested, load_config, str_to_bool
 from isaac_bench.dataset.category_normalizer import normalize_category
 from isaac_bench.dataset.episode_generator import read_jsonl
 from isaac_bench.env.habitat_like_env import MapSimHabitatLikeEnv
+from isaac_bench.debug.graph_debug_dump import save_graph_debug_dump
 from isaac_bench.graph.decision import SGNavDecision
 from isaac_bench.graph.sgnav_scenegraph_adapter import SGNAV_ROOM_NAMES, SGNavSceneGraphAdapter
 from isaac_bench.mapping.coordinate_transform import MapInfo, grid_to_world_xy, is_inside_grid, world_xy_to_grid
@@ -23,6 +24,7 @@ from isaac_bench.mapping.room_map_from_rooms_json import build_room_index_map, l
 from isaac_bench.metrics.episode_logger import JsonlEpisodeLogger
 from isaac_bench.metrics.evaluator import EpisodeEvaluator
 from isaac_bench.navigation.astar import GridAStarPlanner, astar_distance_map
+from isaac_bench.navigation.frontier_commitment import FrontierCommitmentManager
 from isaac_bench.navigation.waypoint_follower import HolonomicWaypointFollower
 from isaac_bench.perception.detection_types import Detection2D, Detection3D
 from isaac_bench.perception.detector_ipc import SubprocessDetector
@@ -397,6 +399,7 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
     scenegraph = SGNavSceneGraphAdapter(
         args.sgnav_repo,
         use_original=args.use_original_scenegraph,
+        semantic_priors_path=getattr(args, "semantic_priors_path", None),
         vllm_config={
             "enabled": bool(getattr(args, "vllm_frontier_scoring", False)),
             "base_url": getattr(args, "vllm_base_url", None),
@@ -447,6 +450,7 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
         stop_verification_min_hits=int(args.stop_verification_min_hits),
         found_goal_stop_distance_m=float(args.found_goal_stop_distance_m),
         score_frontiers_before_candidate=bool(args.score_frontiers_before_candidate),
+        frontier_scenegraph_score_norm=str(args.frontier_scenegraph_score_norm),
     )
     follower = HolonomicWaypointFollower(
         max_vx=float(args.max_vx_mps),
@@ -473,6 +477,22 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
     start_pose = tuple(float(v) for v in episode["start_pose_world"])
     mapper.reset((float(start_pose[0]), float(start_pose[1])))
     dynamic_map_info = mapper.grid.map_info
+    frontier_commitment = (
+        FrontierCommitmentManager(
+            resolution_m=dynamic_map_info.resolution_m,
+            match_radius_m=float(args.frontier_commit_match_radius_m),
+            reached_radius_m=float(args.frontier_commit_reached_radius_m),
+            min_commit_steps=int(args.frontier_commit_min_steps),
+            max_commit_steps=int(args.frontier_commit_max_steps),
+            switch_margin=float(args.frontier_commit_switch_margin),
+            switch_ratio=float(args.frontier_commit_switch_ratio),
+            no_progress_steps=int(args.frontier_commit_no_progress_steps),
+            progress_min_delta_m=float(args.frontier_commit_progress_min_delta_m),
+            blacklist_ttl_steps=int(args.frontier_blacklist_ttl_steps),
+        )
+        if bool(args.frontier_commitment_enabled)
+        else None
+    )
     room_map_mode = str(getattr(args, "room_map_mode", "observed_rooms_json") or "none").strip().lower()
     if room_map_mode in {"observed_rooms_json", "rooms_json", "observed"}:
         full_room_map = build_sgnav_room_map(scene_dir, dynamic_map_info)
@@ -496,6 +516,8 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
     goal_detection_history = []
     last_frontiers = []
     last_nav_decision = None
+    last_frontier_commitment_metadata = {}
+    last_frontier_commitment_reason = ""
     last_selected_candidate = None
     logged_selected_candidate_id = None
     last_dynamic_occupancy = mapper.grid.occupied.astype(bool)
@@ -918,8 +940,8 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
                     needs_replan = True
 
             if needs_replan:
-                frontier_free = free.astype(bool) & navigable.astype(bool)
                 dynamic_traversible = mapper.traversible(unknown_is_obstacle=True).astype(bool)
+                frontier_free = free.astype(bool) & dynamic_traversible.astype(bool)
                 distance_traversible = dynamic_traversible & navigable.astype(bool)
                 rr, cc = int(current_grid[0]), int(current_grid[1])
                 if 0 <= rr < distance_traversible.shape[0] and 0 <= cc < distance_traversible.shape[1]:
@@ -973,10 +995,58 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
                     allow_frontier=True,
                     current_step=step,
                 )
+                if frontier_commitment is not None and nav_decision.mode == "frontier":
+                    frontier_decision = nav_decision.frontier_decision
+                    proposed_frontier = frontier_decision.selected_frontier if frontier_decision is not None else None
+                    proposed_score = 0.0
+                    scores_by_index = []
+                    if frontier_decision is not None:
+                        scores_by_index = list(frontier_decision.total_scores)
+                        if frontier_decision.selected_index is not None and frontier_decision.selected_index < len(scores_by_index):
+                            proposed_score = float(scores_by_index[int(frontier_decision.selected_index)])
+                    commit_decision = frontier_commitment.select(
+                        frontiers,
+                        proposed_frontier,
+                        proposed_score,
+                        current_grid,
+                        step,
+                        planner=nav_planner,
+                        target_cells=nav_decision.target_cells,
+                        scores_by_index=scores_by_index,
+                    )
+                    last_frontier_commitment_metadata = dict(commit_decision.metadata)
+                    last_frontier_commitment_metadata["frontier_commitment_reason"] = commit_decision.reason
+                    last_frontier_commitment_reason = commit_decision.reason
+                    nav_decision.target_cells = list(commit_decision.target_cells)
+                    nav_decision.reason = commit_decision.reason
+                    if frontier_decision is not None:
+                        frontier_decision.selected_frontier = commit_decision.frontier
+                        if commit_decision.frontier is not None:
+                            try:
+                                frontier_decision.selected_index = frontiers.index(commit_decision.frontier)
+                            except ValueError:
+                                frontier_decision.selected_index = None
+                        else:
+                            frontier_decision.selected_index = None
+                    nav_decision.metadata = {
+                        **dict(nav_decision.metadata or {}),
+                        "frontier_commitment": last_frontier_commitment_metadata,
+                    }
                 last_nav_decision = nav_decision
                 evaluator.num_frontier_decisions += 1
                 last_decision_mode = nav_decision.mode
                 last_decision_reason = nav_decision.reason
+                if bool(getattr(args, "debug_graph_dump", False)):
+                    save_graph_debug_dump(
+                        args.debug_graph_dump_dir,
+                        step=step,
+                        goal=episode["goal_category"],
+                        scenegraph=scenegraph,
+                        frontiers=frontiers,
+                        frontier_decision=nav_decision.frontier_decision,
+                        nav_decision=nav_decision,
+                        commitment_metadata=last_frontier_commitment_metadata,
+                    )
                 if bool(getattr(args, "frontier_debug_dump", False)):
                     selected_frontier_cell = None
                     if nav_decision.frontier_decision is not None and nav_decision.frontier_decision.selected_frontier is not None:
@@ -1136,6 +1206,14 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
                     break
                 result = nav_planner.plan(current_grid, nav_goals)
                 if not result.path:
+                    if frontier_commitment is not None and nav_decision.mode == "frontier":
+                        frontier_commitment.invalidate_active(step, "astar_no_path", blacklist=True)
+                        current_path = []
+                        last_frontier_commitment_metadata = {
+                            **dict(last_frontier_commitment_metadata),
+                            "frontier_commitment_reason": "astar_no_path_blacklisted",
+                        }
+                        continue
                     failure_reason = "astar_no_path"
                     if viz is not None:
                         viz.update(
@@ -1391,6 +1469,15 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
         row["frontier_min_distance_m"] = float(args.frontier_min_distance_m)
         row["frontier_debug_dump"] = bool(args.frontier_debug_dump)
         row["frontier_debug_dir"] = str(args.frontier_debug_dir)
+        row["frontier_commitment_enabled"] = bool(args.frontier_commitment_enabled)
+        row["frontier_commitment_reason"] = str(last_frontier_commitment_reason)
+        row["frontier_commitment"] = dict(last_frontier_commitment_metadata)
+        row["active_frontier_id"] = last_frontier_commitment_metadata.get("active_frontier_id")
+        row["active_frontier_age"] = last_frontier_commitment_metadata.get("active_frontier_age")
+        row["active_frontier_distance_m"] = last_frontier_commitment_metadata.get("active_frontier_distance_m")
+        row["frontier_scenegraph_score_norm"] = str(args.frontier_scenegraph_score_norm)
+        row["debug_graph_dump"] = bool(args.debug_graph_dump)
+        row["debug_graph_dump_dir"] = str(args.debug_graph_dump_dir)
         row["segmenter"] = str(getattr(args, "segmenter", "none") or "none")
         row["camera_annotator_device"] = camera_annotator_device
         row["detector_cuda_rgb"] = bool(detector_cuda_rgb)
@@ -1558,6 +1645,16 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--frontier-allow-near-fallback", "--frontier_allow_near_fallback", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--frontier-debug-dump", "--frontier_debug_dump", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--frontier-debug-dir", "--frontier_debug_dir", default=None)
+    parser.add_argument("--frontier-commitment-enabled", "--frontier_commitment_enabled", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--frontier-commit-match-radius-m", "--frontier_commit_match_radius_m", type=float, default=None)
+    parser.add_argument("--frontier-commit-reached-radius-m", "--frontier_commit_reached_radius_m", type=float, default=None)
+    parser.add_argument("--frontier-commit-min-steps", "--frontier_commit_min_steps", type=int, default=None)
+    parser.add_argument("--frontier-commit-max-steps", "--frontier_commit_max_steps", type=int, default=None)
+    parser.add_argument("--frontier-commit-switch-margin", "--frontier_commit_switch_margin", type=float, default=None)
+    parser.add_argument("--frontier-commit-switch-ratio", "--frontier_commit_switch_ratio", type=float, default=None)
+    parser.add_argument("--frontier-commit-no-progress-steps", "--frontier_commit_no_progress_steps", type=int, default=None)
+    parser.add_argument("--frontier-commit-progress-min-delta-m", "--frontier_commit_progress_min_delta_m", type=float, default=None)
+    parser.add_argument("--frontier-blacklist-ttl-steps", "--frontier_blacklist_ttl_steps", type=int, default=None)
     parser.add_argument("--robot-radius-m", type=float, default=None)
     parser.add_argument(
         "--online-inflation-radius-m",
@@ -1575,6 +1672,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--max-detections-per-frame", type=int, default=None)
     parser.add_argument("--object-merge-radius-m", type=float, default=None)
     parser.add_argument("--frontier-distance-weight", type=float, default=None)
+    parser.add_argument("--frontier-scenegraph-score-norm", "--frontier_scenegraph_score_norm", default=None, choices=["none", "minmax", "zscore"])
+    parser.add_argument("--semantic-priors-path", "--semantic_priors_path", default=None)
+    parser.add_argument("--debug-graph-dump", "--debug_graph_dump", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--debug-graph-dump-dir", "--debug_graph_dump_dir", default=None)
     parser.add_argument("--runtime-planning-clearance-m", type=float, default=None)
     parser.add_argument("--candidate-min-detector-hits", type=int, default=None)
     parser.add_argument("--candidate-start-min-confidence", type=float, default=None)
@@ -1748,6 +1849,56 @@ def main(argv: Optional[List[str]] = None) -> int:
         else get_nested(cfg, "mapping.frontier_debug_dump", False)
     )
     args.frontier_debug_dir = str(args.frontier_debug_dir or get_nested(cfg, "mapping.frontier_debug_dir", "data/debug_frontier"))
+    args.frontier_commitment_enabled = bool(
+        args.frontier_commitment_enabled
+        if args.frontier_commitment_enabled is not None
+        else get_nested(cfg, "sgnav.frontier_commitment_enabled", True)
+    )
+    args.frontier_commit_match_radius_m = float(
+        args.frontier_commit_match_radius_m
+        if args.frontier_commit_match_radius_m is not None
+        else get_nested(cfg, "sgnav.frontier_commit_match_radius_m", 0.75)
+    )
+    args.frontier_commit_reached_radius_m = float(
+        args.frontier_commit_reached_radius_m
+        if args.frontier_commit_reached_radius_m is not None
+        else get_nested(cfg, "sgnav.frontier_commit_reached_radius_m", 0.60)
+    )
+    args.frontier_commit_min_steps = int(
+        args.frontier_commit_min_steps
+        if args.frontier_commit_min_steps is not None
+        else get_nested(cfg, "sgnav.frontier_commit_min_steps", 12)
+    )
+    args.frontier_commit_max_steps = int(
+        args.frontier_commit_max_steps
+        if args.frontier_commit_max_steps is not None
+        else get_nested(cfg, "sgnav.frontier_commit_max_steps", 120)
+    )
+    args.frontier_commit_switch_margin = float(
+        args.frontier_commit_switch_margin
+        if args.frontier_commit_switch_margin is not None
+        else get_nested(cfg, "sgnav.frontier_commit_switch_margin", 0.25)
+    )
+    args.frontier_commit_switch_ratio = float(
+        args.frontier_commit_switch_ratio
+        if args.frontier_commit_switch_ratio is not None
+        else get_nested(cfg, "sgnav.frontier_commit_switch_ratio", 1.15)
+    )
+    args.frontier_commit_no_progress_steps = int(
+        args.frontier_commit_no_progress_steps
+        if args.frontier_commit_no_progress_steps is not None
+        else get_nested(cfg, "sgnav.frontier_commit_no_progress_steps", 25)
+    )
+    args.frontier_commit_progress_min_delta_m = float(
+        args.frontier_commit_progress_min_delta_m
+        if args.frontier_commit_progress_min_delta_m is not None
+        else get_nested(cfg, "sgnav.frontier_commit_progress_min_delta_m", 0.10)
+    )
+    args.frontier_blacklist_ttl_steps = int(
+        args.frontier_blacklist_ttl_steps
+        if args.frontier_blacklist_ttl_steps is not None
+        else get_nested(cfg, "sgnav.frontier_blacklist_ttl_steps", 100)
+    )
     default_robot_radius_m = get_nested(cfg, "robot.footprint_radius_m", None)
     if default_robot_radius_m is None:
         default_robot_radius_m = 0.5 * float(get_nested(cfg, "robot.footprint_width_m", 0.28))
@@ -1764,7 +1915,19 @@ def main(argv: Optional[List[str]] = None) -> int:
     args.sam2_device = str(args.sam2_device or get_nested(cfg, "perception.sam2_device", "cuda"))
     args.max_detections_per_frame = int(args.max_detections_per_frame if args.max_detections_per_frame is not None else get_nested(cfg, "perception.max_detections_per_frame", 100))
     args.object_merge_radius_m = float(args.object_merge_radius_m if args.object_merge_radius_m is not None else get_nested(cfg, "perception.object_merge_radius_m", 0.5))
-    args.frontier_distance_weight = float(args.frontier_distance_weight if args.frontier_distance_weight is not None else get_nested(cfg, "sgnav.frontier_distance_weight", 2.0))
+    args.frontier_distance_weight = float(args.frontier_distance_weight if args.frontier_distance_weight is not None else get_nested(cfg, "sgnav.frontier_distance_weight", 0.7))
+    args.frontier_scenegraph_score_norm = str(
+        args.frontier_scenegraph_score_norm
+        if args.frontier_scenegraph_score_norm is not None
+        else get_nested(cfg, "sgnav.frontier_scenegraph_score_norm", "minmax")
+    )
+    args.semantic_priors_path = str(args.semantic_priors_path or get_nested(cfg, "sgnav.semantic_priors_path", "isaac_bench/configs/sgnav_semantic_priors.yaml"))
+    args.debug_graph_dump = bool(
+        args.debug_graph_dump
+        if args.debug_graph_dump is not None
+        else get_nested(cfg, "sgnav.debug_graph_dump", False)
+    )
+    args.debug_graph_dump_dir = str(args.debug_graph_dump_dir or get_nested(cfg, "sgnav.debug_graph_dump_dir", "debug/graphs"))
     args.runtime_planning_clearance_m = float(args.runtime_planning_clearance_m if args.runtime_planning_clearance_m is not None else get_nested(cfg, "astar.runtime_planning_clearance_m", 0.0))
     args.candidate_min_detector_hits = int(args.candidate_min_detector_hits if args.candidate_min_detector_hits is not None else get_nested(cfg, "sgnav.candidate_min_detector_hits", 2))
     args.candidate_start_min_confidence = float(args.candidate_start_min_confidence if args.candidate_start_min_confidence is not None else get_nested(cfg, "sgnav.candidate_start_min_confidence", 0.55))

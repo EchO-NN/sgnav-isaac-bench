@@ -170,7 +170,21 @@ sgnav:
   panorama_steps: 8
   panorama_wz_radps: 0.8
   panorama_render_updates_per_step: 1
-  frontier_distance_weight: 2.0
+  frontier_distance_weight: 0.7
+  frontier_scenegraph_score_norm: minmax
+  frontier_commitment_enabled: true
+  frontier_commit_match_radius_m: 0.75
+  frontier_commit_reached_radius_m: 0.60
+  frontier_commit_min_steps: 12
+  frontier_commit_max_steps: 120
+  frontier_commit_switch_margin: 0.25
+  frontier_commit_switch_ratio: 1.15
+  frontier_commit_no_progress_steps: 25
+  frontier_commit_progress_min_delta_m: 0.10
+  frontier_blacklist_ttl_steps: 100
+  semantic_priors_path: isaac_bench/configs/sgnav_semantic_priors.yaml
+  debug_graph_dump: false
+  debug_graph_dump_dir: debug/graphs
   candidate_min_detector_hits: 2
   candidate_start_min_confidence: 0.55
   candidate_start_min_hits: 2

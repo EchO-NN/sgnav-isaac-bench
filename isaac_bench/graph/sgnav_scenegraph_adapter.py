@@ -8,6 +8,7 @@ from collections.abc import Mapping as ABCMapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from io import BytesIO
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Dict, List, Mapping, Optional, Sequence, Tuple
 from urllib import request as urllib_request
@@ -15,6 +16,7 @@ from urllib.error import URLError
 
 import numpy as np
 
+from isaac_bench.config import load_yaml, repo_root
 from isaac_bench.dataset.category_normalizer import normalize_category
 from isaac_bench.perception.detection_types import Detection2D
 from isaac_bench.perception.object_memory import ObjectMemory
@@ -300,6 +302,7 @@ class SGNavSceneGraphAdapter:
         self,
         sgnav_repo: str = "/home/echo/SG-Nav",
         use_original: bool = False,
+        semantic_priors_path: Optional[str] = None,
         vllm_config: Optional[Mapping[str, object]] = None,
     ):
         self.sgnav_repo = sgnav_repo
@@ -308,7 +311,11 @@ class SGNavSceneGraphAdapter:
         self.obj_goal_sg = ""
         self.object_memory: Optional[ObjectMemory] = None
         self.room_map = None
-        self.room_names = list(SGNAV_ROOM_NAMES)
+        priors = self._load_semantic_priors(semantic_priors_path)
+        self.room_names = list(priors["room_names"])
+        self.related_category_pairs = set(priors["related_category_pairs"])
+        self.goal_room_priors = dict(priors["goal_room_priors"])
+        self.category_aliases = dict(priors["aliases"])
         self.last_score_debug: Dict[str, object] = {}
         self.runtime_nodes: Dict[str, RuntimeGraphNode] = {}
         self.runtime_edges: List[RuntimeGraphEdge] = []
@@ -321,6 +328,59 @@ class SGNavSceneGraphAdapter:
         self.vllm_scorer = VLLMFrontierScorer(vllm_config)
         if self.use_original:
             self._try_init_original()
+
+    def _load_semantic_priors(self, path: Optional[str]) -> Dict[str, object]:
+        data: Dict[str, object] = {
+            "room_names": list(SGNAV_ROOM_NAMES),
+            "related_category_pairs": set(RELATED_CATEGORY_PAIRS),
+            "goal_room_priors": {
+                normalize_category(key): tuple(normalize_category(room).replace("_", " ") for room in rooms)
+                for key, rooms in GOAL_ROOM_PRIORS.items()
+            },
+            "aliases": {},
+        }
+        priors_path = Path(path) if path else repo_root() / "isaac_bench" / "configs" / "sgnav_semantic_priors.yaml"
+        if not priors_path.is_absolute():
+            priors_path = repo_root() / priors_path
+        if not priors_path.exists():
+            return data
+        try:
+            raw = load_yaml(priors_path)
+            aliases = {
+                normalize_category(str(key)): normalize_category(str(value))
+                for key, value in dict(raw.get("aliases", {}) or {}).items()
+            }
+            if raw.get("room_names"):
+                data["room_names"] = [str(name) for name in raw.get("room_names", [])]
+            if aliases:
+                data["aliases"] = aliases
+            pairs = set()
+            for pair in raw.get("related_category_pairs", []) or []:
+                if len(pair) < 2:
+                    continue
+                a = self._canonical_category_static(str(pair[0]), aliases)
+                b = self._canonical_category_static(str(pair[1]), aliases)
+                pairs.add(tuple(sorted((a, b))))
+            if pairs:
+                data["related_category_pairs"] = pairs
+            goal_priors = {}
+            for goal, rooms in dict(raw.get("goal_room_priors", {}) or {}).items():
+                goal_priors[self._canonical_category_static(str(goal), aliases)] = tuple(
+                    normalize_category(str(room)).replace("_", " ") for room in rooms
+                )
+            if goal_priors:
+                data["goal_room_priors"] = goal_priors
+        except Exception as exc:
+            print("[sgnav-adapter] semantic priors unavailable, using defaults: %s" % exc, flush=True)
+        return data
+
+    @staticmethod
+    def _canonical_category_static(category: str, aliases: Mapping[str, str]) -> str:
+        cat = normalize_category(category)
+        return str(aliases.get(cat, cat))
+
+    def _canonical_category(self, category: str) -> str:
+        return self._canonical_category_static(category, self.category_aliases)
 
     @contextmanager
     def _sgnav_cwd(self):
@@ -360,7 +420,7 @@ class SGNavSceneGraphAdapter:
             self.scenegraph = None
 
     def reset(self, goal_category: str) -> None:
-        self.obj_goal_sg = normalize_category(str(goal_category))
+        self.obj_goal_sg = self._canonical_category(str(goal_category))
         self.runtime_nodes.clear()
         self.runtime_edges.clear()
         self.runtime_groups.clear()
@@ -485,13 +545,13 @@ class SGNavSceneGraphAdapter:
         for fallback_id, mem_node in enumerate(self.object_memory.nodes):
             mem_id = int(getattr(mem_node, "node_id", fallback_id))
             node = ObjectNode()
-            node.set_caption(normalize_category(mem_node.category))
+            node.set_caption(self._canonical_category(mem_node.category))
             node.set_center([int(mem_node.center_grid[0]), int(mem_node.center_grid[1])])
             node.is_new_node = False
             node.is_goal_node = self._category_matches_goal(mem_node.category)
             node.score = float(mem_node.confidence)
             object_payload = {
-                "captions": [normalize_category(mem_node.category)],
+                "captions": [self._canonical_category(mem_node.category)],
                 "conf": [float(mem_node.confidence)],
                 "image_idx": list(range(int(mem_node.observed_count))),
                 "mask_idx": [0] * int(mem_node.observed_count),
@@ -561,19 +621,19 @@ class SGNavSceneGraphAdapter:
         return scores
 
     def _category_matches_goal(self, category: str) -> bool:
-        cat = normalize_category(category)
-        goal = normalize_category(self.obj_goal_sg)
+        cat = self._canonical_category(category)
+        goal = self._canonical_category(self.obj_goal_sg)
         return cat == goal or (goal and (goal in cat or cat in goal))
 
     def _node_relevance(self, node) -> float:
         if self._category_matches_goal(node.category):
             return 8.0
-        cat = normalize_category(node.category)
-        goal = normalize_category(self.obj_goal_sg)
-        if tuple(sorted((cat, goal))) in RELATED_CATEGORY_PAIRS:
+        cat = self._canonical_category(node.category)
+        goal = self._canonical_category(self.obj_goal_sg)
+        if tuple(sorted((cat, goal))) in self.related_category_pairs:
             return 2.0
         room_name = self.room_name_at_grid(node.center_grid)
-        if room_name and normalize_category(room_name).replace("_", " ") in GOAL_ROOM_PRIORS.get(goal, ()):
+        if room_name and normalize_category(room_name).replace("_", " ") in self.goal_room_priors.get(goal, ()):
             return 1.25
         return 0.35
 
@@ -594,8 +654,8 @@ class SGNavSceneGraphAdapter:
         return self.room_names[idx]
 
     def _room_prior_score(self, frontier: Tuple[int, int]) -> float:
-        goal = normalize_category(self.obj_goal_sg)
-        priors = GOAL_ROOM_PRIORS.get(goal, ())
+        goal = self._canonical_category(self.obj_goal_sg)
+        priors = self.goal_room_priors.get(goal, ())
         if not priors:
             return 0.0
         room_name = self.room_name_at_grid(frontier)
@@ -619,7 +679,7 @@ class SGNavSceneGraphAdapter:
             self.runtime_nodes[node_id] = RuntimeGraphNode(
                 node_id=node_id,
                 kind="object",
-                caption=normalize_category(mem_node.category),
+                caption=self._canonical_category(mem_node.category),
                 center_grid=(int(mem_node.center_grid[0]), int(mem_node.center_grid[1])),
                 center_world=tuple(float(v) for v in mem_node.center_world),
                 confidence=float(mem_node.confidence),
@@ -661,8 +721,8 @@ class SGNavSceneGraphAdapter:
                 if src.center_world is None or dst.center_world is None:
                     continue
                 dist = float(np.linalg.norm(np.asarray(src.center_world[:2]) - np.asarray(dst.center_world[:2])))
-                related_pair = tuple(sorted((normalize_category(src.caption), normalize_category(dst.caption))))
-                is_related = related_pair in RELATED_CATEGORY_PAIRS
+                related_pair = tuple(sorted((self._canonical_category(src.caption), self._canonical_category(dst.caption))))
+                is_related = related_pair in self.related_category_pairs
                 same_room = bool(src.room and src.room == dst.room)
                 if is_related and dist <= 3.0:
                     relation = "related near"

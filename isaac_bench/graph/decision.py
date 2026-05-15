@@ -21,6 +21,7 @@ class DecisionResult:
     distance_scores: List[float]
     total_scores: List[float]
     reason: str
+    metadata: Dict[str, object] = field(default_factory=dict)
 
 
 @dataclass
@@ -45,6 +46,26 @@ class CandidateTrack:
     rejected: bool = False
     last_counted_observed_count: int = 0
     last_seen_step: int = -1
+
+
+def normalize_scores(values: Sequence[float], mode: str = "minmax") -> np.ndarray:
+    arr = np.asarray(values, dtype=np.float32)
+    if len(arr) == 0:
+        return arr
+    norm_mode = str(mode or "minmax").strip().lower()
+    if norm_mode == "none":
+        return arr
+    if norm_mode == "minmax":
+        lo, hi = float(np.min(arr)), float(np.max(arr))
+        if hi - lo < 1e-6:
+            return np.zeros_like(arr)
+        return (arr - lo) / (hi - lo)
+    if norm_mode == "zscore":
+        std = float(np.std(arr))
+        if std < 1e-6:
+            return np.zeros_like(arr)
+        return (arr - float(np.mean(arr))) / std
+    raise ValueError("unsupported score normalization mode: %s" % mode)
 
 
 class SGNavDecision:
@@ -73,6 +94,7 @@ class SGNavDecision:
         stop_verification_min_hits: int = 2,
         found_goal_stop_distance_m: float = 0.35,
         score_frontiers_before_candidate: bool = False,
+        frontier_scenegraph_score_norm: str = "minmax",
     ):
         self.scenegraph = scenegraph
         self.frontier_distance_weight = float(frontier_distance_weight)
@@ -97,6 +119,7 @@ class SGNavDecision:
         self.stop_verification_min_hits = max(1, int(stop_verification_min_hits))
         self.found_goal_stop_distance_m = max(0.05, float(found_goal_stop_distance_m))
         self.score_frontiers_before_candidate = bool(score_frontiers_before_candidate)
+        self.frontier_scenegraph_score_norm = str(frontier_scenegraph_score_norm or "minmax").strip().lower()
         self.state = "frontier"
         self.reperception_candidate_id: Optional[int] = None
         self.reperception_steps = 0
@@ -110,7 +133,8 @@ class SGNavDecision:
         if not frontier_clusters:
             return DecisionResult(None, None, [], [], [], "no_frontiers")
         locs = np.asarray([f.center_grid for f in frontier_clusters], dtype=np.int32)
-        sg_scores = self.scenegraph.score(locs, len(frontier_clusters))
+        raw_sg_scores = np.asarray(self.scenegraph.score(locs, len(frontier_clusters)), dtype=np.float32)
+        sg_scores = normalize_scores(raw_sg_scores, self.frontier_scenegraph_score_norm)
         dist_scores = np.asarray([getattr(f, "distance_inverse", 0.0) for f in frontier_clusters], dtype=np.float32)
         if len(dist_scores) != len(frontier_clusters) or not np.all(np.isfinite(dist_scores)):
             dists = np.asarray([f.path_distance_from_agent for f in frontier_clusters], dtype=np.float32)
@@ -125,6 +149,14 @@ class SGNavDecision:
             [float(x) for x in dist_scores],
             [float(x) for x in total],
             "selected_frontier",
+            metadata={
+                "raw_scenegraph_scores": [float(x) for x in raw_sg_scores],
+                "normalized_scenegraph_scores": [float(x) for x in sg_scores],
+                "distance_scores": [float(x) for x in dist_scores],
+                "total_scores": [float(x) for x in total],
+                "scenegraph_score_norm": self.frontier_scenegraph_score_norm,
+                "frontier_distance_weight": float(self.frontier_distance_weight),
+            },
         )
 
     def choose_navigation_target(
