@@ -18,6 +18,13 @@ import numpy as np
 
 from isaac_bench.config import load_yaml, repo_root
 from isaac_bench.dataset.category_normalizer import normalize_category
+from isaac_bench.graph.edge_builder import apply_edge_proposals, propose_object_edges_with_llm
+from isaac_bench.graph.frontier_interpolation import frontier_debug_payload, score_frontiers_by_subgraphs
+from isaac_bench.graph.hcot_scorer import HCoTSubgraphScorer
+from isaac_bench.graph.paper_scene_graph import PaperSceneGraph
+from isaac_bench.graph.subgraph_builder import build_object_centered_subgraphs
+from isaac_bench.mapping.coordinate_transform import grid_to_world_xy
+from isaac_bench.mapping.frontier import FrontierCluster
 from isaac_bench.perception.detection_types import Detection2D
 from isaac_bench.perception.object_memory import ObjectMemory
 
@@ -304,9 +311,11 @@ class SGNavSceneGraphAdapter:
         use_original: bool = False,
         semantic_priors_path: Optional[str] = None,
         vllm_config: Optional[Mapping[str, object]] = None,
+        sgnav_mode: str = "legacy",
     ):
         self.sgnav_repo = sgnav_repo
         self.use_original = bool(use_original)
+        self.sgnav_mode = str(sgnav_mode or "legacy").strip().lower()
         self.scenegraph = None
         self.obj_goal_sg = ""
         self.object_memory: Optional[ObjectMemory] = None
@@ -324,8 +333,11 @@ class SGNavSceneGraphAdapter:
         self._runtime_edge_keys: set = set()
         self.frame_observations: Dict[str, object] = {}
         self.latest_rgb_image: Optional[np.ndarray] = None
+        self.latest_map_info = None
         self.graph_version = 0
         self.vllm_scorer = VLLMFrontierScorer(vllm_config)
+        self.paper_graph = PaperSceneGraph(related_category_pairs=self.related_category_pairs)
+        self.hcot_scorer = HCoTSubgraphScorer(llm_client=None)
         if self.use_original:
             self._try_init_original()
 
@@ -427,8 +439,10 @@ class SGNavSceneGraphAdapter:
         self.runtime_rooms.clear()
         self.frame_observations = {}
         self.latest_rgb_image = None
+        self.latest_map_info = None
         self.graph_version = 0
         self.last_score_debug = {}
+        self.paper_graph.reset()
         if self.scenegraph is not None:
             try:
                 with self._sgnav_cwd():
@@ -464,6 +478,7 @@ class SGNavSceneGraphAdapter:
         if hasattr(object_memory, "dedupe"):
             object_memory.dedupe(map_info=map_info)
         self.room_map = room_map
+        self.latest_map_info = map_info
         if rgb is not None:
             self.latest_rgb_image = np.asarray(rgb, dtype=np.uint8).copy()
         self.frame_observations = {
@@ -478,6 +493,8 @@ class SGNavSceneGraphAdapter:
             "camera_pose_world": tuple(float(v) for v in camera_pose_world) if camera_pose_world is not None else None,
         }
         self._rebuild_runtime_graph(map_info=map_info)
+        if self.sgnav_mode == "paper":
+            self._update_paper_graph_from_memory(object_memory)
         if self.scenegraph is not None:
             try:
                 with self._sgnav_cwd():
@@ -499,6 +516,8 @@ class SGNavSceneGraphAdapter:
     def score(self, frontier_locations: np.ndarray, num_frontiers: int) -> np.ndarray:
         if num_frontiers <= 0:
             return np.zeros((0,), dtype=np.float32)
+        if self.sgnav_mode == "paper":
+            return self._paper_score(frontier_locations, num_frontiers)
         if self.scenegraph is not None:
             try:
                 with self._sgnav_cwd():
@@ -527,6 +546,39 @@ class SGNavSceneGraphAdapter:
             }
             return vllm_scores
         return self._fallback_score(frontier_locations, num_frontiers)
+
+    def _update_paper_graph_from_memory(self, object_memory: ObjectMemory) -> None:
+        self.paper_graph.update_from_object_memory(object_memory)
+        all_objects = list(self.paper_graph.object_nodes.values())
+        proposals = propose_object_edges_with_llm(all_objects, all_objects, llm_client=None)
+        apply_edge_proposals(self.paper_graph, proposals)
+        self.paper_graph.update_group_nodes()
+
+    def _paper_score(self, frontier_locations: np.ndarray, num_frontiers: int) -> np.ndarray:
+        subgraphs = build_object_centered_subgraphs(self.paper_graph)
+        subgraph_scores = self.hcot_scorer.score(subgraphs, self.obj_goal_sg, graph_version=self.paper_graph.version)
+        frontiers = []
+        for idx, loc in enumerate(np.asarray(frontier_locations[:num_frontiers], dtype=np.int32)):
+            row, col = int(loc[0]), int(loc[1])
+            if self.latest_map_info is not None:
+                wx, wy = grid_to_world_xy(row, col, self.latest_map_info)
+            else:
+                wx, wy = float(row), float(col)
+            frontiers.append(FrontierCluster((row, col), (float(wx), float(wy)), [(row, col)], 1, float(idx + 1)))
+        frontier_scores = score_frontiers_by_subgraphs(frontiers, subgraph_scores)
+        payload = frontier_debug_payload(frontier_scores)
+        payload.update(
+            {
+                "mode": "paper_subgraph_interpolation",
+                "num_object_nodes": len(self.paper_graph.object_nodes),
+                "num_room_nodes": len(self.paper_graph.room_nodes),
+                "num_group_nodes": len(self.paper_graph.group_nodes),
+                "num_object_edges": len(self.paper_graph.object_edges),
+                "num_subgraphs": len(subgraphs),
+            }
+        )
+        self.last_score_debug = payload
+        return np.asarray([item.score for item in frontier_scores], dtype=np.float32)
 
     def _sync_original_nodes(self, map_info=None) -> None:
         if self.scenegraph is None or self.object_memory is None:

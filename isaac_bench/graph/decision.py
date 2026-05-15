@@ -6,7 +6,9 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import numpy as np
 
 from isaac_bench.dataset.category_normalizer import normalize_category
+from isaac_bench.graph.reperception import compute_goal_candidate_credibility
 from isaac_bench.graph.sgnav_scenegraph_adapter import SGNavSceneGraphAdapter
+from isaac_bench.graph.subgraph_builder import build_object_centered_subgraphs
 from isaac_bench.mapping.coordinate_transform import MapInfo, grid_to_world_xy
 from isaac_bench.mapping.frontier import FrontierCluster
 from isaac_bench.navigation.astar import GridAStarPlanner, astar_distance_map
@@ -535,6 +537,17 @@ class SGNavDecision:
         frontier_decision: Optional[DecisionResult] = None,
     ) -> float:
         _ = current_pose, frontier_decision
+        if str(getattr(self.scenegraph, "sgnav_mode", "")).strip().lower() == "paper":
+            paper_graph = getattr(self.scenegraph, "paper_graph", None)
+            paper_candidate = None if paper_graph is None else paper_graph.object_nodes.get("object:%s" % int(candidate.node_id))
+            if paper_candidate is not None:
+                subgraphs = build_object_centered_subgraphs(paper_graph)
+                subgraph_scores = self.scenegraph.hcot_scorer.score(
+                    subgraphs,
+                    getattr(self.scenegraph, "obj_goal_sg", normalize_category(candidate.category)),
+                    graph_version=getattr(paper_graph, "version", 0),
+                )
+                return float(compute_goal_candidate_credibility(paper_candidate, float(candidate.confidence), subgraph_scores))
         conf = float(candidate.confidence)
         hit_term = min(float(candidate.observed_count), 5.0) / 5.0
         return float(np.clip(conf * (0.5 + 0.5 * hit_term), 0.0, 1.0))
@@ -570,6 +583,7 @@ class SGNavDecision:
     ) -> Dict[str, object]:
         return {
             "candidate_credibility": float(credibility),
+            "candidate_credibility_method": "graph_based" if str(getattr(self.scenegraph, "sgnav_mode", "")).strip().lower() == "paper" else "confidence_hits",
             "candidate_observed_count": int(candidate.observed_count),
             "candidate_track_observation_count": int(track.observation_count),
             "candidate_reperception_steps": int(track.steps),

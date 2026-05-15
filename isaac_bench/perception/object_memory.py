@@ -1,13 +1,13 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from typing import List, Optional, Sequence, Tuple
 
 import numpy as np
 
 from isaac_bench.dataset.category_normalizer import normalize_category
 from isaac_bench.mapping.coordinate_transform import MapInfo, world_xy_to_grid
-from isaac_bench.perception.detection_types import Detection3D
+from isaac_bench.perception.detection_types import Detection3D, FusedInstance
 
 
 @dataclass
@@ -20,9 +20,27 @@ class ObjectNode:
     observed_count: int
     last_seen_step: int
     raw_label: str = ""
+    point_cloud_world: Optional[np.ndarray] = None
+    bbox_world: Optional[np.ndarray] = None
+    last_mask: Optional[np.ndarray] = None
+    source_instance_id: str = ""
+    source: str = ""
 
     def to_dict(self) -> dict:
-        return asdict(self)
+        return {
+            "node_id": int(self.node_id),
+            "category": self.category,
+            "center_world": tuple(float(v) for v in self.center_world),
+            "center_grid": tuple(int(v) for v in self.center_grid),
+            "confidence": float(self.confidence),
+            "observed_count": int(self.observed_count),
+            "last_seen_step": int(self.last_seen_step),
+            "raw_label": self.raw_label,
+            "point_cloud_world": _array_to_list(self.point_cloud_world),
+            "bbox_world": _array_to_list(self.bbox_world),
+            "source_instance_id": self.source_instance_id,
+            "source": self.source,
+        }
 
 
 class ObjectMemory:
@@ -78,6 +96,10 @@ class ObjectMemory:
                     observed_count=1,
                     last_seen_step=int(step_id),
                     raw_label=det.raw_label,
+                    point_cloud_world=_copy_array(det.point_cloud_world),
+                    bbox_world=_copy_array(det.bbox_world),
+                    last_mask=_copy_array(det.mask),
+                    source=getattr(det, "source", ""),
                 )
                 self._next_id += 1
                 self.nodes.append(node)
@@ -93,10 +115,45 @@ class ObjectMemory:
             else:
                 matched.center_grid = center_grid
             matched.confidence = max(float(matched.confidence), float(det.confidence))
+            matched.point_cloud_world = _merge_point_clouds(matched.point_cloud_world, det.point_cloud_world)
+            matched.bbox_world = _copy_array(det.bbox_world) if det.bbox_world is not None else _bbox_from_points(matched.point_cloud_world)
+            matched.last_mask = _copy_array(det.mask)
             matched.observed_count += 1
             matched.last_seen_step = int(step_id)
             changed.append(matched)
         self.dedupe(map_info=map_info)
+        return changed
+
+    def update_fused_instances(
+        self,
+        instances: Sequence[FusedInstance],
+        step_id: int,
+        map_info: Optional[MapInfo] = None,
+    ) -> List[ObjectNode]:
+        detections: List[Detection3D] = []
+        instance_ids: List[str] = []
+        sources: List[str] = []
+        for instance in instances:
+            if instance.node_type != "object":
+                continue
+            detections.append(
+                Detection3D(
+                    category=instance.category,
+                    raw_label=instance.category,
+                    confidence=float(instance.confidence),
+                    center_world=tuple(float(v) for v in instance.center_world),
+                    bbox_xyxy=(0.0, 0.0, 0.0, 0.0),
+                    point_cloud_world=instance.point_cloud_world,
+                    bbox_world=instance.bbox_world,
+                    mask=instance.last_mask,
+                )
+            )
+            instance_ids.append(instance.instance_id)
+            sources.append(instance.source)
+        changed = self.update(detections, step_id=step_id, map_info=map_info)
+        for node, instance_id, source in zip(changed, instance_ids, sources):
+            node.source_instance_id = instance_id
+            node.source = source
         return changed
 
     def dedupe(self, map_info: Optional[MapInfo] = None) -> None:
@@ -131,10 +188,50 @@ class ObjectMemory:
         if map_info is not None:
             target.center_grid = world_xy_to_grid(float(merged_center[0]), float(merged_center[1]), map_info)
         target.confidence = max(float(target.confidence), float(duplicate.confidence))
+        target.point_cloud_world = _merge_point_clouds(target.point_cloud_world, duplicate.point_cloud_world)
+        target.bbox_world = _bbox_from_points(target.point_cloud_world) if target.point_cloud_world is not None else target.bbox_world
+        if duplicate.last_mask is not None:
+            target.last_mask = _copy_array(duplicate.last_mask)
         target.observed_count = int(target_count + dup_count)
         target.last_seen_step = max(int(target.last_seen_step), int(duplicate.last_seen_step))
         if not target.raw_label and duplicate.raw_label:
             target.raw_label = duplicate.raw_label
+        if not target.source_instance_id and duplicate.source_instance_id:
+            target.source_instance_id = duplicate.source_instance_id
+        if not target.source and duplicate.source:
+            target.source = duplicate.source
 
     def to_dicts(self) -> List[dict]:
         return [node.to_dict() for node in self.nodes]
+
+
+def _copy_array(value: Optional[np.ndarray]) -> Optional[np.ndarray]:
+    if value is None:
+        return None
+    return np.asarray(value).copy()
+
+
+def _array_to_list(value: Optional[np.ndarray]):
+    if value is None:
+        return None
+    return np.asarray(value).tolist()
+
+
+def _merge_point_clouds(a: Optional[np.ndarray], b: Optional[np.ndarray], max_points: int = 4096) -> Optional[np.ndarray]:
+    if a is None and b is None:
+        return None
+    parts = [np.asarray(item, dtype=np.float32) for item in (a, b) if item is not None and len(item) > 0]
+    if not parts:
+        return None
+    merged = np.concatenate(parts, axis=0)
+    if len(merged) <= int(max_points):
+        return merged.copy()
+    indices = np.linspace(0, len(merged) - 1, int(max_points)).astype(np.int64)
+    return merged[indices].copy()
+
+
+def _bbox_from_points(points: Optional[np.ndarray]) -> Optional[np.ndarray]:
+    if points is None or len(points) == 0:
+        return None
+    arr = np.asarray(points, dtype=np.float32)
+    return np.stack([np.min(arr, axis=0), np.max(arr, axis=0)], axis=0)

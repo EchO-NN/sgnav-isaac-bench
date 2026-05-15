@@ -17,7 +17,7 @@ repo:
 
 visualization:
   sgnav_popup: auto
-  sgnav_popup_every_steps: 20
+  sgnav_popup_every_steps: 3
   sgnav_popup_save_dir:
   sgnav_popup_save_every_steps: 10
   sgnav_popup_width: 1440
@@ -25,7 +25,7 @@ visualization:
   sgnav_popup_jpeg_quality: 75
 
 isaac:
-  headless: true
+  headless: false
   control_dt: 0.2
   perception_every_steps: 5
   observed_radius_m: 3.0
@@ -67,7 +67,7 @@ episodes:
   min_start_goal_bbox_distance_m: 1.5
   min_goal_clearance_m: 0.80
   min_planning_clearance_m: 0.0
-  success_distance_m: 1.0
+  success_distance_m: 0.2
   success_requires_stop: true
   success_requires_visible: false
   max_steps: 500
@@ -156,7 +156,7 @@ perception:
   sam2_checkpoint: data/models/sam2.1_hiera_small.pt
   sam2_model_cfg: configs/sam2.1/sam2.1_hiera_s.yaml
   sam2_device: cuda
-  confidence_threshold: 0.7
+  confidence_threshold: 0.25
   nms_iou_threshold: 0.5
   prompt_mode: global_dataset_vocab
   max_detections_per_frame: 100
@@ -165,13 +165,14 @@ perception:
   min_depth_points_per_detection: 20
 
 sgnav:
+  mode: paper
   seed_gt_object_memory: false
   allow_gt_goal_fallback: false
   panorama_steps: 8
   panorama_wz_radps: 0.8
   panorama_render_updates_per_step: 1
-  frontier_distance_weight: 0.7
-  frontier_scenegraph_score_norm: minmax
+  frontier_distance_weight: 0.0
+  frontier_scenegraph_score_norm: none
   frontier_commitment_enabled: true
   frontier_commit_match_radius_m: 0.75
   frontier_commit_reached_radius_m: 0.60
@@ -192,7 +193,7 @@ sgnav:
   candidate_match_substring: false
   candidate_accept_requires_reperception: true
   candidate_reject_ttl_steps: 80
-  candidate_accept_threshold: 0.65
+  candidate_accept_threshold: 0.8
   candidate_stop_distance_m: 1.0
   candidate_standoff_min_m: 0.65
   candidate_standoff_max_m: 1.80
@@ -206,6 +207,45 @@ sgnav:
   stop_verification_steps: 4
   stop_verification_min_hits: 2
   found_goal_stop_distance_m: 0.35
+  perception:
+    instance_source: yolo_world_sam2_depth_fusion
+    instance_merge_distance_m: 0.75
+    instance_merge_iou_3d: 0.15
+  scene_graph:
+    enabled: true
+    node_types:
+      object: true
+      group: true
+      room: true
+    dense_connect_new_objects: true
+    llm_edge_batching: true
+    short_edge_vlm_pruning: true
+    long_edge_geometric_pruning: true
+    group_nodes: true
+  subgraph:
+    enabled: true
+    type: object_centered
+    include_parent_room: true
+    include_parent_group: true
+    include_direct_object_neighbors: true
+    cache_scores: true
+  hc_p_prompting:
+    enabled: true
+    strict_json: true
+    max_retries: 2
+    min_distance_m: 0.25
+    probability_normalization: true
+  frontier:
+    use_fbe: true
+    scoring: subgraph_interpolation
+    min_distance_m: 0.25
+  local_policy:
+    type: astar_deterministic_backend
+  reperception:
+    enabled: true
+    method: graph_based
+    n_max: 10
+    s_thres: 0.8
 
 vllm:
   frontier_scoring: false

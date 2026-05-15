@@ -1,7 +1,10 @@
 # SG-Nav Isaac/InteriorAgent Benchmark
 
-This directory is a standalone first-pass Isaac benchmark wrapper. It references
-the original SG-Nav checkout at `/home/echo/SG-Nav` without modifying it.
+This branch implements SG-Nav paper mode in Isaac Sim. The original online
+open-vocabulary 3D instance segmentation module is replaced by YOLO-World +
+SAM2 + RGB-D depth fusion; downstream navigation follows SG-Nav's hierarchical
+scene graph, dense edge generation and pruning, object-centered H-CoT subgraph
+scoring, frontier interpolation, and graph-based re-perception.
 
 ## Setup
 
@@ -112,11 +115,12 @@ JSONL for stress-testing A*.
 
 ## Run Isaac SG-Nav Closed Loop
 
-Run this inside the `sgnav-isaac` Python 3.11 env. This is the full Isaac SG-Nav
-loop: RGB-D observation, online depth occupancy/free-space mapping,
-YOLO-World/dry detector, optional SAM2 masks, object memory, SG-Nav scene graph
-scoring, candidate/frontier/re-perception/STOP policy, A* replanning, and
-holonomic Kaya control.
+Run this inside the `sgnav-isaac` Python 3.11 env. The default config runs
+`sgnav.mode: paper`: RGB-D observation, online depth occupancy/free-space
+mapping, YOLO-World + SAM2 + depth fusion, hierarchical scene graph updates,
+object-centered H-CoT subgraph scoring, `sum(P_sub / D)` frontier interpolation,
+graph-based re-perception, deterministic A* replanning, and holonomic Kaya
+control.
 
 ```bash
 ./scripts/run_sgnav_isaac_env.sh \
@@ -124,12 +128,11 @@ holonomic Kaya control.
   --config isaac_bench/configs/isaac_bench.yaml \
   --episode-file data/interioragent_episodes/debug.jsonl \
   --episode-index 0 \
-  --planner astar \
   --detector yolo_world \
   --sim-backend isaac \
-  --headless false \
-  --output data/isaac_bench_runs/isaac_closed_loop/results.jsonl \
-  --debug-map debug/isaac_closed_loop.png
+  --headless true \
+  --output data/isaac_bench_runs/sgnav_paper_mode/results.jsonl \
+  --debug-map debug/sgnav_paper_mode.png
 ```
 
 Use `--headless true` for non-GUI runs. A*, frontiers, collision guarding,

@@ -85,6 +85,7 @@ def detections_to_3d(
         if points is None or len(points) == 0:
             continue
         center = np.median(points, axis=0)
+        bbox_world = world_points_bbox(points)
         out.append(
             Detection3D(
                 category=det.category,
@@ -92,9 +93,19 @@ def detections_to_3d(
                 confidence=det.confidence,
                 center_world=tuple(float(v) for v in center),
                 bbox_xyxy=det.bbox_xyxy,
+                point_cloud_world=points,
+                bbox_world=bbox_world,
+                mask=None if det.mask is None else np.asarray(det.mask).astype(bool).copy(),
             )
         )
     return out
+
+
+def world_points_bbox(points_world: np.ndarray) -> np.ndarray:
+    points = np.asarray(points_world, dtype=np.float32)
+    if points.ndim != 2 or points.shape[1] != 3 or len(points) == 0:
+        return np.zeros((2, 3), dtype=np.float32)
+    return np.stack([np.min(points, axis=0), np.max(points, axis=0)], axis=0).astype(np.float32)
 
 
 def _foreground_depth_mask(depth_values: np.ndarray, min_points: int = 20) -> np.ndarray:

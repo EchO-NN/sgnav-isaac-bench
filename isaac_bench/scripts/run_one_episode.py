@@ -28,6 +28,7 @@ from isaac_bench.navigation.frontier_commitment import FrontierCommitmentManager
 from isaac_bench.navigation.waypoint_follower import HolonomicWaypointFollower
 from isaac_bench.perception.detection_types import Detection2D, Detection3D
 from isaac_bench.perception.detector_ipc import SubprocessDetector
+from isaac_bench.perception.fused_instance_registry import FusedInstanceRegistry
 from isaac_bench.perception.object_memory import ObjectMemory
 from isaac_bench.perception.sam2_segmenter import build_sam2_segmenter
 from isaac_bench.perception.yolo_world_detector import build_detector
@@ -393,6 +394,10 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
     metric_planner = GridAStarPlanner(static_navigable, static_map_info.resolution_m, allow_diagonal=True)
     evaluator = EpisodeEvaluator(episode, metric_planner)
     object_memory = ObjectMemory(merge_radius_m=float(args.object_merge_radius_m))
+    fused_instance_registry = FusedInstanceRegistry(
+        merge_distance_m=float(getattr(args, "instance_merge_distance_m", args.object_merge_radius_m)),
+        merge_iou_3d=float(getattr(args, "instance_merge_iou_3d", 0.15)),
+    )
     if args.seed_gt_object_memory:
         print("[sgnav-loop] seed_gt_object_memory ignored for depth-online mapping", flush=True)
     seeded = 0
@@ -411,6 +416,7 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
             "image_max_width": int(getattr(args, "vllm_image_max_width", 640)),
             "image_jpeg_quality": int(getattr(args, "vllm_image_jpeg_quality", 75)),
         },
+        sgnav_mode=str(getattr(args, "sgnav_mode", "legacy")),
     )
     if bool(getattr(args, "vllm_frontier_scoring", False)):
         print(
@@ -824,7 +830,24 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
                 detections_3d = []
             else:
                 raise ValueError("Unsupported detection localization mode: %s" % detection_localization)
-            object_memory.update(detections_3d, step_id=step_idx, map_info=map_info_local)
+            if str(getattr(args, "sgnav_mode", "legacy")).strip().lower() == "paper" and detection_localization == "depth":
+                fused_instances = fused_instance_registry.update(
+                    detections_2d,
+                    obs_local["depth"],
+                    intr,
+                    obs_local["camera_pose_world"],
+                    step_id=step_idx,
+                    depth_max_m=float(args.depth_max_m),
+                    min_points=int(args.min_depth_points_per_detection),
+                    stride=int(args.depth_stride_px),
+                )
+                object_memory.update_fused_instances(
+                    [instance for instance in fused_instances if int(instance.last_seen_step) == int(step_idx)],
+                    step_id=step_idx,
+                    map_info=map_info_local,
+                )
+            else:
+                object_memory.update(detections_3d, step_id=step_idx, map_info=map_info_local)
             evaluator.num_yolo_calls += 1
             return obs_local
 
@@ -1428,6 +1451,13 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
         row["graph_group_nodes"] = int(len(getattr(scenegraph, "runtime_groups", [])))
         row["graph_room_nodes"] = int(len(getattr(scenegraph, "runtime_rooms", {})))
         row["graph_edges"] = int(len(getattr(scenegraph, "runtime_edges", [])))
+        paper_graph = getattr(scenegraph, "paper_graph", None)
+        row["sgnav_mode"] = str(getattr(args, "sgnav_mode", "legacy"))
+        row["paper_num_object_nodes"] = int(len(getattr(paper_graph, "object_nodes", {}) or {}))
+        row["paper_num_room_nodes"] = int(len(getattr(paper_graph, "room_nodes", {}) or {}))
+        row["paper_num_group_nodes"] = int(len(getattr(paper_graph, "group_nodes", {}) or {}))
+        row["paper_num_object_edges"] = int(len(getattr(paper_graph, "object_edges", []) or []))
+        row["paper_frontier_interpolation"] = dict(getattr(scenegraph, "last_score_debug", {}) or {})
         row["vllm_frontier_scoring"] = bool(getattr(args, "vllm_frontier_scoring", False))
         row["vllm_image_scoring"] = bool(getattr(args, "vllm_image_scoring", True))
         row["score_frontiers_before_candidate"] = bool(getattr(args, "score_frontiers_before_candidate", False))
@@ -1534,7 +1564,7 @@ def run_episode_map_sim(episode: dict, args) -> dict:
     env.reset()
 
     object_memory = ObjectMemory()
-    scenegraph = SGNavSceneGraphAdapter(args.sgnav_repo, use_original=args.use_original_scenegraph)
+    scenegraph = SGNavSceneGraphAdapter(args.sgnav_repo, use_original=args.use_original_scenegraph, sgnav_mode=str(getattr(args, "sgnav_mode", "legacy")))
     scenegraph.reset(episode["goal_category"])
     scenegraph.update(object_memory)
     decision = SGNavDecision(scenegraph)
@@ -1577,6 +1607,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--debug-map", default=None)
     parser.add_argument("--save-debug-video", action="store_true")
     parser.add_argument("--sgnav-repo", default=None)
+    parser.add_argument("--sgnav-mode", default=None, choices=["legacy", "paper"])
     parser.add_argument("--use-original-scenegraph", action="store_true", default=None)
     parser.add_argument("--max-control-steps", type=int, default=None)
     parser.add_argument("--control-dt", type=float, default=None)
@@ -1671,6 +1702,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--sam2-device", default=None)
     parser.add_argument("--max-detections-per-frame", type=int, default=None)
     parser.add_argument("--object-merge-radius-m", type=float, default=None)
+    parser.add_argument("--instance-merge-distance-m", type=float, default=None)
+    parser.add_argument("--instance-merge-iou-3d", type=float, default=None)
     parser.add_argument("--frontier-distance-weight", type=float, default=None)
     parser.add_argument("--frontier-scenegraph-score-norm", "--frontier_scenegraph_score_norm", default=None, choices=["none", "minmax", "zscore"])
     parser.add_argument("--semantic-priors-path", "--semantic_priors_path", default=None)
@@ -1748,7 +1781,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     args.sgnav_viz_width = int(args.sgnav_viz_width or get_nested(cfg, "visualization.sgnav_popup_width", 1440))
     args.sgnav_viz_height = int(args.sgnav_viz_height or get_nested(cfg, "visualization.sgnav_popup_height", 900))
     args.sgnav_viz_jpeg_quality = int(args.sgnav_viz_jpeg_quality or get_nested(cfg, "visualization.sgnav_popup_jpeg_quality", 75))
-    args.sim_backend = args.sim_backend or "map"
+    args.sgnav_mode = str(args.sgnav_mode or get_nested(cfg, "sgnav.mode", "legacy")).strip().lower()
+    args.sim_backend = args.sim_backend or get_nested(cfg, "repo.backend", "map")
     args.output = args.output or str(Path(get_nested(cfg, "project.output_dir", "data/isaac_bench_runs")) / "run_one_episode" / "results.jsonl")
     args.sgnav_repo = args.sgnav_repo or get_nested(cfg, "paths.sgnav_repo", "/home/echo/SG-Nav")
     if args.use_original_scenegraph is None:
@@ -1915,6 +1949,16 @@ def main(argv: Optional[List[str]] = None) -> int:
     args.sam2_device = str(args.sam2_device or get_nested(cfg, "perception.sam2_device", "cuda"))
     args.max_detections_per_frame = int(args.max_detections_per_frame if args.max_detections_per_frame is not None else get_nested(cfg, "perception.max_detections_per_frame", 100))
     args.object_merge_radius_m = float(args.object_merge_radius_m if args.object_merge_radius_m is not None else get_nested(cfg, "perception.object_merge_radius_m", 0.5))
+    args.instance_merge_distance_m = float(
+        args.instance_merge_distance_m
+        if args.instance_merge_distance_m is not None
+        else get_nested(cfg, "sgnav.perception.instance_merge_distance_m", get_nested(cfg, "perception.object_merge_radius_m", 0.75))
+    )
+    args.instance_merge_iou_3d = float(
+        args.instance_merge_iou_3d
+        if args.instance_merge_iou_3d is not None
+        else get_nested(cfg, "sgnav.perception.instance_merge_iou_3d", 0.15)
+    )
     args.frontier_distance_weight = float(args.frontier_distance_weight if args.frontier_distance_weight is not None else get_nested(cfg, "sgnav.frontier_distance_weight", 0.7))
     args.frontier_scenegraph_score_norm = str(
         args.frontier_scenegraph_score_norm
