@@ -4,6 +4,7 @@ import argparse
 import json
 import math
 from collections import Counter
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable, List, Optional, Tuple
 
@@ -14,14 +15,14 @@ from isaac_bench.dataset.category_normalizer import normalize_category
 from isaac_bench.dataset.episode_generator import read_jsonl
 from isaac_bench.env.habitat_like_env import MapSimHabitatLikeEnv
 from isaac_bench.debug.graph_debug_dump import save_graph_debug_dump
-from isaac_bench.graph.decision import SGNavDecision
+from isaac_bench.graph.decision import NavigationDecision, SGNavDecision
 from isaac_bench.graph.sgnav_scenegraph_adapter import SGNAV_ROOM_NAMES, SGNavSceneGraphAdapter
 from isaac_bench.mapping.coordinate_transform import MapInfo, grid_to_world_xy, is_inside_grid, world_xy_to_grid
 from isaac_bench.mapping.frontier import extract_frontiers, frontier_debug_layers
 from isaac_bench.mapping.frontier_debug import save_frontier_debug_snapshot
 from isaac_bench.mapping.online_mapper import OnlineMapper
 from isaac_bench.mapping.room_map_from_rooms_json import build_room_index_map, load_rooms
-from isaac_bench.metrics.episode_logger import JsonlEpisodeLogger
+from isaac_bench.metrics.episode_logger import JsonlEpisodeLogger, make_jsonable
 from isaac_bench.metrics.evaluator import EpisodeEvaluator
 from isaac_bench.navigation.astar import GridAStarPlanner, astar_distance_map
 from isaac_bench.navigation.frontier_commitment import FrontierCommitmentManager
@@ -199,10 +200,91 @@ def path_cells_to_world(path_cells: Iterable[Tuple[int, int]], map_info: MapInfo
     return [grid_to_world_xy(int(r), int(c), map_info) for r, c in path_cells]
 
 
+@dataclass
+class LongTermGoalState:
+    mode: str = "none"
+    target_cells: List[Tuple[int, int]] = field(default_factory=list)
+    center_grid: Optional[Tuple[int, int]] = None
+    selected_step: int = -1
+    reached: bool = False
+    invalid_reason: str = ""
+    nav_decision: Optional[NavigationDecision] = None
+
+    def exists(self) -> bool:
+        return self.mode not in {"", "none"} and bool(self.target_cells) and not self.invalid_reason
+
+    def set_from(self, nav_decision: NavigationDecision, step: int) -> None:
+        self.mode = str(nav_decision.mode or "none")
+        self.target_cells = [tuple(int(v) for v in cell) for cell in (nav_decision.target_cells or [])]
+        self.center_grid = self._center_from_decision(nav_decision)
+        self.selected_step = int(step)
+        self.reached = False
+        self.invalid_reason = ""
+        self.nav_decision = nav_decision
+
+    def clear(self, reason: str = "cleared") -> None:
+        self.mode = "none"
+        self.target_cells = []
+        self.center_grid = None
+        self.selected_step = -1
+        self.reached = reason == "reached"
+        self.invalid_reason = ""
+        self.nav_decision = None
+
+    def invalidate(self, reason: str) -> None:
+        self.invalid_reason = str(reason)
+        self.mode = "none"
+        self.target_cells = []
+        self.center_grid = None
+        self.nav_decision = None
+
+    def to_navigation_decision(self) -> NavigationDecision:
+        if self.nav_decision is None:
+            return NavigationDecision(self.mode, list(self.target_cells), False, None, None, "locked_long_term_goal")
+        metadata = {
+            **dict(self.nav_decision.metadata or {}),
+            "long_term_goal_locked": True,
+            "long_term_goal_selected_step": int(self.selected_step),
+            "long_term_goal_mode": self.mode,
+        }
+        return NavigationDecision(
+            self.nav_decision.mode,
+            list(self.target_cells),
+            bool(self.nav_decision.stop),
+            self.nav_decision.selected_candidate,
+            self.nav_decision.frontier_decision,
+            "locked_long_term_goal",
+            state=self.nav_decision.state,
+            metadata=metadata,
+        )
+
+    @staticmethod
+    def _center_from_decision(nav_decision: NavigationDecision) -> Optional[Tuple[int, int]]:
+        if nav_decision.frontier_decision is not None and nav_decision.frontier_decision.selected_frontier is not None:
+            return tuple(int(v) for v in nav_decision.frontier_decision.selected_frontier.center_grid)
+        if nav_decision.selected_candidate is not None:
+            return tuple(int(v) for v in nav_decision.selected_candidate.center_grid)
+        if nav_decision.target_cells:
+            return tuple(int(v) for v in nav_decision.target_cells[0])
+        return None
+
+
 def trim_path_to_current(path: List[Tuple[int, int]], current_grid: Tuple[int, int]) -> List[Tuple[int, int]]:
     for idx, cell in enumerate(path):
         if cell == current_grid:
             return path[idx:]
+    return []
+
+
+def trim_path_to_nearest(path: List[Tuple[int, int]], current_grid: Tuple[int, int], max_dist_cells: int = 3) -> List[Tuple[int, int]]:
+    if not path:
+        return []
+    cur = np.asarray(current_grid, dtype=np.float32)
+    arr = np.asarray(path, dtype=np.float32)
+    dists = np.linalg.norm(arr - cur[None, :], axis=1)
+    idx = int(np.argmin(dists))
+    if float(dists[idx]) <= float(max_dist_cells):
+        return path[idx:]
     return []
 
 
@@ -219,6 +301,37 @@ def mark_observed_disc(observed: np.ndarray, center: Tuple[int, int], radius_cel
 def filter_detections_by_confidence(detections: List[Detection2D], min_confidence: float) -> List[Detection2D]:
     threshold = float(min_confidence)
     return [det for det in detections if float(det.confidence) >= threshold]
+
+
+def goal_candidate_pair_distances(object_memory: ObjectMemory, goal_category: str, max_distance_m: float = 1.0) -> List[dict]:
+    goal = normalize_category(goal_category)
+    nodes = [node for node in object_memory.nodes if normalize_category(node.category) == goal]
+    out = []
+    for idx, a in enumerate(nodes):
+        for b in nodes[idx + 1 :]:
+            dist = float(np.linalg.norm(np.asarray(a.center_world[:2], dtype=np.float32) - np.asarray(b.center_world[:2], dtype=np.float32)))
+            if dist <= float(max_distance_m):
+                out.append({"a": int(a.node_id), "b": int(b.node_id), "dist": dist})
+    return out
+
+
+def candidate_center_payload(object_memory: ObjectMemory, goal_category: str, selected_candidate_id: Optional[int] = None) -> List[dict]:
+    goal = normalize_category(goal_category)
+    payload = []
+    for node in object_memory.nodes:
+        if normalize_category(node.category) != goal:
+            continue
+        status = "selected" if selected_candidate_id is not None and int(node.node_id) == int(selected_candidate_id) else "candidate"
+        payload.append(
+            {
+                "node_id": int(node.node_id),
+                "center_grid": tuple(int(v) for v in node.center_grid),
+                "confidence": float(node.confidence),
+                "observed_count": int(node.observed_count),
+                "status": status,
+            }
+        )
+    return payload
 
 
 def detections_to_3d_static_map_ray(
@@ -532,6 +645,8 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
     last_dynamic_observed = mapper.grid.observed.astype(bool)
     last_frontier_raw_cells = 0
     last_frontier_clusters = 0
+    paper_mode = str(getattr(args, "sgnav_mode", "legacy")).strip().lower() == "paper"
+    long_term_goal = LongTermGoalState()
     sgnav_viz_enabled = bool(getattr(args, "sgnav_viz", False))
     sgnav_viz_save_dir = getattr(args, "sgnav_viz_save_dir", None)
     detection_localization = str(getattr(args, "detection_localization", "static_map_ray")).strip().lower()
@@ -848,6 +963,12 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
                 )
             else:
                 object_memory.update(detections_3d, step_id=step_idx, map_info=map_info_local)
+            if paper_mode:
+                object_memory.dedupe_goal_candidates(
+                    goal_category=episode["goal_category"],
+                    merge_radius_m=max(float(args.object_merge_radius_m), 0.75),
+                    map_info=map_info_local,
+                )
             evaluator.num_yolo_calls += 1
             return obs_local
 
@@ -956,7 +1077,7 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
 
             needs_replan = not current_path or step % replan_every == 0
             if current_path:
-                suffix = trim_path_to_current(current_path, current_grid)
+                suffix = trim_path_to_nearest(current_path, current_grid) if paper_mode else trim_path_to_current(current_path, current_grid)
                 if suffix:
                     current_path = suffix
                 else:
@@ -987,38 +1108,69 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
                 if bool(getattr(args, "frontier_debug_dump", False)):
                     assert frontier_free.shape == observed.shape == occupancy.shape == distance_traversible.shape
                     assert int(np.count_nonzero(frontier_layers["frontier"] & ~frontier_free)) == 0
-                last_frontier_raw_cells = int(np.count_nonzero(frontier_layers["frontier"]))
-                frontiers = extract_frontiers(
-                    free=frontier_free,
-                    observed=observed,
-                    traversible=distance_traversible,
-                    map_info=dynamic_map_info,
-                    agent_grid=current_grid,
-                    min_cluster_size=int(args.frontier_min_cluster_size),
-                    min_distance_m=float(args.frontier_min_distance_m),
-                    max_count=int(args.frontier_max_count),
-                    occupancy=occupancy,
-                    obstacle_dilation_radius_cells=int(args.frontier_obstacle_dilation_radius_cells),
-                    unknown_dilation_radius_cells=int(args.frontier_unknown_dilation_radius_cells),
-                    exclude_mask=static_only_nearfield,
-                    unknown_source=str(args.frontier_unknown_source),
-                    cluster_distance_mode=str(args.frontier_cluster_distance_mode),
-                    allow_near_frontier_fallback=bool(args.frontier_allow_near_fallback),
-                )
-                last_frontier_clusters = len(frontiers)
-                last_frontiers = list(frontiers)
-                nav_decision = decision_policy.choose_navigation_target(
-                    object_memory,
-                    episode["goal_category"],
-                    current_grid,
-                    frontiers,
-                    nav_planner,
-                    dynamic_map_info,
-                    pose,
-                    allow_frontier=True,
-                    current_step=step,
-                )
-                if frontier_commitment is not None and nav_decision.mode == "frontier":
+                frontiers = list(last_frontiers)
+                locked_goal_used = False
+                candidate_override = None
+                if paper_mode and long_term_goal.exists() and long_term_goal.mode == "frontier":
+                    candidate_override = decision_policy.choose_navigation_target(
+                        object_memory,
+                        episode["goal_category"],
+                        current_grid,
+                        [],
+                        nav_planner,
+                        dynamic_map_info,
+                        pose,
+                        allow_frontier=False,
+                        current_step=step,
+                    )
+                    if candidate_override.mode not in {"candidate", "reperception", "stop"}:
+                        candidate_override = None
+                if paper_mode and long_term_goal.exists() and candidate_override is None:
+                    nav_decision = long_term_goal.to_navigation_decision()
+                    locked_goal_used = True
+                    if nav_decision.mode == "frontier":
+                        last_frontier_commitment_reason = "continue_committed_frontier"
+                        last_frontier_commitment_metadata = {
+                            **dict(last_frontier_commitment_metadata),
+                            "frontier_commitment_reason": "continue_committed_frontier",
+                            "long_term_goal_locked": True,
+                            "long_term_goal_selected_step": int(long_term_goal.selected_step),
+                        }
+                else:
+                    if candidate_override is not None:
+                        long_term_goal.clear("candidate_override")
+                    last_frontier_raw_cells = int(np.count_nonzero(frontier_layers["frontier"]))
+                    frontiers = extract_frontiers(
+                        free=frontier_free,
+                        observed=observed,
+                        traversible=distance_traversible,
+                        map_info=dynamic_map_info,
+                        agent_grid=current_grid,
+                        min_cluster_size=int(args.frontier_min_cluster_size),
+                        min_distance_m=float(args.frontier_min_distance_m),
+                        max_count=int(args.frontier_max_count),
+                        occupancy=occupancy,
+                        obstacle_dilation_radius_cells=int(args.frontier_obstacle_dilation_radius_cells),
+                        unknown_dilation_radius_cells=int(args.frontier_unknown_dilation_radius_cells),
+                        exclude_mask=static_only_nearfield,
+                        unknown_source=str(args.frontier_unknown_source),
+                        cluster_distance_mode=str(args.frontier_cluster_distance_mode),
+                        allow_near_frontier_fallback=bool(args.frontier_allow_near_fallback),
+                    )
+                    last_frontier_clusters = len(frontiers)
+                    last_frontiers = list(frontiers)
+                    nav_decision = candidate_override or decision_policy.choose_navigation_target(
+                        object_memory,
+                        episode["goal_category"],
+                        current_grid,
+                        frontiers,
+                        nav_planner,
+                        dynamic_map_info,
+                        pose,
+                        allow_frontier=True,
+                        current_step=step,
+                    )
+                if frontier_commitment is not None and nav_decision.mode == "frontier" and not locked_goal_used:
                     frontier_decision = nav_decision.frontier_decision
                     proposed_frontier = frontier_decision.selected_frontier if frontier_decision is not None else None
                     proposed_score = 0.0
@@ -1055,8 +1207,11 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
                         **dict(nav_decision.metadata or {}),
                         "frontier_commitment": last_frontier_commitment_metadata,
                     }
+                if paper_mode and not locked_goal_used and nav_decision.mode in {"frontier", "candidate"} and nav_decision.target_cells:
+                    long_term_goal.set_from(nav_decision, step)
                 last_nav_decision = nav_decision
-                evaluator.num_frontier_decisions += 1
+                if not locked_goal_used:
+                    evaluator.num_frontier_decisions += 1
                 last_decision_mode = nav_decision.mode
                 last_decision_reason = nav_decision.reason
                 if bool(getattr(args, "debug_graph_dump", False)):
@@ -1093,11 +1248,15 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
                         agent_grid=current_grid,
                         clusters=frontiers,
                         selected_frontier=selected_frontier_cell,
-                        candidate_centers=[
-                            node.center_grid
-                            for node in object_memory.nodes
-                            if category_matches_goal(node.category)
-                        ],
+                        candidate_centers=candidate_center_payload(
+                            object_memory,
+                            episode["goal_category"],
+                            selected_candidate_id=(
+                                int(nav_decision.selected_candidate.node_id)
+                                if nav_decision.selected_candidate is not None
+                                else None
+                            ),
+                        ),
                         candidate_target_cells=nav_decision.target_cells if nav_decision.mode == "candidate" else [],
                         selected_candidate=(
                             nav_decision.selected_candidate.center_grid
@@ -1229,6 +1388,8 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
                     break
                 result = nav_planner.plan(current_grid, nav_goals)
                 if not result.path:
+                    if paper_mode:
+                        long_term_goal.invalidate("astar_no_path")
                     if frontier_commitment is not None and nav_decision.mode == "frontier":
                         frontier_commitment.invalidate_active(step, "astar_no_path", blacklist=True)
                         current_path = []
@@ -1317,6 +1478,8 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
                         )
                     break
                 if last_decision_mode in {"candidate", "frontier"}:
+                    if paper_mode:
+                        long_term_goal.clear("reached")
                     current_path = []
                     force_perception_step = True
                     full_path.append(tuple(int(v) for v in current_grid))
@@ -1446,6 +1609,8 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
             for node in object_memory.nodes
             if category_matches_goal(node.category)
         ]
+        row["candidate_pair_distances_m"] = goal_candidate_pair_distances(object_memory, episode["goal_category"])
+        row["candidate_duplicate_warning"] = any(float(pair["dist"]) < 0.75 for pair in row["candidate_pair_distances_m"])
         row["panorama_frames"] = int(panorama_frames)
         row["graph_object_nodes"] = int(len(getattr(scenegraph, "runtime_nodes", {})))
         row["graph_group_nodes"] = int(len(getattr(scenegraph, "runtime_groups", [])))
@@ -1453,6 +1618,14 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
         row["graph_edges"] = int(len(getattr(scenegraph, "runtime_edges", [])))
         paper_graph = getattr(scenegraph, "paper_graph", None)
         row["sgnav_mode"] = str(getattr(args, "sgnav_mode", "legacy"))
+        row["long_term_goal"] = {
+            "mode": str(long_term_goal.mode),
+            "target_cells_count": int(len(long_term_goal.target_cells)),
+            "center_grid": list(long_term_goal.center_grid) if long_term_goal.center_grid is not None else None,
+            "selected_step": int(long_term_goal.selected_step),
+            "invalid_reason": str(long_term_goal.invalid_reason),
+            "reached": bool(long_term_goal.reached),
+        }
         row["paper_num_object_nodes"] = int(len(getattr(paper_graph, "object_nodes", {}) or {}))
         row["paper_num_room_nodes"] = int(len(getattr(paper_graph, "room_nodes", {}) or {}))
         row["paper_num_group_nodes"] = int(len(getattr(paper_graph, "group_nodes", {}) or {}))
@@ -1519,6 +1692,7 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
             debug_map = args.debug_map or str(Path(args.output).with_suffix(".png"))
             start = world_xy_to_grid(float(start_pose[0]), float(start_pose[1]), dynamic_map_info)
             save_map_png(debug_map, last_dynamic_occupancy, last_dynamic_navigable, start=start, goals=goal_cells, path_cells=full_path)
+        row = make_jsonable(row)
         JsonlEpisodeLogger(args.output).log(row)
         print(json.dumps(row, ensure_ascii=False), flush=True)
         args._row_already_logged = True
@@ -2051,6 +2225,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     else:
         row = run_episode_map_sim(episode, args)
     if not getattr(args, "_row_already_logged", False):
+        row = make_jsonable(row)
         logger = JsonlEpisodeLogger(args.output)
         logger.log(row)
         print(json.dumps(row, ensure_ascii=False), flush=True)

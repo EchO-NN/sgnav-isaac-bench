@@ -184,10 +184,17 @@ def _fallback_relation(src: ObjectNode, dst: ObjectNode) -> str:
 def _ensure_json_list(value: object) -> List[object]:
     if isinstance(value, list):
         return value
+    if isinstance(value, dict):
+        for key in ("edges", "relationships", "relations", "items"):
+            items = value.get(key)
+            if isinstance(items, list):
+                return items
     if isinstance(value, str):
         parsed = json.loads(value)
         if isinstance(parsed, list):
             return parsed
+        if isinstance(parsed, dict):
+            return _ensure_json_list(parsed)
     raise ValueError("LLM response must be a JSON list")
 
 

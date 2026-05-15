@@ -25,7 +25,7 @@ def save_frontier_debug_snapshot(
     agent_grid: GridCell,
     clusters: Iterable[FrontierCluster],
     selected_frontier: Optional[GridCell] = None,
-    candidate_centers: Optional[Iterable[GridCell]] = None,
+    candidate_centers: Optional[Iterable[GridCell | dict]] = None,
     candidate_target_cells: Optional[Iterable[GridCell]] = None,
     selected_candidate: Optional[GridCell] = None,
     decision_mode: str = "",
@@ -36,6 +36,8 @@ def save_frontier_debug_snapshot(
     clusters_list = list(clusters)
     selected = np.asarray(selected_frontier if selected_frontier is not None else (-1, -1), dtype=np.int32)
     candidate_centers_list = list(candidate_centers or [])
+    candidate_center_cells = [_candidate_cell(item) for item in candidate_centers_list]
+    candidate_center_status = [_candidate_status(item) for item in candidate_centers_list]
     candidate_targets_list = list(candidate_target_cells or [])
     selected_candidate_arr = np.asarray(selected_candidate if selected_candidate is not None else (-1, -1), dtype=np.int32)
     npz_path = out_path / f"frontier_step_{int(step):06d}.npz"
@@ -56,7 +58,8 @@ def save_frontier_debug_snapshot(
         cluster_mean_dists=np.asarray([c.mean_path_distance for c in clusters_list], dtype=np.float32),
         cluster_center_dists=np.asarray([c.center_path_distance for c in clusters_list], dtype=np.float32),
         selected_frontier=selected,
-        candidate_centers=np.asarray(candidate_centers_list, dtype=np.int32),
+        candidate_centers=np.asarray(candidate_center_cells, dtype=np.int32),
+        candidate_center_status=np.asarray(candidate_center_status),
         candidate_target_cells=np.asarray(candidate_targets_list, dtype=np.int32),
         selected_candidate=selected_candidate_arr,
         decision_mode=np.asarray(str(decision_mode)),
@@ -91,7 +94,7 @@ def _save_frontier_debug_png(
     agent_grid: GridCell,
     clusters: list[FrontierCluster],
     selected_frontier: Optional[GridCell],
-    candidate_centers: list[GridCell],
+    candidate_centers: list[GridCell | dict],
     candidate_target_cells: list[GridCell],
     selected_candidate: Optional[GridCell],
 ) -> Optional[Path]:
@@ -138,9 +141,30 @@ def _save_frontier_debug_png(
         box(selected_frontier, (255, 60, 60), radius=4)
     for cell in candidate_target_cells[:64]:
         box(cell, (220, 70, 255), radius=1)
-    for cell in candidate_centers[:64]:
-        box(cell, (255, 80, 80), radius=3)
+    for item in candidate_centers[:64]:
+        cell = _candidate_cell(item)
+        status = _candidate_status(item)
+        color = {
+            "candidate": (255, 150, 40),
+            "selected": (255, 50, 50),
+            "accepted": (40, 220, 90),
+            "rejected": (135, 135, 135),
+        }.get(status, (255, 150, 40))
+        box(cell, color, radius=4 if status == "selected" else 3)
     if selected_candidate is not None:
         box(selected_candidate, (255, 30, 30), radius=5)
     image.save(path)
     return path
+
+
+def _candidate_cell(item) -> GridCell:
+    if isinstance(item, dict):
+        cell = item.get("center_grid", (-1, -1))
+        return (int(cell[0]), int(cell[1]))
+    return (int(item[0]), int(item[1]))
+
+
+def _candidate_status(item) -> str:
+    if isinstance(item, dict):
+        return str(item.get("status", "candidate"))
+    return "candidate"

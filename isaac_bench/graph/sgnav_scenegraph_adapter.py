@@ -20,7 +20,7 @@ from isaac_bench.config import load_yaml, repo_root
 from isaac_bench.dataset.category_normalizer import normalize_category
 from isaac_bench.graph.edge_builder import apply_edge_proposals, propose_object_edges_with_llm
 from isaac_bench.graph.frontier_interpolation import frontier_debug_payload, score_frontiers_by_subgraphs
-from isaac_bench.graph.hcot_scorer import HCoTSubgraphScorer
+from isaac_bench.graph.hcot_scorer import HCoTSubgraphScorer, OpenAICompatibleJSONClient
 from isaac_bench.graph.paper_scene_graph import PaperSceneGraph
 from isaac_bench.graph.subgraph_builder import build_object_centered_subgraphs
 from isaac_bench.mapping.coordinate_transform import grid_to_world_xy
@@ -335,9 +335,11 @@ class SGNavSceneGraphAdapter:
         self.latest_rgb_image: Optional[np.ndarray] = None
         self.latest_map_info = None
         self.graph_version = 0
-        self.vllm_scorer = VLLMFrontierScorer(vllm_config)
+        paper_llm_config = dict(vllm_config or {})
+        self.paper_llm_client = OpenAICompatibleJSONClient(paper_llm_config) if self.sgnav_mode == "paper" and bool(paper_llm_config.get("enabled", False)) else None
+        self.vllm_scorer = VLLMFrontierScorer({**paper_llm_config, "enabled": False} if self.sgnav_mode == "paper" else vllm_config)
         self.paper_graph = PaperSceneGraph(related_category_pairs=self.related_category_pairs)
-        self.hcot_scorer = HCoTSubgraphScorer(llm_client=None)
+        self.hcot_scorer = HCoTSubgraphScorer(llm_client=self.paper_llm_client)
         if self.use_original:
             self._try_init_original()
 
@@ -549,8 +551,13 @@ class SGNavSceneGraphAdapter:
 
     def _update_paper_graph_from_memory(self, object_memory: ObjectMemory) -> None:
         self.paper_graph.update_from_object_memory(object_memory)
+        new_ids = set(getattr(self.paper_graph, "new_object_ids", []) or [])
+        if not new_ids:
+            self.paper_graph.update_group_nodes()
+            return
         all_objects = list(self.paper_graph.object_nodes.values())
-        proposals = propose_object_edges_with_llm(all_objects, all_objects, llm_client=None)
+        new_objects = [node for node in all_objects if node.id in new_ids]
+        proposals = propose_object_edges_with_llm(new_objects, all_objects, llm_client=self.paper_llm_client)
         apply_edge_proposals(self.paper_graph, proposals)
         self.paper_graph.update_group_nodes()
 

@@ -177,6 +177,36 @@ class ObjectMemory:
             self._merge_node_into(match, node, map_info=map_info)
         self.nodes = merged
 
+    def dedupe_goal_candidates(
+        self,
+        goal_category: str,
+        merge_radius_m: float,
+        map_info: Optional[MapInfo] = None,
+    ) -> None:
+        goal_key = self._category_key(goal_category)
+        old_radius = float(self.merge_radius_m)
+        self.merge_radius_m = max(old_radius, float(merge_radius_m))
+        goal_nodes = [node for node in self.nodes if self._category_key(node.category) == goal_key]
+        other_nodes = [node for node in self.nodes if self._category_key(node.category) != goal_key]
+        if len(goal_nodes) < 2:
+            self.merge_radius_m = old_radius
+            return
+        merged_goals: List[ObjectNode] = []
+        for node in sorted(goal_nodes, key=lambda item: int(item.node_id)):
+            match = None
+            best_dist = float("inf")
+            for existing in merged_goals:
+                dist = self._xy_distance(existing.center_world, node.center_world)
+                if dist < self.merge_radius_m and dist < best_dist:
+                    match = existing
+                    best_dist = dist
+            if match is None:
+                merged_goals.append(node)
+            else:
+                self._merge_node_into(match, node, map_info=map_info)
+        self.nodes = sorted(other_nodes + merged_goals, key=lambda item: int(item.node_id))
+        self.merge_radius_m = old_radius
+
     def _merge_node_into(self, target: ObjectNode, duplicate: ObjectNode, map_info: Optional[MapInfo] = None) -> None:
         target_count = max(1, int(target.observed_count))
         dup_count = max(1, int(duplicate.observed_count))

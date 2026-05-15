@@ -414,7 +414,7 @@ class SGNavPopupVisualizer:
         selected_id = self._selected_candidate_id(nav_decision)
         for node in self._visible_map_nodes(object_memory, goal_category, nav_decision)[:300]:
             radius = 8 if selected_id is not None and int(node.node_id) == selected_id else 5
-            self._dot(draw, xy(node.center_grid), (255, 60, 60), radius=radius)
+            self._dot(draw, xy(node.center_grid), self._candidate_node_color(node, selected_id, nav_decision), radius=radius)
 
         self._draw_agent(draw, xy(current_grid), float(pose[3]) if len(pose) > 3 else 0.0, scale)
         zoom = max(1.0, min(w / max(crop_w, 1), h / max(crop_h, 1)))
@@ -680,7 +680,9 @@ class SGNavPopupVisualizer:
             ((245, 245, 245), "A*"),
             ((0, 225, 255), "frontier center"),
             ((255, 225, 40), "chosen frontier"),
-            ((255, 60, 60), "goal cand"),
+            ((255, 150, 40), "goal cand"),
+            ((255, 50, 50), "selected cand"),
+            ((40, 220, 90), "accepted goal"),
             ((220, 70, 255), "standoff"),
             ((255, 150, 40), "planner target"),
         ]
@@ -728,6 +730,22 @@ class SGNavPopupVisualizer:
         if nav_decision is None or nav_decision.selected_candidate is None:
             return None
         return int(nav_decision.selected_candidate.node_id)
+
+    @classmethod
+    def _candidate_node_color(
+        cls,
+        node,
+        selected_id: Optional[int],
+        nav_decision: Optional[NavigationDecision],
+    ) -> Tuple[int, int, int]:
+        if selected_id is None or int(node.node_id) != int(selected_id):
+            return (255, 150, 40)
+        meta = dict(getattr(nav_decision, "metadata", {}) or {}) if nav_decision is not None else {}
+        if bool(meta.get("candidate_rejected", False)):
+            return (135, 135, 135)
+        if bool(meta.get("candidate_accepted", False)) or (nav_decision is not None and nav_decision.mode == "stop"):
+            return (40, 220, 90)
+        return (255, 50, 50)
 
     @staticmethod
     def _category_matches_goal(category: str, goal_category: str) -> bool:

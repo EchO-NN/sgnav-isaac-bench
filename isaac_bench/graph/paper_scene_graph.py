@@ -60,6 +60,9 @@ class ObjectNode:
     observed_count: int
     last_seen_step: int
     room_id: Optional[str] = None
+    center_grid: Optional[Tuple[int, int]] = None
+    is_new_node: bool = False
+    is_goal_node: bool = False
 
 
 @dataclass
@@ -110,6 +113,7 @@ class PaperSceneGraph:
         self.group_nodes: Dict[str, GroupNode] = {}
         self.object_edges: List[ObjectEdge] = []
         self.affiliation_edges: List[AffiliationEdge] = []
+        self.new_object_ids: List[str] = []
         self.version = 0
 
     def reset(self) -> None:
@@ -118,17 +122,20 @@ class PaperSceneGraph:
         self.group_nodes = {}
         self.object_edges = []
         self.affiliation_edges = []
+        self.new_object_ids = []
         self.version = 0
 
     def update_object_and_room_nodes(self, fused_instances: Sequence[FusedInstance]) -> List[ObjectNode]:
         new_objects: List[ObjectNode] = []
+        self.new_object_ids = []
         for instance in fused_instances:
             if instance.node_type == "room":
                 self._upsert_room(instance)
             else:
                 node = self._upsert_object(instance)
-                if int(node.observed_count) <= int(instance.observed_count):
+                if node.is_new_node:
                     new_objects.append(node)
+                    self.new_object_ids.append(node.id)
         if not self.room_nodes:
             self._ensure_unknown_room()
         self.update_affiliation_edges()
@@ -136,8 +143,11 @@ class PaperSceneGraph:
         return new_objects
 
     def update_from_object_memory(self, object_memory: ObjectMemory) -> None:
+        previous_ids = set(self.object_nodes)
+        self.new_object_ids = []
         for mem_node in object_memory.nodes:
             node_id = "object:%s" % int(mem_node.node_id)
+            is_new = node_id not in previous_ids
             points = _points_or_center(mem_node.point_cloud_world, mem_node.center_world)
             bbox = _bbox_or_points(mem_node.bbox_world, points)
             self.object_nodes[node_id] = ObjectNode(
@@ -149,7 +159,11 @@ class PaperSceneGraph:
                 center_world=np.asarray(mem_node.center_world, dtype=np.float32),
                 observed_count=int(mem_node.observed_count),
                 last_seen_step=int(mem_node.last_seen_step),
+                center_grid=tuple(int(v) for v in mem_node.center_grid),
+                is_new_node=is_new,
             )
+            if is_new:
+                self.new_object_ids.append(node_id)
         if not self.room_nodes:
             self._ensure_unknown_room()
         self.update_affiliation_edges()
@@ -173,47 +187,26 @@ class PaperSceneGraph:
                 group.room_id = next(iter(room_ids))
                 self.affiliation_edges.append(AffiliationEdge(src_id=group.id, dst_id=group.room_id, relation="belongs_to"))
 
-    def update_group_nodes(self) -> None:
-        adjacency: Dict[str, set] = {obj_id: set() for obj_id in self.object_nodes}
-        for edge in self.object_edges:
-            src = self.object_nodes.get(edge.src_id)
-            dst = self.object_nodes.get(edge.dst_id)
-            if src is None or dst is None:
-                continue
-            pair = tuple(sorted((normalize_category(src.category), normalize_category(dst.category))))
-            if pair not in self.related_category_pairs:
-                continue
-            adjacency[edge.src_id].add(edge.dst_id)
-            adjacency[edge.dst_id].add(edge.src_id)
+    def update_group_nodes(self, eps_m: float = 0.5) -> None:
         self.group_nodes = {}
-        visited = set()
-        for obj_id in sorted(adjacency):
-            if obj_id in visited or not adjacency[obj_id]:
-                continue
-            stack = [obj_id]
-            visited.add(obj_id)
-            members: List[str] = []
-            while stack:
-                cur = stack.pop()
-                members.append(cur)
-                for nxt in adjacency[cur]:
-                    if nxt not in visited:
-                        visited.add(nxt)
-                        stack.append(nxt)
-            if len(members) < 2:
-                continue
-            centers = [self.object_nodes[mid].center_world for mid in members]
-            categories = sorted({self.object_nodes[mid].category for mid in members})
-            rooms = {self.object_nodes[mid].room_id for mid in members}
-            rooms.discard(None)
-            group_id = "group:%s" % "-".join(mid.split(":", 1)[-1] for mid in sorted(members))
-            self.group_nodes[group_id] = GroupNode(
-                id=group_id,
-                category_summary=", ".join(categories),
-                object_ids=sorted(members),
-                center_world=np.mean(np.asarray(centers, dtype=np.float32), axis=0),
-                room_id=next(iter(rooms)) if len(rooms) == 1 else None,
-            )
+        objects_by_room: Dict[str, List[str]] = {}
+        for obj_id, obj in self.object_nodes.items():
+            room_id = obj.room_id or "room:unknown_room"
+            objects_by_room.setdefault(room_id, []).append(obj_id)
+        for room_id, object_ids in objects_by_room.items():
+            for members in _cluster_object_ids_by_distance(self.object_nodes, object_ids, eps_m=float(eps_m)):
+                if not members:
+                    continue
+                centers = [self.object_nodes[mid].center_world for mid in members]
+                member_key = "-".join(mid.split(":", 1)[-1] for mid in sorted(members))
+                group_id = "group:%s:%s" % (room_id.split(":", 1)[-1], member_key)
+                self.group_nodes[group_id] = GroupNode(
+                    id=group_id,
+                    category_summary=_group_summary(self.object_nodes, self.object_edges, members),
+                    object_ids=sorted(members),
+                    center_world=np.mean(np.asarray(centers, dtype=np.float32), axis=0),
+                    room_id=room_id,
+                )
         self.update_affiliation_edges()
         self.version += 1
 
@@ -232,6 +225,7 @@ class PaperSceneGraph:
             center_world=np.asarray(instance.center_world, dtype=np.float32).copy(),
             observed_count=int(instance.observed_count),
             last_seen_step=int(instance.last_seen_step),
+            is_new_node=node_id not in self.object_nodes,
         )
         self.object_nodes[node_id] = node
         return node
@@ -289,6 +283,49 @@ def _bbox_or_points(bbox: Optional[np.ndarray], points: np.ndarray) -> np.ndarra
 def _bbox_from_points(points: np.ndarray) -> np.ndarray:
     arr = np.asarray(points, dtype=np.float32)
     return np.stack([np.min(arr, axis=0), np.max(arr, axis=0)], axis=0)
+
+
+def _cluster_object_ids_by_distance(
+    object_nodes: Dict[str, ObjectNode],
+    object_ids: Sequence[str],
+    eps_m: float,
+) -> List[List[str]]:
+    ids = sorted(object_ids)
+    visited = set()
+    clusters: List[List[str]] = []
+    for obj_id in ids:
+        if obj_id in visited:
+            continue
+        visited.add(obj_id)
+        stack = [obj_id]
+        cluster = []
+        while stack:
+            cur = stack.pop()
+            cluster.append(cur)
+            cur_center = np.asarray(object_nodes[cur].center_world[:2], dtype=np.float32)
+            for other_id in ids:
+                if other_id in visited:
+                    continue
+                other_center = np.asarray(object_nodes[other_id].center_world[:2], dtype=np.float32)
+                if float(np.linalg.norm(cur_center - other_center)) <= float(eps_m):
+                    visited.add(other_id)
+                    stack.append(other_id)
+        clusters.append(sorted(cluster))
+    return clusters
+
+
+def _group_summary(object_nodes: Dict[str, ObjectNode], object_edges: Sequence[ObjectEdge], members: Sequence[str]) -> str:
+    member_set = set(members)
+    categories = sorted({object_nodes[obj_id].category for obj_id in members if obj_id in object_nodes})
+    relations = []
+    for edge in object_edges:
+        if edge.src_id in member_set and edge.dst_id in member_set:
+            src = object_nodes[edge.src_id].category
+            dst = object_nodes[edge.dst_id].category
+            relations.append("%s %s %s" % (src, edge.relation, dst))
+    if relations:
+        return "; ".join(relations[:4])
+    return ", ".join(categories)
 
 
 def _object_inside_room(obj: ObjectNode, room_bbox: np.ndarray) -> bool:

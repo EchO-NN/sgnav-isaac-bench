@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import json
 import re
+from urllib import request as urllib_request
 from dataclasses import dataclass
-from typing import Dict, List, Optional
+from typing import Dict, List, Mapping, Optional
 
 import numpy as np
 
@@ -66,6 +67,46 @@ class HCoTSubgraphScorer:
             raw_llm_response={"fallback": True},
             central_world=np.asarray(subgraph.central_world, dtype=np.float32).copy(),
         )
+
+
+class OpenAICompatibleJSONClient:
+    def __init__(self, config: Optional[Mapping[str, object]] = None):
+        cfg = dict(config or {})
+        self.enabled = bool(cfg.get("enabled", False))
+        self.base_url = str(cfg.get("base_url") or "http://127.0.0.1:8000/v1").rstrip("/")
+        self.model = str(cfg.get("model") or "qwen3-vl-8b-instruct")
+        self.api_key = str(cfg.get("api_key") or "EMPTY")
+        self.timeout_s = float(cfg.get("timeout_s", 8.0))
+        self.temperature = float(cfg.get("temperature", 0.0))
+        self.request_count = 0
+
+    def complete_json(self, prompt: str) -> object:
+        if not self.enabled:
+            raise RuntimeError("OpenAI-compatible JSON client is disabled")
+        payload = {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": "Return strict JSON only."},
+                {"role": "user", "content": prompt},
+            ],
+            "temperature": self.temperature,
+            "max_tokens": 768,
+        }
+        data = json.dumps(payload).encode("utf-8")
+        req = urllib_request.Request(
+            self.base_url + "/chat/completions",
+            data=data,
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": "Bearer %s" % self.api_key,
+            },
+            method="POST",
+        )
+        self.request_count += 1
+        with urllib_request.urlopen(req, timeout=self.timeout_s) as response:
+            body = json.loads(response.read().decode("utf-8"))
+        content = body["choices"][0]["message"].get("content", "")
+        return _parse_json_value(str(content))
 
 
 def score_subgraph_with_hcot(
@@ -160,3 +201,18 @@ def _parse_json_object(value: object) -> dict:
         if isinstance(parsed, dict):
             return parsed
     raise ValueError("response must be a JSON object")
+
+
+def _parse_json_value(value: object) -> object:
+    if isinstance(value, (dict, list)):
+        return value
+    if isinstance(value, str):
+        text = value.strip()
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            match = re.search(r"(\{.*\}|\[.*\])", text, flags=re.DOTALL)
+            if match is None:
+                raise
+            return json.loads(match.group(0))
+    raise ValueError("response must be JSON")

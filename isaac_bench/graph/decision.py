@@ -6,7 +6,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import numpy as np
 
 from isaac_bench.dataset.category_normalizer import normalize_category
-from isaac_bench.graph.reperception import compute_goal_candidate_credibility
+from isaac_bench.graph.reperception import GraphReperceptionManager, compute_goal_candidate_credibility
 from isaac_bench.graph.sgnav_scenegraph_adapter import SGNavSceneGraphAdapter
 from isaac_bench.graph.subgraph_builder import build_object_centered_subgraphs
 from isaac_bench.mapping.coordinate_transform import MapInfo, grid_to_world_xy
@@ -48,6 +48,7 @@ class CandidateTrack:
     rejected: bool = False
     last_counted_observed_count: int = 0
     last_seen_step: int = -1
+    reperception_debug: Dict[str, object] = field(default_factory=dict)
 
 
 def normalize_scores(values: Sequence[float], mode: str = "minmax") -> np.ndarray:
@@ -129,6 +130,7 @@ class SGNavDecision:
         self.stop_verification_steps_taken = 0
         self.active_candidate_track: Optional[CandidateTrack] = None
         self.rejected_candidates: Dict[int, int] = {}
+        self.graph_reperception = GraphReperceptionManager(n_max=self.reperception_max_steps, s_thres=self.candidate_accept_threshold)
         self.last_reason = ""
 
     def choose_frontier(self, frontier_clusters: List[FrontierCluster]) -> DecisionResult:
@@ -565,14 +567,41 @@ class SGNavDecision:
         delta = max(0, observed_count - int(track.last_counted_observed_count))
         last_seen_step = int(getattr(candidate, "last_seen_step", current_step if current_step is not None else -1))
         if delta > 0:
-            score = self._candidate_observation_score(candidate, current_pose)
-            track.score_sum += float(score) * float(delta)
-            track.observation_count += int(delta)
+            if str(getattr(self.scenegraph, "sgnav_mode", "")).strip().lower() == "paper":
+                paper_result = self._update_graph_reperception(candidate)
+                if paper_result is not None:
+                    track.score_sum = float(paper_result["accumulated_credibility"])
+                    track.observation_count = int(paper_result["num_reperception_steps"])
+                    track.reperception_debug = dict(paper_result)
+                else:
+                    score = self._candidate_observation_score(candidate, current_pose)
+                    track.score_sum += float(score) * float(delta)
+                    track.observation_count += int(delta)
+            else:
+                score = self._candidate_observation_score(candidate, current_pose)
+                track.score_sum += float(score) * float(delta)
+                track.observation_count += int(delta)
             track.last_counted_observed_count = observed_count
             track.last_seen_step = last_seen_step
         if track.observation_count <= 0:
             return 0.0
+        if str(getattr(self.scenegraph, "sgnav_mode", "")).strip().lower() == "paper":
+            return float(track.score_sum)
         return float(track.score_sum / max(1, track.observation_count))
+
+    def _update_graph_reperception(self, candidate: ObjectNode) -> Optional[Dict[str, object]]:
+        paper_graph = getattr(self.scenegraph, "paper_graph", None)
+        paper_candidate = None if paper_graph is None else paper_graph.object_nodes.get("object:%s" % int(candidate.node_id))
+        if paper_candidate is None:
+            return None
+        subgraphs = build_object_centered_subgraphs(paper_graph)
+        subgraph_scores = self.scenegraph.hcot_scorer.score(
+            subgraphs,
+            getattr(self.scenegraph, "obj_goal_sg", normalize_category(candidate.category)),
+            graph_version=getattr(paper_graph, "version", 0),
+        )
+        result = self.graph_reperception.update(paper_candidate, float(candidate.confidence), subgraph_scores)
+        return result.to_dict()
 
     def _candidate_metadata(
         self,
@@ -591,6 +620,7 @@ class SGNavDecision:
             "candidate_accepted": bool(track.accepted),
             "candidate_distance_m": float(distance_to_candidate),
             "selected_candidate_id": int(candidate.node_id),
+            "reperception": dict(track.reperception_debug),
         }
 
     def _is_candidate_rejected(self, candidate: ObjectNode, current_step: Optional[int]) -> bool:
