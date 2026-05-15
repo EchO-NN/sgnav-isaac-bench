@@ -4,6 +4,7 @@ import argparse
 import json
 import math
 import sys
+import time
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -816,6 +817,28 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
     detector_cuda_rgb = detector_can_use_cuda_rgb(detector, args.detector, camera_annotator_device)
     vllm_needs_cpu_rgb = bool(getattr(args, "vllm_frontier_scoring", False) and getattr(args, "vllm_image_scoring", True))
     logged_detector_rgb_device = False
+    latency_totals_ms = {
+        "perception": 0.0,
+        "mapping": 0.0,
+        "graph": 0.0,
+        "llm": 0.0,
+        "planning": 0.0,
+    }
+    latency_counts = {key: 0 for key in latency_totals_ms}
+
+    def record_latency(name: str, started_at: float) -> None:
+        latency_totals_ms[name] += max(0.0, (time.perf_counter() - started_at) * 1000.0)
+        latency_counts[name] += 1
+
+    def total_llm_requests() -> int:
+        vllm_scorer = getattr(scenegraph, "vllm_scorer", None)
+        paper_llm_client = getattr(scenegraph, "paper_llm_client", None)
+        hcot_scorer = getattr(scenegraph, "hcot_scorer", None)
+        return (
+            int(getattr(vllm_scorer, "request_count", 0))
+            + int(getattr(paper_llm_client, "request_count", 0))
+            + int(getattr(hcot_scorer, "llm_request_count", 0))
+        )
 
     def needs_viz_frame(step_idx: int) -> bool:
         return viz_requested and step_idx < max_steps and step_idx % viz_every == 0
@@ -904,6 +927,7 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
             pose_local = current_obs["pose_world"]
             if not current_obs.get("has_depth"):
                 return None
+            started_at = time.perf_counter()
             mapper.update(current_obs["depth"], intr, pose_local, current_obs["camera_pose_world"])
             mapper.last_debug_stats["depth_source"] = str(current_obs.get("depth_source", "unknown"))
             mapper.last_debug_stats["camera_frame_sync_updates"] = int(current_obs.get("camera_frame_sync_updates", 0) or 0)
@@ -997,6 +1021,7 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
             last_dynamic_free = free_local
             last_dynamic_navigable = navigable_local
             last_dynamic_observed = observed_local
+            record_latency("mapping", started_at)
             return {
                 "pose": pose_local,
                 "map_info": dynamic_map_info,
@@ -1019,6 +1044,7 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
             if detector is None:
                 last_detections_2d = []
                 return current_obs
+            started_at = time.perf_counter()
             obs_local = current_obs
             detector_rgb = obs_local["rgb"]
             used_cuda_rgb = False
@@ -1126,9 +1152,12 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
                     map_info=map_info_local,
                 )
             evaluator.num_yolo_calls += 1
+            record_latency("perception", started_at)
             return obs_local
 
         def update_scenegraph_frame(current_obs: dict, step_idx: int, map_state: dict) -> None:
+            started_at = time.perf_counter()
+            llm_requests_before = total_llm_requests()
             room_map = None if full_room_map is None else observed_room_map(full_room_map, map_state["observed"])
             rgb_for_graph = current_obs["rgb"] if current_obs.get("has_rgb") and current_obs.get("rgb_device") == "cpu" else None
             if rgb_for_graph is None and vllm_needs_cpu_rgb:
@@ -1149,6 +1178,9 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
                 step_id=step_idx,
             )
             evaluator.num_scenegraph_updates += 1
+            record_latency("graph", started_at)
+            if total_llm_requests() > llm_requests_before:
+                record_latency("llm", started_at)
 
         panorama_steps = max(0, int(getattr(args, "panorama_steps", 0)))
         if panorama_steps > 0:
@@ -1240,6 +1272,8 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
                     needs_replan = True
 
             if needs_replan:
+                planning_started_at = time.perf_counter()
+                llm_requests_before = total_llm_requests()
                 dynamic_traversible = mapper.traversible(unknown_is_obstacle=True).astype(bool)
                 frontier_free = free.astype(bool) & dynamic_traversible.astype(bool)
                 distance_traversible = dynamic_traversible & navigable.astype(bool)
@@ -1639,6 +1673,9 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
                     break
                 current_path = result.path
                 full_path.extend(result.path)
+                record_latency("planning", planning_started_at)
+                if total_llm_requests() > llm_requests_before:
+                    record_latency("llm", planning_started_at)
 
             if viz is not None and step % viz_every == 0:
                 viz.update(
@@ -1956,6 +1993,12 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
         row["max_vx_mps"] = float(args.max_vx_mps)
         row["max_vy_mps"] = float(args.max_vy_mps)
         row["max_wz_radps"] = float(args.max_wz_radps)
+        row["perception_latency_ms"] = float(latency_totals_ms["perception"])
+        row["mapping_latency_ms"] = float(latency_totals_ms["mapping"])
+        row["graph_latency_ms"] = float(latency_totals_ms["graph"])
+        row["llm_latency_ms"] = float(latency_totals_ms["llm"])
+        row["planning_latency_ms"] = float(latency_totals_ms["planning"])
+        row["latency_counts"] = {key: int(value) for key, value in latency_counts.items()}
         if args.save_debug_video or args.debug_map:
             debug_map = args.debug_map or str(Path(args.output).with_suffix(".png"))
             start = world_xy_to_grid(float(start_pose[0]), float(start_pose[1]), dynamic_map_info)
@@ -2002,7 +2045,9 @@ def run_episode_map_sim(episode: dict, args) -> dict:
     planner = GridAStarPlanner(navigable, map_info.resolution_m, allow_diagonal=True)
     start = (int(episode["start_grid"][0]), int(episode["start_grid"][1]))
     goals = [(int(r), int(c)) for r, c in episode["goal_regions_grid"]]
+    planning_started_at = time.perf_counter()
     result = planner.plan(start, goals)
+    planning_latency_ms = max(0.0, (time.perf_counter() - planning_started_at) * 1000.0)
     evaluator = EpisodeEvaluator(episode, planner)
     env = MapSimHabitatLikeEnv(args.episode_file, args.episode_index)
     env.reset()
@@ -2049,6 +2094,7 @@ def run_episode_map_sim(episode: dict, args) -> dict:
     row["goal_candidate_count"] = 0
     row["frontier_count"] = 0
     row["selected_frontier"] = None
+    row["planning_latency_ms"] = float(planning_latency_ms)
     row = complete_result_row(row, args)
     if args.save_debug_video or args.debug_map:
         debug_map = args.debug_map or str(Path(args.output).with_suffix(".png"))
