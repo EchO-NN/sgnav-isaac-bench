@@ -54,8 +54,10 @@ class EpisodeEvaluator:
             "initial_distance_to_goal": float(shortest),
             "shortest_path_distance": float(shortest),
             "path_length": path_length,
+            "steps": int(self.num_steps),
             "num_steps": int(self.num_steps),
             "elapsed_wall_time_s": float(time.time() - self.start_wall_time),
+            "collisions": int(self.num_collisions),
             "num_collisions": int(self.num_collisions),
             "num_yolo_calls": int(self.num_yolo_calls),
             "num_scenegraph_updates": int(self.num_scenegraph_updates),
@@ -64,4 +66,3 @@ class EpisodeEvaluator:
             "detector": detector,
             "failure_reason": failure_reason,
         }
-

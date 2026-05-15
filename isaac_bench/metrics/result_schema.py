@@ -1,0 +1,264 @@
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Iterable, Mapping, MutableMapping, Optional
+
+
+REQUIRED_RESULT_FIELDS = [
+    "metric_valid",
+    "strict_benchmark",
+    "fallbacks_used",
+    "detector_backend",
+    "segmenter_backend",
+    "llm_backend",
+    "sim_backend",
+    "map_source",
+    "policy_name",
+    "sgnav_decision_mode",
+    "sgnav_decision_reason",
+    "object_memory_count",
+    "goal_candidate_count",
+    "frontier_count",
+    "selected_frontier",
+    "stop_reason",
+    "success",
+    "spl",
+    "softspl",
+    "distance_to_goal",
+    "path_length",
+    "steps",
+    "collisions",
+    "stuck_events",
+    "timeout",
+    "perception_latency_ms",
+    "mapping_latency_ms",
+    "graph_latency_ms",
+    "llm_latency_ms",
+    "planning_latency_ms",
+]
+
+
+SGNAV_STEP_DUMP_KEYS = [
+    "objects",
+    "groups",
+    "rooms",
+    "edges",
+    "subgraphs",
+    "subgraph_texts_or_payloads",
+    "llm_scores",
+    "subgraph_probabilities",
+    "frontier_scores",
+    "selected_frontier",
+    "candidate_goals",
+    "reperception_state",
+    "stop_state",
+]
+
+
+class BenchmarkAssetError(RuntimeError):
+    """Raised when a strict benchmark run is missing a required asset."""
+
+
+def complete_result_row(row: Mapping[str, object], args: object | None = None) -> dict:
+    out = dict(row)
+    strict_benchmark = bool(_get_arg(args, "strict_benchmark", out.get("strict_benchmark", False)))
+    ablation_name = _get_arg(args, "ablation_name", out.get("ablation_name"))
+    detector_backend = str(_get_arg(args, "detector", out.get("detector_backend", out.get("detector", "none"))))
+    segmenter_backend = str(_get_arg(args, "segmenter", out.get("segmenter_backend", out.get("segmenter", "none"))))
+    sim_backend = str(_get_arg(args, "sim_backend", out.get("sim_backend", "map")))
+    llm_backend = _infer_llm_backend(out, args)
+    map_source = _infer_map_source(out, sim_backend)
+    policy_name = _infer_policy_name(out, args, sim_backend)
+
+    out["strict_benchmark"] = strict_benchmark
+    out["ablation_name"] = ablation_name
+    out["detector_backend"] = detector_backend
+    out["segmenter_backend"] = segmenter_backend
+    out["llm_backend"] = llm_backend
+    out["sim_backend"] = sim_backend
+    out["map_source"] = map_source
+    out["policy_name"] = policy_name
+    out["steps"] = int(out.get("steps", out.get("num_steps", 0)) or 0)
+    out["collisions"] = int(out.get("collisions", out.get("num_collisions", 0)) or 0)
+    out["stuck_events"] = int(out.get("stuck_events", out.get("num_stuck_events", 0)) or 0)
+    out["timeout"] = bool(
+        out.get("timeout", False)
+        or out.get("failure_reason") == "max_control_steps"
+        or out.get("terminal_reason") == "timeout"
+    )
+    out["object_memory_count"] = int(out.get("object_memory_count", 0) or 0)
+    out["goal_candidate_count"] = int(
+        out.get("goal_candidate_count", len(out.get("object_memory_goal_candidates", []) or [])) or 0
+    )
+    out["frontier_count"] = int(out.get("frontier_count", out.get("frontier_clusters", 0)) or 0)
+    out["selected_frontier"] = out.get("selected_frontier", out.get("frontier_center_grid"))
+    out["stop_reason"] = _infer_stop_reason(out)
+
+    for key in (
+        "sgnav_decision_mode",
+        "sgnav_decision_reason",
+        "success",
+        "spl",
+        "softspl",
+        "distance_to_goal",
+        "path_length",
+    ):
+        out.setdefault(key, None)
+    for key in (
+        "perception_latency_ms",
+        "mapping_latency_ms",
+        "graph_latency_ms",
+        "llm_latency_ms",
+        "planning_latency_ms",
+    ):
+        out[key] = float(out.get(key, 0.0) or 0.0)
+
+    fallbacks = _stable_unique([*list(out.get("fallbacks_used", []) or []), *_infer_fallbacks(out, args)])
+    out["fallbacks_used"] = fallbacks
+    explicit_invalid = out.get("metric_valid") is False
+    out["metric_valid"] = bool((not fallbacks) and not explicit_invalid)
+    if strict_benchmark and fallbacks:
+        out["metric_valid"] = False
+
+    missing = [field for field in REQUIRED_RESULT_FIELDS if field not in out]
+    if missing:
+        raise ValueError("result row missing required fields after completion: %s" % ", ".join(missing))
+    return out
+
+
+def validate_strict_benchmark_assets(args: object) -> None:
+    if not bool(_get_arg(args, "strict_benchmark", False)):
+        return
+    detector = str(_get_arg(args, "detector", "") or "").strip().lower()
+    segmenter = str(_get_arg(args, "segmenter", "") or "").strip().lower()
+    if detector == "yolo_world":
+        _require_existing_asset("YOLO-World model", _get_arg(args, "yolo_world_model", ""))
+        if segmenter == "sam2":
+            _require_existing_asset("SAM2 checkpoint", _get_arg(args, "sam2_checkpoint", ""))
+
+
+def empty_sgnav_step_dump(metadata: Optional[Mapping[str, object]] = None) -> dict:
+    payload = {
+        "objects": [],
+        "groups": [],
+        "rooms": [],
+        "edges": [],
+        "subgraphs": [],
+        "subgraph_texts_or_payloads": [],
+        "llm_scores": [],
+        "subgraph_probabilities": [],
+        "frontier_scores": [],
+        "selected_frontier": None,
+        "candidate_goals": [],
+        "reperception_state": {},
+        "stop_state": {},
+    }
+    if metadata:
+        payload["metadata"] = dict(metadata)
+    payload["contract_version"] = "sgnav_step_dump_v1"
+    return payload
+
+
+def _get_arg(args: object | None, name: str, default: object = None) -> object:
+    if args is None:
+        return default
+    return getattr(args, name, default)
+
+
+def _infer_llm_backend(row: Mapping[str, object], args: object | None) -> str:
+    if row.get("llm_backend"):
+        return str(row["llm_backend"])
+    if bool(_get_arg(args, "vllm_frontier_scoring", row.get("vllm_frontier_scoring", False))):
+        return "vllm_frontier"
+    if bool(_get_arg(args, "llm_enabled", row.get("hcot_llm_enabled", row.get("paper_llm_enabled", False)))):
+        return "openai_compatible"
+    return "deterministic_local"
+
+
+def _infer_map_source(row: Mapping[str, object], sim_backend: str) -> str:
+    if row.get("map_source"):
+        return str(row["map_source"])
+    if row.get("mapping_source"):
+        return str(row["mapping_source"])
+    if sim_backend == "isaac":
+        return "online_rgbd_depth"
+    return "static_preprocessed"
+
+
+def _infer_policy_name(row: Mapping[str, object], args: object | None, sim_backend: str) -> str:
+    if row.get("policy_name"):
+        return str(row["policy_name"])
+    policy = _get_arg(args, "policy", None)
+    if policy:
+        return str(policy)
+    planner = str(_get_arg(args, "planner", row.get("planner", "astar")))
+    sgnav_mode = str(_get_arg(args, "sgnav_mode", row.get("sgnav_mode", "legacy")))
+    if sim_backend == "isaac":
+        return "sgnav_%s_%s" % (sgnav_mode, planner)
+    return "%s_static_map_baseline" % planner
+
+
+def _infer_stop_reason(row: Mapping[str, object]) -> str:
+    if row.get("stop_reason"):
+        return str(row["stop_reason"])
+    if row.get("failure_reason"):
+        return str(row["failure_reason"])
+    if bool(row.get("success", False)):
+        return "success"
+    if row.get("terminal_reason"):
+        return str(row["terminal_reason"])
+    if bool(row.get("timeout", False)):
+        return "timeout"
+    return "not_success"
+
+
+def _infer_fallbacks(row: Mapping[str, object], args: object | None) -> list[str]:
+    detector = str(row.get("detector_backend", "")).strip().lower()
+    segmenter = str(row.get("segmenter_backend", "")).strip().lower()
+    llm_backend = str(row.get("llm_backend", "")).strip().lower()
+    sim_backend = str(row.get("sim_backend", "")).strip().lower()
+    ablation_name = row.get("ablation_name")
+    fallbacks: list[str] = []
+    if detector == "dry_run":
+        fallbacks.append("dry_run_detector")
+    if detector == "none":
+        fallbacks.append("detector_none")
+    if detector == "yolo_world" and segmenter != "sam2":
+        fallbacks.append("sam2_missing_or_disabled")
+    if bool(_get_arg(args, "seed_gt_object_memory", row.get("seed_gt_object_memory", False))):
+        fallbacks.append("seeded_gt_object_memory")
+    if int(row.get("seeded_object_memory_count", 0) or 0) > 0:
+        fallbacks.append("seeded_gt_object_memory")
+    if bool(_get_arg(args, "allow_gt_goal_fallback", row.get("allow_gt_goal_fallback", False))):
+        fallbacks.append("gt_goal_fallback_allowed")
+    if row.get("sgnav_decision_mode") == "gt_goal_fallback":
+        fallbacks.append("gt_goal_fallback_used")
+    if llm_backend == "deterministic_local" and not ablation_name:
+        fallbacks.append("llm_deterministic_local")
+    if sim_backend == "map":
+        fallbacks.append("static_map_planning")
+    if bool(_get_arg(args, "static_nearfield_map", row.get("static_nearfield_map", False))):
+        fallbacks.append("static_nearfield_map")
+    if bool(_get_arg(args, "frontier_allow_near_fallback", row.get("frontier_allow_near_fallback", False))):
+        fallbacks.append("frontier_near_fallback")
+    return fallbacks
+
+
+def _stable_unique(values: Iterable[object]) -> list[str]:
+    out: list[str] = []
+    seen = set()
+    for value in values:
+        item = str(value)
+        if not item or item in seen:
+            continue
+        out.append(item)
+        seen.add(item)
+    return out
+
+
+def _require_existing_asset(kind: str, value: object) -> None:
+    path = "" if value is None else str(value)
+    if not path:
+        raise BenchmarkAssetError("Missing %s path for strict benchmark run" % kind)
+    if not Path(path).expanduser().exists():
+        raise BenchmarkAssetError("Missing %s for strict benchmark run: %s" % (kind, path))

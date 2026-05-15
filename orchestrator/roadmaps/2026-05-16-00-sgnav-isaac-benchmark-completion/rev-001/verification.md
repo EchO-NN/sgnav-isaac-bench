@@ -25,6 +25,10 @@ here only when this roadmap needs a specific check or override.
 
 - Criterion: real benchmark perception uses YOLO-World plus SAM2.
   Check: metric-capable runs do not silently select `dry_run`, seeded GT object memory, GT goal fallback, missing-model stubs, or detector IPC degradation unless a reviewed explicit non-metric/debug flag labels the output as non-metric.
+- Criterion: result rows follow the metric validity contract.
+  Check: every row includes the fields required by `docs/benchmark_metric_validity_contract.md`; dry-run, seeded GT memory, unmarked deterministic local LLM scoring, and static-map SG-Nav planning are marked `metric_valid=false`.
+- Criterion: SG-Nav decision dumps are inspectable.
+  Check: `python -m isaac_bench.scripts.dump_sgnav_step ...` writes a JSON artifact with the keys required by `docs/sgnav_decision_dump_contract.md`.
 - Criterion: SG-Nav paper mechanism is preserved except for the Isaac/InteriorAgent runtime substrate.
   Check: touched navigation or policy code still supports RGB-D observation, online occupancy/free-space mapping, online 3D scene graph, object/group/room hierarchy where feasible, subgraph text or equivalent representation, hierarchical LLM scoring, subgraph probability to frontier interpolation, frontier selection, graph-based re-perception, deterministic local planning, and SG-Nav STOP confirmation.
 - Criterion: benchmark metrics are complete and reproducible.

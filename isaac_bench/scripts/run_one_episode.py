@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import sys
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -24,6 +25,7 @@ from isaac_bench.mapping.online_mapper import OnlineMapper
 from isaac_bench.mapping.room_map_from_rooms_json import build_room_index_map, load_rooms
 from isaac_bench.metrics.episode_logger import JsonlEpisodeLogger, make_jsonable
 from isaac_bench.metrics.evaluator import EpisodeEvaluator
+from isaac_bench.metrics.result_schema import BenchmarkAssetError, complete_result_row, validate_strict_benchmark_assets
 from isaac_bench.navigation.astar import GridAStarPlanner, astar_distance_map
 from isaac_bench.navigation.frontier_commitment import FrontierCommitmentManager
 from isaac_bench.navigation.waypoint_follower import HolonomicWaypointFollower
@@ -1958,6 +1960,7 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
             debug_map = args.debug_map or str(Path(args.output).with_suffix(".png"))
             start = world_xy_to_grid(float(start_pose[0]), float(start_pose[1]), dynamic_map_info)
             save_map_png(debug_map, last_dynamic_occupancy, last_dynamic_navigable, start=start, goals=goal_cells, path_cells=full_path)
+        row = complete_result_row(row, args)
         row = make_jsonable(row)
         summary_row = final_log_row(row)
         JsonlEpisodeLogger(args.output).log(row)
@@ -2039,6 +2042,14 @@ def run_episode_map_sim(episode: dict, args) -> dict:
         stop_called = True
 
     row = evaluator.finish(stop_called=stop_called, planner=args.planner, detector=args.detector, failure_reason=failure_reason)
+    row["sim_backend"] = "map"
+    row["map_source"] = "static_preprocessed"
+    row["policy_name"] = "%s_static_map_baseline" % str(args.planner)
+    row["object_memory_count"] = 0
+    row["goal_candidate_count"] = 0
+    row["frontier_count"] = 0
+    row["selected_frontier"] = None
+    row = complete_result_row(row, args)
     if args.save_debug_video or args.debug_map:
         debug_map = args.debug_map or str(Path(args.output).with_suffix(".png"))
         save_map_png(debug_map, occupancy, navigable, start=start, goals=goals, path_cells=result.path)
@@ -2062,6 +2073,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--output", default=None)
     parser.add_argument("--debug-map", default=None)
     parser.add_argument("--save-debug-video", action="store_true")
+    parser.add_argument("--strict-benchmark", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--allow-debug-fallbacks", action="store_true", default=None)
+    parser.add_argument("--policy", default=None)
+    parser.add_argument("--ablation-name", default=None)
     parser.add_argument("--sgnav-repo", default=None)
     parser.add_argument("--sgnav-mode", default=None, choices=["legacy", "paper"])
     parser.add_argument("--use-original-scenegraph", action="store_true", default=None)
@@ -2245,6 +2260,18 @@ def main(argv: Optional[List[str]] = None) -> int:
     args.sgnav_viz_height = int(args.sgnav_viz_height or get_nested(cfg, "visualization.sgnav_popup_height", 900))
     args.sgnav_viz_jpeg_quality = int(args.sgnav_viz_jpeg_quality or get_nested(cfg, "visualization.sgnav_popup_jpeg_quality", 75))
     args.sgnav_mode = str(args.sgnav_mode or get_nested(cfg, "sgnav.mode", "legacy")).strip().lower()
+    args.strict_benchmark = bool(
+        args.strict_benchmark
+        if args.strict_benchmark is not None
+        else get_nested(cfg, "benchmark.strict_benchmark", True)
+    )
+    args.allow_debug_fallbacks = bool(
+        args.allow_debug_fallbacks
+        if args.allow_debug_fallbacks is not None
+        else get_nested(cfg, "benchmark.allow_debug_fallbacks", False)
+    )
+    args.policy = args.policy or get_nested(cfg, "benchmark.policy", None)
+    args.ablation_name = args.ablation_name or get_nested(cfg, "benchmark.ablation_name", None)
     args.sim_backend = args.sim_backend or get_nested(cfg, "repo.backend", "map")
     args.output = args.output or str(Path(get_nested(cfg, "project.output_dir", "data/isaac_bench_runs")) / "run_one_episode" / "results.jsonl")
     args.sgnav_repo = args.sgnav_repo or get_nested(cfg, "paths.sgnav_repo", "/home/echo/SG-Nav")
@@ -2524,6 +2551,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         from isaac_bench.navigation.nav2_client import Nav2NavigateToPoseClient
 
         Nav2NavigateToPoseClient()
+    try:
+        validate_strict_benchmark_assets(args)
+    except BenchmarkAssetError as exc:
+        print("Error: %s" % exc, file=sys.stderr)
+        return 2
     episodes = read_jsonl(args.episode_file)
     episode = apply_success_distance_override(episodes[int(args.episode_index)], args)
     if args.sim_backend == "isaac":

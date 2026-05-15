@@ -15,6 +15,12 @@ repo:
   planner: astar
   use_original_scenegraph: false
 
+benchmark:
+  strict_benchmark: true
+  allow_debug_fallbacks: false
+  policy: sgnav_original
+  ablation_name:
+
 visualization:
   sgnav_popup: auto
   sgnav_popup_every_steps: 3
@@ -152,7 +158,7 @@ perception:
   yolo_world_model: data/models/yolov8l-worldv2.pt
   use_ultralytics: true
   detection_localization: depth
-  segmenter: auto
+  segmenter: sam2
   sam2_checkpoint: data/models/sam2.1_hiera_small.pt
   sam2_model_cfg: configs/sam2.1/sam2.1_hiera_s.yaml
   sam2_device: cuda

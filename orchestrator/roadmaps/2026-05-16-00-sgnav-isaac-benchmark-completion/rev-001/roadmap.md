@@ -103,6 +103,19 @@ claim metric completeness.
 Completion signal: Metric and debug modes are distinguishable in CLI/config,
 hidden fallback risks have regression coverage, existing smoke/A* commands
 still work, and roadmap verification can reject benchmark-unsafe changes.
+Milestone acceptance gates:
+- `docs/sgnav_paper_parity_contract.md` defines the exact metric-path SG-Nav
+  mechanism.
+- `docs/benchmark_metric_validity_contract.md` defines strict benchmark
+  validity, fallback labels, and missing-asset behavior.
+- `python -m isaac_bench.scripts.dump_sgnav_step ...` writes the required
+  SG-Nav decision dump JSON artifact shape.
+- Pytest passes for mode contract, result schema, fallback policy, and config
+  defaults.
+- A dry-run smoke result is marked `metric_valid=false`.
+- A strict benchmark run with missing YOLO-World or SAM2 fails clearly before
+  silently falling back.
+- The existing A* smoke command still works or has a compatibility alias.
 Parallel lane: lane-contract
 Coordination notes: Start here. Keep changes small and reviewable because later
 milestones rely on these invariants.
