@@ -82,6 +82,10 @@ class FrontierCommitmentManager:
             self._blacklist(self.active.center_grid, int(step), str(reason))
         self.active = None
 
+    def blacklist_frontier(self, frontier_or_cell, step: int, reason: str) -> None:
+        center = getattr(frontier_or_cell, "center_grid", frontier_or_cell)
+        self._blacklist(tuple(int(v) for v in center), int(step), str(reason))
+
     def select(
         self,
         frontiers: Sequence[FrontierCluster],
@@ -120,7 +124,8 @@ class FrontierCommitmentManager:
             if not switch_reason:
                 if matched_active is not None:
                     self.active.center_grid = tuple(int(v) for v in matched_active.center_grid)
-                    self.active.target_cells = [tuple(int(x) for x in cell) for cell in matched_active.members]
+                    if target_cells is not None:
+                        self.active.target_cells = [tuple(int(x) for x in cell) for cell in target_cells]
                     self.active.last_seen_step = int(step)
                     self.active.selected_score = active_score
                 return FrontierCommitmentDecision(
@@ -141,13 +146,14 @@ class FrontierCommitmentManager:
 
         if proposed is None:
             return FrontierCommitmentDecision(None, [], None, False, "no_available_frontier", self._metadata(step))
+        proposed_targets = [tuple(int(x) for x in cell) for cell in (target_cells if target_cells is not None else proposed.members)]
         if planner is not None:
-            result = planner.plan(current_grid, proposed.members)
+            result = planner.plan(current_grid, proposed_targets)
             if not result.path:
                 self._blacklist(proposed.center_grid, int(step), "frontier_unreachable")
                 return FrontierCommitmentDecision(None, [], None, False, "frontier_unreachable", self._metadata(step))
         stable_id = stable_ids.get(id(proposed), self._new_stable_id())
-        chosen_targets = [tuple(int(x) for x in cell) for cell in (target_cells or proposed.members)]
+        chosen_targets = proposed_targets
         self.active = ActiveFrontierTarget(
             stable_id=int(stable_id),
             center_grid=tuple(int(v) for v in proposed.center_grid),

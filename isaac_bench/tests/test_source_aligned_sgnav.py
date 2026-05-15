@@ -5,6 +5,7 @@ from isaac_bench.graph.paper_scene_graph import PaperSceneGraph
 from isaac_bench.graph.sgnav_scenegraph_adapter import SGNavSceneGraphAdapter
 from isaac_bench.mapping.coordinate_transform import MapInfo
 from isaac_bench.mapping.frontier_debug import save_frontier_debug_snapshot
+from isaac_bench.mapping.frontier import FrontierCluster
 from isaac_bench.navigation.astar import GridAStarPlanner
 from isaac_bench.perception.detection_types import Detection3D
 from isaac_bench.perception.object_memory import ObjectMemory
@@ -180,12 +181,76 @@ def test_final_log_row_contains_only_requested_fields():
         "extra_debug": "hidden",
     }
 
+    row.update(
+        {
+            "frontier_target_mode": "center",
+            "frontier_center_grid": [1, 2],
+            "frontier_actual_target_grid": [1, 2],
+            "frontier_unreachable_recovery": False,
+            "frontier_unreachable_reason": None,
+            "frontier_stop_at_current_grid": None,
+            "frontier_blacklisted": False,
+            "active_long_term_goal_mode": "frontier",
+            "active_long_term_goal_age": 3,
+        }
+    )
     out = final_log_row(row)
 
-    assert out == {
-        "goal_category": "chair",
-        "success": True,
-        "distance_to_goal": 0.4,
-        "spl": 0.7,
-        "stop_reason": "stop_verification_confirmed",
-    }
+    assert out["goal_category"] == "chair"
+    assert out["success"] is True
+    assert out["distance_to_goal"] == 0.4
+    assert out["spl"] == 0.7
+    assert out["stop_reason"] == "stop_verification_confirmed"
+    assert out["frontier_target_mode"] == "center"
+    assert out["active_long_term_goal_age"] == 3
+    assert "extra_debug" not in out
+
+
+def test_frontier_navigation_targets_center_cell_only():
+    map_info = MapInfo(resolution_m=1.0, min_x=0.0, max_x=10.0, min_y=0.0, max_y=10.0, width=10, height=10)
+    traversible = np.ones((10, 10), dtype=bool)
+    planner = GridAStarPlanner(traversible, resolution_m=1.0, allow_diagonal=True)
+    scenegraph = SGNavSceneGraphAdapter(use_original=False)
+    decision = SGNavDecision(scenegraph)
+    frontier = FrontierCluster((4, 4), (4.0, 4.0), [(4, 4), (4, 5), (5, 4)], 3, 2.0)
+
+    nav = decision.choose_navigation_target(ObjectMemory(), "chair", (1, 1), [frontier], planner, map_info, (1.0, 1.0, 0.0, 0.0))
+
+    assert nav.mode == "frontier"
+    assert nav.target_cells == [(4, 4)]
+    assert nav.metadata["frontier_target_mode"] == "center"
+    assert nav.metadata["frontier_actual_target_grid"] == [4, 4]
+
+
+def test_frontier_navigation_falls_back_to_reachable_member_closest_to_center():
+    map_info = MapInfo(resolution_m=1.0, min_x=0.0, max_x=10.0, min_y=0.0, max_y=10.0, width=10, height=10)
+    traversible = np.ones((10, 10), dtype=bool)
+    traversible[4, 4] = False
+    planner = GridAStarPlanner(traversible, resolution_m=1.0, allow_diagonal=True)
+    scenegraph = SGNavSceneGraphAdapter(use_original=False)
+    decision = SGNavDecision(scenegraph)
+    frontier = FrontierCluster((4, 4), (4.0, 4.0), [(4, 4), (4, 5), (6, 6)], 3, 2.0)
+
+    nav = decision.choose_navigation_target(ObjectMemory(), "chair", (1, 1), [frontier], planner, map_info, (1.0, 1.0, 0.0, 0.0))
+
+    assert nav.target_cells == [(4, 5)]
+    assert nav.metadata["frontier_target_mode"] == "fallback_member"
+    assert nav.metadata["frontier_unreachable_recovery"] is True
+
+
+def test_frontier_navigation_marks_unreachable_when_center_and_members_fail():
+    map_info = MapInfo(resolution_m=1.0, min_x=0.0, max_x=10.0, min_y=0.0, max_y=10.0, width=10, height=10)
+    traversible = np.zeros((10, 10), dtype=bool)
+    traversible[1, 1] = True
+    planner = GridAStarPlanner(traversible, resolution_m=1.0, allow_diagonal=True)
+    scenegraph = SGNavSceneGraphAdapter(use_original=False)
+    decision = SGNavDecision(scenegraph)
+    frontier = FrontierCluster((4, 4), (4.0, 4.0), [(4, 4), (4, 5)], 2, 2.0)
+
+    nav = decision.choose_navigation_target(ObjectMemory(), "chair", (1, 1), [frontier], planner, map_info, (1.0, 1.0, 0.0, 0.0))
+
+    assert nav.mode == "frontier"
+    assert nav.target_cells == []
+    assert nav.reason == "frontier_unreachable"
+    assert nav.metadata["frontier_target_mode"] == "unreachable"
+    assert nav.metadata["frontier_unreachable_reason"] == "frontier_center_and_members_unreachable"

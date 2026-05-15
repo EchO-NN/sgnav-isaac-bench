@@ -51,6 +51,16 @@ def test_fused_instance_registry_registers_and_merges_close_instances():
     assert instances[0].last_mask is not None
 
 
+def test_fused_instance_registry_ignores_detections_beyond_depth_max():
+    registry = FusedInstanceRegistry(merge_distance_m=0.75, merge_iou_3d=0.05)
+    det = Detection2D("chair", "chair", 0.9, (2.0, 2.0, 5.0, 5.0), mask=_mask())
+    far_depth = np.full((6, 6), 4.0, dtype=np.float32)
+
+    instances = registry.update([det], far_depth, _intr(), (0.0, 0.0, 1.0, 0.0), step_id=1, depth_max_m=3.0, min_points=1, stride=1)
+
+    assert instances == []
+
+
 def test_fused_instance_registry_keeps_far_instances_separate_and_exports_objects():
     registry = FusedInstanceRegistry(merge_distance_m=0.75, merge_iou_3d=0.05)
     det = Detection2D("chair", "chair", 0.8, (2.0, 2.0, 5.0, 5.0), mask=_mask())

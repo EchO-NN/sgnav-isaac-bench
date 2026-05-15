@@ -329,19 +329,25 @@ class SGNavDecision:
             self.stop_verification_steps_taken = 0
             frontier_decision = prefetched_frontier_decision or self.choose_frontier(frontiers)
             if frontier_decision.selected_frontier is not None:
+                target_cells, target_meta = self._frontier_target_cells(
+                    frontier_decision.selected_frontier,
+                    planner,
+                    current_grid,
+                )
                 self.state = "frontier"
-                self.last_reason = frontier_decision.reason
+                self.last_reason = "frontier_unreachable" if not target_cells else frontier_decision.reason
                 return NavigationDecision(
                     "frontier",
-                    list(frontier_decision.selected_frontier.members),
+                    target_cells,
                     False,
                     None,
                     frontier_decision,
-                    frontier_decision.reason,
+                    self.last_reason,
                     state=self.state,
                     metadata={
                         **rejected_metadata,
-                        "target_cells_count": int(len(frontier_decision.selected_frontier.members)),
+                        **target_meta,
+                        "target_cells_count": int(len(target_cells)),
                     },
                 )
             self.state = "none"
@@ -359,6 +365,39 @@ class SGNavDecision:
         self.state = "none"
         self.last_reason = "no_candidate"
         return NavigationDecision("none", [], False, None, None, "no_candidate", state=self.state, metadata=rejected_metadata)
+
+    def _frontier_target_cells(
+        self,
+        frontier: FrontierCluster,
+        planner: GridAStarPlanner,
+        current_grid: Tuple[int, int],
+    ) -> Tuple[List[Tuple[int, int]], Dict[str, object]]:
+        center = tuple(int(v) for v in frontier.center_grid)
+        center_reachable = bool(planner.plan(current_grid, [center]).path)
+        meta: Dict[str, object] = {
+            "frontier_target_mode": "center" if center_reachable else "fallback_member",
+            "frontier_center_grid": [int(center[0]), int(center[1])],
+            "frontier_actual_target_grid": None,
+            "frontier_unreachable_recovery": False,
+            "frontier_unreachable_reason": None,
+        }
+        if center_reachable:
+            meta["frontier_actual_target_grid"] = [int(center[0]), int(center[1])]
+            return [center], meta
+        center_arr = np.asarray(center, dtype=np.float32)
+        members = sorted(
+            {tuple(int(v) for v in cell) for cell in frontier.members},
+            key=lambda cell: float(np.linalg.norm(np.asarray(cell, dtype=np.float32) - center_arr)),
+        )
+        for member in members:
+            if planner.plan(current_grid, [member]).path:
+                meta["frontier_actual_target_grid"] = [int(member[0]), int(member[1])]
+                meta["frontier_unreachable_recovery"] = True
+                return [member], meta
+        meta["frontier_target_mode"] = "unreachable"
+        meta["frontier_unreachable_recovery"] = True
+        meta["frontier_unreachable_reason"] = "frontier_center_and_members_unreachable"
+        return [], meta
 
     def select_goal_candidate(
         self,

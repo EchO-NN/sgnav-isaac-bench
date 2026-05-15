@@ -125,7 +125,7 @@ nearfield_static_map:
 mapping:
   online_resolution_m: 0.05
   map_size_m: 40.0
-  depth_max_m: 5.0
+  depth_max_m: 3.0
   depth_min_m: 0.20
   depth_stride_px: 8
   obstacle_min_height_m: 0.20
@@ -171,7 +171,7 @@ sgnav:
   panorama_steps: 8
   panorama_wz_radps: 0.8
   panorama_render_updates_per_step: 1
-  frontier_distance_weight: 0.0
+  frontier_distance_weight: 2.0
   frontier_scenegraph_score_norm: none
   frontier_commitment_enabled: true
   frontier_commit_match_radius_m: 0.75

@@ -6,13 +6,13 @@ import math
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable, List, Optional, Tuple
+from typing import Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 
 from isaac_bench.config import get_nested, load_config, str_to_bool
 from isaac_bench.dataset.category_normalizer import normalize_category
-from isaac_bench.dataset.episode_generator import read_jsonl
+from isaac_bench.dataset.episode_generator import filter_start_clearance_objects, point_to_bbox_2d_distance, read_jsonl
 from isaac_bench.env.habitat_like_env import MapSimHabitatLikeEnv
 from isaac_bench.debug.graph_debug_dump import save_graph_debug_dump
 from isaac_bench.graph.decision import NavigationDecision, SGNavDecision
@@ -85,6 +85,86 @@ def apply_episode_planning_clearance(
     with open(objects_all_path, "r", encoding="utf-8") as handle:
         clearance_objects = filter_start_clearance_objects(json.load(handle))
     return build_clearance_mask(navigable, map_info, clearance_objects, min_clearance)
+
+
+def apply_success_distance_override(episode: dict, args) -> dict:
+    success_distance_m = getattr(args, "success_distance_m", None)
+    if success_distance_m is None:
+        return dict(episode)
+    success_distance = float(success_distance_m)
+    updated = dict(episode)
+    scene_dir, map_info, _occupancy, navigable = load_preprocessed_for_episode(updated)
+    navigable = apply_episode_planning_clearance(
+        scene_dir,
+        map_info,
+        navigable,
+        updated,
+        runtime_planning_clearance_m=getattr(args, "runtime_planning_clearance_m", 0.0),
+    )
+    goal_objects = load_episode_goal_objects(scene_dir, updated)
+    goal_cells = build_exact_goal_cells(goal_objects, navigable, map_info, success_distance)
+    if goal_cells:
+        start = (int(updated["start_grid"][0]), int(updated["start_grid"][1]))
+        planner = GridAStarPlanner(navigable, map_info.resolution_m, allow_diagonal=True)
+        shortest = planner.distance(start, goal_cells)
+        if math.isfinite(shortest):
+            updated["goal_regions_grid"] = [[int(r), int(c)] for r, c in goal_cells]
+            updated["shortest_path_distance_m"] = float(shortest)
+    updated["success_distance_m"] = success_distance
+    metadata = dict(updated.get("metadata", {}))
+    metadata["runtime_success_distance_override_m"] = success_distance
+    updated["metadata"] = metadata
+    return updated
+
+
+def load_episode_goal_objects(scene_dir: Path, episode: Mapping[str, object]) -> List[Mapping[str, object]]:
+    objects_path = scene_dir / "objects.json"
+    with open(objects_path, "r", encoding="utf-8") as handle:
+        objects = json.load(handle)
+    goal_ids = {str(value) for value in episode.get("goal_instance_ids", []) or []}
+    if goal_ids:
+        matched = [obj for obj in objects if str(obj.get("instance_id")) in goal_ids]
+        if matched:
+            return matched
+    goal_category = normalize_category(str(episode.get("goal_category", "")))
+    return [obj for obj in objects if normalize_category(str(obj.get("category", ""))) == goal_category]
+
+
+def build_exact_goal_cells(
+    goal_objects: Sequence[Mapping[str, object]],
+    navigable: np.ndarray,
+    map_info: MapInfo,
+    success_distance_m: float,
+) -> List[Tuple[int, int]]:
+    cells = []
+    fallback: List[Tuple[int, int]] = []
+    best_distance = math.inf
+    for r, c in np.argwhere(np.asarray(navigable).astype(bool)):
+        rr, cc = int(r), int(c)
+        wx, wy = grid_to_world_xy(rr, cc, map_info)
+        distance = min_goal_bbox_distance(wx, wy, goal_objects)
+        if not math.isfinite(distance):
+            continue
+        if distance <= float(success_distance_m):
+            cells.append((rr, cc))
+            continue
+        if distance + 1e-6 < best_distance:
+            best_distance = distance
+            fallback = [(rr, cc)]
+        elif abs(distance - best_distance) <= 1e-6:
+            fallback.append((rr, cc))
+    return cells if cells else fallback
+
+
+def min_goal_bbox_distance(x: float, y: float, goal_objects: Sequence[Mapping[str, object]]) -> float:
+    distances = []
+    for obj in goal_objects:
+        bbox_min = obj.get("bbox_min_world")
+        bbox_max = obj.get("bbox_max_world")
+        if bbox_min is None or bbox_max is None:
+            continue
+        distances.append(point_to_bbox_2d_distance(x, y, bbox_min, bbox_max))
+    return min(distances) if distances else math.inf
 
 
 def maybe_build_detector(
@@ -338,13 +418,27 @@ def final_log_row(row: dict) -> dict:
     stop_reason = row.get("failure_reason")
     if not stop_reason:
         stop_reason = row.get("sgnav_decision_reason") or ("success" if bool(row.get("success", False)) else "not_success")
-    return {
+    out = {
         "goal_category": row.get("goal_category"),
         "success": bool(row.get("success", False)),
         "distance_to_goal": row.get("distance_to_goal"),
         "spl": row.get("spl"),
         "stop_reason": stop_reason,
     }
+    for key in (
+        "frontier_target_mode",
+        "frontier_center_grid",
+        "frontier_actual_target_grid",
+        "frontier_unreachable_recovery",
+        "frontier_unreachable_reason",
+        "frontier_stop_at_current_grid",
+        "frontier_blacklisted",
+        "active_long_term_goal_mode",
+        "active_long_term_goal_age",
+    ):
+        if key in row:
+            out[key] = row.get(key)
+    return out
 
 
 def detections_to_3d_static_map_ray(
@@ -658,6 +752,13 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
     last_dynamic_observed = mapper.grid.observed.astype(bool)
     last_frontier_raw_cells = 0
     last_frontier_clusters = 0
+    frontier_target_mode = None
+    frontier_center_grid = None
+    frontier_actual_target_grid = None
+    frontier_unreachable_recovery = False
+    frontier_unreachable_reason = None
+    frontier_stop_at_current_grid = None
+    frontier_blacklisted = False
     paper_mode = str(getattr(args, "sgnav_mode", "legacy")).strip().lower() == "paper"
     long_term_goal = LongTermGoalState()
     sgnav_viz_enabled = bool(getattr(args, "sgnav_viz", False))
@@ -1220,6 +1321,32 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
                         **dict(nav_decision.metadata or {}),
                         "frontier_commitment": last_frontier_commitment_metadata,
                     }
+                if nav_decision.mode == "frontier":
+                    nav_meta = dict(nav_decision.metadata or {})
+                    frontier_target_mode = nav_meta.get("frontier_target_mode")
+                    frontier_center_grid = nav_meta.get("frontier_center_grid")
+                    frontier_actual_target_grid = nav_meta.get("frontier_actual_target_grid")
+                    frontier_unreachable_recovery = bool(nav_meta.get("frontier_unreachable_recovery", False))
+                    frontier_unreachable_reason = nav_meta.get("frontier_unreachable_reason")
+                    if nav_decision.frontier_decision is not None and not nav_decision.target_cells:
+                        selected_frontier = nav_decision.frontier_decision.selected_frontier
+                        if frontier_commitment is not None and selected_frontier is not None:
+                            frontier_commitment.blacklist_frontier(
+                                selected_frontier,
+                                step,
+                                str(frontier_unreachable_reason or "frontier_unreachable"),
+                            )
+                        frontier_blacklisted = True
+                        long_term_goal.invalidate(str(frontier_unreachable_reason or "frontier_unreachable"))
+                        current_path = []
+                        force_perception_step = True
+                        last_frontier_commitment_reason = str(frontier_unreachable_reason or "frontier_unreachable")
+                        last_frontier_commitment_metadata = {
+                            **dict(last_frontier_commitment_metadata),
+                            "frontier_commitment_reason": last_frontier_commitment_reason,
+                            "frontier_blacklisted": True,
+                        }
+                        continue
                 if paper_mode and not locked_goal_used and nav_decision.mode in {"frontier", "candidate"} and nav_decision.target_cells:
                     long_term_goal.set_from(nav_decision, step)
                 last_nav_decision = nav_decision
@@ -1406,9 +1533,14 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
                     if frontier_commitment is not None and nav_decision.mode == "frontier":
                         frontier_commitment.invalidate_active(step, "astar_no_path", blacklist=True)
                         current_path = []
+                        force_perception_step = True
+                        frontier_unreachable_recovery = True
+                        frontier_unreachable_reason = "astar_no_path"
+                        frontier_blacklisted = True
                         last_frontier_commitment_metadata = {
                             **dict(last_frontier_commitment_metadata),
                             "frontier_commitment_reason": "astar_no_path_blacklisted",
+                            "frontier_blacklisted": True,
                         }
                         continue
                     failure_reason = "astar_no_path"
@@ -1565,6 +1697,35 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
                 float(args.camera_forward_offset_m),
             )
             if blocked_by_guard:
+                if paper_mode and last_decision_mode == "frontier":
+                    if frontier_commitment is not None:
+                        frontier_commitment.invalidate_active(step, "kinematic_collision_guard", blacklist=True)
+                    long_term_goal.invalidate("kinematic_collision_guard")
+                    frontier_stop_at_current_grid = [int(current_grid[0]), int(current_grid[1])]
+                    frontier_blacklisted = True
+                    frontier_unreachable_recovery = True
+                    frontier_unreachable_reason = "kinematic_collision_guard"
+                    last_frontier_commitment_reason = "kinematic_collision_guard_blacklisted"
+                    last_frontier_commitment_metadata = {
+                        **dict(last_frontier_commitment_metadata),
+                        "frontier_commitment_reason": last_frontier_commitment_reason,
+                        "frontier_blacklisted": True,
+                        "frontier_stop_at_current_grid": frontier_stop_at_current_grid,
+                    }
+                    current_path = []
+                    full_path.append(tuple(int(v) for v in current_grid))
+                    force_perception_step = True
+                    obs = server.step_kinematic_velocity(
+                        0.0,
+                        0.0,
+                        0.0,
+                        dt=float(args.control_dt),
+                        render_updates=int(args.render_updates_per_step),
+                        read_rgb=detector_requires_rgb(detector, args.detector),
+                        read_depth=True,
+                        rgb_device="cuda" if detector_cuda_rgb else "cpu",
+                    )
+                    continue
                 failure_reason = "kinematic_collision_guard"
                 break
             next_step = step + 1
@@ -1639,6 +1800,19 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
             "invalid_reason": str(long_term_goal.invalid_reason),
             "reached": bool(long_term_goal.reached),
         }
+        row["frontier_target_mode"] = frontier_target_mode
+        row["frontier_center_grid"] = frontier_center_grid
+        row["frontier_actual_target_grid"] = frontier_actual_target_grid
+        row["frontier_unreachable_recovery"] = bool(frontier_unreachable_recovery)
+        row["frontier_unreachable_reason"] = frontier_unreachable_reason
+        row["frontier_stop_at_current_grid"] = frontier_stop_at_current_grid
+        row["frontier_blacklisted"] = bool(frontier_blacklisted)
+        row["active_long_term_goal_mode"] = str(long_term_goal.mode)
+        row["active_long_term_goal_age"] = (
+            max(0, int(evaluator.num_steps) - int(long_term_goal.selected_step))
+            if int(long_term_goal.selected_step) >= 0
+            else None
+        )
         row["paper_num_object_nodes"] = int(len(getattr(paper_graph, "object_nodes", {}) or {}))
         row["paper_num_room_nodes"] = int(len(getattr(paper_graph, "room_nodes", {}) or {}))
         row["paper_num_group_nodes"] = int(len(getattr(paper_graph, "group_nodes", {}) or {}))
@@ -1783,6 +1957,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--config", default="isaac_bench/configs/isaac_bench.yaml")
     parser.add_argument("--episode-file", required=True)
     parser.add_argument("--episode-index", type=int, default=0)
+    parser.add_argument("--success-distance-m", type=float, default=None)
     parser.add_argument("--planner", default=None, choices=["astar", "nav2"])
     parser.add_argument("--detector", default=None, choices=["dry_run", "yolo_world", "none"])
     parser.add_argument("--yolo-world-model", default=None)
@@ -2227,13 +2402,19 @@ def main(argv: Optional[List[str]] = None) -> int:
     )
     args.seed_gt_object_memory = bool(get_nested(cfg, "sgnav.seed_gt_object_memory", False) if args.seed_gt_object_memory is None else args.seed_gt_object_memory)
     args.allow_gt_goal_fallback = bool(get_nested(cfg, "sgnav.allow_gt_goal_fallback", False) if args.allow_gt_goal_fallback is None else args.allow_gt_goal_fallback)
+    configured_success_distance = get_nested(cfg, "episodes.success_distance_m", None)
+    args.success_distance_m = (
+        float(args.success_distance_m)
+        if args.success_distance_m is not None
+        else (float(configured_success_distance) if configured_success_distance is not None else None)
+    )
 
     if args.planner == "nav2":
         from isaac_bench.navigation.nav2_client import Nav2NavigateToPoseClient
 
         Nav2NavigateToPoseClient()
     episodes = read_jsonl(args.episode_file)
-    episode = episodes[int(args.episode_index)]
+    episode = apply_success_distance_override(episodes[int(args.episode_index)], args)
     if args.sim_backend == "isaac":
         row = run_episode_isaac_closed_loop(episode, args)
     else:
