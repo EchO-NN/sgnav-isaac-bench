@@ -4,15 +4,17 @@ import argparse
 import json
 import os
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Sequence, Union
 
 from isaac_bench.config import get_nested, load_config
 
 
-def _path_from_env_or_config(env_name: str, cfg: dict, config_key: str, default: str) -> str:
-    value = os.environ.get(env_name)
-    if value:
-        return value
+def _path_from_env_or_config(env_names: Union[str, Sequence[str]], cfg: dict, config_key: str, default: str) -> str:
+    names = [env_names] if isinstance(env_names, str) else list(env_names)
+    for env_name in names:
+        value = os.environ.get(env_name)
+        if value:
+            return value
     return str(get_nested(cfg, config_key, default) or default)
 
 
@@ -45,7 +47,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     checks = [
         _check_path(
             "isaac_sim_root",
-            _path_from_env_or_config("ISAAC_SIM_ROOT", cfg, "paths.isaac_sim_root", "/home/echo/isaac-sim-standalone-5.1.0-linux-x86_64"),
+            _path_from_env_or_config(
+                ["ISAAC_SIM_ROOT", "ISAAC_ROOT"],
+                cfg,
+                "paths.isaac_sim_root",
+                "/home/echo/isaac-sim-standalone-5.1.0-linux-x86_64",
+            ),
             args.require_isaac,
         ),
         _check_path(

@@ -21,6 +21,8 @@ The default config uses:
 Use these environment variables or config fields to point at local assets:
 
 - `ISAAC_SIM_ROOT` or `paths.isaac_sim_root`
+- `ISAAC_ROOT` is accepted as a legacy alias for `ISAAC_SIM_ROOT` by the setup
+  and activation scripts.
 - `INTERIORAGENT_ROOT` or `paths.interioragent_root`
 - `YOLO_WORLD_MODEL` or `paths.yolo_world_model`
 - `SAM2_CHECKPOINT` or `perception.sam2_checkpoint`

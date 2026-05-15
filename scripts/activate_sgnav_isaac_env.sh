@@ -2,7 +2,8 @@
 set -euo pipefail
 
 ENV_NAME="${SGNAV_ISAAC_ENV_NAME:-sgnav-isaac}"
-ISAAC_ROOT="${ISAAC_ROOT:-/home/echo/isaac-sim-standalone-5.1.0-linux-x86_64}"
+ISAAC_ROOT="${ISAAC_ROOT:-${ISAAC_SIM_ROOT:-/home/echo/isaac-sim-standalone-5.1.0-linux-x86_64}}"
+export ISAAC_SIM_ROOT="$ISAAC_ROOT"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CONDA_SH="${CONDA_SH:-/home/echo/miniforge3/etc/profile.d/conda.sh}"
 

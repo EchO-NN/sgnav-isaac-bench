@@ -24,6 +24,24 @@ def _usd_lib_paths(isaac_sim_root: str) -> Optional[tuple[str, str]]:
     return os.pathsep.join(py_paths), str(libs[0] / "bin")
 
 
+def _reexec_pythonpath(repo_root: Path, usd_pythonpath: str, existing_pythonpath: str = "") -> str:
+    parts = [str(repo_root), usd_pythonpath]
+    for entry in sys.path:
+        if entry and Path(entry).exists():
+            parts.append(str(Path(entry).resolve()))
+    if existing_pythonpath:
+        parts.append(existing_pythonpath)
+    deduped = []
+    seen = set()
+    for part in parts:
+        for item in str(part).split(os.pathsep):
+            if not item or item in seen:
+                continue
+            seen.add(item)
+            deduped.append(item)
+    return os.pathsep.join(deduped)
+
+
 def ensure_pxr_or_reexec(isaac_sim_root: str) -> None:
     try:
         from pxr import Usd  # noqa: F401
@@ -42,7 +60,7 @@ def ensure_pxr_or_reexec(isaac_sim_root: str) -> None:
         kit_python = root / "kit" / "python" / "bin" / "python3"
     env = os.environ.copy()
     env["ISAAC_BENCH_REEXEC_USD"] = "1"
-    env["PYTHONPATH"] = os.pathsep.join([str(Path.cwd()), py_path, env.get("PYTHONPATH", "")])
+    env["PYTHONPATH"] = _reexec_pythonpath(Path.cwd(), py_path, env.get("PYTHONPATH", ""))
     env["LD_LIBRARY_PATH"] = os.pathsep.join([ld_path, env.get("LD_LIBRARY_PATH", "")])
     cmd = [str(kit_python)] + sys.argv
     raise SystemExit(subprocess.call(cmd, env=env, cwd=str(Path.cwd())))
@@ -95,9 +113,15 @@ def preprocess_scene(scene, out_root: Path, args) -> dict:
 
 def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--dataset-root", default="/home/echo/InteriorAgent")
+    parser.add_argument("--dataset-root", default=os.environ.get("INTERIORAGENT_ROOT", "/home/echo/InteriorAgent"))
     parser.add_argument("--out", default="data/interioragent_preprocessed")
-    parser.add_argument("--isaac-sim-root", default="/home/echo/isaac-sim-standalone-5.1.0-linux-x86_64")
+    parser.add_argument(
+        "--isaac-sim-root",
+        default=os.environ.get(
+            "ISAAC_SIM_ROOT",
+            os.environ.get("ISAAC_ROOT", "/home/echo/isaac-sim-standalone-5.1.0-linux-x86_64"),
+        ),
+    )
     parser.add_argument("--scene-id", action="append", default=None)
     parser.add_argument("--scene-glob", default="kujiale_*")
     parser.add_argument("--resolution", type=float, default=0.05)

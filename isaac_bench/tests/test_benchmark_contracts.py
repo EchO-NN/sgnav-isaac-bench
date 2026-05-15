@@ -13,8 +13,8 @@ from isaac_bench.metrics.result_schema import (
     complete_result_row,
     validate_strict_benchmark_assets,
 )
+from isaac_bench.scripts.check_assets import _path_from_env_or_config, main as check_assets_main
 from isaac_bench.scripts.dump_sgnav_step import main as dump_sgnav_step_main
-from isaac_bench.scripts.check_assets import main as check_assets_main
 from isaac_bench.scripts.run_benchmark import main as run_benchmark_main
 from isaac_bench.scripts.run_one_episode import main as run_one_episode_main
 
@@ -192,6 +192,15 @@ def test_check_assets_reports_required_missing_paths(tmp_path, capsys, monkeypat
 
     assert status == 2
     assert "MISSING yolo_world_model" in captured.out
+
+
+def test_asset_path_lookup_accepts_legacy_isaac_root_env(monkeypatch):
+    monkeypatch.delenv("ISAAC_SIM_ROOT", raising=False)
+    monkeypatch.setenv("ISAAC_ROOT", "/tmp/legacy-isaac-root")
+
+    resolved = _path_from_env_or_config(["ISAAC_SIM_ROOT", "ISAAC_ROOT"], {}, "missing", "default")
+
+    assert resolved == "/tmp/legacy-isaac-root"
 
 
 def test_policy_and_allow_debug_fallback_flags_parse_before_asset_check(tmp_path, capsys):
