@@ -43,6 +43,9 @@ Every episode result row must include:
 - `strict_benchmark=true` means `metric_valid` can be true only when
   `fallbacks_used` is empty.
 - `dry_run` detector implies `metric_valid=false`.
+- A YOLO/SAM detection is a valid online object detection only when
+  `confidence > 0.65`. Detections at or below 0.65 must not draw RGB bboxes,
+  enter object memory, form object scene-graph nodes, or seed goal candidates.
 - Seeded ground-truth object memory implies `metric_valid=false`.
 - Mock or local deterministic LLM scoring implies `metric_valid=false` unless
   the run is explicitly marked as a named ablation.

@@ -5,7 +5,13 @@ from typing import Iterable, List, Optional, Sequence, Tuple
 import numpy as np
 
 from isaac_bench.dataset.category_normalizer import normalize_category
-from isaac_bench.perception.detection_types import Detection2D, Detection3D, FusedInstance
+from isaac_bench.perception.detection_types import (
+    MIN_VALID_DETECTION_CONFIDENCE,
+    Detection2D,
+    Detection3D,
+    FusedInstance,
+    detection_confidence_is_valid,
+)
 from isaac_bench.sensors.camera_geometry import CameraIntrinsics
 from isaac_bench.sensors.depth_backproject import detection_to_world_points, world_points_bbox
 
@@ -34,11 +40,13 @@ class FusedInstanceRegistry:
         merge_iou_3d: float = 0.15,
         max_points_per_instance: int = 4096,
         room_categories: Optional[Iterable[str]] = None,
+        min_valid_confidence: float = MIN_VALID_DETECTION_CONFIDENCE,
     ):
         self.merge_distance_m = float(merge_distance_m)
         self.merge_iou_3d = float(merge_iou_3d)
         self.max_points_per_instance = max(1, int(max_points_per_instance))
         self.room_categories = {normalize_category(name) for name in (room_categories or DEFAULT_ROOM_CATEGORIES)}
+        self.min_valid_confidence = float(min_valid_confidence)
         self.instances: List[FusedInstance] = []
         self._next_id = 0
 
@@ -58,6 +66,8 @@ class FusedInstanceRegistry:
         stride: int = 4,
     ) -> List[FusedInstance]:
         for det in detections:
+            if not detection_confidence_is_valid(float(det.confidence), self.min_valid_confidence):
+                continue
             points = detection_to_world_points(
                 det,
                 depth,

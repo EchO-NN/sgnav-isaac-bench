@@ -44,7 +44,12 @@ from isaac_bench.metrics.result_schema import BenchmarkAssetError, complete_resu
 from isaac_bench.navigation.astar import GridAStarPlanner, astar_distance_map
 from isaac_bench.navigation.frontier_commitment import FrontierCommitmentManager
 from isaac_bench.navigation.waypoint_follower import HolonomicWaypointFollower
-from isaac_bench.perception.detection_types import Detection2D, Detection3D
+from isaac_bench.perception.detection_types import (
+    MIN_VALID_DETECTION_CONFIDENCE,
+    Detection2D,
+    Detection3D,
+    detection_confidence_is_valid,
+)
 from isaac_bench.perception.detector_ipc import SubprocessDetector
 from isaac_bench.perception.fused_instance_registry import FusedInstanceRegistry
 from isaac_bench.perception.object_memory import ObjectMemory
@@ -222,7 +227,7 @@ def ensure_detector_loaded(args, scene_dir: Path, allow_ipc_fallback: bool = Fal
         args._detector_key = None
         return
     categories = load_scene_categories(scene_dir)
-    conf = float(getattr(args, "detector_conf", 0.7))
+    conf = max(float(getattr(args, "detector_conf", 0.7)), float(getattr(args, "min_valid_detection_confidence", MIN_VALID_DETECTION_CONFIDENCE)))
     iou = float(getattr(args, "detector_iou", 0.5))
     key = (str(args.detector), str(args.yolo_world_model), conf, iou, bool(allow_ipc_fallback), tuple(categories))
     if getattr(args, "_detector_key", None) == key:
@@ -411,7 +416,7 @@ def mark_observed_disc(observed: np.ndarray, center: Tuple[int, int], radius_cel
 
 def filter_detections_by_confidence(detections: List[Detection2D], min_confidence: float) -> List[Detection2D]:
     threshold = float(min_confidence)
-    return [det for det in detections if float(det.confidence) >= threshold]
+    return [det for det in detections if detection_confidence_is_valid(float(det.confidence), threshold)]
 
 
 def goal_candidate_pair_distances(object_memory: ObjectMemory, goal_category: str, max_distance_m: float = 1.0) -> List[dict]:
@@ -713,10 +718,14 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
 
     metric_planner = GridAStarPlanner(static_navigable, static_map_info.resolution_m, allow_diagonal=True)
     evaluator = EpisodeEvaluator(episode, metric_planner)
-    object_memory = ObjectMemory(merge_radius_m=float(args.object_merge_radius_m))
+    object_memory = ObjectMemory(
+        merge_radius_m=float(args.object_merge_radius_m),
+        min_valid_confidence=float(args.min_valid_detection_confidence),
+    )
     fused_instance_registry = FusedInstanceRegistry(
         merge_distance_m=float(getattr(args, "instance_merge_distance_m", args.object_merge_radius_m)),
         merge_iou_3d=float(getattr(args, "instance_merge_iou_3d", 0.15)),
+        min_valid_confidence=float(args.min_valid_detection_confidence),
     )
     if args.seed_gt_object_memory:
         print("[sgnav-loop] seed_gt_object_memory ignored for depth-online mapping", flush=True)
@@ -1010,6 +1019,7 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
             show_frontier_member_cells=bool(args.show_frontier_member_cells),
             show_object_nodes=bool(args.show_object_nodes),
             show_candidate_markers=bool(args.show_candidate_markers),
+            min_valid_detection_confidence=float(args.min_valid_detection_confidence),
             max_green_like_primitives_before_warning=int(args.max_green_like_primitives_before_warning),
         ) if (sgnav_viz_enabled or sgnav_viz_save_dir) else None
         intr = CameraIntrinsics.from_hfov(int(args.isaac_width), int(args.isaac_height), float(args.camera_hfov_deg))
@@ -2053,6 +2063,8 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
         row["candidate_reperception_steps"] = decision_metadata.get("candidate_reperception_steps")
         row["candidate_rejected"] = bool(decision_metadata.get("candidate_rejected", False))
         row["candidate_accepted"] = bool(decision_metadata.get("candidate_accepted", False))
+        row["detector_confidence_threshold"] = float(args.detector_conf)
+        row["min_valid_detection_confidence"] = float(args.min_valid_detection_confidence)
         row["candidate_start_min_confidence"] = float(args.candidate_start_min_confidence)
         row["candidate_start_min_hits"] = int(args.candidate_start_min_hits)
         row["candidate_standoff_max_cells"] = int(args.candidate_standoff_max_cells)
@@ -2254,7 +2266,7 @@ def run_episode_map_sim(episode: dict, args) -> dict:
     env = MapSimHabitatLikeEnv(args.episode_file, args.episode_index)
     env.reset()
 
-    object_memory = ObjectMemory()
+    object_memory = ObjectMemory(min_valid_confidence=float(args.min_valid_detection_confidence))
     scenegraph = SGNavSceneGraphAdapter(
         args.sgnav_repo,
         use_original=args.use_original_scenegraph,
@@ -2297,6 +2309,8 @@ def run_episode_map_sim(episode: dict, args) -> dict:
     row["goal_candidate_count"] = 0
     row["frontier_count"] = 0
     row["selected_frontier"] = None
+    row["detector_confidence_threshold"] = float(args.detector_conf)
+    row["min_valid_detection_confidence"] = float(args.min_valid_detection_confidence)
     row["planning_latency_ms"] = float(planning_latency_ms)
     row = complete_result_row(row, args)
     if args.save_debug_video or args.debug_map:
@@ -2315,6 +2329,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--detector", default=None, choices=["dry_run", "yolo_world", "none"])
     parser.add_argument("--yolo-world-model", default=None)
     parser.add_argument("--detector-conf", type=float, default=None)
+    parser.add_argument("--min-valid-detection-confidence", type=float, default=None)
     parser.add_argument("--detector-iou", type=float, default=None)
     parser.add_argument("--headless", nargs="?", const=True, default=None, type=str_to_bool)
     parser.add_argument("--no-headless", dest="headless", action="store_false")
@@ -2510,7 +2525,15 @@ def main(argv: Optional[List[str]] = None) -> int:
     args.planner = args.planner or get_nested(cfg, "repo.planner", "astar")
     args.detector = args.detector or get_nested(cfg, "repo.detector", "dry_run")
     args.yolo_world_model = args.yolo_world_model or get_nested(cfg, "paths.yolo_world_model", get_nested(cfg, "perception.yolo_world_model", "data/models/yolov8l-worldv2.pt"))
-    args.detector_conf = float(args.detector_conf if args.detector_conf is not None else get_nested(cfg, "perception.confidence_threshold", 0.7))
+    args.min_valid_detection_confidence = float(
+        args.min_valid_detection_confidence
+        if args.min_valid_detection_confidence is not None
+        else get_nested(cfg, "perception.min_valid_detection_confidence", MIN_VALID_DETECTION_CONFIDENCE)
+    )
+    args.detector_conf = max(
+        float(args.detector_conf if args.detector_conf is not None else get_nested(cfg, "perception.confidence_threshold", 0.7)),
+        float(args.min_valid_detection_confidence),
+    )
     args.detector_iou = float(args.detector_iou if args.detector_iou is not None else get_nested(cfg, "perception.nms_iou_threshold", 0.5))
     args.headless = bool(get_nested(cfg, "isaac.headless", True) if args.headless is None else args.headless)
     viz_cfg = get_nested(cfg, "visualization.sgnav_popup", "auto")
@@ -2800,7 +2823,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     args.debug_graph_dump_dir = str(args.debug_graph_dump_dir or get_nested(cfg, "sgnav.debug_graph_dump_dir", "debug/graphs"))
     args.runtime_planning_clearance_m = float(args.runtime_planning_clearance_m if args.runtime_planning_clearance_m is not None else get_nested(cfg, "astar.runtime_planning_clearance_m", 0.0))
     args.candidate_min_detector_hits = int(args.candidate_min_detector_hits if args.candidate_min_detector_hits is not None else get_nested(cfg, "sgnav.candidate_min_detector_hits", 2))
-    args.candidate_start_min_confidence = float(args.candidate_start_min_confidence if args.candidate_start_min_confidence is not None else get_nested(cfg, "sgnav.candidate_start_min_confidence", 0.55))
+    args.candidate_start_min_confidence = max(
+        float(args.candidate_start_min_confidence if args.candidate_start_min_confidence is not None else get_nested(cfg, "sgnav.candidate_start_min_confidence", 0.55)),
+        float(args.min_valid_detection_confidence),
+    )
     args.candidate_start_min_hits = int(args.candidate_start_min_hits if args.candidate_start_min_hits is not None else get_nested(cfg, "sgnav.candidate_start_min_hits", 2))
     args.candidate_recent_max_age_steps = int(
         args.candidate_recent_max_age_steps

@@ -40,3 +40,17 @@ def test_object_memory_dedupes_existing_close_nodes():
     assert mem.nodes[0].category == "tv"
     assert mem.nodes[0].observed_count == 2
     assert mem.nodes[0].confidence == 0.9
+
+
+def test_object_memory_rejects_detections_at_or_below_valid_confidence_floor():
+    mem = ObjectMemory(merge_radius_m=0.5)
+    low = Detection3D("chair", "chair", 0.65, (1.0, 2.0, 0.5), (0, 0, 10, 10))
+    high = Detection3D("chair", "chair", 0.66, (1.0, 2.0, 0.5), (0, 0, 10, 10))
+
+    low_changed = mem.update([low], step_id=1)
+    high_changed = mem.update([high], step_id=2)
+
+    assert low_changed == []
+    assert len(mem.nodes) == 1
+    assert high_changed == [mem.nodes[0]]
+    assert mem.nodes[0].confidence == 0.66

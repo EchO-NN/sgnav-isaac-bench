@@ -7,7 +7,12 @@ import numpy as np
 
 from isaac_bench.dataset.category_normalizer import normalize_category
 from isaac_bench.mapping.coordinate_transform import MapInfo, world_xy_to_grid
-from isaac_bench.perception.detection_types import Detection3D, FusedInstance
+from isaac_bench.perception.detection_types import (
+    MIN_VALID_DETECTION_CONFIDENCE,
+    Detection3D,
+    FusedInstance,
+    detection_confidence_is_valid,
+)
 
 
 @dataclass
@@ -44,8 +49,9 @@ class ObjectNode:
 
 
 class ObjectMemory:
-    def __init__(self, merge_radius_m: float = 0.5):
+    def __init__(self, merge_radius_m: float = 0.5, min_valid_confidence: float = MIN_VALID_DETECTION_CONFIDENCE):
         self.merge_radius_m = float(merge_radius_m)
+        self.min_valid_confidence = float(min_valid_confidence)
         self.nodes: List[ObjectNode] = []
         self._next_id = 0
 
@@ -79,6 +85,8 @@ class ObjectMemory:
     def update(self, detections: List[Detection3D], step_id: int, map_info: Optional[MapInfo] = None) -> List[ObjectNode]:
         changed: List[ObjectNode] = []
         for det in detections:
+            if not detection_confidence_is_valid(float(det.confidence), self.min_valid_confidence):
+                continue
             center = tuple(float(v) for v in det.center_world)
             category = self._category_key(det.category)
             matched = self.find_match(category, center)
@@ -135,6 +143,8 @@ class ObjectMemory:
         sources: List[str] = []
         for instance in instances:
             if instance.node_type != "object":
+                continue
+            if not detection_confidence_is_valid(float(instance.confidence), self.min_valid_confidence):
                 continue
             detections.append(
                 Detection3D(

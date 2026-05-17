@@ -16,7 +16,7 @@ from isaac_bench.config import repo_root
 from isaac_bench.dataset.category_normalizer import normalize_category
 from isaac_bench.graph.decision import NavigationDecision
 from isaac_bench.mapping.frontier import FrontierCluster
-from isaac_bench.perception.detection_types import Detection2D
+from isaac_bench.perception.detection_types import MIN_VALID_DETECTION_CONFIDENCE, Detection2D, detection_confidence_is_valid
 from isaac_bench.perception.object_memory import ObjectMemory
 
 
@@ -45,6 +45,7 @@ class SGNavPopupVisualizer:
         show_frontier_member_cells: bool = True,
         show_object_nodes: bool = True,
         show_candidate_markers: bool = True,
+        min_valid_detection_confidence: float = MIN_VALID_DETECTION_CONFIDENCE,
         max_green_like_primitives_before_warning: int = 200,
     ) -> None:
         self.enabled = bool(enabled)
@@ -61,6 +62,7 @@ class SGNavPopupVisualizer:
         self.show_frontier_member_cells = bool(show_frontier_member_cells)
         self.show_object_nodes = bool(show_object_nodes)
         self.show_candidate_markers = bool(show_candidate_markers)
+        self.min_valid_detection_confidence = float(min_valid_detection_confidence)
         self.max_green_like_primitives_before_warning = max(0, int(max_green_like_primitives_before_warning))
         self._last_overlay_layers: List[dict] = []
         self._room_masks: List[object] = []
@@ -297,11 +299,12 @@ class SGNavPopupVisualizer:
         left_w = panel_w - right_w
         rgb_h = int(panel_h * 0.62)
         text_h = panel_h - rgb_h
+        valid_detections_2d = self._valid_detections(detections_2d)
 
         panel = Image.new("RGB", (panel_w, panel_h), (18, 20, 24))
         rgb_panel = self._render_rgb(
             rgb,
-            detections_2d,
+            valid_detections_2d,
             (left_w, rgb_h),
             goal_category=goal_category,
             nav_decision=nav_decision,
@@ -323,7 +326,7 @@ class SGNavPopupVisualizer:
         )
         text_panel = self._render_text(
             step=step,
-            detections_2d=detections_2d,
+            detections_2d=valid_detections_2d,
             frontiers=frontiers,
             nav_decision=nav_decision,
             object_memory=object_memory,
@@ -342,6 +345,13 @@ class SGNavPopupVisualizer:
         draw.line([(left_w, 0), (left_w, panel_h)], fill=(70, 74, 80), width=2)
         draw.line([(0, rgb_h), (left_w, rgb_h)], fill=(70, 74, 80), width=2)
         return np.asarray(panel, dtype=np.uint8)
+
+    def _valid_detections(self, detections: Sequence[Detection2D]) -> List[Detection2D]:
+        return [
+            det
+            for det in detections
+            if detection_confidence_is_valid(float(det.confidence), self.min_valid_detection_confidence)
+        ]
 
     def _render_rgb(
         self,
@@ -368,7 +378,8 @@ class SGNavPopupVisualizer:
         image.paste(rgb_image, (offset_x, offset_y))
         draw = ImageDraw.Draw(image)
         sx, sy = render_w / max(src_w, 1), render_h / max(src_h, 1)
-        for det in detections[:30]:
+        valid_detections = self._valid_detections(detections)
+        for det in valid_detections[:30]:
             x1, y1, x2, y2 = det.bbox_xyxy
             box = [
                 int(offset_x + x1 * sx),
@@ -380,7 +391,7 @@ class SGNavPopupVisualizer:
             draw.rectangle(box, outline=color, width=2)
             label = "%s %.2f" % (det.category, float(det.confidence))
             self._label(draw, (box[0], max(0, box[1] - 14)), label, color)
-        self._label(draw, (8, 8), "RGB / YOLO detections: %d  green=normal red=goal" % len(detections), (255, 255, 255))
+        self._label(draw, (8, 8), "RGB / YOLO detections: %d  green=normal red=goal" % len(valid_detections), (255, 255, 255))
         return image
 
     def _render_map(

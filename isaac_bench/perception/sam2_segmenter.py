@@ -6,7 +6,7 @@ from typing import List, Optional
 
 import numpy as np
 
-from isaac_bench.perception.detection_types import Detection2D
+from isaac_bench.perception.detection_types import MIN_VALID_DETECTION_CONFIDENCE, Detection2D, detection_confidence_is_valid
 from isaac_bench.perception.detector_base import DetectorBase
 
 
@@ -19,6 +19,7 @@ class SAM2BoxSegmenter:
         model_cfg: str,
         device: str = "cuda",
         autocast_bfloat16: bool = True,
+        min_valid_confidence: float = MIN_VALID_DETECTION_CONFIDENCE,
     ) -> None:
         try:
             import torch
@@ -36,6 +37,7 @@ class SAM2BoxSegmenter:
         self.torch = torch
         self.device = str(device or "cuda")
         self.autocast_bfloat16 = bool(autocast_bfloat16)
+        self.min_valid_confidence = float(min_valid_confidence)
         checkpoint_path = Path(str(checkpoint)) if checkpoint else None
         if checkpoint_path is not None and str(checkpoint_path) and not checkpoint_path.exists():
             raise RuntimeError("SAM2 checkpoint not found: %s" % checkpoint_path)
@@ -56,8 +58,13 @@ class SAM2BoxSegmenter:
         self.predictor = SAM2ImagePredictor(model)
 
     def segment(self, rgb: np.ndarray, detections: List[Detection2D]) -> List[Detection2D]:
+        detections = [
+            det
+            for det in detections
+            if detection_confidence_is_valid(float(det.confidence), self.min_valid_confidence)
+        ]
         if not detections:
-            return detections
+            return []
         image = np.asarray(rgb)
         if image.dtype != np.uint8:
             image = np.clip(image, 0, 255).astype(np.uint8)

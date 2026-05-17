@@ -319,11 +319,11 @@ def test_vllm_frontier_scorer_encodes_cpu_rgb_image():
 
 def test_low_confidence_2d_detections_are_filtered():
     detections = [
-        Detection2D("table", "table", 0.49, (0, 0, 10, 10)),
-        Detection2D("chair", "chair", 0.51, (0, 0, 10, 10)),
+        Detection2D("table", "table", 0.65, (0, 0, 10, 10)),
+        Detection2D("chair", "chair", 0.66, (0, 0, 10, 10)),
     ]
 
-    kept = filter_detections_by_confidence(detections, 0.5)
+    kept = filter_detections_by_confidence(detections, 0.65)
 
     assert [det.category for det in kept] == ["chair"]
 

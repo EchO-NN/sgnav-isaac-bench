@@ -166,6 +166,8 @@ def test_config_defaults_match_benchmark_contract():
     assert cfg["benchmark"]["policy"] == "sgnav_original"
     assert cfg["repo"]["detector"] == "yolo_world"
     assert cfg["perception"]["segmenter"] == "sam2"
+    assert cfg["perception"]["confidence_threshold"] == 0.65
+    assert cfg["perception"]["min_valid_detection_confidence"] == 0.65
     assert cfg["sgnav"]["seed_gt_object_memory"] is False
     assert cfg["sgnav"]["allow_gt_goal_fallback"] is False
     assert cfg["nearfield_static_map"]["enabled"] is False

@@ -68,6 +68,24 @@ def test_sgnav_popup_bbox_colors_goal_red_normal_green():
     assert tuple(arr[40, 70]) == (255, 60, 60)
 
 
+def test_sgnav_popup_does_not_draw_low_confidence_bbox():
+    viz = SGNavPopupVisualizer(enabled=False, panel_size=(320, 240))
+    image = viz._render_rgb(
+        np.zeros((80, 100, 3), dtype=np.uint8),
+        [
+            Detection2D("chair", "chair", 0.65, (20, 20, 40, 40), 0),
+            Detection2D("mirror", "mirror", 0.66, (60, 20, 80, 40), 1),
+        ],
+        (100, 80),
+        goal_category="mirror",
+        nav_decision=None,
+    )
+    arr = np.asarray(image)
+
+    assert tuple(arr[40, 30]) == (0, 0, 0)
+    assert tuple(arr[40, 70]) == (255, 60, 60)
+
+
 def test_sgnav_popup_map_nodes_only_goal_or_selected_candidate():
     memory = ObjectMemory()
     memory.update(
