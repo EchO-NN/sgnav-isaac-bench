@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 from typing import Iterable, Mapping, Optional
+
+import numpy as np
 
 
 def save_graph_debug_dump(
@@ -31,7 +34,7 @@ def save_graph_debug_dump(
         "score_debug": dict(getattr(scenegraph, "last_score_debug", {}) or {}),
     }
     out = path / ("graph_step_%06d.json" % int(step))
-    out.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    out.write_text(json.dumps(_json_ready(payload), ensure_ascii=False, indent=2), encoding="utf-8")
     return out
 
 
@@ -135,3 +138,19 @@ def _decision(nav_decision) -> dict:
         "target_cells": [list(cell) for cell in (getattr(nav_decision, "target_cells", []) or [])[:64]],
         "metadata": dict(getattr(nav_decision, "metadata", {}) or {}),
     }
+
+
+def _json_ready(value):
+    if isinstance(value, Mapping):
+        return {str(key): _json_ready(item) for key, item in value.items()}
+    if isinstance(value, np.ndarray):
+        return _json_ready(value.tolist())
+    if isinstance(value, np.generic):
+        return _json_ready(value.item())
+    if isinstance(value, (list, tuple)):
+        return [_json_ready(item) for item in value]
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, (str, int, bool)) or value is None:
+        return value
+    return str(value)

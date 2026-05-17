@@ -39,6 +39,11 @@ def test_graph_debug_dump_contains_runtime_nodes_edges_and_scores(tmp_path):
         map_info,
         (0.5, 0.5, 0.0, 0.0),
     )
+    scenegraph.last_score_debug = {
+        "score": np.float32(1.25),
+        "grid": np.asarray([3, 4], dtype=np.int64),
+        "bad_float": np.float32("nan"),
+    }
 
     out = save_graph_debug_dump(
         str(tmp_path),
@@ -48,7 +53,7 @@ def test_graph_debug_dump_contains_runtime_nodes_edges_and_scores(tmp_path):
         frontiers=frontiers,
         frontier_decision=nav.frontier_decision,
         nav_decision=nav,
-        commitment_metadata={"active_frontier_id": 3},
+        commitment_metadata={"active_frontier_id": np.int64(3), "score": np.float32(0.5)},
     )
     payload = json.loads(out.read_text(encoding="utf-8"))
 
@@ -58,6 +63,10 @@ def test_graph_debug_dump_contains_runtime_nodes_edges_and_scores(tmp_path):
     assert any(edge["rel"] in {"belongs to", "related near", "near"} for edge in payload["edges"])
     assert payload["frontiers"][0]["total"] is not None
     assert payload["commitment"]["active_frontier_id"] == 3
+    assert payload["commitment"]["score"] == 0.5
+    assert payload["score_debug"]["score"] == 1.25
+    assert payload["score_debug"]["grid"] == [3, 4]
+    assert payload["score_debug"]["bad_float"] is None
 
 
 def test_scenegraph_loads_semantic_priors_yaml_aliases(tmp_path):
