@@ -155,36 +155,84 @@ def prepare_room_context_for_frontier_scoring(
         cache.last_result = result
         return result
 
-    update_kwargs = {"step": int(step_idx)}
-    try:
-        update_params = inspect.signature(room_segmenter.update).parameters
-    except (TypeError, ValueError):
-        update_params = {}
-    if "object_memory" in update_params:
-        update_kwargs["object_memory"] = getattr(object_memory, "nodes", [])
-    room_masks = room_segmenter.update(
-        occupancy_arr,
-        free_arr,
-        obstacle_arr,
-        unknown_arr,
-        **update_kwargs,
-    )
-    seg_debug = dict(room_segmenter.last_debug or room_segmentation_debug(room_masks))
-    assignments = assign_objects_to_room_masks(getattr(object_memory, "nodes", []), room_masks, map_info)
     labels: Dict[str, RoomSemanticLabel] = {}
     label_cache_hits = 0
     label_requests = 0
     labeling_ran = False
+    premerge_labels_by_label_id: Dict[int, RoomSemanticLabel] = {}
     if room_labeler is None:
         if strict_benchmark:
             raise RuntimeError("strict benchmark requires room VLM labeling before SG-Nav frontier scoring")
     else:
+        use_premerge = hasattr(room_segmenter, "build_proposals") and hasattr(room_segmenter, "finalize_proposals")
+        if use_premerge:
+            proposal_rooms, proposal_state = room_segmenter.build_proposals(
+                occupancy_arr,
+                free_arr,
+                obstacle_arr,
+                unknown_arr,
+                step=int(step_idx),
+                object_memory=getattr(object_memory, "nodes", []),
+            )
+            proposal_assignments = assign_objects_to_room_masks(getattr(object_memory, "nodes", []), proposal_rooms, map_info)
+            for proposal in proposal_rooms:
+                label_id = int((proposal.metadata or {}).get("label_id", 0) or 0)
+                if label_id <= 0:
+                    continue
+                evidence = summarize_room_object_evidence(getattr(object_memory, "nodes", []), proposal_assignments, proposal.room_id)
+                evidence_hash = _hash_room_evidence(proposal, evidence)
+                cache_key = "premerge:%s:%s" % (label_id, evidence_hash)
+                cached_label = cache.label_cache.get(cache_key)
+                if cached_label is not None:
+                    premerge_labels_by_label_id[label_id] = cached_label
+                    label_cache_hits += 1
+                    continue
+                before = int(getattr(room_labeler, "request_count", 0))
+                premerge_labels_by_label_id[label_id] = room_labeler.label_room(proposal, evidence, None)
+                after = int(getattr(room_labeler, "request_count", 0))
+                label_requests += max(0, after - before)
+                labeling_ran = True
+                cache.label_cache[cache_key] = premerge_labels_by_label_id[label_id]
+            room_masks = room_segmenter.finalize_proposals(proposal_state, premerge_labels_by_label_id)
+        else:
+            update_kwargs = {"step": int(step_idx)}
+            try:
+                update_params = inspect.signature(room_segmenter.update).parameters
+            except (TypeError, ValueError):
+                update_params = {}
+            if "object_memory" in update_params:
+                update_kwargs["object_memory"] = getattr(object_memory, "nodes", [])
+            room_masks = room_segmenter.update(
+                occupancy_arr,
+                free_arr,
+                obstacle_arr,
+                unknown_arr,
+                **update_kwargs,
+            )
+    if room_labeler is None:
+        update_kwargs = {"step": int(step_idx)}
+        try:
+            update_params = inspect.signature(room_segmenter.update).parameters
+        except (TypeError, ValueError):
+            update_params = {}
+        if "object_memory" in update_params:
+            update_kwargs["object_memory"] = getattr(object_memory, "nodes", [])
+        room_masks = room_segmenter.update(
+            occupancy_arr,
+            free_arr,
+            obstacle_arr,
+            unknown_arr,
+            **update_kwargs,
+        )
+    seg_debug = dict(room_segmenter.last_debug or room_segmentation_debug(room_masks))
+    assignments = assign_objects_to_room_masks(getattr(object_memory, "nodes", []), room_masks, map_info)
+    if room_labeler is not None:
         for room in room_masks:
             if room.stale:
                 continue
             evidence = summarize_room_object_evidence(getattr(object_memory, "nodes", []), assignments, room.room_id)
             evidence_hash = _hash_room_evidence(room, evidence)
-            cache_key = "%s:%s" % (room.room_id, evidence_hash)
+            cache_key = "final:%s:%s" % (room.room_id, evidence_hash)
             cached_label = cache.label_cache.get(cache_key)
             if cached_label is not None:
                 labels[room.room_id] = cached_label
@@ -197,6 +245,11 @@ def prepare_room_context_for_frontier_scoring(
             labeling_ran = True
             cache.label_cache[cache_key] = labels[room.room_id]
             cache.label_evidence_hash_by_room[room.room_id] = evidence_hash
+    seg_debug["premerge_room_semantics"] = {
+        "labels": [label.to_dict() for _label_id, label in sorted(premerge_labels_by_label_id.items())],
+        "used_for_open_plan_merge": bool(premerge_labels_by_label_id),
+        "final_labels_recomputed_after_merge": bool(premerge_labels_by_label_id and labels),
+    }
 
     semantics_debug = room_semantics_debug(
         labels,

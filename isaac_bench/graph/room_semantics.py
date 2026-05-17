@@ -92,6 +92,10 @@ class RoomSemanticLabel:
     label_reliability: float = 0.0
     reliability_factors: Dict[str, object] = field(default_factory=dict)
 
+    @property
+    def is_reliable(self) -> bool:
+        return bool(self.category != "unknown" and float(self.label_reliability) >= 0.65)
+
     def to_dict(self) -> dict:
         return {
             "room_id": self.room_id,
@@ -99,6 +103,7 @@ class RoomSemanticLabel:
             "confidence": float(self.confidence),
             "vlm_self_confidence": float(self.vlm_self_confidence),
             "label_reliability": float(self.label_reliability),
+            "is_reliable": bool(self.is_reliable),
             "reliability_factors": dict(self.reliability_factors),
             "supporting_objects": list(self.supporting_objects),
             "conflicting_evidence": list(self.conflicting_evidence),

@@ -15,41 +15,51 @@ Metric-path SG-Nav runs must use the following pipeline:
    or below 0.65 must not draw RGB bboxes, enter mask/depth fusion, create
    object-memory nodes, create scene-graph object nodes, seed candidate goals,
    or support STOP confirmation.
-5. SAM2 mask pixels and RGB-D depth are backprojected into online 3D object
-   memory.
-6. Online occupancy and free-space maps are updated from live RGB-D evidence.
-7. Reachable frontiers are extracted from the observed-free and unknown-space
+5. YOLO-World boxes that touch the image edge are raw-detection debug records
+   only. They must not be sent to SAM2/depth backprojection, update object
+   memory, create goal candidates, support STOP, or become SG-Nav/GNN object
+   nodes.
+6. SAM2 mask pixels and RGB-D depth are backprojected into online 3D object
+   memory for non-edge detections only. Object tracks maintain accumulated
+   `class_conf_sums`/`class_hits`; the current category is the accumulated
+   winner, not the most recent frame.
+7. Online occupancy and free-space maps are updated from live RGB-D evidence.
+8. Reachable frontiers are extracted from the observed-free and unknown-space
    boundary.
-8. The online scene graph represents object nodes, clustering-based group
+9. The online scene graph represents object nodes, clustering-based group
    nodes, and online geometry room-mask nodes where feasible. Metric room nodes
    must not use `rooms.json` labels or oracle room masks.
-9. Room masks are prepared lazily only for SG-Nav frontier scoring. After
+10. Room masks are prepared lazily only for SG-Nav frontier scoring. After
    reachable frontier extraction, `prepare_room_context_for_frontier_scoring`
    runs room segmentation/labeling immediately before scene graph update and
    HCoT/subgraph frontier interpolation. Mapper-only updates, perception-only
    updates, committed-frontier local replans, and candidate re-perception/STOP
    confirmation must use cached context and must not trigger room VLM calls.
-10. Room masks come from traditional online occupancy/free-space segmentation:
+11. Room masks come from traditional online occupancy/free-space segmentation:
    observed-free structural masks, distance-transform seeds, watershed or
-   seeded region growing, doorway-aware refinement, stable IDs, and VLM room
-   labels over objects inside the mask. `unknown` is a valid first-class room
-   category when evidence is weak or ambiguous.
-11. VLM room-label `confidence` is only `vlm_self_confidence`, not calibrated
+   seeded region growing, doorway-aware refinement, stable IDs, and two-stage
+   room recognition. Premerge room labels can preserve weak/open-plan
+   functional splits only when both sides are reliable, non-unknown, and
+   different; final room masks are labeled again for SG-Nav room nodes.
+   `unknown` is a valid first-class room category when evidence is weak or
+   ambiguous, but it does not create functional splits without a structural
+   boundary.
+12. VLM room-label `confidence` is only `vlm_self_confidence`, not calibrated
    probability. Room node confidence must use evidence-derived
    `label_reliability`; evidence-gated `unknown` remains metric-valid.
-12. SG-Nav-compatible object-centered subgraph text or payloads are generated
+13. SG-Nav-compatible object-centered subgraph text or payloads are generated
    from the scene graph, including central object, parent room mask/label,
    parent group, direct object neighbors, and edges.
-13. Subgraphs are scored by the SG-Nav paper HCoT sequence: prior
+14. Subgraphs are scored by the SG-Nav paper HCoT sequence: prior
    object-goal distance, distance-prediction questions, subgraph-grounded
    answers, final distance summary, then `P_sub = 1 / max(distance,
    min_distance_m)`.
-14. Subgraph probabilities are interpolated onto reachable frontiers. The paper
+15. Subgraph probabilities are interpolated onto reachable frontiers. The paper
    path must not ask an LLM to directly choose frontiers.
-15. Candidate goals are re-perceived and their credibility is accumulated from
+16. Candidate goals are re-perceived and their credibility is accumulated from
     graph and detector evidence.
-16. STOP is allowed only after SG-Nav goal confirmation rules are satisfied.
-17. Local motion uses a deterministic A* planner or an FMM-equivalent grid
+17. STOP is allowed only after SG-Nav goal confirmation rules are satisfied.
+18. Local motion uses a deterministic A* planner or an FMM-equivalent grid
     planner.
 
 ## Forbidden Metric-Path Substitutions

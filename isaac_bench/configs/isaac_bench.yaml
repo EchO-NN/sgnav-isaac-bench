@@ -191,6 +191,10 @@ mapping:
     open_boundary_merge: true
     merge_same_semantic_category: true
     merge_unknown_into_open_labeled_region: true
+    use_premerge_labels_for_open_plan_merge: true
+    min_label_reliability_for_functional_split: 0.65
+    unknown_allows_functional_split: false
+    final_label_after_merge: true
     merge_wide_openings: true
     small_segment_merge_area_m2: 1.2
     id_iou_threshold: 0.35
@@ -214,6 +218,23 @@ perception:
   object_merge_radius_m: 0.5
   object_forget_after_steps: 100
   min_depth_points_per_detection: 20
+  yolo_world:
+    reject_edge_touching_bboxes: true
+    bbox_edge_margin_px: 2
+    bbox_edge_margin_ratio: 0.0
+    category_accumulation: true
+
+object_memory:
+  category_update_mode: confidence_sum
+  expose_mean_confidence: true
+  expose_detection_count: true
+  use_edge_touching_detections_for_policy: false
+
+room_semantics:
+  use_premerge_labels_for_open_plan_merge: true
+  min_label_reliability_for_functional_split: 0.65
+  unknown_allows_functional_split: false
+  final_label_after_merge: true
 
 sgnav:
   mode: paper

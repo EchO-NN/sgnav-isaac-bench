@@ -40,7 +40,17 @@ def build_object_centered_subgraphs(graph: PaperSceneGraph) -> List[Subgraph]:
         for node_id in sorted(included_ids):
             if node_id in graph.object_nodes:
                 node = graph.object_nodes[node_id]
-                nodes.append({"id": node.id, "type": "object", "category": node.category, "confidence": float(node.confidence)})
+                nodes.append(
+                    {
+                        "id": node.id,
+                        "type": "object",
+                        "category": node.category,
+                        "confidence": float(node.confidence),
+                        "mean_confidence": float(getattr(node, "mean_confidence", node.confidence)),
+                        "detection_count": int(getattr(node, "detection_count", node.observed_count)),
+                        "winner_detection_count": int(getattr(node, "winner_detection_count", node.observed_count)),
+                    }
+                )
             elif node_id in graph.room_nodes:
                 node = graph.room_nodes[node_id]
                 nodes.append(

@@ -61,6 +61,9 @@ class ObjectNode:
     center_world: np.ndarray
     observed_count: int
     last_seen_step: int
+    mean_confidence: float = 0.0
+    detection_count: int = 0
+    winner_detection_count: int = 0
     room_id: Optional[str] = None
     center_grid: Optional[Tuple[int, int]] = None
     is_new_node: bool = False
@@ -176,6 +179,9 @@ class PaperSceneGraph:
                 center_world=np.asarray(mem_node.center_world, dtype=np.float32),
                 observed_count=int(mem_node.observed_count),
                 last_seen_step=int(mem_node.last_seen_step),
+                mean_confidence=float(getattr(mem_node, "mean_confidence", mem_node.confidence)),
+                detection_count=int(getattr(mem_node, "valid_detection_count", mem_node.observed_count) or mem_node.observed_count),
+                winner_detection_count=int(getattr(mem_node, "winner_detection_count", mem_node.observed_count)),
                 center_grid=tuple(int(v) for v in mem_node.center_grid),
                 is_new_node=is_new,
             )
@@ -353,6 +359,9 @@ class PaperSceneGraph:
             center_world=np.asarray(instance.center_world, dtype=np.float32).copy(),
             observed_count=int(instance.observed_count),
             last_seen_step=int(instance.last_seen_step),
+            mean_confidence=float(getattr(instance, "mean_confidence", instance.confidence)),
+            detection_count=int(getattr(instance, "valid_detection_count", instance.observed_count) or instance.observed_count),
+            winner_detection_count=int(getattr(instance, "winner_detection_count", instance.observed_count)),
             is_new_node=node_id not in self.object_nodes,
         )
         self.object_nodes[node_id] = node

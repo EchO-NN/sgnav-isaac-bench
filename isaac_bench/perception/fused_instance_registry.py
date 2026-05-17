@@ -10,6 +10,7 @@ from isaac_bench.perception.detection_types import (
     Detection2D,
     Detection3D,
     FusedInstance,
+    bbox_touches_image_edge,
     detection_confidence_is_valid,
 )
 from isaac_bench.sensors.camera_geometry import CameraIntrinsics
@@ -41,18 +42,28 @@ class FusedInstanceRegistry:
         max_points_per_instance: int = 4096,
         room_categories: Optional[Iterable[str]] = None,
         min_valid_confidence: float = MIN_VALID_DETECTION_CONFIDENCE,
+        reject_edge_touching_bboxes: bool = False,
+        bbox_edge_margin_px: float = 2,
+        bbox_edge_margin_ratio: float = 0.0,
     ):
         self.merge_distance_m = float(merge_distance_m)
         self.merge_iou_3d = float(merge_iou_3d)
         self.max_points_per_instance = max(1, int(max_points_per_instance))
         self.room_categories = {normalize_category(name) for name in (room_categories or DEFAULT_ROOM_CATEGORIES)}
         self.min_valid_confidence = float(min_valid_confidence)
+        self.reject_edge_touching_bboxes = bool(reject_edge_touching_bboxes)
+        self.bbox_edge_margin_px = float(bbox_edge_margin_px)
+        self.bbox_edge_margin_ratio = float(bbox_edge_margin_ratio)
         self.instances: List[FusedInstance] = []
         self._next_id = 0
+        self.raw_detection_log: List[dict] = []
+        self.raw_rejected_detections_count = 0
 
     def reset(self) -> None:
         self.instances = []
         self._next_id = 0
+        self.raw_detection_log = []
+        self.raw_rejected_detections_count = 0
 
     def update(
         self,
@@ -66,7 +77,16 @@ class FusedInstanceRegistry:
         stride: int = 4,
     ) -> List[FusedInstance]:
         for det in detections:
+            raw_record = self._raw_detection_record(det, step_id, intr.width, intr.height)
+            self.raw_detection_log.append(raw_record)
+            if raw_record["bbox_touches_edge"] and self.reject_edge_touching_bboxes:
+                self.raw_rejected_detections_count += 1
+                if len(self.instances) == 1:
+                    self.instances[0].edge_rejected_count = int(self.instances[0].edge_rejected_count) + 1
+                continue
             if not detection_confidence_is_valid(float(det.confidence), self.min_valid_confidence):
+                raw_record["used_for_object_track"] = False
+                raw_record["reject_reason"] = "low_confidence"
                 continue
             points = detection_to_world_points(
                 det,
@@ -78,6 +98,8 @@ class FusedInstanceRegistry:
                 stride=stride,
             )
             if points is None or len(points) == 0:
+                raw_record["used_for_object_track"] = False
+                raw_record["reject_reason"] = "insufficient_depth_points"
                 continue
             category = normalize_category(det.category)
             node_type = self._node_type_for_category(category)
@@ -85,6 +107,8 @@ class FusedInstanceRegistry:
             center_world = np.median(np.asarray(points, dtype=np.float32), axis=0).astype(np.float32)
             match = self._find_match(category, node_type, center_world, bbox_world)
             if match is None:
+                class_conf_sums = {category: float(det.confidence)}
+                class_hits = {category: 1}
                 self.instances.append(
                     FusedInstance(
                         instance_id="%s_%d" % (node_type, self._next_id),
@@ -97,11 +121,17 @@ class FusedInstanceRegistry:
                         last_mask=self._copy_mask(det.mask),
                         last_seen_step=int(step_id),
                         observed_count=1,
+                        class_conf_sums=class_conf_sums,
+                        class_hits=class_hits,
+                        valid_detection_count=1,
+                        total_conf_sum=float(det.confidence),
                     )
                 )
                 self._next_id += 1
+                raw_record["used_for_object_track"] = True
                 continue
             self._merge(match, points, bbox_world, center_world, det, step_id)
+            raw_record["used_for_object_track"] = True
         return list(self.instances)
 
     def to_detections_3d(self, node_type: str = "object") -> List[Detection3D]:
@@ -113,7 +143,7 @@ class FusedInstanceRegistry:
                 Detection3D(
                     category=instance.category,
                     raw_label=instance.category,
-                    confidence=float(instance.confidence),
+                    confidence=float(instance.mean_confidence),
                     center_world=tuple(float(v) for v in instance.center_world),
                     bbox_xyxy=(0.0, 0.0, 0.0, 0.0),
                     point_cloud_world=instance.point_cloud_world,
@@ -133,7 +163,8 @@ class FusedInstanceRegistry:
         best: Optional[FusedInstance] = None
         best_dist = float("inf")
         for instance in self.instances:
-            if instance.node_type != node_type or normalize_category(instance.category) != category:
+            _ = category
+            if instance.node_type != node_type:
                 continue
             dist = float(np.linalg.norm(np.asarray(instance.center_world[:2], dtype=np.float32) - np.asarray(center_world[:2], dtype=np.float32)))
             if dist > self.merge_distance_m or dist >= best_dist:
@@ -165,6 +196,12 @@ class FusedInstanceRegistry:
         instance.last_mask = self._copy_mask(det.mask)
         instance.last_seen_step = int(step_id)
         instance.observed_count = old_count + 1
+        category = normalize_category(det.category)
+        instance.class_conf_sums[category] = float(instance.class_conf_sums.get(category, 0.0)) + float(det.confidence)
+        instance.class_hits[category] = int(instance.class_hits.get(category, 0)) + 1
+        instance.valid_detection_count = int(instance.valid_detection_count) + 1
+        instance.total_conf_sum = float(instance.total_conf_sum) + float(det.confidence)
+        instance.category = instance.stable_category
 
     def _node_type_for_category(self, category: str) -> str:
         return "room" if normalize_category(category) in self.room_categories else "object"
@@ -181,6 +218,30 @@ class FusedInstanceRegistry:
         if mask is None:
             return None
         return np.asarray(mask).astype(bool).copy()
+
+    def _raw_detection_record(self, det: Detection2D, step_id: int, width: int, height: int) -> dict:
+        touches = bbox_touches_image_edge(
+            det.bbox_xyxy,
+            width,
+            height,
+            margin_px=self.bbox_edge_margin_px,
+            margin_ratio=self.bbox_edge_margin_ratio,
+        )
+        rejected = bool(touches and self.reject_edge_touching_bboxes)
+        det.bbox_touches_edge = bool(touches)
+        det.used_for_object_track = not rejected
+        det.reject_reason = "bbox_touches_image_edge" if touches and self.reject_edge_touching_bboxes else None
+        return {
+            "raw_detection_id": "frame_%04d_det_%04d" % (int(step_id), len(self.raw_detection_log)),
+            "step": int(step_id),
+            "category": normalize_category(det.category),
+            "raw_label": str(det.raw_label),
+            "confidence": float(det.confidence),
+            "bbox_xyxy": [float(v) for v in det.bbox_xyxy],
+            "bbox_touches_edge": bool(touches),
+            "used_for_object_track": not rejected,
+            "reject_reason": "bbox_touches_image_edge" if touches and self.reject_edge_touching_bboxes else None,
+        }
 
 
 def bbox_iou_3d(a: np.ndarray, b: np.ndarray) -> float:

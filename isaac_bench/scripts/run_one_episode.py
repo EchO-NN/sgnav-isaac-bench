@@ -48,6 +48,7 @@ from isaac_bench.perception.detection_types import (
     MIN_VALID_DETECTION_CONFIDENCE,
     Detection2D,
     Detection3D,
+    bbox_touches_image_edge,
     detection_confidence_is_valid,
 )
 from isaac_bench.perception.detector_ipc import SubprocessDetector
@@ -419,6 +420,58 @@ def filter_detections_by_confidence(detections: List[Detection2D], min_confidenc
     return [det for det in detections if detection_confidence_is_valid(float(det.confidence), threshold)]
 
 
+def filter_edge_touching_detections(
+    detections: List[Detection2D],
+    *,
+    image_width: int,
+    image_height: int,
+    step_idx: int,
+    reject_edge_touching_bboxes: bool,
+    margin_px: float,
+    margin_ratio: float,
+    min_confidence: Optional[float] = None,
+    raw_log: Optional[List[dict]] = None,
+) -> List[Detection2D]:
+    kept: List[Detection2D] = []
+    for idx, det in enumerate(detections):
+        touches = bbox_touches_image_edge(
+            det.bbox_xyxy,
+            int(image_width),
+            int(image_height),
+            margin_px=float(margin_px),
+            margin_ratio=float(margin_ratio),
+        )
+        low_confidence = (
+            min_confidence is not None
+            and not detection_confidence_is_valid(float(det.confidence), float(min_confidence))
+        )
+        det.bbox_touches_edge = bool(touches)
+        rejected = bool(low_confidence or (touches and reject_edge_touching_bboxes))
+        det.used_for_object_track = not rejected
+        if low_confidence:
+            det.reject_reason = "low_confidence"
+        elif touches and reject_edge_touching_bboxes:
+            det.reject_reason = "bbox_touches_image_edge"
+        else:
+            det.reject_reason = None
+        record = {
+            "raw_detection_id": "frame_%04d_det_%04d" % (int(step_idx), int(idx)),
+            "step": int(step_idx),
+            "category": normalize_category(det.category),
+            "raw_label": str(det.raw_label),
+            "confidence": float(det.confidence),
+            "bbox_xyxy": [float(v) for v in det.bbox_xyxy],
+            "bbox_touches_edge": bool(touches),
+            "used_for_object_track": not rejected,
+            "reject_reason": det.reject_reason,
+        }
+        if raw_log is not None:
+            raw_log.append(record)
+        if not rejected:
+            kept.append(det)
+    return kept
+
+
 def goal_candidate_pair_distances(object_memory: ObjectMemory, goal_category: str, max_distance_m: float = 1.0) -> List[dict]:
     goal = normalize_category(goal_category)
     nodes = [node for node in object_memory.nodes if normalize_category(node.category) == goal]
@@ -726,6 +779,9 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
         merge_distance_m=float(getattr(args, "instance_merge_distance_m", args.object_merge_radius_m)),
         merge_iou_3d=float(getattr(args, "instance_merge_iou_3d", 0.15)),
         min_valid_confidence=float(args.min_valid_detection_confidence),
+        reject_edge_touching_bboxes=bool(args.reject_edge_touching_bboxes),
+        bbox_edge_margin_px=float(args.bbox_edge_margin_px),
+        bbox_edge_margin_ratio=float(args.bbox_edge_margin_ratio),
     )
     if args.seed_gt_object_memory:
         print("[sgnav-loop] seed_gt_object_memory ignored for depth-online mapping", flush=True)
@@ -913,6 +969,7 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
     last_frontier_commitment_reason = ""
     last_selected_candidate = None
     logged_selected_candidate_id = None
+    raw_detection_debug_log: List[dict] = []
     last_dynamic_occupancy = mapper.grid.occupied.astype(bool)
     last_dynamic_free = mapper.grid.free.astype(bool)
     last_dynamic_navigable = mapper.traversible(unknown_is_obstacle=True)
@@ -1204,9 +1261,19 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
                 print("[sgnav-loop] detector RGB input: CPU fallback", flush=True)
                 logged_detector_rgb_device = True
             detections_2d = detector.detect(detector_rgb)
-            detections_2d = filter_detections_by_confidence(detections_2d, float(args.detector_conf))
             if int(args.max_detections_per_frame) > 0:
                 detections_2d = detections_2d[: int(args.max_detections_per_frame)]
+            detections_2d = filter_edge_touching_detections(
+                list(detections_2d),
+                image_width=int(args.isaac_width),
+                image_height=int(args.isaac_height),
+                step_idx=int(step_idx),
+                reject_edge_touching_bboxes=bool(args.reject_edge_touching_bboxes),
+                margin_px=float(args.bbox_edge_margin_px),
+                margin_ratio=float(args.bbox_edge_margin_ratio),
+                min_confidence=float(args.detector_conf),
+                raw_log=raw_detection_debug_log,
+            )
             if segmenter is not None and detections_2d:
                 try:
                     segment_rgb = obs_local["rgb"] if obs_local.get("rgb_device") == "cpu" else viz_rgb(obs_local)
@@ -2074,6 +2141,11 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
             for key, value in sorted(detection_category_counts.items(), key=lambda item: (-item[1], item[0]))
         }
         row["goal_detection_history"] = list(goal_detection_history)
+        row["raw_detection_log"] = list(raw_detection_debug_log)
+        row["raw_rejected_detections_count"] = int(
+            len([item for item in raw_detection_debug_log if not bool(item.get("used_for_object_track", True))])
+        )
+        row["object_memory_tracks"] = object_memory.to_dicts()
         row["selected_candidate"] = last_selected_candidate.to_dict() if last_selected_candidate is not None else None
         row["object_memory_goal_candidates"] = [
             node.to_dict()
@@ -2332,6 +2404,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--detector-conf", type=float, default=None)
     parser.add_argument("--min-valid-detection-confidence", type=float, default=None)
     parser.add_argument("--detector-iou", type=float, default=None)
+    parser.add_argument("--reject-edge-touching-bboxes", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--bbox-edge-margin-px", type=float, default=None)
+    parser.add_argument("--bbox-edge-margin-ratio", type=float, default=None)
     parser.add_argument("--headless", nargs="?", const=True, default=None, type=str_to_bool)
     parser.add_argument("--no-headless", dest="headless", action="store_false")
     parser.add_argument("--sim-backend", default=None, choices=["map", "isaac"])
@@ -2537,6 +2612,21 @@ def main(argv: Optional[List[str]] = None) -> int:
         float(args.min_valid_detection_confidence),
     )
     args.detector_iou = float(args.detector_iou if args.detector_iou is not None else get_nested(cfg, "perception.nms_iou_threshold", 0.5))
+    args.reject_edge_touching_bboxes = bool(
+        args.reject_edge_touching_bboxes
+        if args.reject_edge_touching_bboxes is not None
+        else get_nested(cfg, "perception.yolo_world.reject_edge_touching_bboxes", True)
+    )
+    args.bbox_edge_margin_px = float(
+        args.bbox_edge_margin_px
+        if args.bbox_edge_margin_px is not None
+        else get_nested(cfg, "perception.yolo_world.bbox_edge_margin_px", 2)
+    )
+    args.bbox_edge_margin_ratio = float(
+        args.bbox_edge_margin_ratio
+        if args.bbox_edge_margin_ratio is not None
+        else get_nested(cfg, "perception.yolo_world.bbox_edge_margin_ratio", 0.0)
+    )
     args.headless = bool(get_nested(cfg, "isaac.headless", True) if args.headless is None else args.headless)
     viz_cfg = get_nested(cfg, "visualization.sgnav_popup", "auto")
     if args.sgnav_viz is None:
@@ -2771,6 +2861,15 @@ def main(argv: Optional[List[str]] = None) -> int:
     args.online_inflation_radius_m = float(args.online_inflation_radius_m if args.online_inflation_radius_m is not None else get_nested(cfg, "mapping.inflation_radius_m", 0.0))
     args.room_map_mode = str(args.room_map_mode or get_nested(cfg, "mapping.room_map_mode", "online_geometry_watershed"))
     args.room_segmentation_config = dict(get_nested(cfg, "mapping.room_segmentation", {}) or {})
+    room_semantics_cfg = dict(get_nested(cfg, "room_semantics", {}) or {})
+    for key in (
+        "use_premerge_labels_for_open_plan_merge",
+        "min_label_reliability_for_functional_split",
+        "unknown_allows_functional_split",
+        "final_label_after_merge",
+    ):
+        if key in room_semantics_cfg:
+            args.room_segmentation_config.setdefault(key, room_semantics_cfg[key])
     room_node_cfg = dict(get_nested(cfg, "sgnav.scene_graph.room_nodes", {}) or {})
     args.room_label_backend = str(args.room_label_backend or room_node_cfg.get("room_label_backend", "vlm"))
     args.room_label_allowed_categories = list(room_node_cfg.get("allowed_room_categories", DEFAULT_ROOM_CATEGORIES) or DEFAULT_ROOM_CATEGORIES)

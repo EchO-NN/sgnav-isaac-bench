@@ -43,6 +43,10 @@ class RoomSegmentationConfig:
     open_boundary_merge: bool = True
     merge_same_semantic_category: bool = True
     merge_unknown_into_open_labeled_region: bool = True
+    use_premerge_labels_for_open_plan_merge: bool = True
+    min_label_reliability_for_functional_split: float = 0.65
+    unknown_allows_functional_split: bool = False
+    final_label_after_merge: bool = True
     merge_wide_openings: bool = True
     small_segment_merge_area_m2: float = 1.2
     id_iou_threshold: float = 0.35
@@ -141,6 +145,17 @@ class RoomAdjacencyEvidence:
         }
 
 
+@dataclass
+class RoomProposalState:
+    proposal_labels: np.ndarray
+    structural_free_mask: np.ndarray
+    structural_obstacle_mask: np.ndarray
+    unknown_mask: np.ndarray
+    distance_m: np.ndarray
+    step: int = 0
+    debug: Dict[str, object] = field(default_factory=dict)
+
+
 class OnlineRoomSegmenter:
     def __init__(self, config: Optional[RoomSegmentationConfig | Mapping[str, object]] = None):
         if isinstance(config, RoomSegmentationConfig):
@@ -170,6 +185,31 @@ class OnlineRoomSegmenter:
         if free.shape != occ.shape or free.shape != unknown.shape:
             raise ValueError("room segmentation masks must have the same HxW shape")
 
+        proposal_rooms, proposal_state = self.build_proposals(
+            occupancy_map,
+            observed_free_mask,
+            obstacle_mask,
+            unknown_mask,
+            step=step,
+            object_memory=object_memory,
+        )
+        _ = proposal_rooms
+        return self.finalize_proposals(proposal_state, proposal_semantic_labels=None)
+
+    def build_proposals(
+        self,
+        occupancy_map: np.ndarray,
+        observed_free_mask: np.ndarray,
+        obstacle_mask: np.ndarray,
+        unknown_mask: np.ndarray,
+        step: int,
+        object_memory: Optional[Iterable[object]] = None,
+    ) -> Tuple[List[RoomMask], RoomProposalState]:
+        free = np.asarray(observed_free_mask, dtype=bool)
+        occ = np.asarray(obstacle_mask if obstacle_mask is not None else occupancy_map, dtype=bool)
+        unknown = np.asarray(unknown_mask, dtype=bool)
+        if free.shape != occ.shape or free.shape != unknown.shape:
+            raise ValueError("room proposal masks must have the same HxW shape")
         structural_obstacles, obstacle_debug = _build_structural_obstacle_mask_with_debug(
             occ,
             free,
@@ -184,22 +224,34 @@ class OnlineRoomSegmenter:
         else:
             obstacle_for_rooms = occ
         structural = build_structural_free_mask(free_for_rooms, obstacle_for_rooms, unknown, self.config)
-        room_masks, seg_debug = segment_room_masks(
+        proposal_rooms, proposal_state = build_room_proposals(
             structural,
             unknown,
             self.config,
             step=int(step),
             structural_obstacle_mask=structural_obstacles,
-            return_debug=True,
         )
-        room_masks = self._assign_stable_ids(room_masks, int(step))
+        proposal_state.debug["structural_obstacle_mask"] = obstacle_debug
+        return proposal_rooms, proposal_state
+
+    def finalize_proposals(
+        self,
+        proposal_state: RoomProposalState,
+        proposal_semantic_labels: Optional[Mapping[int, object]] = None,
+    ) -> List[RoomMask]:
+        room_masks, seg_debug = finalize_room_proposals(
+            proposal_state,
+            self.config,
+            proposal_semantic_labels=proposal_semantic_labels,
+        )
+        room_masks = self._assign_stable_ids(room_masks, int(proposal_state.step))
         self._previous = {room.room_id: room for room in room_masks}
         self._last_live_ids = {room.room_id for room in room_masks if not room.stale}
         self.last_debug = room_segmentation_debug(
             room_masks,
-            structural,
+            proposal_state.structural_free_mask,
             segmentation_debug=seg_debug,
-            structural_obstacle_debug=obstacle_debug,
+            structural_obstacle_debug=proposal_state.debug.get("structural_obstacle_mask"),
         )
         return room_masks
 
@@ -410,6 +462,117 @@ def build_structural_free_mask(
     return free.astype(bool)
 
 
+def build_room_proposals(
+    structural_free_mask: np.ndarray,
+    unknown_mask: np.ndarray,
+    config: RoomSegmentationConfig,
+    step: int = 0,
+    structural_obstacle_mask: Optional[np.ndarray] = None,
+) -> Tuple[List[RoomMask], RoomProposalState]:
+    free = np.asarray(structural_free_mask, dtype=bool)
+    unknown = np.asarray(unknown_mask, dtype=bool)
+    structural_obstacles = np.asarray(structural_obstacle_mask, dtype=bool) if structural_obstacle_mask is not None else ~free & ~unknown
+    proposal_labels = np.zeros_like(free, dtype=np.int32)
+    distance_global = np.zeros_like(free, dtype=np.float32)
+    proposal_rooms: List[RoomMask] = []
+    if not np.any(free):
+        state = RoomProposalState(proposal_labels, free, structural_obstacles, unknown, distance_global, step=int(step), debug=_empty_room_segmentation_debug())
+        return [], state
+    min_cells = max(1, int(config.min_observed_free_cells))
+    min_area_cells = max(1, int(round(float(config.min_room_area_m2) / max(float(config.resolution_m) ** 2, 1e-9))))
+    components = _connected_components(free)
+    if len(components) == 1:
+        component_list = components
+    else:
+        component_list = [comp for comp in components if len(comp) >= min_cells and len(comp) >= min_area_cells]
+        if not component_list and components:
+            component_list = [max(components, key=len)]
+    next_label = 1
+    for component in component_list:
+        comp_mask = np.zeros_like(free, dtype=bool)
+        for row, col in component:
+            comp_mask[row, col] = True
+        local_labels, distance_m = _watershed_component(comp_mask, config)
+        distance_global[comp_mask] = distance_m[comp_mask]
+        for local_label in sorted(int(v) for v in np.unique(local_labels) if int(v) > 0):
+            mask = local_labels == local_label
+            if int(np.count_nonzero(mask)) < min_cells and proposal_rooms:
+                continue
+            proposal_labels[mask] = int(next_label)
+            room = _room_from_mask("proposal_%04d" % int(next_label), mask, unknown, [], config, step)
+            room.metadata["label_id"] = int(next_label)
+            room.metadata["proposal_labels"] = [int(next_label)]
+            room.metadata["is_premerge_proposal"] = True
+            proposal_rooms.append(room)
+            next_label += 1
+    if not proposal_rooms and np.any(free):
+        proposal_labels[free] = 1
+        room = _room_from_mask("proposal_0001", free, unknown, [], config, step)
+        room.metadata["label_id"] = 1
+        room.metadata["proposal_labels"] = [1]
+        room.metadata["is_premerge_proposal"] = True
+        proposal_rooms.append(room)
+    debug = {
+        "proposal_mode": str(config.proposal_mode),
+        "finalization_mode": "premerge_proposals",
+        "proposal_room_count": int(len(proposal_rooms)),
+        "final_room_count": int(len(proposal_rooms)),
+        "proposal_room_masks": _proposal_masks_debug(proposal_labels),
+        "merge_operations": [],
+        "doorway_edges": [],
+        "adjacency_evidence": [],
+    }
+    state = RoomProposalState(
+        proposal_labels=proposal_labels,
+        structural_free_mask=free,
+        structural_obstacle_mask=structural_obstacles,
+        unknown_mask=unknown,
+        distance_m=distance_global,
+        step=int(step),
+        debug=debug,
+    )
+    return proposal_rooms, state
+
+
+def finalize_room_proposals(
+    proposal_state: RoomProposalState,
+    config: RoomSegmentationConfig,
+    proposal_semantic_labels: Optional[Mapping[int, object]] = None,
+) -> Tuple[List[RoomMask], dict]:
+    labels = np.asarray(proposal_state.proposal_labels, dtype=np.int32)
+    if not np.any(labels > 0):
+        return [], _empty_room_segmentation_debug()
+    final_labels, finalization_debug, doorway_edges = merge_open_plan_proposals(
+        proposal_labels=labels,
+        structural_free_mask=proposal_state.structural_free_mask,
+        structural_obstacle_mask=proposal_state.structural_obstacle_mask,
+        unknown_mask=proposal_state.unknown_mask,
+        distance_m=proposal_state.distance_m,
+        config=config,
+        proposal_semantic_labels=proposal_semantic_labels,
+    )
+    min_cells = max(1, int(config.min_observed_free_cells))
+    room_masks: List[RoomMask] = []
+    original_labels = np.asarray(proposal_state.proposal_labels, dtype=np.int32)
+    for label_id in sorted(int(v) for v in np.unique(final_labels) if int(v) > 0):
+        mask = final_labels == label_id
+        if int(np.count_nonzero(mask)) < min_cells and room_masks:
+            continue
+        room_edges = [
+            dict(edge)
+            for edge in doorway_edges
+            if int(edge.get("room_a_label", -1)) == int(label_id) or int(edge.get("room_b_label", -1)) == int(label_id)
+        ]
+        room = _room_from_mask("pending", mask, proposal_state.unknown_mask, room_edges, config, int(proposal_state.step))
+        room.metadata["label_id"] = int(label_id)
+        room.metadata["source_finalization_mode"] = str(config.finalization_mode)
+        room.metadata["proposal_labels"] = sorted(int(v) for v in np.unique(original_labels[mask]) if int(v) > 0)
+        room_masks.append(room)
+    finalization_debug["proposal_room_count"] = int(len([v for v in np.unique(labels) if int(v) > 0]))
+    finalization_debug["final_room_count"] = int(len(room_masks))
+    return room_masks, finalization_debug
+
+
 def segment_room_masks(
     structural_free_mask: np.ndarray,
     unknown_mask: np.ndarray,
@@ -445,7 +608,9 @@ def segment_room_masks(
         "proposal_room_masks": [],
         "merge_operations": [],
         "doorway_edges": [],
+        "functional_split_edges": [],
         "adjacency_evidence": [],
+        "adjacency_decisions": [],
     }
     label_offset = 0
     for component in component_list:
@@ -477,6 +642,7 @@ def segment_room_masks(
         merged_debug["proposal_room_count"] += int(finalization_debug.get("proposal_room_count", proposal_count) or 0)
         merged_debug["merge_operations"].extend(list(finalization_debug.get("merge_operations") or []))
         merged_debug["doorway_edges"].extend(list(finalization_debug.get("doorway_edges") or []))
+        merged_debug["functional_split_edges"].extend(list(finalization_debug.get("functional_split_edges") or []))
         merged_debug["adjacency_evidence"].extend(list(finalization_debug.get("adjacency_evidence") or []))
         for item in list(finalization_debug.get("proposal_room_masks") or []):
             proposal_item = dict(item)
@@ -548,8 +714,9 @@ def merge_open_plan_proposals(
 
     merge_operations: List[dict] = []
     doorway_edges: List[dict] = []
+    functional_split_edges: List[dict] = []
     evidence_rows: List[dict] = []
-    semantic_labels = {int(k): str(v).strip().lower() for k, v in dict(proposal_semantic_labels or {}).items()}
+    semantic_labels = {int(k): _semantic_label_info(v, config) for k, v in dict(proposal_semantic_labels or {}).items()}
     for (a, b), boundary_cells in sorted(adjacency.items()):
         evidence = compute_room_adjacency_evidence(
             labels,
@@ -563,26 +730,50 @@ def merge_open_plan_proposals(
             config,
         )
         reason = evidence.merge_reason
-        sem_a = semantic_labels.get(int(a), "")
-        sem_b = semantic_labels.get(int(b), "")
-        if (
-            bool(config.merge_same_semantic_category)
-            and sem_a
-            and sem_b
-            and sem_a == sem_b
-            and not evidence.verified_doorway
-        ):
-            reason = "open_plan_no_verified_doorway_same_semantic_%s" % sem_a
+        left_info = semantic_labels.get(int(a), _semantic_label_info("", config))
+        right_info = semantic_labels.get(int(b), _semantic_label_info("", config))
+        verified_structural = bool(evidence.verified_doorway)
+        functional_split = False if verified_structural else should_keep_open_plan_functional_split(left_info, right_info, config)
+        decision = "keep_split" if verified_structural or functional_split else "merge"
+        if functional_split:
+            reason = "reliable_different_room_types"
             evidence.merge_reason = reason
-        elif (
-            bool(config.merge_unknown_into_open_labeled_region)
-            and {sem_a, sem_b} & {"unknown", "unknown_room"}
-            and (sem_a or sem_b)
-            and not evidence.verified_doorway
-        ):
-            reason = "open_unknown_into_open_labeled_region"
-            evidence.merge_reason = reason
-        evidence_rows.append(evidence.to_dict())
+        elif not verified_structural:
+            sem_a = str(left_info["category"])
+            sem_b = str(right_info["category"])
+            if (
+                bool(config.merge_same_semantic_category)
+                and sem_a
+                and sem_b
+                and sem_a == sem_b
+                and sem_a not in {"unknown", "unknown_room"}
+            ):
+                reason = "open_plan_no_verified_doorway_same_semantic_%s" % sem_a
+                evidence.merge_reason = reason
+            elif (
+                bool(config.merge_unknown_into_open_labeled_region)
+                and {sem_a, sem_b} & {"unknown", "unknown_room", ""}
+                and (sem_a or sem_b)
+            ):
+                reason = "open_unknown_into_open_labeled_region"
+                evidence.merge_reason = reason
+        evidence_payload = evidence.to_dict()
+        evidence_payload.update(
+            {
+                "left": "proposal_%s" % int(a),
+                "right": "proposal_%s" % int(b),
+                "verified_structural_boundary": verified_structural,
+                "left_premerge_category": left_info["category"],
+                "right_premerge_category": right_info["category"],
+                "left_reliable": bool(left_info["is_reliable"]),
+                "right_reliable": bool(right_info["is_reliable"]),
+                "left_label_reliability": float(left_info["label_reliability"]),
+                "right_label_reliability": float(right_info["label_reliability"]),
+                "decision": decision,
+                "reason": reason,
+            }
+        )
+        evidence_rows.append(evidence_payload)
         if evidence.verified_doorway:
             doorway_edges.append(
                 {
@@ -601,6 +792,20 @@ def merge_open_plan_proposals(
                             1.0,
                         )
                     ),
+                }
+            )
+            continue
+        if functional_split:
+            functional_split_edges.append(
+                {
+                    "room_a_label": int(a),
+                    "room_b_label": int(b),
+                    "edge_type": "adjacent_open_plan_functional_split",
+                    "source": "premerge_room_recognition",
+                    "confidence": float(min(left_info["label_reliability"], right_info["label_reliability"])),
+                    "left_premerge_category": left_info["category"],
+                    "right_premerge_category": right_info["category"],
+                    "reason": reason,
                 }
             )
             continue
@@ -648,7 +853,9 @@ def merge_open_plan_proposals(
         "proposal_room_masks": proposal_debug,
         "merge_operations": merge_operations,
         "doorway_edges": remapped_edges,
+        "functional_split_edges": functional_split_edges,
         "adjacency_evidence": evidence_rows,
+        "adjacency_decisions": evidence_rows,
     }
     return out, debug, remapped_edges
 
@@ -720,6 +927,49 @@ def compute_room_adjacency_evidence(
         merge_reason=reason,
         boundary_cells_sample=[list(map(int, cell)) for cell in _sample_cells(unique_cells, 96)],
     )
+
+
+def should_keep_open_plan_functional_split(left_label: Mapping[str, object], right_label: Mapping[str, object], config: RoomSegmentationConfig) -> bool:
+    left_category = str(left_label.get("category", "")).strip().lower()
+    right_category = str(right_label.get("category", "")).strip().lower()
+    unknowns = {"", "unknown", "unknown_room"}
+    if not bool(config.use_premerge_labels_for_open_plan_merge):
+        return False
+    if not bool(config.unknown_allows_functional_split) and (left_category in unknowns or right_category in unknowns):
+        return False
+    if not bool(left_label.get("is_reliable", False)) or not bool(right_label.get("is_reliable", False)):
+        return False
+    if left_category == right_category:
+        return False
+    return True
+
+
+def _semantic_label_info(value: object, config: RoomSegmentationConfig) -> dict:
+    category = getattr(value, "category", None)
+    if category is None and isinstance(value, Mapping):
+        category = value.get("category")
+    if category is None:
+        category = str(value or "")
+    category = str(category).strip().lower().replace(" ", "_")
+    if category in {"unknown_room", ""}:
+        category = "unknown" if category else ""
+    reliability = getattr(value, "label_reliability", None)
+    if reliability is None and isinstance(value, Mapping):
+        reliability = value.get("label_reliability", value.get("confidence"))
+    if reliability is None:
+        reliability = 1.0 if category and category != "unknown" else 0.0
+    is_reliable = getattr(value, "is_reliable", None)
+    if is_reliable is None and isinstance(value, Mapping):
+        is_reliable = value.get("is_reliable")
+    if is_reliable is None:
+        is_reliable = float(reliability) >= float(config.min_label_reliability_for_functional_split)
+    if category in {"", "unknown"}:
+        is_reliable = False
+    return {
+        "category": category,
+        "label_reliability": float(np.clip(float(reliability), 0.0, 1.0)),
+        "is_reliable": bool(is_reliable),
+    }
 
 
 def assign_objects_to_room_masks(
@@ -1224,7 +1474,9 @@ def _empty_room_segmentation_debug() -> dict:
         "proposal_room_masks": [],
         "merge_operations": [],
         "doorway_edges": [],
+        "functional_split_edges": [],
         "adjacency_evidence": [],
+        "adjacency_decisions": [],
     }
 
 

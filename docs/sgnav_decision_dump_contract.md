@@ -29,7 +29,11 @@ Every dump artifact must include:
 ## Semantics
 
 - `objects`, `groups`, `rooms`, and `edges` describe the online scene graph
-  state used by the decision.
+  state used by the decision. Object entries should expose the stable
+  accumulated category plus simple policy/GNN fields such as
+  `mean_confidence`, `detection_count`, and `winner_detection_count`; raw
+  rejected detections stay in episode/debug logs rather than becoming graph
+  objects.
 - `room_context` records whether room context was invoked for frontier scoring,
   whether segmentation or VLM labeling ran, cache hit state, label request/cache
   counts, and the testable call order
@@ -38,7 +42,9 @@ Every dump artifact must include:
 - `room_segmentation` records online geometry room masks, structural obstacle
   filtering, proposal/final room counts, doorway metadata, adjacency evidence,
   merge operations, proposal-vs-final debug layers, partial state, and mask
-  confidence.
+  confidence. For open-plan merges it records premerge room categories,
+  reliability gates, structural-boundary decisions, and final merged room
+  counts.
 - `room_semantics` records VLM/LLM room labels, allowed categories, `unknown`
   reasons, `vlm_self_confidence`, evidence-derived `label_reliability`,
   reliability factors, and backend state.

@@ -58,9 +58,13 @@ def _objects(scenegraph) -> list[dict]:
             {
                 "id": node.node_id,
                 "cat": node.caption,
+                "category": node.caption,
                 "center_grid": list(node.center_grid) if node.center_grid is not None else None,
                 "center_world": list(node.center_world) if node.center_world is not None else None,
                 "conf": float(node.confidence),
+                "mean_confidence": float(getattr(node, "mean_confidence", node.confidence)),
+                "detection_count": int(getattr(node, "detection_count", node.observed_count)),
+                "winner_detection_count": int(getattr(node, "winner_detection_count", node.observed_count)),
                 "hits": int(node.observed_count),
                 "room": node.room,
             }

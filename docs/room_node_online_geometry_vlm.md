@@ -26,15 +26,23 @@ beds, TVs, plants, pictures, lamps, and cabinets are not allowed to split
 rooms. Unknown cells are not treated as structural wall support.
 
 Distance-transform watershed or deterministic seeded region growing is used
-only to create room proposals. Final room masks come from a
-doorway-constrained merge pass: adjacent proposals are kept separate only when
-there is verified physical doorway/gateway evidence, including a narrow neck,
-low unknown support, structural wall support at both doorway endpoints, and a
-separation test showing that closing the gateway creates two meaningful
-free-space components. Open-plan proposal boundaries, furniture-caused
-boundaries, same-semantic room proposals, and unknown proposals adjacent to an
-open labeled room merge into one physical room node. Stable room IDs are then
-preserved by mask IoU/centroid matching.
+only to create premerge room proposals. Final room masks come from a
+doorway-constrained merge pass:
+
+- verified structural walls, doorways, or gateways preserve a physical split
+  regardless of room type;
+- weak/open-plan proposal boundaries preserve a functional split only when
+  premerge room recognition returns reliable, non-unknown, different room
+  categories on both sides;
+- same-category proposals, unknown proposals, unreliable labels, furniture
+  boundaries, and unknown-supported boundaries merge into one physical
+  room/zone mask.
+
+Objects such as sinks, fridges, sofas, or TVs are only evidence for room
+recognition. They are not direct hardcoded split rules. Premerge labels are used
+only for merge/split decisions; final room masks are labeled again before they
+become SG-Nav room nodes. Stable room IDs are then preserved by mask
+IoU/centroid matching.
 
 Each `RoomMask` records `source=online_geometry_watershed`, area, centroid,
 observed cells, boundary unknown fraction, doorway edges, confidence, partial
@@ -78,11 +86,20 @@ count, visual evidence, partial-room state, boundary unknown fraction, ambiguity
 margin, mask confidence, and contradictory evidence checks. `RoomNode.confidence`
 uses this evidence reliability rather than raw VLM confidence.
 
+For open-plan functional split decisions, the default reliability gate is
+`room_semantics.min_label_reliability_for_functional_split: 0.65`. `unknown`
+never creates a functional split unless a structural boundary already preserves
+the split.
+
 ## Config
 
 The default strict path uses:
 
 - `mapping.room_map_mode: online_geometry_watershed`
+- `room_semantics.use_premerge_labels_for_open_plan_merge: true`
+- `room_semantics.min_label_reliability_for_functional_split: 0.65`
+- `room_semantics.unknown_allows_functional_split: false`
+- `room_semantics.final_label_after_merge: true`
 - `sgnav.scene_graph.room_nodes.source: online_geometry_watershed_vlm`
 - `sgnav.scene_graph.room_nodes.strict_no_oracle_rooms: true`
 

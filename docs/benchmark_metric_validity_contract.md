@@ -46,6 +46,18 @@ Every episode result row must include:
 - A YOLO/SAM detection is a valid online object detection only when
   `confidence > 0.65`. Detections at or below 0.65 must not draw RGB bboxes,
   enter object memory, form object scene-graph nodes, or seed goal candidates.
+- YOLO-World boxes that touch an image edge are raw debug detections only:
+  `used_for_object_track=false` and
+  `reject_reason=bbox_touches_image_edge`. They must not update SAM2/depth
+  fusion, object-memory centers, category accumulators, room evidence, goal
+  candidates, STOP, SG-Nav policy graph objects, or first-version GNN object
+  features.
+- Object-memory categories must use track-level accumulated confidence
+  (`class_conf_sums` / `class_hits`). A single recent class switch must not
+  overwrite the stable category when another class has higher accumulated
+  confidence. Metric/debug dumps should expose simple graph fields:
+  `category`, `mean_confidence`, `detection_count`, `winner_detection_count`,
+  center, and room assignment.
 - Seeded ground-truth object memory implies `metric_valid=false`.
 - Mock or local deterministic LLM scoring implies `metric_valid=false` unless
   the run is explicitly marked as a named ablation.
@@ -62,6 +74,11 @@ Every episode result row must include:
   Raw room VLM `confidence` is stored as `vlm_self_confidence` and must not be
   treated as calibrated probability; room-node confidence must be evidence
   reliability (`label_reliability`) or otherwise guarded by reliability gates.
+- Open-plan room proposal splits may be preserved only when premerge room
+  recognition yields reliable, non-unknown, different room categories on both
+  sides. Same category, unknown, or unreliable labels must merge unless a
+  verified structural boundary preserves the split. Direct hardcoded object
+  lists must not be authoritative split rules.
 - Strict SG-Nav room segmentation/recognition is scoring-gated. Room VLM calls
   should be recorded only when a new frontier-scoring decision needs fresh room
   evidence; cached room context must be used for committed-frontier replans and

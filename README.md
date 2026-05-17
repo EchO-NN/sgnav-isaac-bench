@@ -98,6 +98,15 @@ VLM labels over objects inside those masks. `unknown` is the correct room label
 when the evidence is insufficient. `rooms.json` labels are rejected in strict
 metric mode except for a named `oracle_room_ablation`.
 
+Room segmentation is two-stage. Geometry first creates premerge proposals;
+proposal labels are used only to decide weak/open-plan merges. Verified
+structural walls, doorways, or gateways preserve splits regardless of room
+labels. Open-plan proposal boundaries preserve a functional split only when
+both premerge labels are reliable, non-unknown, and different; same, unknown,
+or unreliable labels merge. Final merged room masks are labeled again before
+they become SG-Nav room nodes. Objects such as sinks, fridges, sofas, or TVs are
+room-recognition evidence, not direct hardcoded split rules.
+
 Room segmentation and room recognition are lazy and scoring-gated: they run
 only immediately before a new SG-Nav frontier-scoring decision, after reachable
 frontiers are extracted and before scene-graph/HCoT scoring. They do not run
@@ -233,6 +242,13 @@ appear in strict visualization.
 YOLO/SAM detections are treated as valid only when `confidence > 0.65`. Lower
 or equal detections are filtered before bbox rendering, mask/depth fusion,
 object memory insertion, scene-graph object nodes, and goal-candidate logic.
+YOLO boxes touching an image edge are also rejected from SAM2, depth
+backprojection, object memory, room evidence, candidate goals, STOP, and policy
+graph objects, while still being written as raw debug detections with
+`reject_reason=bbox_touches_image_edge`. Object tracks use accumulated
+`class_conf_sums` and `class_hits`; the stable category is the accumulated
+winner and graph/debug dumps expose `mean_confidence`, `detection_count`, and
+`winner_detection_count`.
 
 Convert one graph step into the SG-Nav decision dump contract:
 

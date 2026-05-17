@@ -11,7 +11,7 @@ are intentionally conservative: `faithful`, `optimized-equivalent`,
 | SAM mask refinement | SAM2 replaces SAM mask refinement and attaches box-prompt masks. | optimized-equivalent | `isaac_bench/perception/sam2_segmenter.py`, `ensure_segmenter_loaded` |
 | online occupancy/free map | Live depth is fused into online occupied/free/observed grids. | engineered-faithful | `isaac_bench/mapping/online_mapper.py::OnlineMapper` |
 | frontier extraction | Reachable frontiers are extracted at observed-free/unknown boundaries. | engineered-faithful | `isaac_bench/mapping/frontier.py::extract_frontiers` |
-| object nodes | YOLO-World/SAM2/depth detections accumulate into object memory and `PaperSceneGraph` object nodes. | engineered-faithful | `FusedInstanceRegistry.update`, `PaperSceneGraph.update_from_object_memory` |
+| object nodes | Non-edge YOLO-World/SAM2/depth detections accumulate into object memory with track-level category confidence sums before `PaperSceneGraph` object nodes are emitted. | engineered-faithful | `FusedInstanceRegistry.update`, `ObjectMemory.update_fused_instances`, `PaperSceneGraph.update_from_object_memory` |
 | group nodes | Related object groups remain cluster-based in the online scene graph. | engineered-faithful | `PaperSceneGraph.update_group_nodes` |
 | room nodes | Room nodes are online geometry masks plus object/VLM semantics, not oracle `rooms.json` in strict mode. | approximate-but-justified | `isaac_bench/mapping/room_segmentation.py`, `isaac_bench/graph/room_semantics.py` |
 | object-room edges | Objects are assigned to room masks by centroid or footprint overlap. | engineered-faithful | `assign_objects_to_room_masks`, `PaperSceneGraph.update_affiliation_edges` |
@@ -25,6 +25,23 @@ are intentionally conservative: `faithful`, `optimized-equivalent`,
 | distance bias | Distance bias is an engineered calibration term with default `frontier_distance_weight=0.2`. | engineered-faithful | `isaac_bench/graph/decision.py::SGNavDecision.choose_frontier` |
 | candidate re-perception | Candidate credibility accumulates detector confidence and graph/subgraph support; acceptance wins when threshold is reached, including at `n_max`. | engineered-faithful | `isaac_bench/graph/reperception.py::GraphReperceptionManager.update` |
 | STOP | STOP is allowed only after SG-Nav candidate confirmation / stop verification. | engineered-faithful | `SGNavDecision.choose_navigation_target`, `build_stop_state_payload` |
+
+## T0 Room Merge And Object Memory Rules
+
+Room watershed labels are proposals, not final rooms. Before frontier scoring,
+premerge proposals are labeled only for open-plan merge decisions; final merged
+room masks are then labeled again for SG-Nav room nodes. Verified structural
+boundaries preserve splits. Weak/open boundaries preserve a functional split
+only when both proposal labels are reliable, non-unknown, and different. Object
+lists such as sink/fridge/sofa/TV are evidence to the room recognizer only, not
+authoritative split rules.
+
+YOLO detections at or below `0.65` confidence, and YOLO boxes touching an image
+edge, are rejected before SAM2/depth fusion, object memory, candidate-goal
+logic, STOP, policy graph objects, and first-version GNN features. Rejected
+detections remain in raw debug logs. Object tracks expose the accumulated
+winner category plus `mean_confidence`, `detection_count`, and
+`winner_detection_count`.
 
 ## T0 Runtime Scheduling
 

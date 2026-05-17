@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import List, Optional, Sequence, Tuple
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -30,14 +30,40 @@ class ObjectNode:
     last_mask: Optional[np.ndarray] = None
     source_instance_id: str = ""
     source: str = ""
+    class_conf_sums: Dict[str, float] = field(default_factory=dict)
+    class_hits: Dict[str, int] = field(default_factory=dict)
+    valid_detection_count: int = 0
+    total_conf_sum: float = 0.0
+    edge_rejected_count: int = 0
+    raw_rejected_detections_count: int = 0
+
+    @property
+    def stable_category(self) -> str:
+        if not self.class_conf_sums:
+            return self.category
+        return max(sorted(self.class_conf_sums), key=lambda key: float(self.class_conf_sums[key]))
+
+    @property
+    def winner_detection_count(self) -> int:
+        return int(self.class_hits.get(self.stable_category, self.observed_count))
+
+    @property
+    def mean_confidence(self) -> float:
+        hits = max(1, int(self.winner_detection_count))
+        return float(self.class_conf_sums.get(self.stable_category, float(self.confidence) * hits)) / float(hits)
 
     def to_dict(self) -> dict:
         return {
             "node_id": int(self.node_id),
+            "track_id": "obj_%04d" % int(self.node_id),
             "category": self.category,
+            "stable_category": self.stable_category,
             "center_world": tuple(float(v) for v in self.center_world),
             "center_grid": tuple(int(v) for v in self.center_grid),
             "confidence": float(self.confidence),
+            "mean_confidence": float(self.mean_confidence),
+            "detection_count": int(self.valid_detection_count or self.observed_count),
+            "winner_detection_count": int(self.winner_detection_count),
             "observed_count": int(self.observed_count),
             "last_seen_step": int(self.last_seen_step),
             "raw_label": self.raw_label,
@@ -45,6 +71,10 @@ class ObjectNode:
             "bbox_world": _array_to_list(self.bbox_world),
             "source_instance_id": self.source_instance_id,
             "source": self.source,
+            "class_conf_sums": {str(k): float(v) for k, v in sorted(self.class_conf_sums.items())},
+            "class_hits": {str(k): int(v) for k, v in sorted(self.class_hits.items())},
+            "edge_rejected_count": int(self.edge_rejected_count),
+            "raw_rejected_detections_count": int(self.raw_rejected_detections_count),
         }
 
 
@@ -70,12 +100,10 @@ class ObjectMemory:
         return float(np.linalg.norm(aa - bb))
 
     def find_match(self, category: str, center_world: Sequence[float]) -> Optional[ObjectNode]:
-        category_key = self._category_key(category)
+        _ = category
         best = None
         best_dist = float("inf")
         for node in self.nodes:
-            if self._category_key(node.category) != category_key:
-                continue
             dist = self._xy_distance(center_world, node.center_world)
             if dist < self.merge_radius_m and dist < best_dist:
                 best = node
@@ -95,6 +123,8 @@ class ObjectMemory:
             else:
                 center_grid = (0, 0)
             if matched is None:
+                class_conf_sums = {category: float(det.confidence)}
+                class_hits = {category: 1}
                 node = ObjectNode(
                     node_id=self._next_id,
                     category=category,
@@ -108,6 +138,10 @@ class ObjectMemory:
                     bbox_world=_copy_array(det.bbox_world),
                     last_mask=_copy_array(det.mask),
                     source=getattr(det, "source", ""),
+                    class_conf_sums=class_conf_sums,
+                    class_hits=class_hits,
+                    valid_detection_count=1,
+                    total_conf_sum=float(det.confidence),
                 )
                 self._next_id += 1
                 self.nodes.append(node)
@@ -123,6 +157,8 @@ class ObjectMemory:
             else:
                 matched.center_grid = center_grid
             matched.confidence = max(float(matched.confidence), float(det.confidence))
+            _accumulate_category_observation(matched, category, float(det.confidence))
+            matched.category = matched.stable_category
             matched.point_cloud_world = _merge_point_clouds(matched.point_cloud_world, det.point_cloud_world)
             matched.bbox_world = _copy_array(det.bbox_world) if det.bbox_world is not None else _bbox_from_points(matched.point_cloud_world)
             matched.last_mask = _copy_array(det.mask)
@@ -138,33 +174,73 @@ class ObjectMemory:
         step_id: int,
         map_info: Optional[MapInfo] = None,
     ) -> List[ObjectNode]:
-        detections: List[Detection3D] = []
-        instance_ids: List[str] = []
-        sources: List[str] = []
+        changed: List[ObjectNode] = []
         for instance in instances:
             if instance.node_type != "object":
                 continue
             if not detection_confidence_is_valid(float(instance.confidence), self.min_valid_confidence):
                 continue
-            detections.append(
-                Detection3D(
-                    category=instance.category,
-                    raw_label=instance.category,
+            category = self._category_key(instance.category)
+            center = tuple(float(v) for v in instance.center_world)
+            matched = self._find_match_for_fused_instance(instance, center)
+            center_grid = world_xy_to_grid(center[0], center[1], map_info) if map_info is not None else (0, 0)
+            class_conf_sums, class_hits, valid_detection_count, total_conf_sum = _category_accumulators_from_instance(instance)
+            if matched is None:
+                node = ObjectNode(
+                    node_id=self._next_id,
+                    category=category,
+                    center_world=center,
+                    center_grid=center_grid,
                     confidence=float(instance.confidence),
-                    center_world=tuple(float(v) for v in instance.center_world),
-                    bbox_xyxy=(0.0, 0.0, 0.0, 0.0),
-                    point_cloud_world=instance.point_cloud_world,
-                    bbox_world=instance.bbox_world,
-                    mask=instance.last_mask,
+                    observed_count=int(instance.observed_count),
+                    last_seen_step=int(step_id),
+                    raw_label=instance.category,
+                    point_cloud_world=_copy_array(instance.point_cloud_world),
+                    bbox_world=_copy_array(instance.bbox_world),
+                    last_mask=_copy_array(instance.last_mask),
+                    source_instance_id=instance.instance_id,
+                    source=instance.source,
+                    class_conf_sums=class_conf_sums,
+                    class_hits=class_hits,
+                    valid_detection_count=int(valid_detection_count),
+                    total_conf_sum=float(total_conf_sum),
+                    edge_rejected_count=int(getattr(instance, "edge_rejected_count", 0)),
+                    raw_rejected_detections_count=int(getattr(instance, "edge_rejected_count", 0)),
                 )
-            )
-            instance_ids.append(instance.instance_id)
-            sources.append(instance.source)
-        changed = self.update(detections, step_id=step_id, map_info=map_info)
-        for node, instance_id, source in zip(changed, instance_ids, sources):
-            node.source_instance_id = instance_id
-            node.source = source
+                node.category = node.stable_category
+                self._next_id += 1
+                self.nodes.append(node)
+                changed.append(node)
+                continue
+            matched.center_world = center
+            matched.center_grid = center_grid
+            matched.confidence = max(float(matched.confidence), float(instance.confidence))
+            matched.observed_count = max(int(matched.observed_count), int(instance.observed_count))
+            matched.last_seen_step = int(step_id)
+            matched.raw_label = instance.category
+            matched.point_cloud_world = _copy_array(instance.point_cloud_world)
+            matched.bbox_world = _copy_array(instance.bbox_world)
+            matched.last_mask = _copy_array(instance.last_mask)
+            matched.source_instance_id = instance.instance_id
+            matched.source = instance.source
+            matched.class_conf_sums = class_conf_sums
+            matched.class_hits = class_hits
+            matched.valid_detection_count = int(valid_detection_count)
+            matched.total_conf_sum = float(total_conf_sum)
+            matched.edge_rejected_count = int(getattr(instance, "edge_rejected_count", matched.edge_rejected_count))
+            matched.raw_rejected_detections_count = int(getattr(instance, "edge_rejected_count", matched.raw_rejected_detections_count))
+            matched.category = matched.stable_category
+            changed.append(matched)
+        self.dedupe(map_info=map_info)
         return changed
+
+    def _find_match_for_fused_instance(self, instance: FusedInstance, center_world: Sequence[float]) -> Optional[ObjectNode]:
+        instance_id = str(getattr(instance, "instance_id", "") or "")
+        if instance_id:
+            for node in self.nodes:
+                if str(node.source_instance_id or "") == instance_id:
+                    return node
+        return self.find_match(getattr(instance, "category", ""), center_world)
 
     def dedupe(self, map_info: Optional[MapInfo] = None) -> None:
         if len(self.nodes) < 2:
@@ -175,13 +251,12 @@ class ObjectMemory:
             match = None
             best_dist = float("inf")
             for existing in merged:
-                if self._category_key(existing.category) != node.category:
-                    continue
                 dist = self._xy_distance(existing.center_world, node.center_world)
                 if dist < self.merge_radius_m and dist < best_dist:
                     match = existing
                     best_dist = dist
             if match is None:
+                _ensure_category_accumulator(node)
                 merged.append(node)
                 continue
             self._merge_node_into(match, node, map_info=map_info)
@@ -228,6 +303,8 @@ class ObjectMemory:
         if map_info is not None:
             target.center_grid = world_xy_to_grid(float(merged_center[0]), float(merged_center[1]), map_info)
         target.confidence = max(float(target.confidence), float(duplicate.confidence))
+        _merge_category_accumulators(target, duplicate)
+        target.category = target.stable_category
         target.point_cloud_world = _merge_point_clouds(target.point_cloud_world, duplicate.point_cloud_world)
         target.bbox_world = _bbox_from_points(target.point_cloud_world) if target.point_cloud_world is not None else target.bbox_world
         if duplicate.last_mask is not None:
@@ -249,6 +326,60 @@ def _copy_array(value: Optional[np.ndarray]) -> Optional[np.ndarray]:
     if value is None:
         return None
     return np.asarray(value).copy()
+
+
+def _ensure_category_accumulator(node: ObjectNode) -> None:
+    if not node.class_conf_sums:
+        category = normalize_category(node.category)
+        count = max(1, int(node.observed_count))
+        node.class_conf_sums = {category: float(node.confidence) * float(count)}
+        node.class_hits = {category: count}
+        node.valid_detection_count = count
+        node.total_conf_sum = float(node.confidence) * float(count)
+        node.category = category
+
+
+def _accumulate_category_observation(node: ObjectNode, category: str, confidence: float) -> None:
+    _ensure_category_accumulator(node)
+    label = normalize_category(category)
+    node.class_conf_sums[label] = float(node.class_conf_sums.get(label, 0.0)) + float(confidence)
+    node.class_hits[label] = int(node.class_hits.get(label, 0)) + 1
+    node.valid_detection_count = int(node.valid_detection_count) + 1
+    node.total_conf_sum = float(node.total_conf_sum) + float(confidence)
+
+
+def _merge_category_accumulators(target: ObjectNode, duplicate: ObjectNode) -> None:
+    _ensure_category_accumulator(target)
+    _ensure_category_accumulator(duplicate)
+    for category, value in duplicate.class_conf_sums.items():
+        key = normalize_category(category)
+        target.class_conf_sums[key] = float(target.class_conf_sums.get(key, 0.0)) + float(value)
+    for category, value in duplicate.class_hits.items():
+        key = normalize_category(category)
+        target.class_hits[key] = int(target.class_hits.get(key, 0)) + int(value)
+    target.valid_detection_count = int(target.valid_detection_count) + int(duplicate.valid_detection_count)
+    target.total_conf_sum = float(target.total_conf_sum) + float(duplicate.total_conf_sum)
+    target.edge_rejected_count = int(target.edge_rejected_count) + int(duplicate.edge_rejected_count)
+    target.raw_rejected_detections_count = int(target.raw_rejected_detections_count) + int(duplicate.raw_rejected_detections_count)
+
+
+def _category_accumulators_from_instance(instance: FusedInstance) -> Tuple[Dict[str, float], Dict[str, int], int, float]:
+    sums = {
+        normalize_category(category): float(value)
+        for category, value in dict(getattr(instance, "class_conf_sums", {}) or {}).items()
+    }
+    hits = {
+        normalize_category(category): int(value)
+        for category, value in dict(getattr(instance, "class_hits", {}) or {}).items()
+    }
+    category = normalize_category(getattr(instance, "category", "object"))
+    if not sums:
+        count = max(1, int(getattr(instance, "observed_count", 1)))
+        sums = {category: float(getattr(instance, "confidence", 0.0)) * float(count)}
+        hits = {category: count}
+    valid_detection_count = int(getattr(instance, "valid_detection_count", 0) or sum(max(0, int(v)) for v in hits.values()))
+    total_conf_sum = float(getattr(instance, "total_conf_sum", 0.0) or sum(float(v) for v in sums.values()))
+    return sums, hits, valid_detection_count, total_conf_sum
 
 
 def _array_to_list(value: Optional[np.ndarray]):

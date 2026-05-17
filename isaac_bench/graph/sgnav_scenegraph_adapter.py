@@ -100,6 +100,9 @@ class RuntimeGraphNode:
     center_grid: Optional[Tuple[int, int]] = None
     center_world: Optional[Tuple[float, float, float]] = None
     confidence: float = 0.0
+    mean_confidence: float = 0.0
+    detection_count: int = 0
+    winner_detection_count: int = 0
     observed_count: int = 0
     members: List[str] = field(default_factory=list)
     room: Optional[str] = None
@@ -855,6 +858,9 @@ class SGNavSceneGraphAdapter:
                 center_grid=(int(mem_node.center_grid[0]), int(mem_node.center_grid[1])),
                 center_world=tuple(float(v) for v in mem_node.center_world),
                 confidence=float(mem_node.confidence),
+                mean_confidence=float(getattr(mem_node, "mean_confidence", mem_node.confidence)),
+                detection_count=int(getattr(mem_node, "valid_detection_count", mem_node.observed_count) or mem_node.observed_count),
+                winner_detection_count=int(getattr(mem_node, "winner_detection_count", mem_node.observed_count)),
                 observed_count=int(mem_node.observed_count),
                 room=room_name,
             )
@@ -1041,8 +1047,14 @@ class SGNavSceneGraphAdapter:
             loc = "rc=%s" % (list(node.center_grid),) if node.center_grid else "rc=?"
             room = " room=%s" % node.room if node.room else ""
             object_text.append(
-                "%s conf=%.2f obs=%d %s%s"
-                % (node.caption, float(node.confidence), int(node.observed_count), loc, room)
+                "%s mean_conf=%.2f detections=%d %s%s"
+                % (
+                    node.caption,
+                    float(node.mean_confidence or node.confidence),
+                    int(node.detection_count or node.observed_count),
+                    loc,
+                    room,
+                )
             )
         edge_text = []
         for edge in self.runtime_edges[:max_edges]:
