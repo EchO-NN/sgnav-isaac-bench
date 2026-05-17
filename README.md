@@ -223,9 +223,12 @@ Enable saved panels and graph dumps:
 
 Each saved SG-Nav panel can also write
 `sgnav_step_XXXXXX.layers.json`. That sidecar records primitive counts for
-frontier cells, object nodes, accepted candidates, GT goal cells, and other
-overlay layers. GT goal cells are disabled by default so oracle goal markers do
-not appear in strict visualization.
+frontier cells, online room masks/boundaries/labels, object nodes, accepted
+candidates, GT goal cells, and other overlay layers. Room masks are drawn from
+online geometry room segmentation and VLM room labels by default; use
+`--no-show-room-masks` or `--no-show-room-labels` only when debugging panel
+clutter. GT goal cells are disabled by default so oracle goal markers do not
+appear in strict visualization.
 
 Convert one graph step into the SG-Nav decision dump contract:
 

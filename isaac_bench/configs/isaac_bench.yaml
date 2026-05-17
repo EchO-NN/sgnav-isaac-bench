@@ -32,6 +32,8 @@ visualization:
   debug_overlay_layers: true
   save_overlay_layer_metadata: true
   show_gt_goal_cells: false
+  show_room_masks: true
+  show_room_labels: true
   show_frontier_member_cells: true
   show_object_nodes: true
   show_candidate_markers: true

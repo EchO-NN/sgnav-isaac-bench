@@ -7,7 +7,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
-from typing import Iterable, List, Optional, Sequence, Tuple
+from typing import Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
@@ -40,6 +40,8 @@ class SGNavPopupVisualizer:
         debug_overlay_layers: bool = True,
         save_overlay_layer_metadata: bool = True,
         show_gt_goal_cells: bool = False,
+        show_room_masks: bool = True,
+        show_room_labels: bool = True,
         show_frontier_member_cells: bool = True,
         show_object_nodes: bool = True,
         show_candidate_markers: bool = True,
@@ -54,17 +56,25 @@ class SGNavPopupVisualizer:
         self.debug_overlay_layers = bool(debug_overlay_layers)
         self.save_overlay_layer_metadata = bool(save_overlay_layer_metadata)
         self.show_gt_goal_cells = bool(show_gt_goal_cells)
+        self.show_room_masks = bool(show_room_masks)
+        self.show_room_labels = bool(show_room_labels)
         self.show_frontier_member_cells = bool(show_frontier_member_cells)
         self.show_object_nodes = bool(show_object_nodes)
         self.show_candidate_markers = bool(show_candidate_markers)
         self.max_green_like_primitives_before_warning = max(0, int(max_green_like_primitives_before_warning))
         self._last_overlay_layers: List[dict] = []
+        self._room_masks: List[object] = []
+        self._room_semantic_labels: dict[str, object] = {}
         self._proc: Optional[subprocess.Popen[str]] = None
         self._ipc_dir = Path(tempfile.gettempdir()) / ("sgnav_viz_%d" % os.getpid())
         self._frame_path = self._ipc_dir / "latest.jpg"
         self._font = ImageFont.load_default()
         if self.save_dir:
             self.save_dir.mkdir(parents=True, exist_ok=True)
+
+    def set_room_context(self, room_masks: Sequence[object], room_semantic_labels: Optional[Mapping[str, object]] = None) -> None:
+        self._room_masks = list(room_masks or [])
+        self._room_semantic_labels = dict(room_semantic_labels or {})
 
     def _try_open_window(self) -> None:
         if not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
@@ -399,6 +409,11 @@ class SGNavPopupVisualizer:
         base[~nav] = (72, 74, 76)
         base[occupancy.astype(bool)] = (24, 24, 24)
         base[~obs] = (base[~obs].astype(np.float32) * 0.45 + np.array([20, 24, 34], dtype=np.float32)).astype(np.uint8)
+        active_room_masks = self._active_room_masks(occupancy.shape)
+        room_mask_cell_count = 0
+        room_boundary_cell_count = 0
+        if self.show_room_masks and active_room_masks:
+            base, room_mask_cell_count, room_boundary_cell_count = self._apply_room_mask_overlay(base, active_room_masks)
 
         r0, r1, c0, c1 = self._map_crop_bounds(
             occupancy=occupancy,
@@ -439,6 +454,17 @@ class SGNavPopupVisualizer:
         def xy(cell: GridCell) -> Tuple[int, int]:
             r, c = int(cell[0]), int(cell[1])
             return int(ox + (c - c0 + 0.5) * scale), int(oy + (r - r0 + 0.5) * scale)
+
+        room_color = (145, 110, 255)
+        record("room_masks", self.show_room_masks, room_color, room_mask_cell_count, "online geometry room mask fill")
+        record("room_boundaries", self.show_room_masks, room_color, room_boundary_cell_count, "online geometry room mask boundary")
+        room_label_count = self._draw_room_labels(
+            draw,
+            active_room_masks,
+            xy,
+            crop_bounds=(r0, r1, c0, c1),
+        ) if self.show_room_labels else 0
+        record("room_labels", self.show_room_labels, (250, 250, 255), room_label_count, "VLM room category and reliability")
 
         goal_color = (30, 220, 80)
         goal_count = self._draw_cells(draw, goal_cells, xy, goal_color, radius=2, max_cells=500) if self.show_gt_goal_cells else 0
@@ -501,7 +527,7 @@ class SGNavPopupVisualizer:
         zoom = max(1.0, min(w / max(crop_w, 1), h / max(crop_h, 1)))
         target_count = len(nav_decision.target_cells) if nav_decision is not None else 0
         self._label(draw, (10, 8), "Map / frontiers / A* / goal candidates  zoom %.1fx target_cells=%d" % (zoom, target_count), (255, 255, 255))
-        self._legend(draw, (10, height - 96))
+        self._legend(draw, (10, max(32, height - 120)))
         self._last_overlay_layers = layers if self.debug_overlay_layers else []
         return image
 
@@ -554,6 +580,12 @@ class SGNavPopupVisualizer:
                 add_cell(nav_decision.selected_candidate.center_grid)
         for node in self._visible_map_nodes(object_memory, goal_category, nav_decision)[:500]:
             add_cell(node.center_grid)
+        for room in self._active_room_masks((h, w))[:64]:
+            mask = np.asarray(getattr(room, "mask", None), dtype=bool)
+            rr, cc = np.nonzero(mask)
+            if rr.size:
+                rows.extend(int(v) for v in rr[:: max(1, rr.size // 128)])
+                cols.extend(int(v) for v in cc[:: max(1, cc.size // 128)])
 
         if not rows or not cols:
             return 0, h, 0, w
@@ -690,6 +722,123 @@ class SGNavPopupVisualizer:
             y += 18
         return image
 
+    def _active_room_masks(self, shape: Tuple[int, int]) -> List[object]:
+        out = []
+        for room in self._room_masks:
+            if bool(getattr(room, "stale", False)):
+                continue
+            mask = getattr(room, "mask", None)
+            if mask is None:
+                continue
+            arr = np.asarray(mask, dtype=bool)
+            if arr.shape != tuple(shape) or not np.any(arr):
+                continue
+            out.append(room)
+        return out
+
+    def _apply_room_mask_overlay(self, base: np.ndarray, room_masks: Sequence[object]) -> Tuple[np.ndarray, int, int]:
+        out = np.asarray(base, dtype=np.uint8).copy()
+        total_mask_cells = 0
+        total_boundary_cells = 0
+        for idx, room in enumerate(room_masks[:64]):
+            mask = np.asarray(getattr(room, "mask", None), dtype=bool)
+            if mask.shape != out.shape[:2] or not np.any(mask):
+                continue
+            color = np.asarray(self._room_color(idx), dtype=np.float32)
+            total_mask_cells += int(np.count_nonzero(mask))
+            blended = out[mask].astype(np.float32) * 0.62 + color[None, :] * 0.38
+            out[mask] = np.clip(blended, 0, 255).astype(np.uint8)
+            boundary = self._mask_boundary(mask)
+            total_boundary_cells += int(np.count_nonzero(boundary))
+            out[boundary] = np.asarray(np.clip(color * 1.08, 0, 255), dtype=np.uint8)
+        return out, total_mask_cells, total_boundary_cells
+
+    @staticmethod
+    def _mask_boundary(mask: np.ndarray) -> np.ndarray:
+        arr = np.asarray(mask, dtype=bool)
+        padded = np.pad(arr, 1, mode="constant", constant_values=False)
+        neighbors = (
+            padded[1:-1, :-2]
+            & padded[1:-1, 2:]
+            & padded[:-2, 1:-1]
+            & padded[2:, 1:-1]
+        )
+        return arr & ~neighbors
+
+    def _draw_room_labels(
+        self,
+        draw: ImageDraw.ImageDraw,
+        room_masks: Sequence[object],
+        xy_func,
+        crop_bounds: Tuple[int, int, int, int],
+    ) -> int:
+        r0, r1, c0, c1 = crop_bounds
+        count = 0
+        for idx, room in enumerate(room_masks[:64]):
+            center = self._room_center_cell(room)
+            if center is None:
+                continue
+            r, c = center
+            if not (r0 <= r < r1 and c0 <= c < c1):
+                continue
+            label = self._room_label_text(room)
+            if not label:
+                continue
+            x, y = xy_func(center)
+            color = self._room_color(idx)
+            self._label(draw, (x + 5, y - 9), label[:36], color)
+            self._dot(draw, (x, y), color, radius=4)
+            count += 1
+        return count
+
+    def _room_center_cell(self, room: object) -> Optional[GridCell]:
+        metadata = getattr(room, "metadata", {}) or {}
+        if isinstance(metadata, Mapping) and metadata.get("centroid_grid") is not None:
+            try:
+                row, col = metadata["centroid_grid"][:2]
+                return int(round(float(row))), int(round(float(col)))
+            except Exception:
+                pass
+        mask = getattr(room, "mask", None)
+        if mask is None:
+            return None
+        rr, cc = np.nonzero(np.asarray(mask, dtype=bool))
+        if rr.size == 0:
+            return None
+        return int(round(float(np.mean(rr)))), int(round(float(np.mean(cc))))
+
+    def _room_label_text(self, room: object) -> str:
+        room_id = str(getattr(room, "room_id", "room"))
+        label = self._room_semantic_labels.get(room_id)
+        if label is None:
+            return room_id
+        if isinstance(label, Mapping):
+            category = str(label.get("category", "unknown"))
+            reliability = label.get("label_reliability", label.get("confidence"))
+        else:
+            category = str(getattr(label, "category", "unknown"))
+            reliability = getattr(label, "label_reliability", getattr(label, "confidence", None))
+        if reliability is None:
+            return "%s:%s" % (room_id, category)
+        try:
+            return "%s:%s %.2f" % (room_id, category, float(reliability))
+        except Exception:
+            return "%s:%s" % (room_id, category)
+
+    @staticmethod
+    def _room_color(idx: int) -> Tuple[int, int, int]:
+        palette = [
+            (145, 110, 255),
+            (255, 120, 120),
+            (80, 190, 255),
+            (255, 190, 80),
+            (180, 130, 255),
+            (90, 210, 170),
+            (255, 145, 210),
+            (210, 210, 90),
+        ]
+        return palette[int(idx) % len(palette)]
+
     def _draw_agent(self, draw: ImageDraw.ImageDraw, center: Tuple[int, int], yaw: float, scale: float) -> None:
         x, y = center
         radius = max(5, int(3 * scale))
@@ -765,6 +914,7 @@ class SGNavPopupVisualizer:
         x, y = xy
         items = [
             ((255, 60, 60), "agent"),
+            ((145, 110, 255), "online room"),
             ((245, 245, 245), "A*"),
             ((0, 225, 255), "frontier center"),
             ((255, 225, 40), "chosen frontier"),
