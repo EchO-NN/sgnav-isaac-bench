@@ -37,6 +37,7 @@ def propose_object_edges_with_llm(
     all_objects: Sequence[ObjectNode],
     llm_client: Optional[LLMClient] = None,
     max_retries: int = 2,
+    batch_size: int = 12,
 ) -> List[ObjectEdgeProposal]:
     pairs = _candidate_pairs(new_objects, all_objects)
     if not pairs:
@@ -47,12 +48,21 @@ def propose_object_edges_with_llm(
             for src, dst in pairs
             if _fallback_relation(src, dst) != "none"
         ]
-    parsed = _call_edge_json(llm_client, pairs, max_retries=max_retries)
+    proposals: List[ObjectEdgeProposal] = []
+    chunk_size = max(1, int(batch_size))
+    for start in range(0, len(pairs), chunk_size):
+        chunk = pairs[start : start + chunk_size]
+        parsed = _call_edge_json(llm_client, chunk, max_retries=max_retries)
+        proposals.extend(_edge_proposals_from_items(parsed, chunk))
+    return proposals
+
+
+def _edge_proposals_from_items(items: Sequence[object], pairs) -> List[ObjectEdgeProposal]:
     proposals: List[ObjectEdgeProposal] = []
     valid_pair_ids = {(src.id, dst.id) for src, dst in pairs}
     valid_pair_ids.update((dst.id, src.id) for src, dst in pairs)
     pair_lookup = {"pair_%03d" % idx: (src.id, dst.id) for idx, (src, dst) in enumerate(pairs)}
-    for item in parsed:
+    for item in items:
         if not isinstance(item, dict):
             continue
         pair_id = str(item.get("pair_id") or item.get("pair") or "")

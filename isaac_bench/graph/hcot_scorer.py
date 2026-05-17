@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+from urllib import error as urllib_error
 from urllib import request as urllib_request
 from dataclasses import dataclass
 from typing import Dict, List, Mapping, Optional
@@ -130,8 +131,15 @@ class OpenAICompatibleJSONClient:
             method="POST",
         )
         self.request_count += 1
-        with urllib_request.urlopen(req, timeout=self.timeout_s) as response:
-            body = json.loads(response.read().decode("utf-8"))
+        try:
+            with urllib_request.urlopen(req, timeout=self.timeout_s) as response:
+                body = json.loads(response.read().decode("utf-8"))
+        except urllib_error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            raise RuntimeError(
+                "OpenAI-compatible JSON request failed: HTTP %s %s: %s"
+                % (exc.code, exc.reason, detail[:2000])
+            ) from exc
         content = body["choices"][0]["message"].get("content", "")
         return _parse_json_value(str(content))
 

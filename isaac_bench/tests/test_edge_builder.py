@@ -39,6 +39,15 @@ class RepairingLLM:
         }
 
 
+class EmptyLLM:
+    def __init__(self):
+        self.prompts = []
+
+    def complete_json(self, prompt: str):
+        self.prompts.append(prompt)
+        return {"edges": []}
+
+
 class FakeVLM:
     def complete_json(self, prompt: str, image=None):
         return {"exists": True, "confidence": 0.9, "reason": "visible"}
@@ -80,6 +89,31 @@ def test_propose_object_edges_repairs_invalid_json_without_fallback():
     assert len(proposals) == 1
     assert proposals[0].source == "llm_dense_connect"
     assert proposals[0].reason == "common pair"
+
+
+def test_propose_object_edges_batches_large_pair_sets():
+    graph = PaperSceneGraph()
+    graph.update_object_and_room_nodes(
+        [
+            _instance("table", "table", (0.0, 0.0, 0.5)),
+            _instance("chair", "chair", (0.5, 0.0, 0.5)),
+            _instance("sofa", "sofa", (1.0, 0.0, 0.5)),
+            _instance("lamp", "lamp", (1.5, 0.0, 0.5)),
+            _instance("plant", "plant", (2.0, 0.0, 0.5)),
+        ]
+    )
+    llm = EmptyLLM()
+
+    proposals = propose_object_edges_with_llm(
+        [graph.object_nodes["object:table"]],
+        list(graph.object_nodes.values()),
+        llm,
+        batch_size=2,
+    )
+
+    assert proposals == []
+    assert len(llm.prompts) == 2
+    assert all('"edges"' in prompt for prompt in llm.prompts)
 
 
 def test_apply_edge_proposals_adds_unique_edges():
