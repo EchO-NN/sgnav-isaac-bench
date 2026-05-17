@@ -95,13 +95,27 @@ class OpenAICompatibleJSONClient:
         self.api_key = str(cfg.get("api_key") or "EMPTY")
         self.timeout_s = float(cfg.get("timeout_s", 8.0))
         self.temperature = float(cfg.get("temperature", 0.0))
-        self.max_tokens = int(cfg.get("max_tokens", 2048))
+        self.max_tokens = int(cfg.get("max_tokens", 512))
         self.response_format_json = bool(cfg.get("response_format_json", True))
         self.request_count = 0
 
     def complete_json(self, prompt: str) -> object:
         if not self.enabled:
             raise RuntimeError("OpenAI-compatible JSON client is disabled")
+        max_tokens = max(64, int(self.max_tokens))
+        last_error: Optional[Exception] = None
+        for _ in range(4):
+            try:
+                content = self._complete_json_once(prompt, max_tokens=max_tokens)
+                return _parse_json_value(str(content))
+            except RuntimeError as exc:
+                last_error = exc
+                if max_tokens <= 128 or not _is_context_length_error(str(exc)):
+                    raise
+                max_tokens = max(128, max_tokens // 2)
+        raise RuntimeError("OpenAI-compatible JSON request failed after reducing max_tokens") from last_error
+
+    def _complete_json_once(self, prompt: str, max_tokens: int) -> str:
         payload = {
             "model": self.model,
             "messages": [
@@ -116,7 +130,7 @@ class OpenAICompatibleJSONClient:
                 {"role": "user", "content": prompt},
             ],
             "temperature": self.temperature,
-            "max_tokens": self.max_tokens,
+            "max_tokens": int(max_tokens),
         }
         if self.response_format_json:
             payload["response_format"] = {"type": "json_object"}
@@ -141,7 +155,7 @@ class OpenAICompatibleJSONClient:
                 % (exc.code, exc.reason, detail[:2000])
             ) from exc
         content = body["choices"][0]["message"].get("content", "")
-        return _parse_json_value(str(content))
+        return str(content)
 
 
 def score_subgraph_with_hcot(
@@ -250,3 +264,8 @@ def _strip_json_fence(text: str) -> str:
     if match is not None:
         return match.group(1).strip()
     return text
+
+
+def _is_context_length_error(text: str) -> bool:
+    lowered = text.lower()
+    return "maximum context length" in lowered or "context length" in lowered or "input tokens" in lowered

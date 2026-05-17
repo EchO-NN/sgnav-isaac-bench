@@ -272,6 +272,7 @@ llm:
   api_key: EMPTY
   timeout_s: 30.0
   temperature: 0.0
+  max_tokens: 512
   max_hcot_subgraphs_per_decision: 8
 
 astar:

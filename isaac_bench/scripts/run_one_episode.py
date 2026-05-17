@@ -677,6 +677,7 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
             "api_key": getattr(args, "llm_api_key", None),
             "timeout_s": float(getattr(args, "llm_timeout_s", 30.0)),
             "temperature": float(getattr(args, "llm_temperature", 0.0)),
+            "max_tokens": int(getattr(args, "llm_max_tokens", 512)),
             "max_hcot_subgraphs_per_decision": int(getattr(args, "max_hcot_subgraphs_per_decision", 8)),
         },
         sgnav_mode=str(getattr(args, "sgnav_mode", "legacy")),
@@ -2064,6 +2065,7 @@ def run_episode_map_sim(episode: dict, args) -> dict:
             "api_key": getattr(args, "llm_api_key", None),
             "timeout_s": float(getattr(args, "llm_timeout_s", 30.0)),
             "temperature": float(getattr(args, "llm_temperature", 0.0)),
+            "max_tokens": int(getattr(args, "llm_max_tokens", 512)),
             "max_hcot_subgraphs_per_decision": int(getattr(args, "max_hcot_subgraphs_per_decision", 8)),
         },
         sgnav_mode=str(getattr(args, "sgnav_mode", "legacy")),
@@ -2261,6 +2263,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--llm-api-key", default=None)
     parser.add_argument("--llm-timeout-s", type=float, default=None)
     parser.add_argument("--llm-temperature", type=float, default=None)
+    parser.add_argument("--llm-max-tokens", type=int, default=None)
     parser.add_argument("--max-hcot-subgraphs-per-decision", type=int, default=None)
     parser.add_argument("--vllm-frontier-scoring", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--vllm-base-url", default=None)
@@ -2566,6 +2569,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     args.llm_api_key = args.llm_api_key or get_nested(cfg, "llm.api_key", "EMPTY")
     args.llm_timeout_s = float(args.llm_timeout_s if args.llm_timeout_s is not None else get_nested(cfg, "llm.timeout_s", 30.0))
     args.llm_temperature = float(args.llm_temperature if args.llm_temperature is not None else get_nested(cfg, "llm.temperature", 0.0))
+    args.llm_max_tokens = int(args.llm_max_tokens if args.llm_max_tokens is not None else get_nested(cfg, "llm.max_tokens", 512))
     args.max_hcot_subgraphs_per_decision = int(
         args.max_hcot_subgraphs_per_decision
         if args.max_hcot_subgraphs_per_decision is not None

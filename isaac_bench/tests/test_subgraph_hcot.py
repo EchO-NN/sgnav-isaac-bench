@@ -1,5 +1,5 @@
 from isaac_bench.graph.edge_builder import apply_edge_proposals, propose_object_edges_with_llm
-from isaac_bench.graph.hcot_scorer import HCoTSubgraphScorer, score_subgraph_with_hcot
+from isaac_bench.graph.hcot_scorer import HCoTSubgraphScorer, OpenAICompatibleJSONClient, score_subgraph_with_hcot
 from isaac_bench.graph.subgraph_builder import build_object_centered_subgraphs
 from isaac_bench.tests.test_edge_builder import FakeLLM, _graph_with_table_chair
 
@@ -55,3 +55,9 @@ def test_hcot_scorer_caches_by_graph_goal_and_subgraph():
     scorer.score([subgraph], "chair", graph_version=1)
 
     assert llm.calls == 4
+
+
+def test_openai_json_client_default_output_budget_fits_qwen_context():
+    client = OpenAICompatibleJSONClient({"enabled": True})
+
+    assert client.max_tokens == 512
