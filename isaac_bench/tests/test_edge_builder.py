@@ -19,6 +19,26 @@ class FakeLLM:
         return [{"src": "object:table", "dst": "object:chair", "relation": "next to", "confidence": 0.8, "reason": "common pair"}]
 
 
+class RepairingLLM:
+    def __init__(self):
+        self.prompts = []
+
+    def complete_json(self, prompt: str):
+        self.prompts.append(prompt)
+        if len(self.prompts) == 1:
+            return '{"edges": [{"src": "object:table", "dst": "object:chair", "relation": "next to", "confidence": 0.8, "reason": "common'
+        return {
+            "edges": [
+                {
+                    "pair_id": "pair_000",
+                    "relation": "next to",
+                    "confidence": 0.8,
+                    "reason": "common pair",
+                }
+            ]
+        }
+
+
 class FakeVLM:
     def complete_json(self, prompt: str, image=None):
         return {"exists": True, "confidence": 0.9, "reason": "visible"}
@@ -42,8 +62,24 @@ def test_propose_object_edges_batches_pairs_in_one_llm_call():
     proposals = propose_object_edges_with_llm([graph.object_nodes["object:table"]], list(graph.object_nodes.values()), llm)
 
     assert len(llm.prompts) == 1
+    assert "Return exactly one JSON object" in llm.prompts[0]
+    assert '"edges"' in llm.prompts[0]
+    assert "Return strict JSON list" not in llm.prompts[0]
     assert len(proposals) == 1
     assert proposals[0].relation == "next to"
+
+
+def test_propose_object_edges_repairs_invalid_json_without_fallback():
+    graph = _graph_with_table_chair()
+    llm = RepairingLLM()
+
+    proposals = propose_object_edges_with_llm([graph.object_nodes["object:table"]], list(graph.object_nodes.values()), llm)
+
+    assert len(llm.prompts) == 2
+    assert "previous response failed" in llm.prompts[1]
+    assert len(proposals) == 1
+    assert proposals[0].source == "llm_dense_connect"
+    assert proposals[0].reason == "common pair"
 
 
 def test_apply_edge_proposals_adds_unique_edges():

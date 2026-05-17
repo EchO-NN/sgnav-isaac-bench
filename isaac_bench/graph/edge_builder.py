@@ -36,6 +36,7 @@ def propose_object_edges_with_llm(
     new_objects: Sequence[ObjectNode],
     all_objects: Sequence[ObjectNode],
     llm_client: Optional[LLMClient] = None,
+    max_retries: int = 2,
 ) -> List[ObjectEdgeProposal]:
     pairs = _candidate_pairs(new_objects, all_objects)
     if not pairs:
@@ -46,16 +47,18 @@ def propose_object_edges_with_llm(
             for src, dst in pairs
             if _fallback_relation(src, dst) != "none"
         ]
-    prompt = _edge_prompt(pairs)
-    parsed = _ensure_json_list(llm_client.complete_json(prompt))
+    parsed = _call_edge_json(llm_client, pairs, max_retries=max_retries)
     proposals: List[ObjectEdgeProposal] = []
     valid_pair_ids = {(src.id, dst.id) for src, dst in pairs}
     valid_pair_ids.update((dst.id, src.id) for src, dst in pairs)
+    pair_lookup = {"pair_%03d" % idx: (src.id, dst.id) for idx, (src, dst) in enumerate(pairs)}
     for item in parsed:
         if not isinstance(item, dict):
             continue
-        src_id = str(item.get("src") or item.get("object1_id") or item.get("object1") or "")
-        dst_id = str(item.get("dst") or item.get("object2_id") or item.get("object2") or "")
+        pair_id = str(item.get("pair_id") or item.get("pair") or "")
+        pair_src_dst = pair_lookup.get(pair_id)
+        src_id = str(item.get("src") or item.get("object1_id") or item.get("object1") or (pair_src_dst[0] if pair_src_dst else ""))
+        dst_id = str(item.get("dst") or item.get("object2_id") or item.get("object2") or (pair_src_dst[1] if pair_src_dst else ""))
         relation = str(item.get("relation") or item.get("relationships") or "none").strip().lower()
         if not src_id or not dst_id or (src_id, dst_id) not in valid_pair_ids or relation in {"", "none", "no relation"}:
             continue
@@ -70,6 +73,19 @@ def propose_object_edges_with_llm(
             )
         )
     return proposals
+
+
+def _call_edge_json(llm_client: LLMClient, pairs, max_retries: int = 2) -> List[object]:
+    prompt = _edge_prompt(pairs)
+    last_error: Optional[Exception] = None
+    attempts = max(1, int(max_retries) + 1)
+    for attempt in range(attempts):
+        try:
+            return _ensure_json_list(llm_client.complete_json(prompt))
+        except Exception as exc:
+            last_error = exc
+            prompt = _edge_prompt(pairs, previous_error=str(exc), repair_attempt=attempt + 1)
+    raise ValueError("LLM edge proposal response failed strict JSON schema after %d attempts" % attempts) from last_error
 
 
 def verify_short_edge_with_vlm(
@@ -159,16 +175,37 @@ def _candidate_pairs(new_objects: Sequence[ObjectNode], all_objects: Sequence[Ob
     return pairs
 
 
-def _edge_prompt(pairs) -> str:
+def _edge_prompt(pairs, previous_error: Optional[str] = None, repair_attempt: int = 0) -> str:
     payload = [
-        {"src": src.id, "dst": dst.id, "object1": src.category, "object2": dst.category}
-        for src, dst in pairs
+        {
+            "pair_id": "pair_%03d" % idx,
+            "src": src.id,
+            "dst": dst.id,
+            "src_category": src.category,
+            "dst_category": dst.category,
+        }
+        for idx, (src, dst) in enumerate(pairs)
     ]
-    return (
+    repair = ""
+    if previous_error:
+        repair = (
+            "The previous response failed JSON/schema validation: %s\n"
+            "Repair the answer by returning one valid JSON object only.\n"
+        ) % previous_error
+    return repair + (
         "Predict the most likely relationships between these pairs of objects.\n"
-        "Return strict JSON list. Each item must contain src, dst, relation, confidence, reason.\n"
-        "Allowed relations include next to, opposite to, on, under, near, functionally related, none.\n"
-        "Pairs:\n%s" % json.dumps(payload, ensure_ascii=False)
+        "Return exactly one JSON object with this schema:\n"
+        "{\"edges\":[{\"pair_id\":\"pair_000\",\"src\":\"object:id\",\"dst\":\"object:id\",\"relation\":\"near\",\"confidence\":0.0,\"reason\":\"short\"}]}\n"
+        "Rules:\n"
+        "- Return no markdown, no prose, no code fence, and no trailing text.\n"
+        "- Include only edges whose relation is not none; use {\"edges\":[]} when no relation exists.\n"
+        "- Use only pair_id/src/dst values from the provided pairs.\n"
+        "- Allowed relation values: next to, opposite to, on, under, near, functionally related.\n"
+        "- confidence must be a number from 0.0 to 1.0.\n"
+        "- reason must be at most 12 words.\n"
+        "- Keep the response compact enough to fit in the token budget.\n"
+        "Repair attempt: %d\n"
+        "Pairs:\n%s" % (repair_attempt, json.dumps(payload, ensure_ascii=False))
     )
 
 

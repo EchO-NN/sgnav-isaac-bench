@@ -94,6 +94,8 @@ class OpenAICompatibleJSONClient:
         self.api_key = str(cfg.get("api_key") or "EMPTY")
         self.timeout_s = float(cfg.get("timeout_s", 8.0))
         self.temperature = float(cfg.get("temperature", 0.0))
+        self.max_tokens = int(cfg.get("max_tokens", 2048))
+        self.response_format_json = bool(cfg.get("response_format_json", True))
         self.request_count = 0
 
     def complete_json(self, prompt: str) -> object:
@@ -102,12 +104,21 @@ class OpenAICompatibleJSONClient:
         payload = {
             "model": self.model,
             "messages": [
-                {"role": "system", "content": "Return strict JSON only."},
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a strict JSON API. Return exactly one valid JSON object. "
+                        "Do not include markdown, comments, prose, code fences, or trailing text. "
+                        "Every string must be closed and the JSON must parse with json.loads."
+                    ),
+                },
                 {"role": "user", "content": prompt},
             ],
             "temperature": self.temperature,
-            "max_tokens": 768,
+            "max_tokens": self.max_tokens,
         }
+        if self.response_format_json:
+            payload["response_format"] = {"type": "json_object"}
         data = json.dumps(payload).encode("utf-8")
         req = urllib_request.Request(
             self.base_url + "/chat/completions",
@@ -206,14 +217,7 @@ def _parse_json_object(value: object) -> dict:
     if isinstance(value, dict):
         return value
     if isinstance(value, str):
-        text = value.strip()
-        try:
-            parsed = json.loads(text)
-        except json.JSONDecodeError:
-            match = re.search(r"\{.*\}", text, flags=re.DOTALL)
-            if match is None:
-                raise
-            parsed = json.loads(match.group(0))
+        parsed = _parse_json_value(value)
         if isinstance(parsed, dict):
             return parsed
     raise ValueError("response must be a JSON object")
@@ -223,12 +227,18 @@ def _parse_json_value(value: object) -> object:
     if isinstance(value, (dict, list)):
         return value
     if isinstance(value, str):
-        text = value.strip()
-        try:
-            return json.loads(text)
-        except json.JSONDecodeError:
-            match = re.search(r"(\{.*\}|\[.*\])", text, flags=re.DOTALL)
-            if match is None:
-                raise
-            return json.loads(match.group(0))
+        text = _strip_json_fence(value.strip())
+        decoder = json.JSONDecoder()
+        parsed, end = decoder.raw_decode(text)
+        trailing = text[end:].strip()
+        if trailing:
+            raise json.JSONDecodeError("Extra data after JSON value", text, end)
+        return parsed
     raise ValueError("response must be JSON")
+
+
+def _strip_json_fence(text: str) -> str:
+    match = re.fullmatch(r"```(?:json)?\s*(.*?)\s*```", text, flags=re.DOTALL | re.IGNORECASE)
+    if match is not None:
+        return match.group(1).strip()
+    return text
