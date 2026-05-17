@@ -3,6 +3,13 @@
 Strict SG-Nav room nodes are built online. They do not use InteriorAgent
 `rooms.json`, dataset room labels, or oracle room masks.
 
+Room context is lazy and frontier-scoring gated. The runtime calls
+`prepare_room_context_for_frontier_scoring` only after reachable frontiers have
+been extracted and immediately before SG-Nav scene-graph/HCoT/subgraph frontier
+scoring. Mapper updates, perception updates, committed-frontier A* replans, and
+candidate re-perception/STOP confirmation reuse cached graph context and do not
+trigger room segmentation or VLM room labeling.
+
 ## Geometry Stage
 
 `isaac_bench.mapping.room_segmentation.OnlineRoomSegmenter` consumes only the
@@ -46,12 +53,20 @@ corridor, laundry_room, storage_room, entryway, balcony, unknown`.
 
 The prompt uses only room geometry, objects inside the room mask, and optional
 online visual evidence. It explicitly requires `unknown` when evidence is weak,
-partial, ambiguous, contradictory, or not diagnostic.
+partial, ambiguous, contradictory, or not diagnostic. The VLM-returned
+`confidence` is recorded as `vlm_self_confidence`; it is a self-reported ordinal
+signal, not a calibrated probability.
 
 Post-processing forces `unknown` for invalid categories, low confidence, weak
 evidence, partial weak evidence, ambiguous ranked alternatives, or contradictory
 objects. A VLM returning `unknown` from insufficient evidence is valid; a
 missing/unreachable VLM backend is not valid for strict metrics.
+
+Accepted non-unknown room labels also expose `label_reliability` and
+`reliability_factors`, derived from diagnostic object hits, reliable object
+count, visual evidence, partial-room state, boundary unknown fraction, ambiguity
+margin, mask confidence, and contradictory evidence checks. `RoomNode.confidence`
+uses this evidence reliability rather than raw VLM confidence.
 
 ## Config
 

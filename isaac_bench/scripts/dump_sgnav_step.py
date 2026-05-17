@@ -74,6 +74,7 @@ def _decision_dump_from_runtime_artifacts(graph_debug: dict, result_row: dict) -
         "objects": list(graph_debug.get("objects") or []),
         "groups": list(graph_debug.get("groups") or []),
         "rooms": list(graph_debug.get("rooms") or []),
+        "room_context": dict(graph_debug.get("room_context") or result_row.get("room_context") or _room_context_from_row(result_row)),
         "room_segmentation": dict(
             graph_debug.get("room_segmentation")
             or result_row.get("room_segmentation")
@@ -122,21 +123,8 @@ def _decision_dump_from_runtime_artifacts(graph_debug: dict, result_row: dict) -
         "frontier_scores": frontier_scores,
         "selected_frontier": _selected_frontier(score_debug, frontier_scores, frontiers, result_row),
         "candidate_goals": list(result_row.get("object_memory_goal_candidates") or []),
-        "reperception_state": {
-            "candidate_credibility": result_row.get("candidate_credibility"),
-            "candidate_reperception_steps": result_row.get("candidate_reperception_steps"),
-            "candidate_rejected": result_row.get("candidate_rejected"),
-            "candidate_accepted": result_row.get("candidate_accepted"),
-            "metadata": decision_metadata.get("reperception"),
-        },
-        "stop_state": {
-            "mode": decision.get("mode") or result_row.get("sgnav_decision_mode"),
-            "reason": decision.get("reason") or result_row.get("sgnav_decision_reason"),
-            "stop_reason": result_row.get("stop_reason"),
-            "success": result_row.get("success"),
-            "distance_to_goal": result_row.get("distance_to_goal"),
-            "target_cells": decision.get("target_cells") or [],
-        },
+        "reperception_state": dict(result_row.get("reperception_state") or _reperception_state_from_metadata(decision_metadata, result_row)),
+        "stop_state": dict(result_row.get("stop_state") or _stop_state_from_artifacts(decision, result_row)),
     }
 
 
@@ -170,6 +158,71 @@ def _selected_frontier(score_debug: dict, frontier_scores: list[dict], frontiers
         if item.get("selected"):
             return item
     return result_row.get("selected_frontier")
+
+
+def _room_context_from_row(result_row: dict) -> dict:
+    keys = (
+        "room_context_source",
+        "room_update_invoked_for_frontier_scoring",
+        "room_segmentation_ran",
+        "room_labeling_ran",
+        "room_context_cache_hit",
+        "room_mask_count",
+        "room_label_count",
+        "room_label_requests",
+        "room_label_cache_hits",
+        "room_call_order_trace",
+    )
+    return {key: result_row.get(key) for key in keys if key in result_row}
+
+
+def _reperception_state_from_metadata(decision_metadata: dict, result_row: dict) -> dict:
+    reperception = dict(decision_metadata.get("reperception") or {})
+    candidate_id = reperception.get("candidate_id", decision_metadata.get("selected_candidate_id"))
+    decision = reperception.get("decision")
+    if decision is None:
+        if bool(result_row.get("candidate_accepted", decision_metadata.get("candidate_accepted", False))):
+            decision = "ACCEPT_GOAL"
+        elif bool(result_row.get("candidate_rejected", decision_metadata.get("candidate_rejected", False))):
+            decision = "REJECT_GOAL"
+        elif candidate_id is not None:
+            decision = "CONTINUE_OBSERVING"
+    return {
+        "candidate_id": candidate_id,
+        "num_reperception_steps": int(
+            reperception.get(
+                "num_reperception_steps",
+                result_row.get("candidate_reperception_steps", decision_metadata.get("candidate_reperception_steps", 0)),
+            )
+            or 0
+        ),
+        "accumulated_credibility": float(
+            reperception.get(
+                "accumulated_credibility",
+                result_row.get("candidate_credibility", decision_metadata.get("candidate_credibility", 0.0)),
+            )
+            or 0.0
+        ),
+        "last_s_k": float(reperception.get("last_s_k", reperception.get("s_k", 0.0)) or 0.0),
+        "detector_confidence": float(reperception.get("detector_confidence", 0.0) or 0.0),
+        "supporting_subgraphs": list(reperception.get("supporting_subgraphs") or []),
+        "decision": decision,
+    }
+
+
+def _stop_state_from_artifacts(decision: dict, result_row: dict) -> dict:
+    mode = decision.get("mode") or result_row.get("sgnav_decision_mode")
+    stop_allowed = bool(mode == "stop" or result_row.get("stop_called", False))
+    return {
+        "stop_allowed": stop_allowed,
+        "stop_reason": result_row.get("stop_reason") or decision.get("reason"),
+        "candidate_confirmed": bool(stop_allowed),
+        "mode": mode,
+        "reason": decision.get("reason") or result_row.get("sgnav_decision_reason"),
+        "success": result_row.get("success"),
+        "distance_to_goal": result_row.get("distance_to_goal"),
+        "target_cells": decision.get("target_cells") or [],
+    }
 
 
 if __name__ == "__main__":

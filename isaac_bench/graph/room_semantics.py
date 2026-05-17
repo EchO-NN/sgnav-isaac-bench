@@ -88,12 +88,18 @@ class RoomSemanticLabel:
     rationale: str
     backend: str
     unknown_reason: Optional[str] = None
+    vlm_self_confidence: float = 0.0
+    label_reliability: float = 0.0
+    reliability_factors: Dict[str, object] = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         return {
             "room_id": self.room_id,
             "category": self.category,
             "confidence": float(self.confidence),
+            "vlm_self_confidence": float(self.vlm_self_confidence),
+            "label_reliability": float(self.label_reliability),
+            "reliability_factors": dict(self.reliability_factors),
             "supporting_objects": list(self.supporting_objects),
             "conflicting_evidence": list(self.conflicting_evidence),
             "rationale": self.rationale,
@@ -163,6 +169,9 @@ class VLMRoomLabeler:
                 rationale="Room VLM failed; non-metric debug fallback.",
                 backend="unavailable",
                 unknown_reason="room_vlm_invalid_json",
+                vlm_self_confidence=0.0,
+                label_reliability=0.0,
+                reliability_factors={"backend_available": False},
             )
         return self._postprocess(parsed, room_mask, evidence, visual_evidence, backend="vlm")
 
@@ -193,6 +202,10 @@ class VLMRoomLabeler:
             "room_id": room_mask.room_id,
             "category": best_category,
             "confidence": confidence,
+            "ranked_categories": [
+                {"category": best_category, "confidence": confidence},
+                {"category": self.unknown_category, "confidence": max(0.0, 1.0 - confidence)},
+            ],
             "supporting_objects": support,
             "conflicting_evidence": [],
             "rationale": "Deterministic debug room label from diagnostic objects.",
@@ -208,17 +221,30 @@ class VLMRoomLabeler:
         backend: str,
     ) -> RoomSemanticLabel:
         category = normalize_room_category(parsed.get("category", self.unknown_category))
-        confidence = _safe_float(parsed.get("confidence", 0.0), 0.0)
+        vlm_self_confidence = _safe_float(parsed.get("confidence", parsed.get("vlm_self_confidence", 0.0)), 0.0)
         supporting = _string_list(parsed.get("supporting_objects", []))
         conflicting = _string_list(parsed.get("conflicting_evidence", []))
         rationale = str(parsed.get("rationale", parsed.get("reason", "")))
         unknown_reason = parsed.get("unknown_reason")
         unknown_reason = None if unknown_reason in {None, "", "null"} else str(unknown_reason)
 
-        forced_reason = self._forced_unknown_reason(category, confidence, object_evidence, visual_evidence, room_mask, parsed)
+        reliability, reliability_factors = self._label_reliability(
+            category,
+            vlm_self_confidence,
+            object_evidence,
+            visual_evidence,
+            room_mask,
+            parsed,
+        )
+        forced_reason = self._forced_unknown_reason(
+            category,
+            vlm_self_confidence,
+            reliability_factors,
+            parsed,
+        )
         if forced_reason is not None:
             category = self.unknown_category
-            confidence = min(float(confidence), self.min_confidence - 1e-3)
+            reliability = 0.0
             if forced_reason not in conflicting and forced_reason != "evidence_based_unknown":
                 conflicting.append(forced_reason)
             unknown_reason = forced_reason
@@ -228,58 +254,87 @@ class VLMRoomLabeler:
             unknown_reason = "insufficient_or_ambiguous_evidence"
         if category not in self.allowed_categories:
             category = self.unknown_category
-            confidence = 0.0
+            reliability = 0.0
             unknown_reason = "invalid_category"
         return RoomSemanticLabel(
             room_id=str(parsed.get("room_id", room_mask.room_id)),
             category=category,
-            confidence=float(np.clip(confidence, 0.0, 1.0)),
+            confidence=float(np.clip(reliability, 0.0, 1.0)),
             supporting_objects=supporting,
             conflicting_evidence=conflicting,
             rationale=rationale,
             backend=backend,
             unknown_reason=unknown_reason,
+            vlm_self_confidence=float(np.clip(vlm_self_confidence, 0.0, 1.0)),
+            label_reliability=float(np.clip(reliability, 0.0, 1.0)),
+            reliability_factors=reliability_factors,
         )
+
+    def _label_reliability(
+        self,
+        category: str,
+        vlm_self_confidence: float,
+        object_evidence: Sequence[ObjectEvidence],
+        visual_evidence: Optional[RoomVisualEvidence],
+        room_mask: RoomMask,
+        parsed: Mapping[str, object],
+    ) -> tuple[float, Dict[str, object]]:
+        cats = _expanded_object_categories(object_evidence)
+        reliable_objects = sum(int(ev.count) for ev in object_evidence if float(ev.mean_confidence) >= 0.45 or int(ev.hits) >= 2)
+        strong_visual = bool(visual_evidence and visual_evidence.strong_visual_evidence)
+        diagnostic_hits = _diagnostic_hits_for_category(category, object_evidence)
+        contradictory = _contradictory_evidence(cats)
+        ambiguity_margin_passed = _ambiguity_margin_passed(parsed, self.ambiguity_margin)
+        mask_confidence = float(np.clip(float(getattr(room_mask, "mask_confidence", room_mask.confidence)), 0.0, 1.0))
+        boundary_unknown = float(np.clip(float(room_mask.boundary_unknown_fraction), 0.0, 1.0))
+        evidence_score = min(1.0, 0.25 * float(reliable_objects) + 0.22 * float(diagnostic_hits))
+        if strong_visual:
+            evidence_score = max(evidence_score, 0.70)
+        geometry_score = float(mask_confidence) * (1.0 - 0.35 * boundary_unknown)
+        if room_mask.is_partial and diagnostic_hits < 2 and not strong_visual:
+            geometry_score *= 0.55
+        reliability = 0.15 * float(np.clip(vlm_self_confidence, 0.0, 1.0)) + 0.60 * evidence_score + 0.25 * geometry_score
+        if not ambiguity_margin_passed or contradictory:
+            reliability *= 0.35
+        factors: Dict[str, object] = {
+            "vlm_self_confidence": float(np.clip(vlm_self_confidence, 0.0, 1.0)),
+            "diagnostic_object_hits": int(diagnostic_hits),
+            "reliable_object_count": int(reliable_objects),
+            "has_strong_visual_evidence": bool(strong_visual),
+            "is_partial_room": bool(room_mask.is_partial),
+            "boundary_unknown_fraction": float(boundary_unknown),
+            "ambiguity_margin_passed": bool(ambiguity_margin_passed),
+            "mask_confidence": float(mask_confidence),
+            "contradictory_evidence": bool(contradictory),
+        }
+        return float(np.clip(reliability, 0.0, 1.0)), factors
 
     def _forced_unknown_reason(
         self,
         category: str,
-        confidence: float,
-        object_evidence: Sequence[ObjectEvidence],
-        visual_evidence: Optional[RoomVisualEvidence],
-        room_mask: RoomMask,
+        vlm_self_confidence: float,
+        reliability_factors: Mapping[str, object],
         parsed: Mapping[str, object],
     ) -> Optional[str]:
         if category not in self.allowed_categories:
             return "invalid_category"
         if category == self.unknown_category:
             return None
-        if confidence < self.min_confidence:
+        if vlm_self_confidence < self.min_confidence:
             return "low_confidence"
-        cats = _expanded_object_categories(object_evidence)
-        reliable_objects = sum(int(ev.count) for ev in object_evidence if float(ev.mean_confidence) >= 0.45 or int(ev.hits) >= 2)
-        strong_visual = bool(visual_evidence and visual_evidence.strong_visual_evidence)
-        diagnostic_hits = len(cats & set(DIAGNOSTIC_OBJECTS.get(category, set())))
+        reliable_objects = int(reliability_factors.get("reliable_object_count", 0) or 0)
+        diagnostic_hits = int(reliability_factors.get("diagnostic_object_hits", 0) or 0)
+        strong_visual = bool(reliability_factors.get("has_strong_visual_evidence", False))
         if reliable_objects < self.min_reliable_objects and diagnostic_hits < 2 and not strong_visual:
             return "insufficient_or_ambiguous_evidence"
-        if room_mask.is_partial and diagnostic_hits < 2 and not strong_visual:
+        if not bool(reliability_factors.get("ambiguity_margin_passed", True)):
+            return "ambiguous_ranked_categories"
+        if diagnostic_hits <= 0 and not strong_visual:
+            return "no_diagnostic_evidence"
+        if bool(reliability_factors.get("is_partial_room", False)) and diagnostic_hits < 2 and not strong_visual:
             return "partial_weak_evidence"
-        contradictory = _contradictory_evidence(cats)
-        if contradictory:
+        if bool(reliability_factors.get("contradictory_evidence", False)):
             return "contradictory_evidence"
-        ranked = parsed.get("ranked_categories", parsed.get("alternatives", []))
-        if isinstance(ranked, list) and len(ranked) >= 2:
-            scores = []
-            for item in ranked[:2]:
-                if isinstance(item, Mapping):
-                    scores.append(_safe_float(item.get("confidence", item.get("score", 0.0)), 0.0))
-                else:
-                    try:
-                        scores.append(float(item))
-                    except Exception:
-                        pass
-            if len(scores) >= 2 and abs(scores[0] - scores[1]) < self.ambiguity_margin:
-                return "ambiguous_ranked_categories"
         return None
 
 
@@ -312,7 +367,9 @@ def build_room_label_prompt(
         "Do not use any dataset priors or ground-truth room labels.\n"
         "Return strict JSON only with schema:\n"
         "{\"room_id\":\"room_0001\",\"category\":\"unknown\",\"confidence\":0.0,"
+        "\"ranked_categories\":[{\"category\":\"unknown\",\"confidence\":0.0}],"
         "\"supporting_objects\":[],\"conflicting_evidence\":[],\"rationale\":\"...\",\"unknown_reason\":\"...\"}\n"
+        "Treat confidence as your own self-reported ordinal confidence, not a calibrated probability.\n"
         "Evidence:\n%s" % json.dumps(payload, ensure_ascii=False, sort_keys=True)
     )
 
@@ -429,3 +486,28 @@ def _contradictory_evidence(cats: set[str]) -> bool:
         if flat & left_norm and flat & right_norm:
             return True
     return False
+
+
+def _diagnostic_hits_for_category(category: str, object_evidence: Sequence[ObjectEvidence]) -> int:
+    diagnostic = DIAGNOSTIC_OBJECTS.get(normalize_room_category(category), set())
+    diagnostic_norm = {normalize_category(item).replace("_", " ") for item in diagnostic}
+    cats = {normalize_category(item.category).replace("_", " ") for item in object_evidence}
+    return len(cats & diagnostic_norm)
+
+
+def _ambiguity_margin_passed(parsed: Mapping[str, object], margin: float) -> bool:
+    ranked = parsed.get("ranked_categories", parsed.get("alternatives", []))
+    if not isinstance(ranked, list) or len(ranked) < 2:
+        return True
+    scores = []
+    for item in ranked[:2]:
+        if isinstance(item, Mapping):
+            scores.append(_safe_float(item.get("confidence", item.get("score", 0.0)), 0.0))
+        else:
+            try:
+                scores.append(float(item))
+            except Exception:
+                pass
+    if len(scores) < 2:
+        return True
+    return abs(scores[0] - scores[1]) >= float(margin)

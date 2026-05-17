@@ -32,15 +32,18 @@ class ReperceptionResult:
     accumulated_credibility: float
     num_reperception_steps: int
     decision: ReperceptionDecision
+    supporting_subgraphs: list[dict] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return {
             "candidate_id": self.candidate_id,
             "detector_confidence": float(self.detector_confidence),
             "s_k": float(self.s_k),
+            "last_s_k": float(self.s_k),
             "accumulated_credibility": float(self.accumulated_credibility),
             "num_reperception_steps": int(self.num_reperception_steps),
             "decision": self.decision.value,
+            "supporting_subgraphs": list(self.supporting_subgraphs),
         }
 
 
@@ -60,7 +63,7 @@ class GraphReperceptionManager:
         state = self.states.setdefault(candidate.id, ReperceptionState(candidate_id=candidate.id))
         state.accumulated_credibility += float(s_k)
         state.num_reperception_steps += 1
-        if state.accumulated_credibility >= self.s_thres and state.num_reperception_steps < self.n_max:
+        if state.accumulated_credibility >= self.s_thres:
             decision = ReperceptionDecision.ACCEPT_GOAL
         elif state.num_reperception_steps >= self.n_max and state.accumulated_credibility < self.s_thres:
             decision = ReperceptionDecision.REJECT_GOAL
@@ -73,6 +76,7 @@ class GraphReperceptionManager:
             accumulated_credibility=float(state.accumulated_credibility),
             num_reperception_steps=int(state.num_reperception_steps),
             decision=decision,
+            supporting_subgraphs=_supporting_subgraph_payload(subgraph_scores),
         )
         state.history.append(result.to_dict())
         return result
@@ -91,3 +95,18 @@ def compute_goal_candidate_credibility(
         dist = max(float(np.linalg.norm(candidate_center - sub_center)), float(eps))
         support += float(score.p_sub) / dist
     return float(detector_confidence) * float(support)
+
+
+def _supporting_subgraph_payload(subgraph_scores: Sequence[SubgraphScore]) -> list[dict]:
+    rows = []
+    for score in subgraph_scores:
+        rows.append(
+            {
+                "subgraph_id": str(score.subgraph_id),
+                "central_object_id": str(score.central_object_id),
+                "p_sub": float(score.p_sub),
+                "estimated_distance_m": float(score.estimated_distance_m),
+            }
+        )
+    rows.sort(key=lambda item: float(item["p_sub"]), reverse=True)
+    return rows[:8]

@@ -19,24 +19,33 @@ Metric-path SG-Nav runs must use the following pipeline:
 7. The online scene graph represents object nodes, clustering-based group
    nodes, and online geometry room-mask nodes where feasible. Metric room nodes
    must not use `rooms.json` labels or oracle room masks.
-8. Room masks come from traditional online occupancy/free-space segmentation:
+8. Room masks are prepared lazily only for SG-Nav frontier scoring. After
+   reachable frontier extraction, `prepare_room_context_for_frontier_scoring`
+   runs room segmentation/labeling immediately before scene graph update and
+   HCoT/subgraph frontier interpolation. Mapper-only updates, perception-only
+   updates, committed-frontier local replans, and candidate re-perception/STOP
+   confirmation must use cached context and must not trigger room VLM calls.
+9. Room masks come from traditional online occupancy/free-space segmentation:
    observed-free structural masks, distance-transform seeds, watershed or
    seeded region growing, doorway-aware refinement, stable IDs, and VLM room
    labels over objects inside the mask. `unknown` is a valid first-class room
    category when evidence is weak or ambiguous.
-9. SG-Nav-compatible object-centered subgraph text or payloads are generated
+10. VLM room-label `confidence` is only `vlm_self_confidence`, not calibrated
+   probability. Room node confidence must use evidence-derived
+   `label_reliability`; evidence-gated `unknown` remains metric-valid.
+11. SG-Nav-compatible object-centered subgraph text or payloads are generated
    from the scene graph, including central object, parent room mask/label,
    parent group, direct object neighbors, and edges.
-10. Subgraphs are scored by the SG-Nav paper HCoT sequence: prior
+12. Subgraphs are scored by the SG-Nav paper HCoT sequence: prior
    object-goal distance, distance-prediction questions, subgraph-grounded
    answers, final distance summary, then `P_sub = 1 / max(distance,
    min_distance_m)`.
-11. Subgraph probabilities are interpolated onto reachable frontiers. The paper
+13. Subgraph probabilities are interpolated onto reachable frontiers. The paper
    path must not ask an LLM to directly choose frontiers.
-12. Candidate goals are re-perceived and their credibility is accumulated from
+14. Candidate goals are re-perceived and their credibility is accumulated from
     graph and detector evidence.
-13. STOP is allowed only after SG-Nav goal confirmation rules are satisfied.
-14. Local motion uses a deterministic A* planner or an FMM-equivalent grid
+15. STOP is allowed only after SG-Nav goal confirmation rules are satisfied.
+16. Local motion uses a deterministic A* planner or an FMM-equivalent grid
     planner.
 
 ## Forbidden Metric-Path Substitutions

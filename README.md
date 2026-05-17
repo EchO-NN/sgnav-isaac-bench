@@ -98,6 +98,19 @@ VLM labels over objects inside those masks. `unknown` is the correct room label
 when the evidence is insufficient. `rooms.json` labels are rejected in strict
 metric mode except for a named `oracle_room_ablation`.
 
+Room segmentation and room recognition are lazy and scoring-gated: they run
+only immediately before a new SG-Nav frontier-scoring decision, after reachable
+frontiers are extracted and before scene-graph/HCoT scoring. They do not run
+for mapper-only updates, perception-only updates, committed-frontier local A*
+replans, or candidate re-perception/STOP confirmation. Result rows expose
+`room_update_invoked_for_frontier_scoring`, `room_segmentation_ran`,
+`room_labeling_ran`, `room_context_cache_hit`, and `room_call_order_trace`.
+
+Room VLM `confidence` is stored as `vlm_self_confidence`, a self-reported weak
+signal rather than a calibrated probability. Room node confidence uses
+evidence-derived `label_reliability`; weak, partial, ambiguous, contradictory,
+or non-diagnostic evidence is labeled `unknown`.
+
 ```bash
 ./scripts/run_sgnav_isaac_env.sh \
   -m isaac_bench.scripts.run_one_episode \

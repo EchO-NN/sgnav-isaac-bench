@@ -43,6 +43,7 @@ SGNAV_STEP_DUMP_KEYS = [
     "groups",
     "rooms",
     "edges",
+    "room_context",
     "room_segmentation",
     "room_semantics",
     "subgraphs",
@@ -153,6 +154,7 @@ def empty_sgnav_step_dump(metadata: Optional[Mapping[str, object]] = None) -> di
         "objects": [],
         "groups": [],
         "rooms": [],
+        "room_context": {},
         "room_segmentation": {
             "source": "online_geometry_watershed",
             "room_count": 0,

@@ -18,6 +18,12 @@ from isaac_bench.dataset.episode_generator import point_to_bbox_2d_distance, rea
 from isaac_bench.env.habitat_like_env import MapSimHabitatLikeEnv
 from isaac_bench.debug.graph_debug_dump import save_graph_debug_dump
 from isaac_bench.graph.decision import NavigationDecision, SGNavDecision
+from isaac_bench.graph.room_context import (
+    RoomContextCache,
+    RoomContextResult,
+    prepare_room_context_for_frontier_scoring,
+    room_context_not_invoked_metadata,
+)
 from isaac_bench.graph.sgnav_scenegraph_adapter import SGNAV_ROOM_NAMES, SGNavSceneGraphAdapter
 from isaac_bench.mapping.coordinate_transform import MapInfo, grid_to_world_xy, is_inside_grid, world_xy_to_grid
 from isaac_bench.mapping.frontier import extract_frontiers, frontier_debug_layers
@@ -27,14 +33,10 @@ from isaac_bench.mapping.room_map_from_rooms_json import build_room_index_map, l
 from isaac_bench.mapping.room_segmentation import (
     OnlineRoomSegmenter,
     RoomSegmentationConfig,
-    assign_objects_to_room_masks,
-    room_segmentation_debug,
 )
 from isaac_bench.graph.room_semantics import (
     DEFAULT_ROOM_CATEGORIES,
     VLMRoomLabeler,
-    room_semantics_debug,
-    summarize_room_object_evidence,
 )
 from isaac_bench.metrics.episode_logger import JsonlEpisodeLogger, make_jsonable
 from isaac_bench.metrics.evaluator import EpisodeEvaluator
@@ -443,6 +445,58 @@ def candidate_center_payload(object_memory: ObjectMemory, goal_category: str, se
     return payload
 
 
+def build_reperception_state_payload(decision_metadata: Mapping[str, object]) -> dict:
+    reperception = dict(decision_metadata.get("reperception") or {})
+    candidate_id = reperception.get("candidate_id", decision_metadata.get("selected_candidate_id"))
+    decision = reperception.get("decision")
+    if decision is None:
+        if bool(decision_metadata.get("candidate_accepted", False)):
+            decision = "ACCEPT_GOAL"
+        elif bool(decision_metadata.get("candidate_rejected", False)):
+            decision = "REJECT_GOAL"
+        elif candidate_id is not None:
+            decision = "CONTINUE_OBSERVING"
+    return {
+        "candidate_id": candidate_id,
+        "num_reperception_steps": int(
+            reperception.get(
+                "num_reperception_steps",
+                decision_metadata.get("candidate_reperception_steps", 0),
+            )
+            or 0
+        ),
+        "accumulated_credibility": float(
+            reperception.get(
+                "accumulated_credibility",
+                decision_metadata.get("candidate_credibility", 0.0),
+            )
+            or 0.0
+        ),
+        "last_s_k": float(reperception.get("last_s_k", reperception.get("s_k", 0.0)) or 0.0),
+        "detector_confidence": float(reperception.get("detector_confidence", 0.0) or 0.0),
+        "supporting_subgraphs": list(reperception.get("supporting_subgraphs") or []),
+        "decision": decision,
+    }
+
+
+def build_stop_state_payload(nav_decision: Optional[NavigationDecision], row: Mapping[str, object]) -> dict:
+    metadata = dict(getattr(nav_decision, "metadata", {}) or {}) if nav_decision is not None else {}
+    stop_allowed = bool(getattr(nav_decision, "stop", False)) if nav_decision is not None else False
+    candidate_confirmed = bool(metadata.get("candidate_accepted", False)) or str(getattr(nav_decision, "mode", "")) == "stop"
+    if not stop_allowed and not candidate_confirmed:
+        reason = "candidate_not_confirmed"
+    else:
+        reason = str(row.get("stop_reason") or metadata.get("stop_reason") or getattr(nav_decision, "reason", ""))
+    return {
+        "stop_allowed": bool(stop_allowed),
+        "stop_reason": reason,
+        "candidate_confirmed": bool(candidate_confirmed),
+        "mode": getattr(nav_decision, "mode", None) if nav_decision is not None else None,
+        "success": bool(row.get("success", False)),
+        "distance_to_goal": row.get("distance_to_goal"),
+    }
+
+
 def final_log_row(row: dict) -> dict:
     if row.get("failure_reason"):
         stop_reason = row["failure_reason"]
@@ -783,6 +837,9 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
     room_labeler = None
     room_semantic_labels = {}
     last_room_masks = []
+    room_context_cache = RoomContextCache()
+    last_room_context_result: Optional[RoomContextResult] = None
+    last_room_context_metadata = room_context_not_invoked_metadata()
     last_room_segmentation_debug = {"source": "online_geometry_watershed", "room_count": 0, "rooms": []}
     last_room_semantics_debug = {
         "backend": "unavailable",
@@ -1221,39 +1278,12 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
             return obs_local
 
         def update_scenegraph_frame(current_obs: dict, step_idx: int, map_state: dict) -> None:
-            nonlocal last_room_masks, room_semantic_labels, last_room_segmentation_debug, last_room_semantics_debug
             started_at = time.perf_counter()
             llm_requests_before = total_llm_requests()
             room_map = None if full_room_map is None else observed_room_map(full_room_map, map_state["observed"])
             rgb_for_graph = current_obs["rgb"] if current_obs.get("has_rgb") and current_obs.get("rgb_device") == "cpu" else None
             if rgb_for_graph is None and vllm_needs_cpu_rgb:
                 rgb_for_graph = viz_rgb(current_obs)
-            if room_segmenter is not None:
-                update_every = max(1, int(getattr(room_segmenter.config, "update_every_steps", 5)))
-                if not last_room_masks or int(step_idx) % update_every == 0:
-                    unknown_mask = ~np.asarray(map_state["observed"], dtype=bool)
-                    last_room_masks = room_segmenter.update(
-                        map_state["occupancy"],
-                        map_state["free"],
-                        map_state["occupancy"],
-                        unknown_mask,
-                        step=int(step_idx),
-                    )
-                    last_room_segmentation_debug = dict(room_segmenter.last_debug or room_segmentation_debug(last_room_masks))
-                    assignments = assign_objects_to_room_masks(object_memory.nodes, last_room_masks, map_state["map_info"])
-                    next_labels = {}
-                    if room_labeler is not None:
-                        for room in last_room_masks:
-                            if room.stale:
-                                continue
-                            evidence = summarize_room_object_evidence(object_memory.nodes, assignments, room.room_id)
-                            next_labels[room.room_id] = room_labeler.label_room(room, evidence, None)
-                    room_semantic_labels = next_labels
-                    last_room_semantics_debug = room_semantics_debug(
-                        room_semantic_labels,
-                        getattr(args, "room_label_allowed_categories", DEFAULT_ROOM_CATEGORIES),
-                        getattr(room_labeler, "backend", "unavailable"),
-                    )
             scenegraph.update_from_frame(
                 object_memory,
                 room_map=room_map,
@@ -1273,10 +1303,38 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
                 camera_pose_world=current_obs.get("camera_pose_world"),
                 step_id=step_idx,
             )
+            setattr(scenegraph, "room_context_debug", dict(last_room_context_metadata))
             evaluator.num_scenegraph_updates += 1
             record_latency("graph", started_at)
             if total_llm_requests() > llm_requests_before:
                 record_latency("llm", started_at)
+
+        def update_room_context_for_frontier_scoring(step_idx: int, map_state: dict) -> RoomContextResult:
+            nonlocal last_room_masks, room_semantic_labels, last_room_segmentation_debug
+            nonlocal last_room_semantics_debug, last_room_context_result, last_room_context_metadata
+            result = prepare_room_context_for_frontier_scoring(
+                step_idx=int(step_idx),
+                mapper=mapper,
+                object_memory=object_memory,
+                room_segmenter=room_segmenter,
+                room_labeler=room_labeler,
+                map_info=map_state["map_info"],
+                previous_room_context=room_context_cache,
+                strict_benchmark=bool(getattr(args, "strict_benchmark", False)),
+                occupancy=map_state["occupancy"],
+                observed_free_mask=map_state["free"],
+                obstacle_mask=map_state["occupancy"],
+                unknown_mask=~np.asarray(map_state["observed"], dtype=bool),
+                allowed_categories=getattr(args, "room_label_allowed_categories", DEFAULT_ROOM_CATEGORIES),
+            )
+            last_room_context_result = result
+            last_room_masks = list(result.room_masks)
+            room_semantic_labels = dict(result.room_semantic_labels)
+            last_room_segmentation_debug = dict(result.room_segmentation_debug)
+            last_room_semantics_debug = dict(result.room_semantics_debug)
+            last_room_context_metadata = result.metadata(full_order=False)
+            setattr(scenegraph, "room_context_debug", dict(last_room_context_metadata))
+            return result
 
         panorama_steps = max(0, int(getattr(args, "panorama_steps", 0)))
         if panorama_steps > 0:
@@ -1445,6 +1503,18 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
                     )
                     last_frontier_clusters = len(frontiers)
                     last_frontiers = list(frontiers)
+                    room_context_result = None
+                    candidate_preview = None
+                    if paper_mode and frontiers and candidate_override is None:
+                        candidate_preview = decision_policy.select_goal_candidate(
+                            object_memory,
+                            episode["goal_category"],
+                            pose,
+                            current_step=step,
+                        )
+                        if bool(args.score_frontiers_before_candidate) or candidate_preview is None:
+                            room_context_result = update_room_context_for_frontier_scoring(step, map_state)
+                            update_scenegraph_frame(obs, step, map_state)
                     nav_decision = candidate_override or decision_policy.choose_navigation_target(
                         object_memory,
                         episode["goal_category"],
@@ -1456,6 +1526,13 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
                         allow_frontier=True,
                         current_step=step,
                     )
+                    if room_context_result is not None:
+                        last_room_context_metadata = room_context_result.metadata(full_order=True)
+                        setattr(scenegraph, "room_context_debug", dict(last_room_context_metadata))
+                        nav_decision.metadata = {
+                            **dict(nav_decision.metadata or {}),
+                            **dict(last_room_context_metadata),
+                        }
                 if frontier_commitment is not None and nav_decision.mode == "frontier" and not locked_goal_used:
                     frontier_decision = nav_decision.frontier_decision
                     proposed_frontier = frontier_decision.selected_frontier if frontier_decision is not None else None
@@ -2082,13 +2159,29 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
         row["active_frontier_distance_m"] = last_frontier_commitment_metadata.get("active_frontier_distance_m")
         row["frontier_scenegraph_score_norm"] = str(args.frontier_scenegraph_score_norm)
         row["room_map_mode"] = str(room_map_mode)
+        room_context_row = dict(last_room_context_metadata)
+        row["room_context"] = room_context_row
+        for key in (
+            "room_context_source",
+            "room_update_invoked_for_frontier_scoring",
+            "room_segmentation_ran",
+            "room_labeling_ran",
+            "room_context_cache_hit",
+            "room_label_count",
+            "room_label_requests",
+            "room_label_cache_hits",
+            "room_call_order_trace",
+        ):
+            row[key] = room_context_row.get(key)
         row["room_segmentation"] = dict(last_room_segmentation_debug)
         row["room_semantics"] = dict(last_room_semantics_debug)
-        row["room_mask_count"] = int(len([room for room in last_room_masks if not getattr(room, "stale", False)]))
+        row["room_mask_count"] = int(room_context_row.get("room_mask_count", len([room for room in last_room_masks if not getattr(room, "stale", False)])) or 0)
         row["room_vlm_backend"] = str(getattr(room_labeler, "backend", "unavailable") if room_labeler is not None else "unavailable")
         row["room_vlm_requests"] = int(getattr(room_labeler, "request_count", 0) if room_labeler is not None else 0)
         row["room_vlm_failures"] = int(getattr(room_labeler, "failure_count", 0) if room_labeler is not None else 0)
         row["room_vlm_invalid_json"] = bool(getattr(room_labeler, "failure_count", 0) if room_labeler is not None else 0)
+        row["reperception_state"] = build_reperception_state_payload(decision_metadata)
+        row["stop_state"] = build_stop_state_payload(last_nav_decision, row)
         row["debug_graph_dump"] = bool(args.debug_graph_dump)
         row["debug_graph_dump_dir"] = str(args.debug_graph_dump_dir)
         row["segmenter"] = str(getattr(args, "segmenter", "none") or "none")

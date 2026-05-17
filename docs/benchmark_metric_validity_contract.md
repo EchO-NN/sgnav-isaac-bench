@@ -55,6 +55,14 @@ Every episode result row must include:
   `unknown` room label. Backend failure must fail clearly or mark
   `metric_valid=false` with `room_vlm_unavailable` or
   `room_vlm_invalid_json`.
+- Evidence-based `unknown` from a reachable room VLM is metric-valid by itself.
+  Raw room VLM `confidence` is stored as `vlm_self_confidence` and must not be
+  treated as calibrated probability; room-node confidence must be evidence
+  reliability (`label_reliability`) or otherwise guarded by reliability gates.
+- Strict SG-Nav room segmentation/recognition is scoring-gated. Room VLM calls
+  should be recorded only when a new frontier-scoring decision needs fresh room
+  evidence; cached room context must be used for committed-frontier replans and
+  candidate re-perception/STOP confirmation.
 - The configured strict SG-Nav paper path requires `llm.enabled=true`; an
   unavailable HCoT endpoint may not silently become deterministic local scoring.
 - YOLO-World, SAM2, LLM, model, Isaac, and InteriorAgent missing assets must

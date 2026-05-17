@@ -1,0 +1,318 @@
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+import hashlib
+import json
+from typing import Dict, Mapping, Optional, Sequence
+
+import numpy as np
+
+from isaac_bench.graph.room_semantics import (
+    DEFAULT_ROOM_CATEGORIES,
+    RoomSemanticLabel,
+    VLMRoomLabeler,
+    room_semantics_debug,
+    summarize_room_object_evidence,
+)
+from isaac_bench.mapping.coordinate_transform import MapInfo
+from isaac_bench.mapping.room_segmentation import (
+    ObjectRoomAssignment,
+    OnlineRoomSegmenter,
+    RoomMask,
+    assign_objects_to_room_masks,
+    room_segmentation_debug,
+)
+
+
+SCORING_ROOM_CALL_ORDER_PREFIX = [
+    "frontier_extraction",
+    "room_context_for_frontier_scoring",
+]
+
+SCORING_ROOM_CALL_ORDER_FULL = [
+    "frontier_extraction",
+    "room_context_for_frontier_scoring",
+    "scenegraph_update",
+    "hcot_subgraph_scoring",
+    "frontier_interpolation",
+    "frontier_selection",
+]
+
+
+@dataclass
+class RoomContextResult:
+    room_masks: list[RoomMask] = field(default_factory=list)
+    room_semantic_labels: Dict[str, RoomSemanticLabel] = field(default_factory=dict)
+    room_segmentation_debug: dict = field(default_factory=dict)
+    room_semantics_debug: dict = field(default_factory=dict)
+    object_room_assignments: Dict[str, ObjectRoomAssignment] = field(default_factory=dict)
+    cache_hit: bool = False
+    segmentation_ran: bool = False
+    labeling_ran: bool = False
+    label_requests: int = 0
+    label_cache_hits: int = 0
+    call_order_trace: list[str] = field(default_factory=lambda: list(SCORING_ROOM_CALL_ORDER_PREFIX))
+    map_observed_hash: str = ""
+    object_evidence_hash: str = ""
+    room_mask_geometry_hash: str = ""
+    room_object_evidence_hash: str = ""
+    source: str = "online_geometry_watershed_vlm"
+
+    def metadata(self, *, full_order: bool = True) -> dict:
+        trace = list(SCORING_ROOM_CALL_ORDER_FULL if full_order else self.call_order_trace)
+        return {
+            "room_context_source": self.source,
+            "room_update_invoked_for_frontier_scoring": True,
+            "room_segmentation_ran": bool(self.segmentation_ran),
+            "room_labeling_ran": bool(self.labeling_ran),
+            "room_context_cache_hit": bool(self.cache_hit),
+            "room_mask_count": int(len([room for room in self.room_masks if not getattr(room, "stale", False)])),
+            "room_label_count": int(len(self.room_semantic_labels)),
+            "room_label_requests": int(self.label_requests),
+            "room_label_cache_hits": int(self.label_cache_hits),
+            "room_call_order_trace": trace,
+            "room_map_observed_hash": self.map_observed_hash,
+            "room_object_evidence_hash": self.object_evidence_hash,
+            "room_mask_geometry_hash": self.room_mask_geometry_hash,
+            "room_object_assignment_count": int(len(self.object_room_assignments)),
+        }
+
+
+@dataclass
+class RoomContextCache:
+    last_result: Optional[RoomContextResult] = None
+    label_cache: Dict[str, RoomSemanticLabel] = field(default_factory=dict)
+    label_evidence_hash_by_room: Dict[str, str] = field(default_factory=dict)
+
+
+def prepare_room_context_for_frontier_scoring(
+    *,
+    step_idx: int,
+    mapper: object | None = None,
+    object_memory,
+    room_segmenter: Optional[OnlineRoomSegmenter],
+    room_labeler: Optional[VLMRoomLabeler],
+    map_info: MapInfo,
+    previous_room_context: Optional[RoomContextCache],
+    strict_benchmark: bool,
+    occupancy: Optional[np.ndarray] = None,
+    observed_free_mask: Optional[np.ndarray] = None,
+    obstacle_mask: Optional[np.ndarray] = None,
+    unknown_mask: Optional[np.ndarray] = None,
+    allowed_categories: Optional[Sequence[str]] = None,
+) -> RoomContextResult:
+    """Prepare online room masks and VLM labels immediately before frontier scoring."""
+    cache = previous_room_context or RoomContextCache()
+    source = "online_geometry_watershed_vlm"
+    allowed = list(allowed_categories or DEFAULT_ROOM_CATEGORIES)
+    if room_segmenter is None:
+        if strict_benchmark:
+            raise RuntimeError("strict benchmark requires online room context before SG-Nav frontier scoring")
+        result = RoomContextResult(
+            room_segmentation_debug={"source": "unavailable", "room_count": 0, "rooms": []},
+            room_semantics_debug={"backend": "unavailable", "allowed_categories": allowed, "labels": []},
+            source="unavailable",
+        )
+        cache.last_result = result
+        return result
+
+    occupancy_arr = _resolve_array("occupancy", occupancy, mapper)
+    free_arr = _resolve_array("free", observed_free_mask, mapper)
+    obstacle_arr = _resolve_array("occupancy", obstacle_mask, mapper)
+    if unknown_mask is None:
+        observed_arr = _resolve_array("observed", None, mapper)
+        unknown_arr = ~np.asarray(observed_arr, dtype=bool)
+    else:
+        unknown_arr = np.asarray(unknown_mask, dtype=bool)
+
+    map_hash = _hash_arrays(free_arr, obstacle_arr, unknown_arr)
+    object_hash = _hash_object_memory(object_memory)
+    if (
+        cache.last_result is not None
+        and cache.last_result.map_observed_hash == map_hash
+        and cache.last_result.object_evidence_hash == object_hash
+    ):
+        cached = cache.last_result
+        result = RoomContextResult(
+            room_masks=list(cached.room_masks),
+            room_semantic_labels=dict(cached.room_semantic_labels),
+            room_segmentation_debug=dict(cached.room_segmentation_debug),
+            room_semantics_debug=dict(cached.room_semantics_debug),
+            object_room_assignments=dict(cached.object_room_assignments),
+            cache_hit=True,
+            segmentation_ran=False,
+            labeling_ran=False,
+            label_requests=0,
+            label_cache_hits=int(len(cached.room_semantic_labels)),
+            call_order_trace=list(SCORING_ROOM_CALL_ORDER_PREFIX),
+            map_observed_hash=map_hash,
+            object_evidence_hash=object_hash,
+            room_mask_geometry_hash=cached.room_mask_geometry_hash,
+            room_object_evidence_hash=cached.room_object_evidence_hash,
+            source=source,
+        )
+        cache.last_result = result
+        return result
+
+    room_masks = room_segmenter.update(
+        occupancy_arr,
+        free_arr,
+        obstacle_arr,
+        unknown_arr,
+        step=int(step_idx),
+    )
+    seg_debug = dict(room_segmenter.last_debug or room_segmentation_debug(room_masks))
+    assignments = assign_objects_to_room_masks(getattr(object_memory, "nodes", []), room_masks, map_info)
+    labels: Dict[str, RoomSemanticLabel] = {}
+    label_cache_hits = 0
+    label_requests = 0
+    labeling_ran = False
+    if room_labeler is None:
+        if strict_benchmark:
+            raise RuntimeError("strict benchmark requires room VLM labeling before SG-Nav frontier scoring")
+    else:
+        for room in room_masks:
+            if room.stale:
+                continue
+            evidence = summarize_room_object_evidence(getattr(object_memory, "nodes", []), assignments, room.room_id)
+            evidence_hash = _hash_room_evidence(room, evidence)
+            cache_key = "%s:%s" % (room.room_id, evidence_hash)
+            cached_label = cache.label_cache.get(cache_key)
+            if cached_label is not None:
+                labels[room.room_id] = cached_label
+                label_cache_hits += 1
+                continue
+            before = int(getattr(room_labeler, "request_count", 0))
+            labels[room.room_id] = room_labeler.label_room(room, evidence, None)
+            after = int(getattr(room_labeler, "request_count", 0))
+            label_requests += max(0, after - before)
+            labeling_ran = True
+            cache.label_cache[cache_key] = labels[room.room_id]
+            cache.label_evidence_hash_by_room[room.room_id] = evidence_hash
+
+    semantics_debug = room_semantics_debug(
+        labels,
+        allowed,
+        getattr(room_labeler, "backend", "unavailable") if room_labeler is not None else "unavailable",
+    )
+    result = RoomContextResult(
+        room_masks=list(room_masks),
+        room_semantic_labels=labels,
+        room_segmentation_debug=seg_debug,
+        room_semantics_debug=semantics_debug,
+        object_room_assignments=dict(assignments),
+        cache_hit=False,
+        segmentation_ran=True,
+        labeling_ran=labeling_ran,
+        label_requests=label_requests,
+        label_cache_hits=label_cache_hits,
+        call_order_trace=list(SCORING_ROOM_CALL_ORDER_PREFIX),
+        map_observed_hash=map_hash,
+        object_evidence_hash=object_hash,
+        room_mask_geometry_hash=_hash_room_masks(room_masks),
+        room_object_evidence_hash=_hash_assignments(assignments),
+        source=source,
+    )
+    cache.last_result = result
+    return result
+
+
+def room_context_not_invoked_metadata() -> dict:
+    return {
+        "room_context_source": "not_invoked",
+        "room_update_invoked_for_frontier_scoring": False,
+        "room_segmentation_ran": False,
+        "room_labeling_ran": False,
+        "room_context_cache_hit": False,
+        "room_mask_count": 0,
+        "room_label_count": 0,
+        "room_label_requests": 0,
+        "room_label_cache_hits": 0,
+        "room_call_order_trace": [],
+    }
+
+
+def _resolve_array(name: str, explicit: Optional[np.ndarray], mapper: object | None) -> np.ndarray:
+    if explicit is not None:
+        return np.asarray(explicit)
+    if mapper is None:
+        raise ValueError("room context requires %s array or mapper" % name)
+    grid = getattr(mapper, "grid", None)
+    if grid is not None and hasattr(grid, name):
+        return np.asarray(getattr(grid, name))
+    if hasattr(mapper, name):
+        value = getattr(mapper, name)
+        return np.asarray(value() if callable(value) else value)
+    raise ValueError("room context could not resolve %s from mapper" % name)
+
+
+def _hash_arrays(*arrays: np.ndarray) -> str:
+    digest = hashlib.blake2b(digest_size=16)
+    for array in arrays:
+        arr = np.asarray(array, dtype=bool)
+        digest.update(str(arr.shape).encode("utf-8"))
+        digest.update(np.ascontiguousarray(arr).view(np.uint8))
+    return digest.hexdigest()
+
+
+def _hash_object_memory(object_memory) -> str:
+    rows = []
+    for node in getattr(object_memory, "nodes", []):
+        rows.append(
+            {
+                "id": str(getattr(node, "id", getattr(node, "node_id", ""))),
+                "category": str(getattr(node, "category", "")),
+                "center": [round(float(v), 3) for v in getattr(node, "center_world", [])[:3]],
+                "conf": round(float(getattr(node, "confidence", 0.0)), 3),
+                "hits": int(getattr(node, "observed_count", 0)),
+                "last": int(getattr(node, "last_seen_step", -1)),
+            }
+        )
+    rows.sort(key=lambda item: item["id"])
+    return _hash_json(rows)
+
+
+def _hash_room_evidence(room: RoomMask, evidence: Sequence[object]) -> str:
+    rows = {
+        "room_id": room.room_id,
+        "objects": [item.to_dict() if hasattr(item, "to_dict") else dict(item) for item in evidence],
+    }
+    return _hash_json(rows)
+
+
+def _hash_room_masks(room_masks: Sequence[RoomMask]) -> str:
+    rows = []
+    for room in room_masks:
+        if room.stale:
+            continue
+        rows.append(
+            {
+                "room_id": room.room_id,
+                "area_m2": round(float(room.area_m2), 3),
+                "centroid_xy": [round(float(v), 3) for v in room.centroid_xy],
+                "boundary_unknown_fraction": round(float(room.boundary_unknown_fraction), 3),
+                "mask_confidence": round(float(room.mask_confidence), 3),
+            }
+        )
+    rows.sort(key=lambda item: item["room_id"])
+    return _hash_json(rows)
+
+
+def _hash_assignments(assignments: Mapping[str, ObjectRoomAssignment]) -> str:
+    rows = []
+    for object_id, assignment in sorted(assignments.items()):
+        rows.append(
+            {
+                "object_id": object_id,
+                "room_id": assignment.room_id,
+                "overlap": round(float(assignment.mask_overlap_ratio), 3),
+                "confidence": round(float(assignment.assignment_confidence), 3),
+                "ambiguous": bool(assignment.ambiguous),
+            }
+        )
+    return _hash_json(rows)
+
+
+def _hash_json(value: object) -> str:
+    text = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.blake2b(text.encode("utf-8"), digest_size=16).hexdigest()

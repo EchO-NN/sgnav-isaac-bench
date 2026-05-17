@@ -26,6 +26,7 @@ def save_graph_debug_dump(
         "score_backend": _score_backend(scenegraph),
         "objects": _objects(scenegraph),
         "rooms": _rooms(scenegraph),
+        "room_context": dict(getattr(scenegraph, "room_context_debug", {}) or {}),
         "room_segmentation": dict(getattr(scenegraph, "room_segmentation_debug", {}) or {}),
         "room_semantics": dict(getattr(scenegraph, "room_semantics_debug", {}) or {}),
         "groups": _groups(scenegraph),
