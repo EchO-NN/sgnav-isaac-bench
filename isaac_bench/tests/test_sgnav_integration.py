@@ -95,6 +95,7 @@ def test_sgnav_candidate_uses_nearest_reachable_cell_when_standoff_unknown():
         candidate_start_min_hits=1,
         candidate_accept_requires_reperception=False,
         candidate_standoff_max_m=1.0,
+        frontier_allow_near_fallback=True,
     )
     planner = GridAStarPlanner(traversible, resolution_m=1.0, allow_diagonal=True)
     target = decision.choose_navigation_target(memory, "mirror", (1, 1), [], planner, map_info, (1.0, 1.0, 0.0, 0.0))
@@ -121,6 +122,7 @@ def test_sgnav_tiny_candidate_progress_falls_back_to_frontier():
         candidate_start_min_hits=1,
         candidate_accept_requires_reperception=False,
         candidate_standoff_max_m=1.0,
+        frontier_allow_near_fallback=True,
     )
     planner = GridAStarPlanner(traversible, resolution_m=0.05, allow_diagonal=True)
     frontiers = [FrontierCluster((2, 3), (0.15, 0.10), [(2, 3)], 1, 0.05)]

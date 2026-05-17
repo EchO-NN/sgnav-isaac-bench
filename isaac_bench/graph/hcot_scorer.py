@@ -5,7 +5,7 @@ import re
 from urllib import error as urllib_error
 from urllib import request as urllib_request
 from dataclasses import dataclass
-from typing import Dict, List, Mapping, Optional
+from typing import Dict, List, Mapping, Optional, Sequence
 
 import numpy as np
 
@@ -26,10 +26,17 @@ class SubgraphScore:
 
 
 class HCoTSubgraphScorer:
-    def __init__(self, llm_client: Optional[LLMClient] = None, min_distance_m: float = 0.25, max_retries: int = 2):
+    def __init__(
+        self,
+        llm_client: Optional[LLMClient] = None,
+        min_distance_m: float = 0.25,
+        max_retries: int = 2,
+        allow_deterministic_fallback: bool = True,
+    ):
         self.llm_client = llm_client
         self.min_distance_m = max(1e-3, float(min_distance_m))
         self.max_retries = max(0, int(max_retries))
+        self.allow_deterministic_fallback = bool(allow_deterministic_fallback)
         self._cache: Dict[str, SubgraphScore] = {}
         self.llm_request_count = 0
         self.llm_failure_count = 0
@@ -52,6 +59,8 @@ class HCoTSubgraphScorer:
         if key in self._cache:
             return self._cache[key]
         if self.llm_client is None:
+            if not self.allow_deterministic_fallback:
+                raise RuntimeError("strict SG-Nav HCoT requires an enabled OpenAI-compatible LLM backend")
             result = self._fallback_score(subgraph, goal_category)
         else:
             self.llm_request_count += 1
@@ -59,8 +68,10 @@ class HCoTSubgraphScorer:
                 result = score_subgraph_with_hcot(subgraph, goal_category, self.llm_client, self.min_distance_m, self.max_retries)
             except Exception as exc:
                 self.llm_failure_count += 1
-                self.llm_fallback_count += 1
                 self.last_error = str(exc)
+                if not self.allow_deterministic_fallback:
+                    raise RuntimeError("strict SG-Nav HCoT LLM failed: %s" % exc) from exc
+                self.llm_fallback_count += 1
                 result = self._fallback_score(subgraph, goal_category)
                 result.raw_llm_response = {
                     **dict(result.raw_llm_response or {}),
@@ -81,7 +92,18 @@ class HCoTSubgraphScorer:
             estimated_distance_m=float(distance),
             p_sub=float(1.0 / max(distance, self.min_distance_m)),
             summary_reason="deterministic fallback subgraph distance estimate",
-            raw_llm_response={"fallback": True},
+            raw_llm_response={
+                "paper_hcot": False,
+                "central_object_category": subgraph.central_object_category,
+                "goal_category": goal_category,
+                "stage1_prior_distance_m": float(distance),
+                "stage2_questions": [],
+                "stage3_answers": [],
+                "stage4_final_distance_m": float(distance),
+                "summary_reason": "deterministic fallback subgraph distance estimate",
+                "p_sub_formula": "1 / max(stage4_final_distance_m, min_distance_m)",
+                "fallback": True,
+            },
             central_world=np.asarray(subgraph.central_world, dtype=np.float32).copy(),
         )
 
@@ -165,63 +187,185 @@ def score_subgraph_with_hcot(
     min_distance_m: float = 0.25,
     max_retries: int = 2,
 ) -> SubgraphScore:
+    """Score one object-centered subgraph with SG-Nav paper-style HCoT.
+
+    The four calls intentionally follow the paper's sequence: prior object-goal
+    distance, questions, subgraph-grounded answers, and final distance summary.
+    The LLM never scores frontiers directly on this path; frontier interpolation
+    consumes the inverse-distance ``P_sub`` returned here.
+    """
     prior = _call_json(
         llm_client,
-        (
-            "Goal object: %s\nCentral object: %s\n"
-            "Predict the most likely distance between the central object and the goal object in an indoor environment.\n"
-            "Return strict JSON: {\"prior_distance_m\": float, \"reason\": \"short explanation\"}."
-        )
-        % (goal_category, subgraph.central_object_category),
+        build_hcot_prior_distance_prompt(subgraph, goal_category),
         max_retries,
     )
+    prior_distance = _safe_float(prior.get("prior_distance_m", prior.get("distance_m", 4.0)), 4.0)
     questions = _call_json(
         llm_client,
-        (
-            "Goal object: %s\nCentral object: %s\n"
-            "Ask useful questions about the central object and the goal object for predicting their distance.\n"
-            "Return strict JSON: {\"questions\": [\"...\", \"...\", \"...\"]}."
-        )
-        % (goal_category, subgraph.central_object_category),
+        build_hcot_question_prompt(subgraph, goal_category, prior_distance),
         max_retries,
     )
+    question_list = _json_string_list(questions.get("questions", []))
     answers = _call_json(
         llm_client,
-        (
-            "Goal object: %s\nCentral object: %s\nSubgraph nodes:\n%s\nSubgraph edges:\n%s\nQuestions:\n%s\n"
-            "Answer the questions using only the subgraph. Return strict JSON: {\"answers\": [{\"question\": \"...\", \"answer\": \"...\"}]}."
-        )
-        % (
-            goal_category,
-            subgraph.central_object_category,
-            json.dumps(subgraph.nodes, ensure_ascii=False),
-            json.dumps(subgraph.edges, ensure_ascii=False),
-            json.dumps(questions.get("questions", []), ensure_ascii=False),
-        ),
+        build_hcot_answer_prompt(subgraph, goal_category, question_list),
         max_retries,
     )
+    answer_list = _answer_string_list(answers.get("answers", []))
     final = _call_json(
         llm_client,
-        (
-            "Goal object: %s\nCentral object: %s\nPrior distance:\n%s\nQuestion-answer evidence:\n%s\n"
-            "Determine the most likely distance between this subgraph and the goal object.\n"
-            "Return strict JSON: {\"estimated_distance_m\": float, \"confidence\": 0.0-1.0, \"summary_reason\": \"short explanation\"}."
-        )
-        % (goal_category, subgraph.central_object_category, json.dumps(prior, ensure_ascii=False), json.dumps(answers, ensure_ascii=False)),
+        build_hcot_final_distance_prompt(subgraph, goal_category, prior_distance, question_list, answer_list),
         max_retries,
     )
-    estimated_distance = float(final.get("estimated_distance_m", final.get("distance", prior.get("prior_distance_m", 4.0))))
+    estimated_distance = _safe_float(
+        final.get("estimated_distance_m", final.get("final_distance_m", final.get("distance", prior_distance))),
+        prior_distance,
+    )
     p_sub = 1.0 / max(float(estimated_distance), float(min_distance_m))
+    summary_reason = str(final.get("summary_reason", final.get("reason", "")))
     return SubgraphScore(
         subgraph_id=subgraph.id,
         central_object_id=subgraph.central_object_id,
         goal_category=goal_category,
         estimated_distance_m=float(estimated_distance),
         p_sub=float(p_sub),
-        summary_reason=str(final.get("summary_reason", final.get("reason", ""))),
-        raw_llm_response={"prior": prior, "questions": questions, "answers": answers, "final": final},
+        summary_reason=summary_reason,
+        raw_llm_response={
+            "paper_hcot": True,
+            "central_object_id": subgraph.central_object_id,
+            "central_object_category": subgraph.central_object_category,
+            "goal_category": goal_category,
+            "stage1_prior_distance_m": float(prior_distance),
+            "stage1_raw": prior,
+            "stage2_questions": question_list,
+            "stage2_raw": questions,
+            "stage3_answers": answer_list,
+            "stage3_raw": answers,
+            "stage4_final_distance_m": float(estimated_distance),
+            "stage4_raw": final,
+            "summary_reason": summary_reason,
+            "p_sub_formula": "1 / max(stage4_final_distance_m, min_distance_m)",
+            "fallback": False,
+        },
         central_world=np.asarray(subgraph.central_world, dtype=np.float32).copy(),
     )
+
+
+def build_hcot_prior_distance_prompt(subgraph: Subgraph, goal_category: str) -> str:
+    context = _subgraph_context_payload(subgraph, goal_category)
+    return (
+        "SG-Nav paper HCoT stage 1/4: prior object-goal distance.\n"
+        "Predict the most likely distance between the central object and the goal object in an indoor environment.\n"
+        "Use only common indoor spatial priors for this prior stage; do not choose or score frontiers.\n"
+        "Return exactly one strict JSON object with schema:\n"
+        "{\"prior_distance_m\": 0.0, \"reason\": \"short explanation\"}\n"
+        "Context:\n%s" % json.dumps(context, ensure_ascii=False, sort_keys=True)
+    )
+
+
+def build_hcot_question_prompt(subgraph: Subgraph, goal_category: str, prior_distance_m: float) -> str:
+    context = _subgraph_context_payload(subgraph, goal_category)
+    context["stage1_prior_distance_m"] = float(prior_distance_m)
+    return (
+        "SG-Nav paper HCoT stage 2/4: ask distance-prediction questions.\n"
+        "Ask useful questions about the central object and goal object for predicting their distance.\n"
+        "Questions should refer to the room, group, direct object neighbors, and edges when present.\n"
+        "Return exactly one strict JSON object with schema:\n"
+        "{\"questions\": [\"question 1\", \"question 2\", \"question 3\"]}\n"
+        "Context:\n%s" % json.dumps(context, ensure_ascii=False, sort_keys=True)
+    )
+
+
+def build_hcot_answer_prompt(subgraph: Subgraph, goal_category: str, questions: Sequence[str]) -> str:
+    context = _subgraph_context_payload(subgraph, goal_category)
+    context["questions"] = list(questions)
+    return (
+        "SG-Nav paper HCoT stage 3/4: answer questions from the object-centered subgraph.\n"
+        "Answer the questions using only the provided subgraph nodes and edges. Do not invent unseen objects.\n"
+        "Return exactly one strict JSON object with schema:\n"
+        "{\"answers\": [{\"question\": \"...\", \"answer\": \"...\"}]}\n"
+        "Context:\n%s" % json.dumps(context, ensure_ascii=False, sort_keys=True)
+    )
+
+
+def build_hcot_final_distance_prompt(
+    subgraph: Subgraph,
+    goal_category: str,
+    prior_distance_m: float,
+    questions: Sequence[str],
+    answers: Sequence[str],
+) -> str:
+    context = _subgraph_context_payload(subgraph, goal_category)
+    context["stage1_prior_distance_m"] = float(prior_distance_m)
+    context["stage2_questions"] = list(questions)
+    context["stage3_answers"] = list(answers)
+    return (
+        "SG-Nav paper HCoT stage 4/4: summarize and output final subgraph-goal distance.\n"
+        "Determine the most likely distance between this object-centered subgraph and the goal object.\n"
+        "Return exactly one strict JSON object with schema:\n"
+        "{\"estimated_distance_m\": 0.0, \"confidence\": 0.0, \"summary_reason\": \"short explanation\"}\n"
+        "The downstream probability is P_sub = 1 / max(estimated_distance_m, min_distance_m); do not score frontiers.\n"
+        "Context:\n%s" % json.dumps(context, ensure_ascii=False, sort_keys=True)
+    )
+
+
+def _subgraph_context_payload(subgraph: Subgraph, goal_category: str) -> dict:
+    nodes = [dict(node) for node in (subgraph.nodes or []) if isinstance(node, Mapping)]
+    edges = [dict(edge) for edge in (subgraph.edges or []) if isinstance(edge, Mapping)]
+
+    def find_node(node_id: Optional[str]) -> Optional[dict]:
+        if not node_id:
+            return None
+        for node in nodes:
+            if str(node.get("id")) == str(node_id):
+                return dict(node)
+        return None
+
+    central = find_node(subgraph.central_object_id) or {
+        "id": subgraph.central_object_id,
+        "type": "object",
+        "category": subgraph.central_object_category,
+    }
+    parent_room = find_node(subgraph.parent_room_id)
+    if parent_room is not None:
+        parent_room = {
+            "id": parent_room.get("id"),
+            "type": "room",
+            "mask_id": parent_room.get("mask_id", parent_room.get("id")),
+            "label": parent_room.get("category", parent_room.get("label", "unknown")),
+            "label_confidence": float(parent_room.get("confidence", parent_room.get("label_confidence", 0.0)) or 0.0),
+            "is_unknown": str(parent_room.get("category", parent_room.get("label", "unknown"))).strip().lower()
+            in {"unknown", "unknown_room"},
+            "source": parent_room.get("source", parent_room.get("mask_source", "unknown")),
+            "is_partial": bool(parent_room.get("is_partial", False)),
+        }
+    parent_group = find_node(subgraph.parent_group_id)
+    direct_objects = []
+    direct_ids = {str(item) for item in (subgraph.directly_connected_object_ids or [])}
+    for node in nodes:
+        if str(node.get("id")) in direct_ids:
+            direct_objects.append(dict(node))
+    return {
+        "paper_hcot": True,
+        "central_object": central,
+        "central_object_id": subgraph.central_object_id,
+        "central_object_category": subgraph.central_object_category,
+        "goal_category": goal_category,
+        "parent_room": parent_room
+        or {
+            "id": None,
+            "mask_id": None,
+            "label": "unknown",
+            "label_confidence": 0.0,
+            "is_unknown": True,
+            "source": "unassigned",
+        },
+        "parent_group": parent_group,
+        "direct_objects": direct_objects,
+        "nodes": nodes,
+        "edges": edges,
+        "central_world": [float(v) for v in np.asarray(subgraph.central_world, dtype=np.float32).reshape(-1)[:3]],
+    }
 
 
 def _call_json(llm_client: LLMClient, prompt: str, max_retries: int) -> dict:
@@ -257,6 +401,45 @@ def _parse_json_value(value: object) -> object:
             raise json.JSONDecodeError("Extra data after JSON value", text, end)
         return parsed
     raise ValueError("response must be JSON")
+
+
+def _safe_float(value: object, default: float) -> float:
+    try:
+        parsed = float(value)
+    except Exception:
+        return float(default)
+    if not np.isfinite(parsed):
+        return float(default)
+    return float(parsed)
+
+
+def _json_string_list(value: object) -> List[str]:
+    if not isinstance(value, list):
+        return []
+    out = []
+    for item in value:
+        if isinstance(item, Mapping):
+            text = item.get("question", item.get("text", item.get("answer", "")))
+        else:
+            text = item
+        text = str(text).strip()
+        if text:
+            out.append(text)
+    return out
+
+
+def _answer_string_list(value: object) -> List[str]:
+    if not isinstance(value, list):
+        return []
+    out = []
+    for item in value:
+        if isinstance(item, Mapping):
+            q = str(item.get("question", "")).strip()
+            a = str(item.get("answer", item.get("text", ""))).strip()
+            out.append(("%s %s" % (q, a)).strip() if q else a)
+        else:
+            out.append(str(item).strip())
+    return [item for item in out if item]
 
 
 def _strip_json_fence(text: str) -> str:

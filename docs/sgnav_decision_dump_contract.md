@@ -12,6 +12,8 @@ Every dump artifact must include:
 - `objects`
 - `groups`
 - `rooms`
+- `room_segmentation`
+- `room_semantics`
 - `edges`
 - `subgraphs`
 - `subgraph_texts_or_payloads`
@@ -27,6 +29,10 @@ Every dump artifact must include:
 
 - `objects`, `groups`, `rooms`, and `edges` describe the online scene graph
   state used by the decision.
+- `room_segmentation` records online geometry room masks, doorway metadata,
+  partial state, and mask confidence.
+- `room_semantics` records VLM/LLM room labels, allowed categories, `unknown`
+  reasons, and backend state.
 - `subgraphs` and `subgraph_texts_or_payloads` capture the SG-Nav-compatible
   reasoning input.
 - `llm_scores` and `subgraph_probabilities` capture scorer output before

@@ -13,6 +13,8 @@ See also:
 - `docs/benchmark_metric_validity_contract.md`
 - `docs/sgnav_decision_dump_contract.md`
 - `docs/external_assets.md`
+- `docs/room_node_online_geometry_vlm.md`
+- `docs/sgnav_paper_mechanism_audit.md`
 
 ## Setup
 
@@ -85,7 +87,16 @@ This command is for smoke/debug only. It must produce `metric_valid=false`.
 Strict SG-Nav requires YOLO-World and SAM2. A row is metric-valid only when no
 debug fallback is used. Local deterministic LLM scoring is non-metric unless a
 named ablation is explicitly declared; configure a real OpenAI-compatible LLM
-for metric SG-Nav scoring.
+for metric SG-Nav scoring. The default config uses `llm.enabled: true`,
+`mapping.room_map_mode: online_geometry_watershed`,
+`sgnav.scene_graph.room_nodes.source: online_geometry_watershed_vlm`,
+`mapping.frontier_min_distance_m: 1.0`, and
+`sgnav.frontier_distance_weight: 0.2`.
+
+Room nodes in strict SG-Nav come from online occupancy/free-space room masks and
+VLM labels over objects inside those masks. `unknown` is the correct room label
+when the evidence is insufficient. `rooms.json` labels are rejected in strict
+metric mode except for a named `oracle_room_ablation`.
 
 ```bash
 ./scripts/run_sgnav_isaac_env.sh \
@@ -101,8 +112,33 @@ for metric SG-Nav scoring.
   --headless true \
   --strict-benchmark true \
   --llm-enabled true \
+  --llm-base-url ${LLM_BASE_URL:-http://127.0.0.1:8000/v1} \
   --output data/isaac_bench_runs/final_strict_smoke/results.jsonl \
   --debug-map debug/final_strict_smoke.png
+```
+
+For a headed Isaac window with saved SG-Nav visualization panels:
+
+```bash
+./scripts/run_sgnav_isaac_env.sh \
+  -m isaac_bench.scripts.run_one_episode \
+  --config isaac_bench/configs/isaac_bench.yaml \
+  --episode-file data/interioragent_episodes/debug.jsonl \
+  --episode-index 0 \
+  --planner astar \
+  --policy sgnav_original \
+  --detector yolo_world \
+  --segmenter sam2 \
+  --sim-backend isaac \
+  --headless false \
+  --strict-benchmark true \
+  --llm-enabled true \
+  --llm-base-url ${LLM_BASE_URL:-http://127.0.0.1:8000/v1} \
+  --sgnav-viz \
+  --sgnav-viz-save-dir debug/full_llm_episode_viz \
+  --debug-graph-dump \
+  --debug-graph-dump-dir debug/full_llm_episode_graphs \
+  --output data/isaac_bench_runs/full_llm_episode/results.jsonl
 ```
 
 For a short integration check on machines with Isaac/model assets:
@@ -171,6 +207,12 @@ Enable saved panels and graph dumps:
   --debug-graph-dump-dir debug/graphs \
   --output data/isaac_bench_runs/debug_panels/results.jsonl
 ```
+
+Each saved SG-Nav panel can also write
+`sgnav_step_XXXXXX.layers.json`. That sidecar records primitive counts for
+frontier cells, object nodes, accepted candidates, GT goal cells, and other
+overlay layers. GT goal cells are disabled by default so oracle goal markers do
+not appear in strict visualization.
 
 Convert one graph step into the SG-Nav decision dump contract:
 

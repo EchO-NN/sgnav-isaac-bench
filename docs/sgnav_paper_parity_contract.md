@@ -16,16 +16,27 @@ Metric-path SG-Nav runs must use the following pipeline:
 5. Online occupancy and free-space maps are updated from live RGB-D evidence.
 6. Reachable frontiers are extracted from the observed-free and unknown-space
    boundary.
-7. The online scene graph represents objects, groups, and rooms where feasible.
-8. SG-Nav-compatible subgraph text or payloads are generated from the scene
-   graph.
-9. Subgraphs are scored by an LLM or by an explicitly declared
-   LLM-compatible scorer.
-10. Subgraph probabilities are interpolated onto reachable frontiers.
-11. Candidate goals are re-perceived and their credibility is accumulated from
+7. The online scene graph represents object nodes, clustering-based group
+   nodes, and online geometry room-mask nodes where feasible. Metric room nodes
+   must not use `rooms.json` labels or oracle room masks.
+8. Room masks come from traditional online occupancy/free-space segmentation:
+   observed-free structural masks, distance-transform seeds, watershed or
+   seeded region growing, doorway-aware refinement, stable IDs, and VLM room
+   labels over objects inside the mask. `unknown` is a valid first-class room
+   category when evidence is weak or ambiguous.
+9. SG-Nav-compatible object-centered subgraph text or payloads are generated
+   from the scene graph, including central object, parent room mask/label,
+   parent group, direct object neighbors, and edges.
+10. Subgraphs are scored by the SG-Nav paper HCoT sequence: prior
+   object-goal distance, distance-prediction questions, subgraph-grounded
+   answers, final distance summary, then `P_sub = 1 / max(distance,
+   min_distance_m)`.
+11. Subgraph probabilities are interpolated onto reachable frontiers. The paper
+   path must not ask an LLM to directly choose frontiers.
+12. Candidate goals are re-perceived and their credibility is accumulated from
     graph and detector evidence.
-12. STOP is allowed only after SG-Nav goal confirmation rules are satisfied.
-13. Local motion uses a deterministic A* planner or an FMM-equivalent grid
+13. STOP is allowed only after SG-Nav goal confirmation rules are satisfied.
+14. Local motion uses a deterministic A* planner or an FMM-equivalent grid
     planner.
 
 ## Forbidden Metric-Path Substitutions
@@ -39,6 +50,10 @@ Metric-path SG-Nav runs must use the following pipeline:
   re-perception and confirmation state.
 - Missing model, dataset, simulator, or LLM assets must not silently switch the
   run into a debug fallback.
+- Dataset room labels or preprocessed oracle room masks must not create strict
+  metric room nodes. `oracle_room_ablation` is the only allowed named ablation.
+- Frontier selection must ignore frontiers closer than `1.0 m` unless an
+  explicit near-frontier fallback is enabled, which makes the row non-metric.
 
 ## Allowed Non-Metric Uses
 

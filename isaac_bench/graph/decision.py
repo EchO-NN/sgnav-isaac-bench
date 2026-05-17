@@ -75,7 +75,10 @@ class SGNavDecision:
     def __init__(
         self,
         scenegraph: SGNavSceneGraphAdapter,
-        frontier_distance_weight: float = 2.0,
+        frontier_distance_weight: float = 0.2,
+        frontier_min_select_distance_m: float = 1.0,
+        frontier_distance_score_span_m: float = 10.0,
+        frontier_allow_near_fallback: bool = False,
         candidate_min_hits: int = 2,
         candidate_start_min_confidence: float = 0.55,
         candidate_start_min_hits: int = 2,
@@ -101,6 +104,9 @@ class SGNavDecision:
     ):
         self.scenegraph = scenegraph
         self.frontier_distance_weight = float(frontier_distance_weight)
+        self.frontier_min_select_distance_m = max(0.0, float(frontier_min_select_distance_m))
+        self.frontier_distance_score_span_m = max(1e-6, float(frontier_distance_score_span_m))
+        self.frontier_allow_near_fallback = bool(frontier_allow_near_fallback)
         self.candidate_min_hits = max(1, int(candidate_min_hits))
         self.candidate_start_min_confidence = float(candidate_start_min_confidence)
         self.candidate_start_min_hits = max(1, int(candidate_start_min_hits))
@@ -142,17 +148,57 @@ class SGNavDecision:
         dist_scores = np.asarray([getattr(f, "distance_inverse", 0.0) for f in frontier_clusters], dtype=np.float32)
         if len(dist_scores) != len(frontier_clusters) or not np.all(np.isfinite(dist_scores)):
             dists = np.asarray([f.path_distance_from_agent for f in frontier_clusters], dtype=np.float32)
-            clipped = np.clip(dists, 1.6, 11.6)
-            dist_scores = 1.0 - (clipped - 1.6) / 10.0
+            min_d = self.frontier_min_select_distance_m
+            clipped = np.clip(dists, min_d, min_d + self.frontier_distance_score_span_m)
+            dist_scores = 1.0 - (clipped - min_d) / self.frontier_distance_score_span_m
+        else:
+            dists = np.asarray([f.path_distance_from_agent for f in frontier_clusters], dtype=np.float32)
         total = sg_scores + self.frontier_distance_weight * dist_scores
-        idx = int(np.argmax(total))
+        eligible = [
+            idx
+            for idx, dist in enumerate(dists)
+            if np.isfinite(float(dist)) and float(dist) >= self.frontier_min_select_distance_m
+        ]
+        filtered_near = int(len(frontier_clusters) - len(eligible))
+        used_near_fallback = False
+        if not eligible:
+            if self.frontier_allow_near_fallback:
+                eligible = list(range(len(frontier_clusters)))
+                used_near_fallback = True
+                reason = "near_frontier_fallback"
+            else:
+                return DecisionResult(
+                    None,
+                    None,
+                    [float(x) for x in sg_scores],
+                    [float(x) for x in dist_scores],
+                    [float(x) for x in total],
+                    "all_frontiers_within_min_distance",
+                    metadata={
+                        "raw_scenegraph_scores": [float(x) for x in raw_sg_scores],
+                        "normalized_scenegraph_scores": [float(x) for x in sg_scores],
+                        "distance_scores": [float(x) for x in dist_scores],
+                        "total_scores": [float(x) for x in total],
+                        "scenegraph_score_norm": self.frontier_scenegraph_score_norm,
+                        "frontier_distance_weight": float(self.frontier_distance_weight),
+                        "frontier_min_select_distance_m": float(self.frontier_min_select_distance_m),
+                        "frontier_distance_score_span_m": float(self.frontier_distance_score_span_m),
+                        "filtered_near_frontiers": filtered_near,
+                        "eligible_frontier_indices": [],
+                        "used_near_frontier_fallback": False,
+                    },
+                )
+        else:
+            reason = "selected_frontier"
+        eligible_total = np.asarray([float(total[idx]) for idx in eligible], dtype=np.float32)
+        idx = int(eligible[int(np.argmax(eligible_total))])
         return DecisionResult(
             idx,
             frontier_clusters[idx],
             [float(x) for x in sg_scores],
             [float(x) for x in dist_scores],
             [float(x) for x in total],
-            "selected_frontier",
+            reason,
             metadata={
                 "raw_scenegraph_scores": [float(x) for x in raw_sg_scores],
                 "normalized_scenegraph_scores": [float(x) for x in sg_scores],
@@ -160,6 +206,11 @@ class SGNavDecision:
                 "total_scores": [float(x) for x in total],
                 "scenegraph_score_norm": self.frontier_scenegraph_score_norm,
                 "frontier_distance_weight": float(self.frontier_distance_weight),
+                "frontier_min_select_distance_m": float(self.frontier_min_select_distance_m),
+                "frontier_distance_score_span_m": float(self.frontier_distance_score_span_m),
+                "filtered_near_frontiers": filtered_near,
+                "eligible_frontier_indices": [int(item) for item in eligible],
+                "used_near_frontier_fallback": bool(used_near_fallback),
             },
         )
 

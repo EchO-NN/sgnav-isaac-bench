@@ -43,7 +43,21 @@ def build_object_centered_subgraphs(graph: PaperSceneGraph) -> List[Subgraph]:
                 nodes.append({"id": node.id, "type": "object", "category": node.category, "confidence": float(node.confidence)})
             elif node_id in graph.room_nodes:
                 node = graph.room_nodes[node_id]
-                nodes.append({"id": node.id, "type": "room", "category": node.room_type, "confidence": float(node.confidence)})
+                nodes.append(
+                    {
+                        "id": node.id,
+                        "type": "room",
+                        "category": node.room_type,
+                        "confidence": float(node.confidence),
+                        "mask_id": getattr(node, "mask_id", None),
+                        "mask_source": getattr(node, "mask_source", "unknown"),
+                        "category_source": getattr(node, "category_source", "unknown"),
+                        "area_m2": float(getattr(node, "area_m2", 0.0) or 0.0),
+                        "centroid_xy": list(getattr(node, "centroid_xy", []) or []),
+                        "boundary_unknown_fraction": float(getattr(node, "boundary_unknown_fraction", 0.0) or 0.0),
+                        "is_partial": bool(getattr(node, "is_partial", False)),
+                    }
+                )
             elif node_id in graph.group_nodes:
                 node = graph.group_nodes[node_id]
                 nodes.append({"id": node.id, "type": "group", "category": node.category_summary, "object_ids": list(node.object_ids)})
@@ -53,7 +67,15 @@ def build_object_centered_subgraphs(graph: PaperSceneGraph) -> List[Subgraph]:
                 edges.append({"src": edge.src_id, "dst": edge.dst_id, "relation": edge.relation, "confidence": float(edge.confidence)})
         for edge in graph.affiliation_edges:
             if edge.src_id in included_ids and edge.dst_id in included_ids:
-                edges.append({"src": edge.src_id, "dst": edge.dst_id, "relation": edge.relation, "confidence": float(edge.confidence)})
+                edges.append(
+                    {
+                        "src": edge.src_id,
+                        "dst": edge.dst_id,
+                        "relation": edge.relation,
+                        "confidence": float(edge.confidence),
+                        "metadata": dict(getattr(edge, "metadata", {}) or {}),
+                    }
+                )
         subgraphs.append(
             Subgraph(
                 id="sg_%s" % obj_id.replace(":", "_"),

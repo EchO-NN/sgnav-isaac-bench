@@ -48,6 +48,15 @@ Every episode result row must include:
   the run is explicitly marked as a named ablation.
 - Static-map planning may be used for smoke or baseline results only. It is not
   valid for the SG-Nav metric path.
+- `room_map_mode=observed_rooms_json`, `rooms_json`, or `observed` implies
+  oracle room maps and is not valid for the strict SG-Nav metric path unless
+  the run is explicitly named `oracle_room_ablation`.
+- Missing or unreachable room VLM backend is not the same as an evidence-based
+  `unknown` room label. Backend failure must fail clearly or mark
+  `metric_valid=false` with `room_vlm_unavailable` or
+  `room_vlm_invalid_json`.
+- The configured strict SG-Nav paper path requires `llm.enabled=true`; an
+  unavailable HCoT endpoint may not silently become deterministic local scoring.
 - YOLO-World, SAM2, LLM, model, Isaac, and InteriorAgent missing assets must
   fail clearly or skip clearly. They must never silently fall back to another
   benchmark path.
@@ -64,6 +73,10 @@ Rows must record all known debug or non-metric substitutions in
 - `gt_goal_fallback_used`
 - `sam2_missing_or_disabled`
 - `llm_deterministic_local`
+- `room_vlm_deterministic_debug`
+- `room_vlm_unavailable`
+- `room_vlm_invalid_json`
+- `oracle_room_map`
 - `static_map_planning`
 - `static_nearfield_map`
 - `frontier_near_fallback`

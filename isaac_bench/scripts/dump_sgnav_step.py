@@ -48,10 +48,18 @@ def main(argv: Optional[List[str]] = None) -> int:
 
 
 def _read_json_artifact(path: str) -> dict:
-    with open(path, "r", encoding="utf-8") as handle:
-        for line in handle:
-            if line.strip():
-                return json.loads(line)
+    text = Path(path).read_text(encoding="utf-8")
+    if not text.strip():
+        return {}
+    try:
+        value = json.loads(text)
+        return value if isinstance(value, dict) else {}
+    except json.JSONDecodeError:
+        pass
+    for line in text.splitlines():
+        if line.strip():
+            value = json.loads(line)
+            return value if isinstance(value, dict) else {}
     return {}
 
 
@@ -66,6 +74,16 @@ def _decision_dump_from_runtime_artifacts(graph_debug: dict, result_row: dict) -
         "objects": list(graph_debug.get("objects") or []),
         "groups": list(graph_debug.get("groups") or []),
         "rooms": list(graph_debug.get("rooms") or []),
+        "room_segmentation": dict(
+            graph_debug.get("room_segmentation")
+            or result_row.get("room_segmentation")
+            or {"source": "online_geometry_watershed", "room_count": 0, "rooms": []}
+        ),
+        "room_semantics": dict(
+            graph_debug.get("room_semantics")
+            or result_row.get("room_semantics")
+            or {"backend": result_row.get("room_vlm_backend", "unavailable"), "allowed_categories": [], "labels": []}
+        ),
         "edges": list(graph_debug.get("edges") or []),
         "subgraphs": supporting_subgraphs,
         "subgraph_texts_or_payloads": [

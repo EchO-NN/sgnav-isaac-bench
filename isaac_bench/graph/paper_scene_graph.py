@@ -7,6 +7,7 @@ import numpy as np
 
 from isaac_bench.dataset.category_normalizer import normalize_category
 from isaac_bench.mapping.coordinate_transform import grid_to_world_xy
+from isaac_bench.mapping.room_segmentation import RoomMask, assign_objects_to_room_masks
 from isaac_bench.perception.detection_types import FusedInstance
 from isaac_bench.perception.object_memory import ObjectMemory
 
@@ -64,6 +65,7 @@ class ObjectNode:
     center_grid: Optional[Tuple[int, int]] = None
     is_new_node: bool = False
     is_goal_node: bool = False
+    room_assignment_metadata: Dict[str, object] = field(default_factory=dict)
 
 
 @dataclass
@@ -74,6 +76,15 @@ class RoomNode:
     region_polygon_world: Optional[np.ndarray]
     point_cloud_world: Optional[np.ndarray]
     contained_object_ids: List[str] = field(default_factory=list)
+    mask_id: Optional[str] = None
+    category_source: str = "unknown"
+    mask_source: str = "unknown"
+    area_m2: float = 0.0
+    centroid_xy: Optional[Tuple[float, float]] = None
+    boundary_unknown_fraction: float = 0.0
+    is_partial: bool = False
+    doorway_edges: List[dict] = field(default_factory=list)
+    metadata: Dict[str, object] = field(default_factory=dict)
 
 
 @dataclass
@@ -102,6 +113,7 @@ class AffiliationEdge:
     dst_id: str
     relation: str
     confidence: float = 1.0
+    metadata: Dict[str, object] = field(default_factory=dict)
 
 
 class PaperSceneGraph:
@@ -115,6 +127,8 @@ class PaperSceneGraph:
         self.object_edges: List[ObjectEdge] = []
         self.affiliation_edges: List[AffiliationEdge] = []
         self.new_object_ids: List[str] = []
+        self.room_masks: Dict[str, RoomMask] = {}
+        self.object_room_assignments: Dict[str, object] = {}
         self.version = 0
 
     def reset(self) -> None:
@@ -124,6 +138,8 @@ class PaperSceneGraph:
         self.object_edges = []
         self.affiliation_edges = []
         self.new_object_ids = []
+        self.room_masks = {}
+        self.object_room_assignments = {}
         self.version = 0
 
     def update_object_and_room_nodes(self, fused_instances: Sequence[FusedInstance]) -> List[ObjectNode]:
@@ -143,7 +159,7 @@ class PaperSceneGraph:
         self.version += 1
         return new_objects
 
-    def update_from_object_memory(self, object_memory: ObjectMemory) -> None:
+    def update_from_object_memory(self, object_memory: ObjectMemory, map_info=None) -> None:
         previous_ids = set(self.object_nodes)
         self.new_object_ids = []
         for mem_node in object_memory.nodes:
@@ -167,7 +183,7 @@ class PaperSceneGraph:
                 self.new_object_ids.append(node_id)
         if not self.room_nodes:
             self._ensure_unknown_room()
-        self.update_affiliation_edges()
+        self.update_affiliation_edges(map_info=map_info)
         self.version += 1
 
     def update_room_nodes_from_room_map(self, room_map: np.ndarray, map_info, room_names: Sequence[str]) -> None:
@@ -196,6 +212,8 @@ class PaperSceneGraph:
                 region_polygon_world=None,
                 point_cloud_world=np.asarray(points, dtype=np.float32),
                 contained_object_ids=[],
+                category_source="oracle_rooms_json",
+                mask_source="preprocessed_rooms_json",
             )
         if next_rooms:
             unknown = self.room_nodes.get("room:unknown_room")
@@ -205,23 +223,97 @@ class PaperSceneGraph:
             self.update_affiliation_edges()
             self.version += 1
 
-    def update_affiliation_edges(self) -> None:
+    def update_room_nodes_from_room_masks(self, room_masks: Sequence[RoomMask], labels: Optional[Dict[str, object]] = None, map_info=None) -> None:
+        labels = dict(labels or {})
+        next_rooms: Dict[str, RoomNode] = {}
+        self.room_masks = {room.room_id: room for room in room_masks if not room.stale}
+        for room in room_masks:
+            if room.stale:
+                continue
+            label = labels.get(room.room_id)
+            category = normalize_category(getattr(label, "category", "unknown")).replace("_", " ")
+            if category == "unknown room":
+                category = "unknown"
+            confidence = float(getattr(label, "confidence", room.confidence))
+            source = str(getattr(label, "backend", "unknown"))
+            rr, cc = np.nonzero(room.mask)
+            points = []
+            if map_info is not None:
+                for r, c in zip(rr, cc):
+                    wx, wy = grid_to_world_xy(int(r), int(c), map_info)
+                    points.append([float(wx), float(wy), 0.0])
+            elif rr.size:
+                points = [[float(c), float(r), 0.0] for r, c in zip(rr, cc)]
+            room_id = "room:%s" % room.room_id
+            next_rooms[room_id] = RoomNode(
+                id=room_id,
+                room_type=category,
+                confidence=float(confidence),
+                region_polygon_world=None,
+                point_cloud_world=np.asarray(points, dtype=np.float32) if points else None,
+                contained_object_ids=[],
+                mask_id=room.room_id,
+                category_source="vlm_object_evidence" if source == "vlm" else source,
+                mask_source=room.source,
+                area_m2=float(room.area_m2),
+                centroid_xy=tuple(float(v) for v in room.centroid_xy),
+                boundary_unknown_fraction=float(room.boundary_unknown_fraction),
+                is_partial=bool(room.is_partial),
+                doorway_edges=list(room.doorway_edges),
+                metadata={
+                    "unknown_reason": getattr(label, "unknown_reason", None),
+                    "supporting_objects": list(getattr(label, "supporting_objects", []) or []),
+                    "conflicting_evidence": list(getattr(label, "conflicting_evidence", []) or []),
+                    "rationale": str(getattr(label, "rationale", "")),
+                    "mask_confidence": float(room.mask_confidence),
+                    "observed_free_cells": int(room.observed_free_cells),
+                },
+            )
+        if next_rooms:
+            self.room_nodes = next_rooms
+            self.update_affiliation_edges(map_info=map_info)
+            self.version += 1
+
+    def update_affiliation_edges(self, map_info=None) -> None:
         self.affiliation_edges = []
         for room in self.room_nodes.values():
             room.contained_object_ids = []
+        if self.room_masks and map_info is not None:
+            self.object_room_assignments = assign_objects_to_room_masks(self.object_nodes.values(), list(self.room_masks.values()), map_info)
+        else:
+            self.object_room_assignments = {}
         for obj in self.object_nodes.values():
             room = self._find_room_for_object(obj)
             obj.room_id = room.id if room is not None else None
+            obj.room_assignment_metadata = {}
             if room is None:
                 continue
+            assignment = self.object_room_assignments.get(obj.id)
+            metadata = assignment.to_edge_metadata() if assignment is not None else {}
+            obj.room_assignment_metadata = dict(metadata)
             room.contained_object_ids.append(obj.id)
-            self.affiliation_edges.append(AffiliationEdge(src_id=obj.id, dst_id=room.id, relation="belongs_to"))
+            self.affiliation_edges.append(
+                AffiliationEdge(
+                    src_id=obj.id,
+                    dst_id=room.id,
+                    relation="belongs_to",
+                    confidence=float(metadata.get("assignment_confidence", 1.0)),
+                    metadata=metadata,
+                )
+            )
         for group in self.group_nodes.values():
             room_ids = {self.object_nodes[obj_id].room_id for obj_id in group.object_ids if obj_id in self.object_nodes}
             room_ids.discard(None)
             if len(room_ids) == 1:
                 group.room_id = next(iter(room_ids))
-                self.affiliation_edges.append(AffiliationEdge(src_id=group.id, dst_id=group.room_id, relation="belongs_to"))
+                self.affiliation_edges.append(
+                    AffiliationEdge(
+                        src_id=group.id,
+                        dst_id=group.room_id,
+                        relation="belongs_to",
+                        metadata={"source": "member_object_room_majority"},
+                    )
+                )
 
     def update_group_nodes(self, eps_m: float = 0.5) -> None:
         self.group_nodes = {}
@@ -294,6 +386,11 @@ class PaperSceneGraph:
         )
 
     def _find_room_for_object(self, obj: ObjectNode) -> Optional[RoomNode]:
+        assignment = self.object_room_assignments.get(obj.id)
+        if assignment is not None and getattr(assignment, "room_id", None):
+            room = self.room_nodes.get("room:%s" % assignment.room_id)
+            if room is not None:
+                return room
         concrete_rooms = [room for room in self.room_nodes.values() if room.point_cloud_world is not None and len(room.point_cloud_world) > 0]
         for room in concrete_rooms:
             room_bbox = _bbox_from_points(room.point_cloud_world)

@@ -43,6 +43,8 @@ SGNAV_STEP_DUMP_KEYS = [
     "groups",
     "rooms",
     "edges",
+    "room_segmentation",
+    "room_semantics",
     "subgraphs",
     "subgraph_texts_or_payloads",
     "llm_scores",
@@ -135,6 +137,15 @@ def validate_strict_benchmark_assets(args: object) -> None:
         _require_existing_asset("YOLO-World model", _get_arg(args, "yolo_world_model", ""))
         if segmenter == "sam2":
             _require_existing_asset("SAM2 checkpoint", _get_arg(args, "sam2_checkpoint", ""))
+    sgnav_mode = str(_get_arg(args, "sgnav_mode", "") or "").strip().lower()
+    if sgnav_mode == "paper" and not bool(_get_arg(args, "llm_enabled", False)):
+        raise BenchmarkAssetError("strict SG-Nav paper mode requires --llm-enabled true and a reachable LLM/VLM endpoint")
+    room_map_mode = str(_get_arg(args, "room_map_mode", "") or "").strip().lower()
+    ablation_name = str(_get_arg(args, "ablation_name", "") or "").strip().lower()
+    if room_map_mode in {"observed_rooms_json", "rooms_json", "observed"} and ablation_name != "oracle_room_ablation":
+        raise BenchmarkAssetError(
+            "strict SG-Nav metric path requires online_geometry_watershed room masks; rooms.json/oracle room maps are not allowed"
+        )
 
 
 def empty_sgnav_step_dump(metadata: Optional[Mapping[str, object]] = None) -> dict:
@@ -142,6 +153,16 @@ def empty_sgnav_step_dump(metadata: Optional[Mapping[str, object]] = None) -> di
         "objects": [],
         "groups": [],
         "rooms": [],
+        "room_segmentation": {
+            "source": "online_geometry_watershed",
+            "room_count": 0,
+            "rooms": [],
+        },
+        "room_semantics": {
+            "backend": "unavailable",
+            "allowed_categories": [],
+            "labels": [],
+        },
         "edges": [],
         "subgraphs": [],
         "subgraph_texts_or_payloads": [],
@@ -235,6 +256,16 @@ def _infer_fallbacks(row: Mapping[str, object], args: object | None) -> list[str
         fallbacks.append("gt_goal_fallback_used")
     if llm_backend == "deterministic_local" and not ablation_name:
         fallbacks.append("llm_deterministic_local")
+    if int(row.get("hcot_llm_fallback_count", 0) or 0) > 0:
+        fallbacks.append("llm_deterministic_local")
+    room_vlm_backend = str(row.get("room_vlm_backend", "") or "").strip().lower()
+    if room_vlm_backend in {"deterministic_debug", "unavailable"} and not ablation_name:
+        fallbacks.append("room_vlm_unavailable" if room_vlm_backend == "unavailable" else "room_vlm_deterministic_debug")
+    if bool(row.get("room_vlm_invalid_json", False)):
+        fallbacks.append("room_vlm_invalid_json")
+    room_map_mode = str(row.get("room_map_mode", _get_arg(args, "room_map_mode", "")) or "").strip().lower()
+    if room_map_mode in {"observed_rooms_json", "rooms_json", "observed"} and str(ablation_name or "") != "oracle_room_ablation":
+        fallbacks.append("oracle_room_map")
     if sim_backend == "map":
         fallbacks.append("static_map_planning")
     if bool(_get_arg(args, "static_nearfield_map", row.get("static_nearfield_map", False))):

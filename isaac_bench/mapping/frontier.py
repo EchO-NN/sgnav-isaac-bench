@@ -67,10 +67,12 @@ def _disk_dilate(mask: np.ndarray, radius_cells: int) -> np.ndarray:
         return out
 
 
-def _distance_inverse(dist_m: float) -> float:
+def _distance_inverse(dist_m: float, min_distance_m: float = 1.0, span_m: float = 10.0) -> float:
     if not np.isfinite(float(dist_m)):
         return 0.0
-    return float(1.0 - (np.clip(float(dist_m), 1.6, 11.6) - 1.6) / 10.0)
+    min_d = float(min_distance_m)
+    span = max(float(span_m), 1e-6)
+    return float(1.0 - (np.clip(float(dist_m), min_d, min_d + span) - min_d) / span)
 
 
 def frontier_debug_layers(
@@ -197,7 +199,7 @@ def extract_frontiers(
     map_info: MapInfo,
     agent_grid: GridCell,
     min_cluster_size: int = 3,
-    min_distance_m: float = 1.6,
+    min_distance_m: float = 1.0,
     max_count: int = 64,
     occupancy: Optional[np.ndarray] = None,
     obstacle_dilation_radius_cells: int = 4,
@@ -257,7 +259,7 @@ def extract_frontiers(
             mean_path_distance=mean_dist,
             max_path_distance=max_dist,
             center_path_distance=center_dist,
-            distance_inverse=_distance_inverse(cluster_dist),
+            distance_inverse=_distance_inverse(cluster_dist, min_distance_m=float(min_distance_m)),
         )
         if cluster_dist < min_distance_m:
             near_clusters.append(cluster)

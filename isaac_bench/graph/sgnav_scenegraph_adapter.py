@@ -25,6 +25,7 @@ from isaac_bench.graph.paper_scene_graph import PaperSceneGraph
 from isaac_bench.graph.subgraph_builder import build_object_centered_subgraphs
 from isaac_bench.mapping.coordinate_transform import grid_to_world_xy
 from isaac_bench.mapping.frontier import FrontierCluster
+from isaac_bench.mapping.room_segmentation import RoomMask, room_mask_to_dict
 from isaac_bench.perception.detection_types import Detection2D
 from isaac_bench.perception.object_memory import ObjectMemory
 
@@ -321,6 +322,10 @@ class SGNavSceneGraphAdapter:
         self.obj_goal_sg = ""
         self.object_memory: Optional[ObjectMemory] = None
         self.room_map = None
+        self.room_masks: List[RoomMask] = []
+        self.room_semantic_labels: Dict[str, object] = {}
+        self.room_segmentation_debug: Dict[str, object] = {}
+        self.room_semantics_debug: Dict[str, object] = {}
         priors = self._load_semantic_priors(semantic_priors_path)
         self.room_names = list(priors["room_names"])
         self.related_category_pairs = set(priors["related_category_pairs"])
@@ -337,6 +342,7 @@ class SGNavSceneGraphAdapter:
         self.latest_map_info = None
         self.graph_version = 0
         paper_llm_config = dict(llm_config or {})
+        allow_hcot_fallback = not bool(paper_llm_config.get("strict_benchmark", False))
         self.paper_llm_client = (
             OpenAICompatibleJSONClient(paper_llm_config)
             if self.sgnav_mode == "paper" and bool(paper_llm_config.get("enabled", False))
@@ -346,7 +352,10 @@ class SGNavSceneGraphAdapter:
         if self.sgnav_mode == "paper":
             self.vllm_scorer.enabled = False
         self.paper_graph = PaperSceneGraph(related_category_pairs=self.related_category_pairs)
-        self.hcot_scorer = HCoTSubgraphScorer(llm_client=self.paper_llm_client)
+        self.hcot_scorer = HCoTSubgraphScorer(
+            llm_client=self.paper_llm_client,
+            allow_deterministic_fallback=allow_hcot_fallback,
+        )
         self.max_hcot_subgraphs_per_decision = int(paper_llm_config.get("max_hcot_subgraphs_per_decision", 8))
         if self.use_original:
             self._try_init_original()
@@ -447,6 +456,10 @@ class SGNavSceneGraphAdapter:
         self.runtime_edges.clear()
         self.runtime_groups.clear()
         self.runtime_rooms.clear()
+        self.room_masks = []
+        self.room_semantic_labels = {}
+        self.room_segmentation_debug = {}
+        self.room_semantics_debug = {}
         self.frame_observations = {}
         self.latest_rgb_image = None
         self.latest_map_info = None
@@ -472,6 +485,10 @@ class SGNavSceneGraphAdapter:
         self,
         object_memory: ObjectMemory,
         room_map=None,
+        room_masks: Optional[Sequence[RoomMask]] = None,
+        room_semantic_labels: Optional[Mapping[str, object]] = None,
+        room_segmentation_debug: Optional[Mapping[str, object]] = None,
+        room_semantics_debug: Optional[Mapping[str, object]] = None,
         rgb: Optional[np.ndarray] = None,
         depth: Optional[np.ndarray] = None,
         detections_2d: Optional[Sequence[Detection2D]] = None,
@@ -488,6 +505,10 @@ class SGNavSceneGraphAdapter:
         if hasattr(object_memory, "dedupe"):
             object_memory.dedupe(map_info=map_info)
         self.room_map = room_map
+        self.room_masks = list(room_masks or [])
+        self.room_semantic_labels = dict(room_semantic_labels or {})
+        self.room_segmentation_debug = dict(room_segmentation_debug or {})
+        self.room_semantics_debug = dict(room_semantics_debug or {})
         self.latest_map_info = map_info
         if rgb is not None:
             self.latest_rgb_image = np.asarray(rgb, dtype=np.uint8).copy()
@@ -501,10 +522,14 @@ class SGNavSceneGraphAdapter:
             "step_id": int(step_id),
             "pose_world": tuple(float(v) for v in pose_world) if pose_world is not None else None,
             "camera_pose_world": tuple(float(v) for v in camera_pose_world) if camera_pose_world is not None else None,
+            "room_mask_count": len([room for room in self.room_masks if not room.stale]),
+            "room_semantic_count": len(self.room_semantic_labels),
         }
         self._rebuild_runtime_graph(map_info=map_info)
         if self.sgnav_mode == "paper":
-            if room_map is not None and map_info is not None:
+            if self.room_masks and map_info is not None:
+                self.paper_graph.update_room_nodes_from_room_masks(self.room_masks, self.room_semantic_labels, map_info=map_info)
+            elif room_map is not None and map_info is not None:
                 self.paper_graph.update_room_nodes_from_room_map(room_map, map_info, self.room_names)
             self._update_paper_graph_from_memory(object_memory, occupancy=occupancy, map_info=map_info)
         if self.scenegraph is not None:
@@ -560,7 +585,7 @@ class SGNavSceneGraphAdapter:
         return self._fallback_score(frontier_locations, num_frontiers)
 
     def _update_paper_graph_from_memory(self, object_memory: ObjectMemory, occupancy: Optional[np.ndarray] = None, map_info=None) -> None:
-        self.paper_graph.update_from_object_memory(object_memory)
+        self.paper_graph.update_from_object_memory(object_memory, map_info=map_info)
         new_ids = set(getattr(self.paper_graph, "new_object_ids", []) or [])
         if not new_ids:
             self.paper_graph.update_group_nodes()
@@ -774,6 +799,15 @@ class SGNavSceneGraphAdapter:
         return 0.35
 
     def room_name_at_grid(self, grid: Sequence[int]) -> Optional[str]:
+        if self.room_masks:
+            r, c = int(grid[0]), int(grid[1])
+            for room in self.room_masks:
+                if room.stale:
+                    continue
+                if 0 <= r < room.mask.shape[0] and 0 <= c < room.mask.shape[1] and bool(room.mask[r, c]):
+                    label = self.room_semantic_labels.get(room.room_id)
+                    category = getattr(label, "category", None)
+                    return str(category).replace("_", " ") if category else "unknown"
         if self.room_map is None:
             return None
         arr = np.asarray(self.room_map)
@@ -805,7 +839,9 @@ class SGNavSceneGraphAdapter:
         self.runtime_groups = []
         self.runtime_rooms = {}
         self._runtime_edge_keys = set()
-        if self.room_map is not None:
+        if self.room_masks:
+            self._rebuild_room_nodes_from_masks()
+        elif self.room_map is not None:
             self._rebuild_room_nodes()
         if self.object_memory is None:
             return
@@ -823,10 +859,49 @@ class SGNavSceneGraphAdapter:
                 room=room_name,
             )
             if room_name:
-                room_id = "room:%s" % normalize_category(room_name).replace("_", " ")
+                room_id = self._runtime_room_id_for_name(room_name)
                 if room_id in self.runtime_rooms:
                     self._append_runtime_edge(node_id, room_id, "belongs to", 1.0)
         self._rebuild_object_edges_and_groups()
+        self._append_room_doorway_edges()
+
+    def _runtime_room_id_for_name(self, room_name: str) -> str:
+        if str(room_name).startswith("room_"):
+            return "room:%s" % room_name
+        return "room:%s" % normalize_category(room_name).replace("_", " ")
+
+    def _rebuild_room_nodes_from_masks(self) -> None:
+        for room in self.room_masks:
+            if room.stale:
+                continue
+            label = self.room_semantic_labels.get(room.room_id)
+            caption = str(getattr(label, "category", "unknown")).replace("_", " ")
+            centroid_grid = None
+            if isinstance(room.metadata, dict) and room.metadata.get("centroid_grid"):
+                values = room.metadata["centroid_grid"]
+                centroid_grid = (int(round(float(values[0]))), int(round(float(values[1]))))
+            if centroid_grid is None:
+                rr, cc = np.nonzero(room.mask)
+                centroid_grid = (int(np.mean(rr)), int(np.mean(cc))) if rr.size else None
+            node_id = "room:%s" % room.room_id
+            node = RuntimeGraphNode(
+                node_id=node_id,
+                kind="room",
+                caption=caption,
+                center_grid=centroid_grid,
+                center_world=(float(room.centroid_xy[0]), float(room.centroid_xy[1]), 0.0),
+                confidence=float(getattr(label, "confidence", room.confidence)),
+                observed_count=int(room.observed_free_cells),
+            )
+            setattr(
+                node,
+                "metadata",
+                {
+                    **room_mask_to_dict(room, include_mask=False),
+                    "semantic_label": getattr(label, "to_dict", lambda: {})() if label is not None else {},
+                },
+            )
+            self.runtime_rooms[node_id] = node
 
     def _rebuild_room_nodes(self) -> None:
         arr = np.asarray(self.room_map)
@@ -909,9 +984,24 @@ class SGNavSceneGraphAdapter:
             for member_id in members:
                 self._append_runtime_edge(group_id, member_id, "contains", 1.0)
             if room:
-                room_id = "room:%s" % normalize_category(room).replace("_", " ")
+                room_id = self._runtime_room_id_for_name(room)
                 if room_id in self.runtime_rooms:
                     self._append_runtime_edge(group_id, room_id, "belongs to", 1.0)
+
+    def _append_room_doorway_edges(self) -> None:
+        for room in self.room_masks:
+            if room.stale:
+                continue
+            for edge in room.doorway_edges:
+                room_a = edge.get("room_a") or edge.get("room_a_id")
+                room_b = edge.get("room_b") or edge.get("room_b_id")
+                if room_a is None or room_b is None:
+                    continue
+                src = "room:%s" % str(room_a).replace("room:", "")
+                dst = "room:%s" % str(room_b).replace("room:", "")
+                if src == dst or src not in self.runtime_rooms or dst not in self.runtime_rooms:
+                    continue
+                self._append_runtime_edge(src, dst, "adjacent via doorway", float(edge.get("confidence", 1.0)))
 
     def _append_runtime_edge(self, source: str, target: str, relation: str, weight: float = 1.0) -> None:
         relation_key = normalize_category(relation).replace("_", " ")

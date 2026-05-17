@@ -170,6 +170,10 @@ def test_config_defaults_match_benchmark_contract():
     assert cfg["sgnav"]["allow_gt_goal_fallback"] is False
     assert cfg["nearfield_static_map"]["enabled"] is False
     assert cfg["mapping"]["frontier_allow_near_fallback"] is False
+    assert cfg["mapping"]["frontier_min_distance_m"] == 1.0
+    assert cfg["mapping"]["room_map_mode"] == "online_geometry_watershed"
+    assert cfg["sgnav"]["frontier_distance_weight"] == 0.2
+    assert cfg["llm"]["enabled"] is True
 
 
 def test_dump_sgnav_step_writes_contract_artifact(tmp_path):

@@ -26,6 +26,8 @@ def save_graph_debug_dump(
         "score_backend": _score_backend(scenegraph),
         "objects": _objects(scenegraph),
         "rooms": _rooms(scenegraph),
+        "room_segmentation": dict(getattr(scenegraph, "room_segmentation_debug", {}) or {}),
+        "room_semantics": dict(getattr(scenegraph, "room_semantics_debug", {}) or {}),
         "groups": _groups(scenegraph),
         "edges": _edges(scenegraph),
         "frontiers": _frontiers(frontiers, frontier_decision),
@@ -74,6 +76,7 @@ def _rooms(scenegraph) -> list[dict]:
                 "caption": node.caption,
                 "center_grid": list(node.center_grid) if node.center_grid is not None else None,
                 "area": int(node.observed_count),
+                "metadata": dict(getattr(node, "metadata", {}) or {}),
             }
         )
     return out

@@ -23,6 +23,11 @@ from isaac_bench.perception.object_memory import ObjectMemory
 GridCell = Tuple[int, int]
 
 
+def _is_green_like(color: Tuple[int, int, int]) -> bool:
+    r, g, b = [int(v) for v in color]
+    return bool(g >= 150 and g > r + 25 and g >= b)
+
+
 class SGNavPopupVisualizer:
     def __init__(
         self,
@@ -32,6 +37,13 @@ class SGNavPopupVisualizer:
         panel_size: Tuple[int, int] = (1440, 900),
         save_every_steps: int = 10,
         ipc_jpeg_quality: int = 75,
+        debug_overlay_layers: bool = True,
+        save_overlay_layer_metadata: bool = True,
+        show_gt_goal_cells: bool = False,
+        show_frontier_member_cells: bool = True,
+        show_object_nodes: bool = True,
+        show_candidate_markers: bool = True,
+        max_green_like_primitives_before_warning: int = 200,
     ) -> None:
         self.enabled = bool(enabled)
         self.window_name = window_name
@@ -39,6 +51,14 @@ class SGNavPopupVisualizer:
         self.panel_size = (int(panel_size[0]), int(panel_size[1]))
         self.save_every_steps = max(1, int(save_every_steps))
         self.ipc_jpeg_quality = max(30, min(95, int(ipc_jpeg_quality)))
+        self.debug_overlay_layers = bool(debug_overlay_layers)
+        self.save_overlay_layer_metadata = bool(save_overlay_layer_metadata)
+        self.show_gt_goal_cells = bool(show_gt_goal_cells)
+        self.show_frontier_member_cells = bool(show_frontier_member_cells)
+        self.show_object_nodes = bool(show_object_nodes)
+        self.show_candidate_markers = bool(show_candidate_markers)
+        self.max_green_like_primitives_before_warning = max(0, int(max_green_like_primitives_before_warning))
+        self._last_overlay_layers: List[dict] = []
         self._proc: Optional[subprocess.Popen[str]] = None
         self._ipc_dir = Path(tempfile.gettempdir()) / ("sgnav_viz_%d" % os.getpid())
         self._frame_path = self._ipc_dir / "latest.jpg"
@@ -176,9 +196,29 @@ class SGNavPopupVisualizer:
         )
         if self.save_dir and int(step) % self.save_every_steps == 0:
             Image.fromarray(panel).save(self.save_dir / ("sgnav_step_%06d.jpg" % int(step)), format="JPEG", quality=85)
+            if self.save_overlay_layer_metadata:
+                meta_path = self.save_dir / ("sgnav_step_%06d.layers.json" % int(step))
+                meta_path.write_text(
+                    json.dumps(self.overlay_layer_metadata(step), ensure_ascii=False, indent=2) + "\n",
+                    encoding="utf-8",
+                )
         if self.enabled:
             self._send_frame(panel)
         return panel
+
+    def overlay_layer_metadata(self, frame_id: int = 0) -> dict:
+        layers = [dict(item) for item in self._last_overlay_layers]
+        green_like = sum(int(item.get("primitive_count", 0)) for item in layers if bool(item.get("green_like", False)))
+        return {
+            "frame_id": int(frame_id),
+            "layers": layers,
+            "green_like_primitive_count": int(green_like),
+            "max_green_like_primitives_before_warning": int(self.max_green_like_primitives_before_warning),
+            "green_like_warning": bool(
+                self.max_green_like_primitives_before_warning > 0
+                and green_like > self.max_green_like_primitives_before_warning
+            ),
+        }
 
     def _read_ready(self, timeout_s: float) -> None:
         if self._proc is None or self._proc.stdout is None:
@@ -382,28 +422,58 @@ class SGNavPopupVisualizer:
         map_img = Image.fromarray(crop).resize((map_w, map_h), Image.NEAREST)
         image.paste(map_img, (ox, oy))
         draw = ImageDraw.Draw(image)
+        layers: List[dict] = []
+
+        def record(name: str, enabled: bool, color: Tuple[int, int, int], count: int, note: str = "") -> None:
+            layers.append(
+                {
+                    "name": name,
+                    "enabled": bool(enabled),
+                    "color": [int(color[0]), int(color[1]), int(color[2])],
+                    "primitive_count": int(count),
+                    "green_like": bool(_is_green_like(color)),
+                    "note": note,
+                }
+            )
 
         def xy(cell: GridCell) -> Tuple[int, int]:
             r, c = int(cell[0]), int(cell[1])
             return int(ox + (c - c0 + 0.5) * scale), int(oy + (r - r0 + 0.5) * scale)
 
-        self._draw_cells(draw, goal_cells, xy, (30, 220, 80), radius=2, max_cells=500)
-        self._draw_cells(draw, full_path, xy, (80, 130, 255), radius=1, max_cells=1200)
-        self._draw_cells(draw, current_path, xy, (245, 245, 245), radius=2, max_cells=500)
+        goal_color = (30, 220, 80)
+        goal_count = self._draw_cells(draw, goal_cells, xy, goal_color, radius=2, max_cells=500) if self.show_gt_goal_cells else 0
+        record("gt_goal_cells", self.show_gt_goal_cells, goal_color, goal_count, "disabled by default; oracle GT overlay")
+        full_path_color = (80, 130, 255)
+        record("full_path", True, full_path_color, self._draw_cells(draw, full_path, xy, full_path_color, radius=1, max_cells=1200))
+        current_path_color = (245, 245, 245)
+        record("current_path", True, current_path_color, self._draw_cells(draw, current_path, xy, current_path_color, radius=2, max_cells=500))
         frontier_raw_cells: List[GridCell] = []
         for frontier in frontiers[:64]:
             frontier_raw_cells.extend(frontier.members)
-        self._draw_cells(draw, frontier_raw_cells, xy, (0, 180, 220), radius=1, max_cells=500)
+        frontier_cell_color = (0, 180, 220)
+        frontier_cell_count = (
+            self._draw_cells(draw, frontier_raw_cells, xy, frontier_cell_color, radius=1, max_cells=500)
+            if self.show_frontier_member_cells
+            else 0
+        )
+        record("frontier_member_cells", self.show_frontier_member_cells, frontier_cell_color, frontier_cell_count)
+        frontier_center_count = 0
         for frontier in frontiers[:64]:
             self._triangle(draw, xy(frontier.center_grid), (0, 225, 255), radius=5)
+            frontier_center_count += 1
+        record("frontier_centers", True, (0, 225, 255), frontier_center_count)
 
         selected_frontier = None
         if nav_decision and nav_decision.frontier_decision:
             selected_frontier = nav_decision.frontier_decision.selected_frontier
         if selected_frontier is not None:
             self._star(draw, xy(selected_frontier.center_grid), (255, 225, 40), radius=8)
-        if nav_decision and nav_decision.target_cells and nav_decision.mode == "candidate":
-            self._draw_crosses(draw, nav_decision.target_cells, xy, (220, 70, 255), radius=5, max_cells=16)
+        record("selected_frontier", selected_frontier is not None, (255, 225, 40), 1 if selected_frontier is not None else 0)
+        candidate_marker_color = (220, 70, 255)
+        candidate_marker_count = 0
+        if self.show_candidate_markers and nav_decision and nav_decision.target_cells and nav_decision.mode == "candidate":
+            candidate_marker_count = self._draw_crosses(draw, nav_decision.target_cells, xy, candidate_marker_color, radius=5, max_cells=16)
+        record("candidate_standoff_markers", self.show_candidate_markers, candidate_marker_color, candidate_marker_count)
         planner_target = None
         if current_path:
             planner_target = current_path[-1]
@@ -411,16 +481,28 @@ class SGNavPopupVisualizer:
             planner_target = nav_decision.target_cells[0]
         if planner_target is not None:
             self._star(draw, xy(planner_target), (255, 150, 40), radius=7)
+        record("planner_target", planner_target is not None, (255, 150, 40), 1 if planner_target is not None else 0)
         selected_id = self._selected_candidate_id(nav_decision)
-        for node in self._visible_map_nodes(object_memory, goal_category, nav_decision)[:300]:
-            radius = 8 if selected_id is not None and int(node.node_id) == selected_id else 5
-            self._dot(draw, xy(node.center_grid), self._candidate_node_color(node, selected_id, nav_decision), radius=radius)
+        object_node_count = 0
+        accepted_candidate_count = 0
+        if self.show_object_nodes:
+            for node in self._visible_map_nodes(object_memory, goal_category, nav_decision)[:300]:
+                radius = 8 if selected_id is not None and int(node.node_id) == selected_id else 5
+                color = self._candidate_node_color(node, selected_id, nav_decision)
+                if color == (40, 220, 90):
+                    accepted_candidate_count += 1
+                self._dot(draw, xy(node.center_grid), color, radius=radius)
+                object_node_count += 1
+        record("object_nodes", self.show_object_nodes, (255, 150, 40), object_node_count)
+        record("accepted_candidate", self.show_object_nodes, (40, 220, 90), accepted_candidate_count)
 
         self._draw_agent(draw, xy(current_grid), float(pose[3]) if len(pose) > 3 else 0.0, scale)
+        record("agent", True, (255, 60, 60), 1)
         zoom = max(1.0, min(w / max(crop_w, 1), h / max(crop_h, 1)))
         target_count = len(nav_decision.target_cells) if nav_decision is not None else 0
         self._label(draw, (10, 8), "Map / frontiers / A* / goal candidates  zoom %.1fx target_cells=%d" % (zoom, target_count), (255, 255, 255))
         self._legend(draw, (10, height - 96))
+        self._last_overlay_layers = layers if self.debug_overlay_layers else []
         return image
 
     def _map_crop_bounds(
@@ -623,13 +705,16 @@ class SGNavPopupVisualizer:
         color: Tuple[int, int, int],
         radius: int,
         max_cells: int,
-    ) -> None:
+    ) -> int:
         cells_list = list(cells)
         if not cells_list:
-            return
+            return 0
         stride = max(1, len(cells_list) // max(1, int(max_cells)))
+        drawn = 0
         for cell in cells_list[::stride][:max_cells]:
             self._dot(draw, xy_func(cell), color, radius=radius)
+            drawn += 1
+        return drawn
 
     def _dot(self, draw: ImageDraw.ImageDraw, xy: Tuple[int, int], color: Tuple[int, int, int], radius: int = 3) -> None:
         x, y = int(xy[0]), int(xy[1])
@@ -660,12 +745,15 @@ class SGNavPopupVisualizer:
         color: Tuple[int, int, int],
         radius: int,
         max_cells: int,
-    ) -> None:
+    ) -> int:
         cells_list = list(cells)
         if not cells_list:
-            return
+            return 0
+        drawn = 0
         for cell in cells_list[: max(1, int(max_cells))]:
             self._cross(draw, xy_func(cell), color, radius=radius)
+            drawn += 1
+        return drawn
 
     def _label(self, draw: ImageDraw.ImageDraw, xy: Tuple[int, int], text: str, color: Tuple[int, int, int]) -> None:
         x, y = int(xy[0]), int(xy[1])

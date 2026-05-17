@@ -29,6 +29,13 @@ visualization:
   sgnav_popup_width: 1440
   sgnav_popup_height: 900
   sgnav_popup_jpeg_quality: 75
+  debug_overlay_layers: true
+  save_overlay_layer_metadata: true
+  show_gt_goal_cells: false
+  show_frontier_member_cells: true
+  show_object_nodes: true
+  show_candidate_markers: true
+  max_green_like_primitives_before_warning: 200
 
 isaac:
   headless: false
@@ -143,7 +150,7 @@ mapping:
   debug: false
   inflation_radius_m: 0.0
   frontier_min_cluster_size: 1
-  frontier_min_distance_m: 1.6
+  frontier_min_distance_m: 1.0
   frontier_max_count: 0
   frontier_obstacle_dilation_radius_cells: 4
   frontier_unknown_dilation_radius_cells: 1
@@ -152,7 +159,28 @@ mapping:
   frontier_allow_near_fallback: false
   frontier_debug_dump: false
   frontier_debug_dir: data/debug_frontier
-  room_map_mode: observed_rooms_json
+  room_map_mode: online_geometry_watershed
+  room_segmentation:
+    enabled: true
+    source_grid: online_depth_observed
+    update_every_steps: 5
+    min_observed_free_cells: 50
+    min_room_area_m2: 1.5
+    max_clutter_component_area_m2: 1.0
+    morphology_close_radius_m: 0.20
+    morphology_open_radius_m: 0.10
+    distance_smooth_sigma_cells: 1.0
+    seed_min_clearance_m: 0.45
+    seed_min_distance_m: 1.2
+    doorway_width_min_m: 0.55
+    doorway_width_max_m: 1.45
+    doorway_clearance_max_m: 0.85
+    merge_wide_openings: true
+    small_segment_merge_area_m2: 1.2
+    id_iou_threshold: 0.35
+    unknown_boundary_confidence_penalty: true
+    debug_dump: false
+    debug_dir: debug/room_segmentation
 
 perception:
   yolo_world_model: data/models/yolov8l-worldv2.pt
@@ -177,7 +205,7 @@ sgnav:
   panorama_steps: 8
   panorama_wz_radps: 0.8
   panorama_render_updates_per_step: 1
-  frontier_distance_weight: 2.0
+  frontier_distance_weight: 0.2
   frontier_scenegraph_score_norm: none
   frontier_commitment_enabled: true
   frontier_commit_match_radius_m: 0.75
@@ -228,6 +256,34 @@ sgnav:
     short_edge_vlm_pruning: true
     long_edge_geometric_pruning: true
     group_nodes: true
+    room_nodes:
+      source: online_geometry_watershed_vlm
+      use_dataset_room_labels_in_metric: false
+      strict_no_oracle_rooms: true
+      room_label_backend: vlm
+      allowed_room_categories:
+        - kitchen
+        - bedroom
+        - bathroom
+        - living_room
+        - dining_room
+        - office
+        - hallway
+        - corridor
+        - laundry_room
+        - storage_room
+        - entryway
+        - balcony
+        - unknown
+      unknown_category: unknown
+      room_label_min_confidence: 0.60
+      room_label_ambiguity_margin: 0.15
+      room_label_min_reliable_objects: 2
+      room_label_hysteresis_updates: 2
+      include_room_mask_thumbnail: true
+      include_room_rgb_views: true
+      max_room_rgb_views: 3
+      max_room_objects_in_prompt: 25
   subgraph:
     enabled: true
     type: object_centered
@@ -266,7 +322,7 @@ vllm:
   image_jpeg_quality: 75
 
 llm:
-  enabled: false
+  enabled: true
   base_url: http://127.0.0.1:8000/v1
   model: qwen3-vl-8b-instruct
   api_key: EMPTY

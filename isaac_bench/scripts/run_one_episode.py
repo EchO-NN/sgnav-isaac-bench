@@ -24,6 +24,18 @@ from isaac_bench.mapping.frontier import extract_frontiers, frontier_debug_layer
 from isaac_bench.mapping.frontier_debug import save_frontier_debug_snapshot
 from isaac_bench.mapping.online_mapper import OnlineMapper
 from isaac_bench.mapping.room_map_from_rooms_json import build_room_index_map, load_rooms
+from isaac_bench.mapping.room_segmentation import (
+    OnlineRoomSegmenter,
+    RoomSegmentationConfig,
+    assign_objects_to_room_masks,
+    room_segmentation_debug,
+)
+from isaac_bench.graph.room_semantics import (
+    DEFAULT_ROOM_CATEGORIES,
+    VLMRoomLabeler,
+    room_semantics_debug,
+    summarize_room_object_evidence,
+)
 from isaac_bench.metrics.episode_logger import JsonlEpisodeLogger, make_jsonable
 from isaac_bench.metrics.evaluator import EpisodeEvaluator
 from isaac_bench.metrics.result_schema import BenchmarkAssetError, complete_result_row, validate_strict_benchmark_assets
@@ -679,6 +691,7 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
             "temperature": float(getattr(args, "llm_temperature", 0.0)),
             "max_tokens": int(getattr(args, "llm_max_tokens", 512)),
             "max_hcot_subgraphs_per_decision": int(getattr(args, "max_hcot_subgraphs_per_decision", 8)),
+            "strict_benchmark": bool(getattr(args, "strict_benchmark", False)),
         },
         sgnav_mode=str(getattr(args, "sgnav_mode", "legacy")),
     )
@@ -699,6 +712,8 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
     decision_policy = SGNavDecision(
         scenegraph,
         frontier_distance_weight=float(args.frontier_distance_weight),
+        frontier_min_select_distance_m=float(args.frontier_min_distance_m),
+        frontier_allow_near_fallback=bool(args.frontier_allow_near_fallback),
         candidate_min_hits=int(args.candidate_min_detector_hits),
         candidate_start_min_confidence=float(args.candidate_start_min_confidence),
         candidate_start_min_hits=int(args.candidate_start_min_hits),
@@ -764,9 +779,51 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
         else None
     )
     room_map_mode = str(getattr(args, "room_map_mode", "observed_rooms_json") or "none").strip().lower()
+    room_segmenter = None
+    room_labeler = None
+    room_semantic_labels = {}
+    last_room_masks = []
+    last_room_segmentation_debug = {"source": "online_geometry_watershed", "room_count": 0, "rooms": []}
+    last_room_semantics_debug = {
+        "backend": "unavailable",
+        "allowed_categories": list(getattr(args, "room_label_allowed_categories", DEFAULT_ROOM_CATEGORIES)),
+        "labels": [],
+    }
     if room_map_mode in {"observed_rooms_json", "rooms_json", "observed"}:
+        if bool(getattr(args, "strict_benchmark", False)):
+            raise BenchmarkAssetError(
+                "strict SG-Nav metric path requires online_geometry_watershed room masks; rooms.json/oracle room maps are not allowed"
+            )
         full_room_map = build_sgnav_room_map(scene_dir, dynamic_map_info)
         scenegraph.update(object_memory, room_map=full_room_map)
+    elif room_map_mode in {"online_geometry_watershed", "online_geometry_watershed_vlm"}:
+        room_cfg = RoomSegmentationConfig.from_mapping(
+            getattr(args, "room_segmentation_config", {}),
+            resolution_m=float(dynamic_map_info.resolution_m),
+            map_info=dynamic_map_info,
+        )
+        room_segmenter = OnlineRoomSegmenter(room_cfg)
+        room_label_client = (
+            getattr(scenegraph, "paper_llm_client", None)
+            if str(getattr(args, "room_label_backend", "vlm")).strip().lower() == "vlm"
+            else None
+        )
+        room_labeler = VLMRoomLabeler(
+            client=room_label_client,
+            allowed_categories=getattr(args, "room_label_allowed_categories", DEFAULT_ROOM_CATEGORIES),
+            min_confidence=float(getattr(args, "room_label_min_confidence", 0.60)),
+            ambiguity_margin=float(getattr(args, "room_label_ambiguity_margin", 0.15)),
+            min_reliable_objects=int(getattr(args, "room_label_min_reliable_objects", 2)),
+            unknown_category=str(getattr(args, "room_label_unknown_category", "unknown")),
+            require_backend=bool(getattr(args, "strict_benchmark", False))
+            and str(getattr(args, "room_label_backend", "vlm")).strip().lower() == "vlm",
+            max_room_objects_in_prompt=int(getattr(args, "max_room_objects_in_prompt", 25)),
+        )
+        last_room_semantics_debug["backend"] = room_labeler.backend
+    elif room_map_mode in {"none", "disabled", ""}:
+        pass
+    else:
+        raise ValueError("unsupported mapping.room_map_mode: %s" % room_map_mode)
     goal_cells = []
     for goal_r, goal_c in static_goal_cells:
         gx, gy = grid_to_world_xy(goal_r, goal_c, static_map_info)
@@ -888,6 +945,13 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
             panel_size=(int(args.sgnav_viz_width), int(args.sgnav_viz_height)),
             save_every_steps=int(args.sgnav_viz_save_every_steps),
             ipc_jpeg_quality=int(args.sgnav_viz_jpeg_quality),
+            debug_overlay_layers=bool(args.debug_overlay_layers),
+            save_overlay_layer_metadata=bool(args.save_overlay_layer_metadata),
+            show_gt_goal_cells=bool(args.show_gt_goal_cells),
+            show_frontier_member_cells=bool(args.show_frontier_member_cells),
+            show_object_nodes=bool(args.show_object_nodes),
+            show_candidate_markers=bool(args.show_candidate_markers),
+            max_green_like_primitives_before_warning=int(args.max_green_like_primitives_before_warning),
         ) if (sgnav_viz_enabled or sgnav_viz_save_dir) else None
         intr = CameraIntrinsics.from_hfov(int(args.isaac_width), int(args.isaac_height), float(args.camera_hfov_deg))
         nearfield_intr = CameraIntrinsics.from_hfov(
@@ -1157,15 +1221,46 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
             return obs_local
 
         def update_scenegraph_frame(current_obs: dict, step_idx: int, map_state: dict) -> None:
+            nonlocal last_room_masks, room_semantic_labels, last_room_segmentation_debug, last_room_semantics_debug
             started_at = time.perf_counter()
             llm_requests_before = total_llm_requests()
             room_map = None if full_room_map is None else observed_room_map(full_room_map, map_state["observed"])
             rgb_for_graph = current_obs["rgb"] if current_obs.get("has_rgb") and current_obs.get("rgb_device") == "cpu" else None
             if rgb_for_graph is None and vllm_needs_cpu_rgb:
                 rgb_for_graph = viz_rgb(current_obs)
+            if room_segmenter is not None:
+                update_every = max(1, int(getattr(room_segmenter.config, "update_every_steps", 5)))
+                if not last_room_masks or int(step_idx) % update_every == 0:
+                    unknown_mask = ~np.asarray(map_state["observed"], dtype=bool)
+                    last_room_masks = room_segmenter.update(
+                        map_state["occupancy"],
+                        map_state["free"],
+                        map_state["occupancy"],
+                        unknown_mask,
+                        step=int(step_idx),
+                    )
+                    last_room_segmentation_debug = dict(room_segmenter.last_debug or room_segmentation_debug(last_room_masks))
+                    assignments = assign_objects_to_room_masks(object_memory.nodes, last_room_masks, map_state["map_info"])
+                    next_labels = {}
+                    if room_labeler is not None:
+                        for room in last_room_masks:
+                            if room.stale:
+                                continue
+                            evidence = summarize_room_object_evidence(object_memory.nodes, assignments, room.room_id)
+                            next_labels[room.room_id] = room_labeler.label_room(room, evidence, None)
+                    room_semantic_labels = next_labels
+                    last_room_semantics_debug = room_semantics_debug(
+                        room_semantic_labels,
+                        getattr(args, "room_label_allowed_categories", DEFAULT_ROOM_CATEGORIES),
+                        getattr(room_labeler, "backend", "unavailable"),
+                    )
             scenegraph.update_from_frame(
                 object_memory,
                 room_map=room_map,
+                room_masks=last_room_masks,
+                room_semantic_labels=room_semantic_labels,
+                room_segmentation_debug=last_room_segmentation_debug,
+                room_semantics_debug=last_room_semantics_debug,
                 rgb=rgb_for_graph,
                 depth=current_obs.get("depth"),
                 detections_2d=last_detections_2d,
@@ -1945,6 +2040,7 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
         row["hcot_llm_attempts"] = int(getattr(hcot_scorer, "llm_request_count", 0))
         row["hcot_llm_failures"] = int(getattr(hcot_scorer, "llm_failure_count", 0))
         row["hcot_llm_fallbacks"] = int(getattr(hcot_scorer, "llm_fallback_count", 0))
+        row["hcot_llm_fallback_count"] = int(getattr(hcot_scorer, "llm_fallback_count", 0))
         row["hcot_llm_last_error"] = getattr(hcot_scorer, "last_error", None)
         row["hc_p_num_subgraphs_total"] = row["paper_frontier_interpolation"].get("num_subgraphs_total")
         row["hc_p_num_subgraphs_scored"] = row["paper_frontier_interpolation"].get("num_subgraphs_scored")
@@ -1985,6 +2081,14 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
         row["active_frontier_age"] = last_frontier_commitment_metadata.get("active_frontier_age")
         row["active_frontier_distance_m"] = last_frontier_commitment_metadata.get("active_frontier_distance_m")
         row["frontier_scenegraph_score_norm"] = str(args.frontier_scenegraph_score_norm)
+        row["room_map_mode"] = str(room_map_mode)
+        row["room_segmentation"] = dict(last_room_segmentation_debug)
+        row["room_semantics"] = dict(last_room_semantics_debug)
+        row["room_mask_count"] = int(len([room for room in last_room_masks if not getattr(room, "stale", False)]))
+        row["room_vlm_backend"] = str(getattr(room_labeler, "backend", "unavailable") if room_labeler is not None else "unavailable")
+        row["room_vlm_requests"] = int(getattr(room_labeler, "request_count", 0) if room_labeler is not None else 0)
+        row["room_vlm_failures"] = int(getattr(room_labeler, "failure_count", 0) if room_labeler is not None else 0)
+        row["room_vlm_invalid_json"] = bool(getattr(room_labeler, "failure_count", 0) if room_labeler is not None else 0)
         row["debug_graph_dump"] = bool(args.debug_graph_dump)
         row["debug_graph_dump_dir"] = str(args.debug_graph_dump_dir)
         row["segmenter"] = str(getattr(args, "segmenter", "none") or "none")
@@ -2214,6 +2318,12 @@ def main(argv: Optional[List[str]] = None) -> int:
         help="Deprecated compatibility option; online traversal inflation is footprint-only.",
     )
     parser.add_argument("--room-map-mode", default=None)
+    parser.add_argument("--room-label-backend", default=None, choices=["vlm", "deterministic_debug", "unavailable"])
+    parser.add_argument("--room-label-min-confidence", type=float, default=None)
+    parser.add_argument("--room-label-ambiguity-margin", type=float, default=None)
+    parser.add_argument("--room-label-min-reliable-objects", type=int, default=None)
+    parser.add_argument("--room-label-unknown-category", default=None)
+    parser.add_argument("--max-room-objects-in-prompt", type=int, default=None)
     parser.add_argument("--detection-localization", default=None, choices=["static_map_ray", "map_ray", "rgb_map_ray", "depth", "none"])
     parser.add_argument("--min-depth-points-per-detection", type=int, default=None)
     parser.add_argument("--segmenter", default=None, choices=["none", "auto", "sam2"])
@@ -2287,6 +2397,13 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--sgnav-viz-width", type=int, default=None)
     parser.add_argument("--sgnav-viz-height", type=int, default=None)
     parser.add_argument("--sgnav-viz-jpeg-quality", type=int, default=None)
+    parser.add_argument("--debug-overlay-layers", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--save-overlay-layer-metadata", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--show-gt-goal-cells", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--show-frontier-member-cells", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--show-object-nodes", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--show-candidate-markers", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--max-green-like-primitives-before-warning", type=int, default=None)
     parser.add_argument("--hold-open", action="store_true")
     args = parser.parse_args(argv)
     cfg = load_config(args.config)
@@ -2309,6 +2426,41 @@ def main(argv: Optional[List[str]] = None) -> int:
     args.sgnav_viz_width = int(args.sgnav_viz_width or get_nested(cfg, "visualization.sgnav_popup_width", 1440))
     args.sgnav_viz_height = int(args.sgnav_viz_height or get_nested(cfg, "visualization.sgnav_popup_height", 900))
     args.sgnav_viz_jpeg_quality = int(args.sgnav_viz_jpeg_quality or get_nested(cfg, "visualization.sgnav_popup_jpeg_quality", 75))
+    args.debug_overlay_layers = bool(
+        args.debug_overlay_layers
+        if args.debug_overlay_layers is not None
+        else get_nested(cfg, "visualization.debug_overlay_layers", True)
+    )
+    args.save_overlay_layer_metadata = bool(
+        args.save_overlay_layer_metadata
+        if args.save_overlay_layer_metadata is not None
+        else get_nested(cfg, "visualization.save_overlay_layer_metadata", True)
+    )
+    args.show_gt_goal_cells = bool(
+        args.show_gt_goal_cells
+        if args.show_gt_goal_cells is not None
+        else get_nested(cfg, "visualization.show_gt_goal_cells", False)
+    )
+    args.show_frontier_member_cells = bool(
+        args.show_frontier_member_cells
+        if args.show_frontier_member_cells is not None
+        else get_nested(cfg, "visualization.show_frontier_member_cells", True)
+    )
+    args.show_object_nodes = bool(
+        args.show_object_nodes
+        if args.show_object_nodes is not None
+        else get_nested(cfg, "visualization.show_object_nodes", True)
+    )
+    args.show_candidate_markers = bool(
+        args.show_candidate_markers
+        if args.show_candidate_markers is not None
+        else get_nested(cfg, "visualization.show_candidate_markers", True)
+    )
+    args.max_green_like_primitives_before_warning = int(
+        args.max_green_like_primitives_before_warning
+        if args.max_green_like_primitives_before_warning is not None
+        else get_nested(cfg, "visualization.max_green_like_primitives_before_warning", 200)
+    )
     args.sgnav_mode = str(args.sgnav_mode or get_nested(cfg, "sgnav.mode", "legacy")).strip().lower()
     args.strict_benchmark = bool(
         args.strict_benchmark
@@ -2392,7 +2544,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     )
     args.mapping_debug = bool(args.mapping_debug if args.mapping_debug is not None else get_nested(cfg, "mapping.debug", False))
     args.frontier_min_cluster_size = int(args.frontier_min_cluster_size if args.frontier_min_cluster_size is not None else get_nested(cfg, "mapping.frontier_min_cluster_size", 1))
-    args.frontier_min_distance_m = float(args.frontier_min_distance_m if args.frontier_min_distance_m is not None else get_nested(cfg, "mapping.frontier_min_distance_m", 1.6))
+    args.frontier_min_distance_m = float(args.frontier_min_distance_m if args.frontier_min_distance_m is not None else get_nested(cfg, "mapping.frontier_min_distance_m", 1.0))
     args.frontier_max_count = int(args.frontier_max_count if args.frontier_max_count is not None else get_nested(cfg, "mapping.frontier_max_count", 0))
     args.frontier_obstacle_dilation_radius_cells = int(
         args.frontier_obstacle_dilation_radius_cells
@@ -2478,7 +2630,32 @@ def main(argv: Optional[List[str]] = None) -> int:
         default_robot_radius_m = 0.5 * float(get_nested(cfg, "robot.footprint_width_m", 0.28))
     args.robot_radius_m = float(args.robot_radius_m if args.robot_radius_m is not None else default_robot_radius_m)
     args.online_inflation_radius_m = float(args.online_inflation_radius_m if args.online_inflation_radius_m is not None else get_nested(cfg, "mapping.inflation_radius_m", 0.0))
-    args.room_map_mode = str(args.room_map_mode or get_nested(cfg, "mapping.room_map_mode", "observed_rooms_json"))
+    args.room_map_mode = str(args.room_map_mode or get_nested(cfg, "mapping.room_map_mode", "online_geometry_watershed"))
+    args.room_segmentation_config = dict(get_nested(cfg, "mapping.room_segmentation", {}) or {})
+    room_node_cfg = dict(get_nested(cfg, "sgnav.scene_graph.room_nodes", {}) or {})
+    args.room_label_backend = str(args.room_label_backend or room_node_cfg.get("room_label_backend", "vlm"))
+    args.room_label_allowed_categories = list(room_node_cfg.get("allowed_room_categories", DEFAULT_ROOM_CATEGORIES) or DEFAULT_ROOM_CATEGORIES)
+    args.room_label_min_confidence = float(
+        args.room_label_min_confidence
+        if args.room_label_min_confidence is not None
+        else room_node_cfg.get("room_label_min_confidence", 0.60)
+    )
+    args.room_label_ambiguity_margin = float(
+        args.room_label_ambiguity_margin
+        if args.room_label_ambiguity_margin is not None
+        else room_node_cfg.get("room_label_ambiguity_margin", 0.15)
+    )
+    args.room_label_min_reliable_objects = int(
+        args.room_label_min_reliable_objects
+        if args.room_label_min_reliable_objects is not None
+        else room_node_cfg.get("room_label_min_reliable_objects", 2)
+    )
+    args.room_label_unknown_category = str(args.room_label_unknown_category or room_node_cfg.get("unknown_category", "unknown"))
+    args.max_room_objects_in_prompt = int(
+        args.max_room_objects_in_prompt
+        if args.max_room_objects_in_prompt is not None
+        else room_node_cfg.get("max_room_objects_in_prompt", 25)
+    )
     args.detection_localization = str(args.detection_localization or get_nested(cfg, "perception.detection_localization", "static_map_ray"))
     args.min_depth_points_per_detection = int(args.min_depth_points_per_detection if args.min_depth_points_per_detection is not None else get_nested(cfg, "perception.min_depth_points_per_detection", 20))
     args.segmenter = str(args.segmenter or get_nested(cfg, "perception.segmenter", "none"))
@@ -2499,7 +2676,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         if args.instance_merge_iou_3d is not None
         else get_nested(cfg, "sgnav.perception.instance_merge_iou_3d", 0.15)
     )
-    args.frontier_distance_weight = float(args.frontier_distance_weight if args.frontier_distance_weight is not None else get_nested(cfg, "sgnav.frontier_distance_weight", 0.7))
+    args.frontier_distance_weight = float(args.frontier_distance_weight if args.frontier_distance_weight is not None else get_nested(cfg, "sgnav.frontier_distance_weight", 0.2))
     args.frontier_scenegraph_score_norm = str(
         args.frontier_scenegraph_score_norm
         if args.frontier_scenegraph_score_norm is not None
@@ -2563,7 +2740,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     args.stop_verification_min_hits = int(args.stop_verification_min_hits if args.stop_verification_min_hits is not None else get_nested(cfg, "sgnav.stop_verification_min_hits", 2))
     args.found_goal_stop_distance_m = float(args.found_goal_stop_distance_m if args.found_goal_stop_distance_m is not None else get_nested(cfg, "sgnav.found_goal_stop_distance_m", 0.35))
     args.require_sgnav_stop = bool(args.require_sgnav_stop if args.require_sgnav_stop is not None else get_nested(cfg, "episodes.success_requires_stop", True))
-    args.llm_enabled = bool(args.llm_enabled if args.llm_enabled is not None else get_nested(cfg, "llm.enabled", False))
+    args.llm_enabled = bool(args.llm_enabled if args.llm_enabled is not None else get_nested(cfg, "llm.enabled", True))
     args.llm_base_url = args.llm_base_url or get_nested(cfg, "llm.base_url", "http://127.0.0.1:8000/v1")
     args.llm_model = args.llm_model or get_nested(cfg, "llm.model", "qwen3-vl-8b-instruct")
     args.llm_api_key = args.llm_api_key or get_nested(cfg, "llm.api_key", "EMPTY")
