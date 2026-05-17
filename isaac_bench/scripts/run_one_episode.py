@@ -1014,6 +1014,7 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
             debug_overlay_layers=bool(args.debug_overlay_layers),
             save_overlay_layer_metadata=bool(args.save_overlay_layer_metadata),
             show_gt_goal_cells=bool(args.show_gt_goal_cells),
+            show_room_proposals=bool(args.show_room_proposals),
             show_room_masks=bool(args.show_room_masks),
             show_room_labels=bool(args.show_room_labels),
             show_frontier_member_cells=bool(args.show_frontier_member_cells),
@@ -1347,7 +1348,7 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
             last_room_context_metadata = result.metadata(full_order=False)
             setattr(scenegraph, "room_context_debug", dict(last_room_context_metadata))
             if viz is not None:
-                viz.set_room_context(last_room_masks, room_semantic_labels)
+                viz.set_room_context(last_room_masks, room_semantic_labels, last_room_segmentation_debug)
             return result
 
         panorama_steps = max(0, int(getattr(args, "panorama_steps", 0)))
@@ -2512,6 +2513,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--debug-overlay-layers", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--save-overlay-layer-metadata", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--show-gt-goal-cells", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--show-room-proposals", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--show-room-masks", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--show-room-labels", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--show-frontier-member-cells", action=argparse.BooleanOptionalAction, default=None)
@@ -2562,6 +2564,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         args.show_gt_goal_cells
         if args.show_gt_goal_cells is not None
         else get_nested(cfg, "visualization.show_gt_goal_cells", False)
+    )
+    args.show_room_proposals = bool(
+        args.show_room_proposals
+        if args.show_room_proposals is not None
+        else get_nested(cfg, "visualization.show_room_proposals", True)
     )
     args.show_room_masks = bool(
         args.show_room_masks

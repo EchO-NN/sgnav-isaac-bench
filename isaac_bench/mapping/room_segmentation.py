@@ -19,9 +19,15 @@ class RoomSegmentationConfig:
     enabled: bool = True
     source_grid: str = "online_depth_observed"
     update_every_steps: int = 5
+    proposal_mode: str = "distance_watershed"
+    finalization_mode: str = "doorway_constrained_merge"
+    use_structural_obstacle_mask: bool = True
+    suppress_furniture_obstacles: bool = True
     min_observed_free_cells: int = 50
     min_room_area_m2: float = 1.5
-    max_clutter_component_area_m2: float = 1.0
+    max_clutter_component_area_m2: float = 4.0
+    min_wall_line_length_m: float = 1.5
+    wall_like_aspect_ratio_min: float = 3.0
     morphology_close_radius_m: float = 0.20
     morphology_open_radius_m: float = 0.10
     distance_smooth_sigma_cells: float = 1.0
@@ -30,6 +36,13 @@ class RoomSegmentationConfig:
     doorway_width_min_m: float = 0.55
     doorway_width_max_m: float = 1.45
     doorway_clearance_max_m: float = 0.85
+    doorway_wall_support_min_ratio: float = 0.35
+    doorway_unknown_support_max_ratio: float = 0.20
+    doorway_endpoint_wall_distance_m: float = 0.35
+    doorway_neck_ratio_max: float = 0.55
+    open_boundary_merge: bool = True
+    merge_same_semantic_category: bool = True
+    merge_unknown_into_open_labeled_region: bool = True
     merge_wide_openings: bool = True
     small_segment_merge_area_m2: float = 1.2
     id_iou_threshold: float = 0.35
@@ -88,6 +101,46 @@ class ObjectRoomAssignment:
         }
 
 
+@dataclass
+class RoomAdjacencyEvidence:
+    room_a_label: int
+    room_b_label: int
+    boundary_cells: int
+    boundary_length_m: float
+    neck_width_m: float
+    min_clearance_m: float
+    mean_clearance_m: float
+    wall_support_left: float
+    wall_support_right: float
+    obstacle_support_ratio: float
+    unknown_support_ratio: float
+    endpoints_touch_structural_wall: bool
+    separates_large_regions: bool
+    verified_doorway: bool
+    merge_reason: str
+    boundary_cells_sample: List[List[int]] = field(default_factory=list)
+
+    def to_dict(self) -> dict:
+        return {
+            "room_a_label": int(self.room_a_label),
+            "room_b_label": int(self.room_b_label),
+            "boundary_cells": int(self.boundary_cells),
+            "boundary_length_m": float(self.boundary_length_m),
+            "neck_width_m": float(self.neck_width_m),
+            "min_clearance_m": float(self.min_clearance_m),
+            "mean_clearance_m": float(self.mean_clearance_m),
+            "wall_support_left": float(self.wall_support_left),
+            "wall_support_right": float(self.wall_support_right),
+            "obstacle_support_ratio": float(self.obstacle_support_ratio),
+            "unknown_support_ratio": float(self.unknown_support_ratio),
+            "endpoints_touch_structural_wall": bool(self.endpoints_touch_structural_wall),
+            "separates_large_regions": bool(self.separates_large_regions),
+            "verified_doorway": bool(self.verified_doorway),
+            "merge_reason": self.merge_reason,
+            "boundary_cells_sample": [list(map(int, cell)) for cell in self.boundary_cells_sample],
+        }
+
+
 class OnlineRoomSegmenter:
     def __init__(self, config: Optional[RoomSegmentationConfig | Mapping[str, object]] = None):
         if isinstance(config, RoomSegmentationConfig):
@@ -106,6 +159,7 @@ class OnlineRoomSegmenter:
         obstacle_mask: np.ndarray,
         unknown_mask: np.ndarray,
         step: int,
+        object_memory: Optional[Iterable[object]] = None,
     ) -> List[RoomMask]:
         if not self.config.enabled:
             self.last_debug = {"enabled": False, "room_count": 0}
@@ -116,12 +170,37 @@ class OnlineRoomSegmenter:
         if free.shape != occ.shape or free.shape != unknown.shape:
             raise ValueError("room segmentation masks must have the same HxW shape")
 
-        structural = build_structural_free_mask(free, occ, unknown, self.config)
-        room_masks = segment_room_masks(structural, unknown, self.config, step=int(step))
+        structural_obstacles, obstacle_debug = _build_structural_obstacle_mask_with_debug(
+            occ,
+            free,
+            unknown,
+            object_memory,
+            self.config,
+        )
+        free_for_rooms = free.copy()
+        if bool(self.config.use_structural_obstacle_mask):
+            free_for_rooms |= occ & ~structural_obstacles & ~unknown
+            obstacle_for_rooms = structural_obstacles
+        else:
+            obstacle_for_rooms = occ
+        structural = build_structural_free_mask(free_for_rooms, obstacle_for_rooms, unknown, self.config)
+        room_masks, seg_debug = segment_room_masks(
+            structural,
+            unknown,
+            self.config,
+            step=int(step),
+            structural_obstacle_mask=structural_obstacles,
+            return_debug=True,
+        )
         room_masks = self._assign_stable_ids(room_masks, int(step))
         self._previous = {room.room_id: room for room in room_masks}
         self._last_live_ids = {room.room_id for room in room_masks if not room.stale}
-        self.last_debug = room_segmentation_debug(room_masks, structural)
+        self.last_debug = room_segmentation_debug(
+            room_masks,
+            structural,
+            segmentation_debug=seg_debug,
+            structural_obstacle_debug=obstacle_debug,
+        )
         return room_masks
 
     def _assign_stable_ids(self, rooms: Sequence[RoomMask], step: int) -> List[RoomMask]:
@@ -192,6 +271,115 @@ class OnlineRoomSegmenter:
         return out
 
 
+MOVABLE_ROOM_CLUTTER_CATEGORIES = {
+    "armchair",
+    "bed",
+    "bench",
+    "cabinet",
+    "chair",
+    "couch",
+    "desk",
+    "dining_table",
+    "dresser",
+    "lamp",
+    "nightstand",
+    "ottoman",
+    "picture",
+    "plant",
+    "shelf",
+    "sofa",
+    "stool",
+    "table",
+    "television",
+    "tv",
+    "wardrobe",
+}
+
+
+def build_structural_obstacle_mask(
+    obstacle_mask: np.ndarray,
+    observed_free_mask: np.ndarray,
+    unknown_mask: np.ndarray,
+    object_memory: Optional[Iterable[object]],
+    config: RoomSegmentationConfig,
+) -> np.ndarray:
+    structural, _debug = _build_structural_obstacle_mask_with_debug(
+        obstacle_mask,
+        observed_free_mask,
+        unknown_mask,
+        object_memory,
+        config,
+    )
+    return structural
+
+
+def _build_structural_obstacle_mask_with_debug(
+    obstacle_mask: np.ndarray,
+    observed_free_mask: np.ndarray,
+    unknown_mask: np.ndarray,
+    object_memory: Optional[Iterable[object]],
+    config: RoomSegmentationConfig,
+) -> Tuple[np.ndarray, dict]:
+    obstacles = np.asarray(obstacle_mask, dtype=bool)
+    free = np.asarray(observed_free_mask, dtype=bool)
+    unknown = np.asarray(unknown_mask, dtype=bool)
+    if obstacles.shape != free.shape or obstacles.shape != unknown.shape:
+        raise ValueError("structural obstacle inputs must have the same HxW shape")
+    candidate_obstacles = obstacles & ~unknown
+    object_mask, object_categories = _object_clutter_mask(candidate_obstacles.shape, object_memory)
+    structural = np.zeros_like(candidate_obstacles, dtype=bool)
+    cell_area = float(config.resolution_m) ** 2
+    max_clutter_cells = max(1, int(round(float(config.max_clutter_component_area_m2) / max(cell_area, 1e-9))))
+    min_wall_line_cells = max(1, int(round(float(config.min_wall_line_length_m) / max(float(config.resolution_m), 1e-9))))
+    components_debug: List[dict] = []
+    for idx, component in enumerate(_connected_components(candidate_obstacles), start=1):
+        rows = np.asarray([cell[0] for cell in component], dtype=np.int32)
+        cols = np.asarray([cell[1] for cell in component], dtype=np.int32)
+        area_cells = int(len(component))
+        area_m2 = float(area_cells) * cell_area
+        height_cells = int(np.max(rows) - np.min(rows) + 1) if rows.size else 0
+        width_cells = int(np.max(cols) - np.min(cols) + 1) if cols.size else 0
+        long_axis = max(height_cells, width_cells)
+        short_axis = max(1, min(height_cells, width_cells))
+        aspect_ratio = float(long_axis) / float(short_axis)
+        comp_mask = np.zeros_like(candidate_obstacles, dtype=bool)
+        comp_mask[rows, cols] = True
+        overlap_categories = sorted({object_categories[cell] for cell in zip(rows.tolist(), cols.tolist()) if cell in object_categories})
+        overlap_object = bool(np.any(comp_mask & object_mask))
+        wall_like = bool(long_axis >= min_wall_line_cells and aspect_ratio >= float(config.wall_like_aspect_ratio_min))
+        compact_clutter = bool(area_cells <= max_clutter_cells and not wall_like)
+        kept_as_wall = bool(wall_like and not (bool(config.suppress_furniture_obstacles) and overlap_object))
+        if not kept_as_wall and not compact_clutter and area_cells > max_clutter_cells:
+            kept_as_wall = bool(aspect_ratio >= max(1.6, float(config.wall_like_aspect_ratio_min) * 0.65) and long_axis >= max(4, min_wall_line_cells // 2))
+        if kept_as_wall:
+            structural |= comp_mask
+        components_debug.append(
+            {
+                "component_index": int(idx),
+                "area_cells": int(area_cells),
+                "area_m2": float(area_m2),
+                "height_cells": int(height_cells),
+                "width_cells": int(width_cells),
+                "aspect_ratio": float(aspect_ratio),
+                "line_support": float(1.0 if wall_like else 0.0),
+                "kept_as_wall": bool(kept_as_wall),
+                "removed_as_clutter": bool(not kept_as_wall),
+                "overlap_object_categories": overlap_categories,
+            }
+        )
+    debug = {
+        "enabled": bool(config.use_structural_obstacle_mask),
+        "source": "structural_obstacle_filter",
+        "input_obstacle_cells": int(np.count_nonzero(obstacles)),
+        "unknown_obstacle_cells_ignored": int(np.count_nonzero(obstacles & unknown)),
+        "structural_obstacle_cells": int(np.count_nonzero(structural)),
+        "suppressed_obstacle_cells": int(np.count_nonzero(candidate_obstacles & ~structural)),
+        "object_clutter_cells": int(np.count_nonzero(object_mask)),
+        "components": components_debug,
+    }
+    return structural.astype(bool), debug
+
+
 def build_structural_free_mask(
     observed_free_mask: np.ndarray,
     obstacle_mask: np.ndarray,
@@ -203,12 +391,14 @@ def build_structural_free_mask(
     unknown = np.asarray(unknown_mask, dtype=bool)
     cell_area = float(config.resolution_m) ** 2
     max_clutter_cells = max(0, int(round(float(config.max_clutter_component_area_m2) / max(cell_area, 1e-9))))
-    if max_clutter_cells > 0 and np.any(obstacles):
+    if max_clutter_cells > 0 and np.any(obstacles) and not bool(config.use_structural_obstacle_mask):
         for component in _connected_components(obstacles):
             if len(component) <= max_clutter_cells:
                 for row, col in component:
                     if not unknown[row, col]:
                         free[row, col] = True
+    if bool(config.use_structural_obstacle_mask):
+        free &= ~obstacles
     free &= ~unknown
     close_radius = _radius_cells(config.morphology_close_radius_m, config.resolution_m)
     open_radius = _radius_cells(config.morphology_open_radius_m, config.resolution_m)
@@ -225,16 +415,22 @@ def segment_room_masks(
     unknown_mask: np.ndarray,
     config: RoomSegmentationConfig,
     step: int = 0,
-) -> List[RoomMask]:
+    structural_obstacle_mask: Optional[np.ndarray] = None,
+    proposal_semantic_labels: Optional[Mapping[int, str]] = None,
+    return_debug: bool = False,
+) -> List[RoomMask] | Tuple[List[RoomMask], dict]:
     free = np.asarray(structural_free_mask, dtype=bool)
     unknown = np.asarray(unknown_mask, dtype=bool)
+    structural_obstacles = np.asarray(structural_obstacle_mask, dtype=bool) if structural_obstacle_mask is not None else ~free & ~unknown
     if not np.any(free):
-        return []
+        debug = _empty_room_segmentation_debug()
+        return ([], debug) if return_debug else []
     min_cells = max(1, int(config.min_observed_free_cells))
     min_area_cells = max(1, int(round(float(config.min_room_area_m2) / max(float(config.resolution_m) ** 2, 1e-9))))
     components = _connected_components(free)
     if not components:
-        return []
+        debug = _empty_room_segmentation_debug()
+        return ([], debug) if return_debug else []
     if len(components) == 1:
         component_list = components
     else:
@@ -243,12 +439,49 @@ def segment_room_masks(
             component_list = [max(components, key=len)]
 
     all_rooms: List[RoomMask] = []
+    merged_debug: dict = {
+        "proposal_room_count": 0,
+        "final_room_count": 0,
+        "proposal_room_masks": [],
+        "merge_operations": [],
+        "doorway_edges": [],
+        "adjacency_evidence": [],
+    }
+    label_offset = 0
     for component in component_list:
         comp_mask = np.zeros_like(free, dtype=bool)
         for row, col in component:
             comp_mask[row, col] = True
         labels, distance_m = _watershed_component(comp_mask, config)
-        labels, doorway_edges = _refine_labels_by_doorways(labels, distance_m, config)
+        proposal_count = len([v for v in np.unique(labels) if int(v) > 0])
+        if str(config.finalization_mode).strip().lower() == "doorway_constrained_merge":
+            labels, finalization_debug, doorway_edges = merge_open_plan_proposals(
+                proposal_labels=labels,
+                structural_free_mask=free,
+                structural_obstacle_mask=structural_obstacles,
+                unknown_mask=unknown,
+                distance_m=distance_m,
+                config=config,
+                proposal_semantic_labels=proposal_semantic_labels,
+            )
+        else:
+            labels, doorway_edges = _refine_labels_by_doorways(labels, distance_m, config)
+            finalization_debug = {
+                "proposal_room_count": proposal_count,
+                "final_room_count": len([v for v in np.unique(labels) if int(v) > 0]),
+                "proposal_room_masks": _proposal_masks_debug(labels),
+                "merge_operations": [],
+                "doorway_edges": list(doorway_edges),
+                "adjacency_evidence": [],
+            }
+        merged_debug["proposal_room_count"] += int(finalization_debug.get("proposal_room_count", proposal_count) or 0)
+        merged_debug["merge_operations"].extend(list(finalization_debug.get("merge_operations") or []))
+        merged_debug["doorway_edges"].extend(list(finalization_debug.get("doorway_edges") or []))
+        merged_debug["adjacency_evidence"].extend(list(finalization_debug.get("adjacency_evidence") or []))
+        for item in list(finalization_debug.get("proposal_room_masks") or []):
+            proposal_item = dict(item)
+            proposal_item["component_index"] = int(len(merged_debug["proposal_room_masks"]) + 1)
+            merged_debug["proposal_room_masks"].append(proposal_item)
         for label_id in sorted(v for v in np.unique(labels) if int(v) > 0):
             mask = labels == label_id
             if not np.any(mask):
@@ -256,11 +489,237 @@ def segment_room_masks(
             if int(np.count_nonzero(mask)) < min_cells and len(all_rooms) > 0:
                 continue
             room = _room_from_mask("pending", mask, unknown, doorway_edges, config, step)
-            room.metadata["label_id"] = int(label_id)
+            room.metadata["label_id"] = int(label_id + label_offset)
+            room.metadata["source_finalization_mode"] = str(config.finalization_mode)
+            room.metadata["proposal_labels"] = sorted(
+                int(v) for v in np.unique(labels[mask]) if int(v) > 0
+            )
             all_rooms.append(room)
+        label_offset += max([int(v) for v in np.unique(labels) if int(v) > 0] or [0])
     if not all_rooms and np.any(free):
         all_rooms.append(_room_from_mask("pending", free, unknown, [], config, step))
-    return all_rooms
+    merged_debug["final_room_count"] = int(len(all_rooms))
+    if not merged_debug["proposal_room_masks"]:
+        merged_debug["proposal_room_masks"] = _proposal_masks_debug(free.astype(np.int32))
+        merged_debug["proposal_room_count"] = int(len(merged_debug["proposal_room_masks"]))
+    return (all_rooms, merged_debug) if return_debug else all_rooms
+
+
+def merge_open_plan_proposals(
+    proposal_labels: np.ndarray,
+    structural_free_mask: np.ndarray,
+    structural_obstacle_mask: np.ndarray,
+    unknown_mask: np.ndarray,
+    distance_m: np.ndarray,
+    config: RoomSegmentationConfig,
+    proposal_semantic_labels: Optional[Mapping[int, str]] = None,
+) -> Tuple[np.ndarray, dict, List[dict]]:
+    labels = np.asarray(proposal_labels, dtype=np.int32).copy()
+    positive = [int(v) for v in np.unique(labels) if int(v) > 0]
+    proposal_debug = _proposal_masks_debug(labels)
+    if len(positive) <= 1:
+        debug = {
+            "proposal_room_count": int(len(positive)),
+            "final_room_count": int(len(positive)),
+            "proposal_room_masks": proposal_debug,
+            "merge_operations": [],
+            "doorway_edges": [],
+            "adjacency_evidence": [],
+        }
+        return labels, debug, []
+
+    adjacency = _proposal_adjacency(labels)
+    parent = {label: label for label in positive}
+
+    def find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a: int, b: int) -> int:
+        ra, rb = find(a), find(b)
+        if ra == rb:
+            return ra
+        root = min(ra, rb)
+        other = max(ra, rb)
+        parent[other] = root
+        return root
+
+    merge_operations: List[dict] = []
+    doorway_edges: List[dict] = []
+    evidence_rows: List[dict] = []
+    semantic_labels = {int(k): str(v).strip().lower() for k, v in dict(proposal_semantic_labels or {}).items()}
+    for (a, b), boundary_cells in sorted(adjacency.items()):
+        evidence = compute_room_adjacency_evidence(
+            labels,
+            int(a),
+            int(b),
+            boundary_cells,
+            structural_free_mask,
+            structural_obstacle_mask,
+            unknown_mask,
+            distance_m,
+            config,
+        )
+        reason = evidence.merge_reason
+        sem_a = semantic_labels.get(int(a), "")
+        sem_b = semantic_labels.get(int(b), "")
+        if (
+            bool(config.merge_same_semantic_category)
+            and sem_a
+            and sem_b
+            and sem_a == sem_b
+            and not evidence.verified_doorway
+        ):
+            reason = "open_plan_no_verified_doorway_same_semantic_%s" % sem_a
+            evidence.merge_reason = reason
+        elif (
+            bool(config.merge_unknown_into_open_labeled_region)
+            and {sem_a, sem_b} & {"unknown", "unknown_room"}
+            and (sem_a or sem_b)
+            and not evidence.verified_doorway
+        ):
+            reason = "open_unknown_into_open_labeled_region"
+            evidence.merge_reason = reason
+        evidence_rows.append(evidence.to_dict())
+        if evidence.verified_doorway:
+            doorway_edges.append(
+                {
+                    "room_a_label": int(a),
+                    "room_b_label": int(b),
+                    "edge_type": "adjacent_via_doorway",
+                    "doorway_width_m": float(evidence.neck_width_m),
+                    "boundary_mean_clearance_m": float(evidence.mean_clearance_m),
+                    "source": "doorway_constrained_merge",
+                    "boundary_cells_sample": evidence.boundary_cells_sample,
+                    "confidence": float(
+                        np.clip(
+                            min(evidence.wall_support_left, evidence.wall_support_right)
+                            * (1.0 - evidence.unknown_support_ratio),
+                            0.0,
+                            1.0,
+                        )
+                    ),
+                }
+            )
+            continue
+        if bool(config.open_boundary_merge):
+            root = union(int(a), int(b))
+            merge_operations.append(
+                {
+                    "from_labels": [int(a), int(b)],
+                    "to_label": int(root),
+                    "to_room_id": None,
+                    "reason": reason,
+                    "boundary_cells": int(evidence.boundary_cells),
+                    "boundary_cells_sample": evidence.boundary_cells_sample,
+                }
+            )
+
+    root_to_final: Dict[int, int] = {}
+    next_label = 1
+    out = np.zeros_like(labels, dtype=np.int32)
+    final_members: Dict[int, List[int]] = {}
+    for label in positive:
+        root = find(label)
+        if root not in root_to_final:
+            root_to_final[root] = next_label
+            next_label += 1
+        final = root_to_final[root]
+        out[labels == label] = final
+        final_members.setdefault(final, []).append(label)
+    for op in merge_operations:
+        root = find(int(op["to_label"]))
+        op["to_label"] = int(root_to_final.get(root, root))
+        op["from_labels"] = sorted({int(v) for v in final_members.get(int(op["to_label"]), op["from_labels"])})
+    remapped_edges = []
+    for edge in doorway_edges:
+        a = root_to_final.get(find(int(edge["room_a_label"])))
+        b = root_to_final.get(find(int(edge["room_b_label"])))
+        if a is None or b is None or a == b:
+            continue
+        remapped_edges.append({**edge, "room_a_label": int(a), "room_b_label": int(b)})
+    debug = {
+        "proposal_mode": str(config.proposal_mode),
+        "finalization_mode": str(config.finalization_mode),
+        "proposal_room_count": int(len(positive)),
+        "final_room_count": int(len([v for v in np.unique(out) if int(v) > 0])),
+        "proposal_room_masks": proposal_debug,
+        "merge_operations": merge_operations,
+        "doorway_edges": remapped_edges,
+        "adjacency_evidence": evidence_rows,
+    }
+    return out, debug, remapped_edges
+
+
+def compute_room_adjacency_evidence(
+    labels: np.ndarray,
+    a: int,
+    b: int,
+    boundary_cells: Sequence[GridCell],
+    structural_free_mask: np.ndarray,
+    structural_obstacle_mask: np.ndarray,
+    unknown_mask: np.ndarray,
+    distance_m: np.ndarray,
+    config: RoomSegmentationConfig,
+) -> RoomAdjacencyEvidence:
+    unique_cells = sorted({(int(r), int(c)) for r, c in boundary_cells})
+    boundary_count = int(len(unique_cells))
+    resolution = float(config.resolution_m)
+    neck_width_m = max(resolution, math.sqrt(float(max(1, boundary_count))) * resolution)
+    clearances = [float(distance_m[cell]) for cell in unique_cells if np.isfinite(float(distance_m[cell]))]
+    min_clearance = float(np.min(clearances)) if clearances else 0.0
+    mean_clearance = float(np.mean(clearances)) if clearances else 0.0
+    boundary_mask = np.zeros_like(labels, dtype=bool)
+    for row, col in unique_cells:
+        if 0 <= row < labels.shape[0] and 0 <= col < labels.shape[1]:
+            boundary_mask[row, col] = True
+    support_radius = max(1, _radius_cells(config.doorway_endpoint_wall_distance_m, resolution))
+    support_region = _dilate(boundary_mask, support_radius)
+    support_area = max(1, int(np.count_nonzero(support_region)))
+    obstacle_support_ratio = float(np.count_nonzero(support_region & structural_obstacle_mask)) / float(support_area)
+    unknown_support_ratio = float(np.count_nonzero(support_region & unknown_mask)) / float(support_area)
+    endpoint_a, endpoint_b = _boundary_endpoints(unique_cells)
+    wall_support_left = _endpoint_wall_support(endpoint_a, structural_obstacle_mask, support_radius)
+    wall_support_right = _endpoint_wall_support(endpoint_b, structural_obstacle_mask, support_radius)
+    endpoints_touch_structural_wall = bool(wall_support_left > 0.0 and wall_support_right > 0.0)
+    separates_large_regions = _closing_boundary_separates(labels, int(a), int(b), unique_cells, structural_free_mask, config)
+    width_ok = float(config.doorway_width_min_m) <= neck_width_m <= float(config.doorway_width_max_m)
+    clearance_ok = mean_clearance <= float(config.doorway_clearance_max_m)
+    unknown_ok = unknown_support_ratio <= float(config.doorway_unknown_support_max_ratio)
+    wall_ok = endpoints_touch_structural_wall and max(wall_support_left, wall_support_right) >= float(config.doorway_wall_support_min_ratio)
+    verified = bool(width_ok and clearance_ok and unknown_ok and wall_ok and separates_large_regions)
+    if verified:
+        reason = "verified_structural_doorway"
+    elif not unknown_ok:
+        reason = "unknown_supported_boundary_not_wall"
+    elif not wall_ok:
+        reason = "open_plan_no_verified_doorway_poor_wall_support"
+    elif not width_ok and neck_width_m > float(config.doorway_width_max_m):
+        reason = "wide_open_boundary"
+    elif not separates_large_regions:
+        reason = "boundary_does_not_separate_rooms"
+    else:
+        reason = "open_plan_no_verified_doorway"
+    return RoomAdjacencyEvidence(
+        room_a_label=int(a),
+        room_b_label=int(b),
+        boundary_cells=boundary_count,
+        boundary_length_m=float(boundary_count) * resolution,
+        neck_width_m=float(neck_width_m),
+        min_clearance_m=float(min_clearance),
+        mean_clearance_m=float(mean_clearance),
+        wall_support_left=float(wall_support_left),
+        wall_support_right=float(wall_support_right),
+        obstacle_support_ratio=float(obstacle_support_ratio),
+        unknown_support_ratio=float(unknown_support_ratio),
+        endpoints_touch_structural_wall=bool(endpoints_touch_structural_wall),
+        separates_large_regions=bool(separates_large_regions),
+        verified_doorway=bool(verified),
+        merge_reason=reason,
+        boundary_cells_sample=[list(map(int, cell)) for cell in _sample_cells(unique_cells, 96)],
+    )
 
 
 def assign_objects_to_room_masks(
@@ -323,13 +782,34 @@ def assign_objects_to_room_masks(
     return assignments
 
 
-def room_segmentation_debug(room_masks: Sequence[RoomMask], structural_free_mask: Optional[np.ndarray] = None) -> dict:
-    return {
+def room_segmentation_debug(
+    room_masks: Sequence[RoomMask],
+    structural_free_mask: Optional[np.ndarray] = None,
+    segmentation_debug: Optional[Mapping[str, object]] = None,
+    structural_obstacle_debug: Optional[Mapping[str, object]] = None,
+) -> dict:
+    live = [room for room in room_masks if not room.stale]
+    base = {
         "source": "online_geometry_watershed",
-        "room_count": int(len([room for room in room_masks if not room.stale])),
+        "proposal_mode": "distance_watershed",
+        "finalization_mode": "doorway_constrained_merge",
+        "room_count": int(len(live)),
+        "final_room_count": int(len(live)),
+        "proposal_room_count": int(len(live)),
+        "merge_operations": [],
+        "doorway_edges": [],
+        "adjacency_evidence": [],
         "structural_free_cells": int(np.count_nonzero(structural_free_mask)) if structural_free_mask is not None else None,
         "rooms": [room_mask_to_dict(room, include_mask=False) for room in room_masks],
     }
+    if segmentation_debug:
+        base.update({key: value for key, value in dict(segmentation_debug).items() if key != "rooms"})
+        base["final_room_count"] = int(len(live))
+        base["room_count"] = int(len(live))
+    if structural_obstacle_debug:
+        base["structural_obstacle_mask"] = dict(structural_obstacle_debug)
+    _attach_room_ids_to_merge_debug(base, live)
+    return base
 
 
 def room_mask_to_dict(room: RoomMask, include_mask: bool = False) -> dict:
@@ -350,6 +830,27 @@ def room_mask_to_dict(room: RoomMask, include_mask: bool = False) -> dict:
     if include_mask:
         payload["mask"] = np.asarray(room.mask, dtype=bool).astype(np.uint8).tolist()
     return payload
+
+
+def _attach_room_ids_to_merge_debug(debug: dict, rooms: Sequence[RoomMask]) -> None:
+    label_to_room = {
+        int(room.metadata["label_id"]): room.room_id
+        for room in rooms
+        if isinstance(room.metadata, Mapping) and room.metadata.get("label_id") is not None
+    }
+    for op in list(debug.get("merge_operations") or []):
+        if not isinstance(op, dict):
+            continue
+        to_label = op.get("to_label")
+        if to_label is not None:
+            op["to_room_id"] = label_to_room.get(int(to_label), op.get("to_room_id"))
+    for edge in list(debug.get("doorway_edges") or []):
+        if not isinstance(edge, dict):
+            continue
+        if edge.get("room_a_label") is not None:
+            edge["room_a"] = label_to_room.get(int(edge["room_a_label"]))
+        if edge.get("room_b_label") is not None:
+            edge["room_b"] = label_to_room.get(int(edge["room_b_label"]))
 
 
 def _watershed_component(component_mask: np.ndarray, config: RoomSegmentationConfig) -> Tuple[np.ndarray, np.ndarray]:
@@ -642,6 +1143,149 @@ def _object_cells(obj: object, map_info: MapInfo) -> List[GridCell]:
                     if is_inside_grid(row, col, map_info):
                         cells.add((int(row), int(col)))
     return sorted(cells)
+
+
+def _object_clutter_mask(shape: Tuple[int, int], object_memory: Optional[Iterable[object]]) -> Tuple[np.ndarray, Dict[GridCell, str]]:
+    out = np.zeros(shape, dtype=bool)
+    categories: Dict[GridCell, str] = {}
+    if object_memory is None:
+        return out, categories
+    source = getattr(object_memory, "nodes", object_memory)
+    for obj in list(source or []):
+        category = str(getattr(obj, "category", getattr(obj, "caption", ""))).strip().lower().replace(" ", "_")
+        if category not in MOVABLE_ROOM_CLUTTER_CATEGORIES:
+            continue
+        cells: set[GridCell] = set()
+        center_grid = getattr(obj, "center_grid", None)
+        if center_grid is not None:
+            cells.add((int(center_grid[0]), int(center_grid[1])))
+        mask = getattr(obj, "last_mask", None)
+        if mask is not None:
+            arr = np.asarray(mask, dtype=bool)
+            if arr.shape == tuple(shape):
+                for row, col in zip(*np.nonzero(arr)):
+                    cells.add((int(row), int(col)))
+        for row, col in cells:
+            for dr, dc in _disk_offsets(2):
+                rr, cc = int(row + dr), int(col + dc)
+                if 0 <= rr < shape[0] and 0 <= cc < shape[1]:
+                    out[rr, cc] = True
+                    categories[(rr, cc)] = category
+    return out, categories
+
+
+def _proposal_adjacency(labels: np.ndarray) -> Dict[Tuple[int, int], List[GridCell]]:
+    arr = np.asarray(labels, dtype=np.int32)
+    adjacency: Dict[Tuple[int, int], List[GridCell]] = {}
+    h, w = arr.shape
+    for row in range(h):
+        for col in range(w):
+            a = int(arr[row, col])
+            if a <= 0:
+                continue
+            for dr, dc in ((1, 0), (0, 1)):
+                rr, cc = row + dr, col + dc
+                if rr >= h or cc >= w:
+                    continue
+                b = int(arr[rr, cc])
+                if b <= 0 or b == a:
+                    continue
+                key = tuple(sorted((a, b)))
+                adjacency.setdefault(key, []).append((row, col))
+                adjacency.setdefault(key, []).append((rr, cc))
+    return adjacency
+
+
+def _proposal_masks_debug(labels: np.ndarray) -> List[dict]:
+    arr = np.asarray(labels, dtype=np.int32)
+    out = []
+    for label in sorted(int(v) for v in np.unique(arr) if int(v) > 0):
+        mask = arr == label
+        rr, cc = np.nonzero(mask)
+        if rr.size == 0:
+            continue
+        out.append(
+            {
+                "label_id": int(label),
+                "cell_count": int(rr.size),
+                "bbox": [int(np.min(rr)), int(np.min(cc)), int(np.max(rr)) + 1, int(np.max(cc)) + 1],
+                "mask": mask.astype(np.uint8).tolist(),
+            }
+        )
+    return out
+
+
+def _empty_room_segmentation_debug() -> dict:
+    return {
+        "proposal_mode": "distance_watershed",
+        "finalization_mode": "doorway_constrained_merge",
+        "proposal_room_count": 0,
+        "final_room_count": 0,
+        "proposal_room_masks": [],
+        "merge_operations": [],
+        "doorway_edges": [],
+        "adjacency_evidence": [],
+    }
+
+
+def _boundary_endpoints(cells: Sequence[GridCell]) -> Tuple[GridCell, GridCell]:
+    if not cells:
+        return (0, 0), (0, 0)
+    if len(cells) == 1:
+        return cells[0], cells[0]
+    arr = np.asarray(cells, dtype=np.float32)
+    span_r = float(np.max(arr[:, 0]) - np.min(arr[:, 0]))
+    span_c = float(np.max(arr[:, 1]) - np.min(arr[:, 1]))
+    order_axis = 0 if span_r >= span_c else 1
+    order = np.argsort(arr[:, order_axis])
+    first = cells[int(order[0])]
+    last = cells[int(order[-1])]
+    return first, last
+
+
+def _endpoint_wall_support(endpoint: GridCell, structural_obstacle_mask: np.ndarray, radius_cells: int) -> float:
+    row, col = int(endpoint[0]), int(endpoint[1])
+    h, w = structural_obstacle_mask.shape
+    cells = 0
+    hits = 0
+    for dr, dc in _disk_offsets(max(1, int(radius_cells))):
+        rr, cc = row + dr, col + dc
+        if 0 <= rr < h and 0 <= cc < w:
+            cells += 1
+            if structural_obstacle_mask[rr, cc]:
+                hits += 1
+    if cells <= 0 or hits <= 0:
+        return 0.0
+    return 1.0
+
+
+def _closing_boundary_separates(
+    labels: np.ndarray,
+    a: int,
+    b: int,
+    boundary_cells: Sequence[GridCell],
+    structural_free_mask: np.ndarray,
+    config: RoomSegmentationConfig,
+) -> bool:
+    region = (labels == int(a)) | (labels == int(b))
+    if not np.any(region):
+        return False
+    closed = np.asarray(structural_free_mask, dtype=bool) & region
+    for row, col in boundary_cells:
+        if 0 <= row < closed.shape[0] and 0 <= col < closed.shape[1]:
+            closed[row, col] = False
+    components = _connected_components(closed)
+    min_cells = max(1, int(round(float(config.small_segment_merge_area_m2) / max(float(config.resolution_m) ** 2, 1e-9))))
+    large = [comp for comp in components if len(comp) >= min_cells]
+    return len(large) >= 2
+
+
+def _sample_cells(cells: Sequence[GridCell], max_cells: int) -> List[GridCell]:
+    src = list(cells)
+    if len(src) <= int(max_cells):
+        return src
+    stride = max(1, len(src) // int(max_cells))
+    return src[::stride][: int(max_cells)]
 
 
 def _connected_components(mask: np.ndarray) -> List[List[GridCell]]:

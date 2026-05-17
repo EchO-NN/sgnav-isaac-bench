@@ -174,6 +174,7 @@ def test_config_defaults_match_benchmark_contract():
     assert cfg["mapping"]["frontier_allow_near_fallback"] is False
     assert cfg["mapping"]["frontier_min_distance_m"] == 1.0
     assert cfg["mapping"]["room_map_mode"] == "online_geometry_watershed"
+    assert cfg["mapping"]["room_segmentation"]["finalization_mode"] == "doorway_constrained_merge"
     assert cfg["sgnav"]["frontier_distance_weight"] == 0.2
     assert cfg["llm"]["enabled"] is True
 

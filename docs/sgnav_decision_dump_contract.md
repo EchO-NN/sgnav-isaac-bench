@@ -35,8 +35,10 @@ Every dump artifact must include:
   counts, and the testable call order
   `frontier_extraction -> room_context_for_frontier_scoring -> scenegraph_update
   -> hcot_subgraph_scoring -> frontier_interpolation -> frontier_selection`.
-- `room_segmentation` records online geometry room masks, doorway metadata,
-  partial state, and mask confidence.
+- `room_segmentation` records online geometry room masks, structural obstacle
+  filtering, proposal/final room counts, doorway metadata, adjacency evidence,
+  merge operations, proposal-vs-final debug layers, partial state, and mask
+  confidence.
 - `room_semantics` records VLM/LLM room labels, allowed categories, `unknown`
   reasons, `vlm_self_confidence`, evidence-derived `label_reliability`,
   reliability factors, and backend state.

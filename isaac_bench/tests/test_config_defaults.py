@@ -11,5 +11,10 @@ def test_required_sgnav_defaults():
     assert cfg["perception"]["min_valid_detection_confidence"] == 0.65
     assert cfg["sgnav"]["candidate_start_min_confidence"] == 0.65
     assert cfg["mapping"]["room_map_mode"] == "online_geometry_watershed"
+    assert cfg["mapping"]["room_segmentation"]["proposal_mode"] == "distance_watershed"
+    assert cfg["mapping"]["room_segmentation"]["finalization_mode"] == "doorway_constrained_merge"
+    assert cfg["mapping"]["room_segmentation"]["use_structural_obstacle_mask"] is True
+    assert cfg["mapping"]["room_segmentation"]["max_clutter_component_area_m2"] == 4.0
     assert cfg["sgnav"]["scene_graph"]["room_nodes"]["source"] == "online_geometry_watershed_vlm"
     assert cfg["visualization"]["show_gt_goal_cells"] is False
+    assert cfg["visualization"]["show_room_proposals"] is True

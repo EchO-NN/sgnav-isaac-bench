@@ -32,6 +32,7 @@ visualization:
   debug_overlay_layers: true
   save_overlay_layer_metadata: true
   show_gt_goal_cells: false
+  show_room_proposals: true
   show_room_masks: true
   show_room_labels: true
   show_frontier_member_cells: true
@@ -165,10 +166,16 @@ mapping:
   room_segmentation:
     enabled: true
     source_grid: online_depth_observed
+    proposal_mode: distance_watershed
+    finalization_mode: doorway_constrained_merge
+    use_structural_obstacle_mask: true
+    suppress_furniture_obstacles: true
     update_every_steps: 5
     min_observed_free_cells: 50
     min_room_area_m2: 1.5
-    max_clutter_component_area_m2: 1.0
+    max_clutter_component_area_m2: 4.0
+    min_wall_line_length_m: 1.5
+    wall_like_aspect_ratio_min: 3.0
     morphology_close_radius_m: 0.20
     morphology_open_radius_m: 0.10
     distance_smooth_sigma_cells: 1.0
@@ -177,6 +184,13 @@ mapping:
     doorway_width_min_m: 0.55
     doorway_width_max_m: 1.45
     doorway_clearance_max_m: 0.85
+    doorway_wall_support_min_ratio: 0.35
+    doorway_unknown_support_max_ratio: 0.20
+    doorway_endpoint_wall_distance_m: 0.35
+    doorway_neck_ratio_max: 0.55
+    open_boundary_merge: true
+    merge_same_semantic_category: true
+    merge_unknown_into_open_labeled_region: true
     merge_wide_openings: true
     small_segment_merge_area_m2: 1.2
     id_iou_threshold: 0.35

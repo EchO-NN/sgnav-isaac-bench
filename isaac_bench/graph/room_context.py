@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import hashlib
+import inspect
 import json
 from typing import Dict, Mapping, Optional, Sequence
 
@@ -154,12 +155,19 @@ def prepare_room_context_for_frontier_scoring(
         cache.last_result = result
         return result
 
+    update_kwargs = {"step": int(step_idx)}
+    try:
+        update_params = inspect.signature(room_segmenter.update).parameters
+    except (TypeError, ValueError):
+        update_params = {}
+    if "object_memory" in update_params:
+        update_kwargs["object_memory"] = getattr(object_memory, "nodes", [])
     room_masks = room_segmenter.update(
         occupancy_arr,
         free_arr,
         obstacle_arr,
         unknown_arr,
-        step=int(step_idx),
+        **update_kwargs,
     )
     seg_debug = dict(room_segmenter.last_debug or room_segmentation_debug(room_masks))
     assignments = assign_objects_to_room_masks(getattr(object_memory, "nodes", []), room_masks, map_info)

@@ -19,12 +19,22 @@ online RGB-D occupancy/free-space state:
 - `obstacle_mask`
 - `unknown_mask`
 
-It builds a structural free-space mask from observed free cells, suppresses
-small clutter only for room segmentation, applies close/open morphology,
-segments connected components with distance-transform seeds plus watershed or
-deterministic seeded region growing, refines splits with doorway-width
-metadata, merges tiny clutter fragments, and preserves stable room IDs by
-mask IoU/centroid matching.
+It first builds a structural obstacle/free-space mask from observed free cells.
+Furniture and movable-object clutter are suppressed before room segmentation:
+compact depth blobs and object-memory detections such as chairs, sofas, tables,
+beds, TVs, plants, pictures, lamps, and cabinets are not allowed to split
+rooms. Unknown cells are not treated as structural wall support.
+
+Distance-transform watershed or deterministic seeded region growing is used
+only to create room proposals. Final room masks come from a
+doorway-constrained merge pass: adjacent proposals are kept separate only when
+there is verified physical doorway/gateway evidence, including a narrow neck,
+low unknown support, structural wall support at both doorway endpoints, and a
+separation test showing that closing the gateway creates two meaningful
+free-space components. Open-plan proposal boundaries, furniture-caused
+boundaries, same-semantic room proposals, and unknown proposals adjacent to an
+open labeled room merge into one physical room node. Stable room IDs are then
+preserved by mask IoU/centroid matching.
 
 Each `RoomMask` records `source=online_geometry_watershed`, area, centroid,
 observed cells, boundary unknown fraction, doorway edges, confidence, partial

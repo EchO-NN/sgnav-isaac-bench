@@ -40,6 +40,7 @@ class SGNavPopupVisualizer:
         debug_overlay_layers: bool = True,
         save_overlay_layer_metadata: bool = True,
         show_gt_goal_cells: bool = False,
+        show_room_proposals: bool = True,
         show_room_masks: bool = True,
         show_room_labels: bool = True,
         show_frontier_member_cells: bool = True,
@@ -57,6 +58,7 @@ class SGNavPopupVisualizer:
         self.debug_overlay_layers = bool(debug_overlay_layers)
         self.save_overlay_layer_metadata = bool(save_overlay_layer_metadata)
         self.show_gt_goal_cells = bool(show_gt_goal_cells)
+        self.show_room_proposals = bool(show_room_proposals)
         self.show_room_masks = bool(show_room_masks)
         self.show_room_labels = bool(show_room_labels)
         self.show_frontier_member_cells = bool(show_frontier_member_cells)
@@ -67,6 +69,7 @@ class SGNavPopupVisualizer:
         self._last_overlay_layers: List[dict] = []
         self._room_masks: List[object] = []
         self._room_semantic_labels: dict[str, object] = {}
+        self._room_segmentation_debug: dict = {}
         self._proc: Optional[subprocess.Popen[str]] = None
         self._ipc_dir = Path(tempfile.gettempdir()) / ("sgnav_viz_%d" % os.getpid())
         self._frame_path = self._ipc_dir / "latest.jpg"
@@ -74,9 +77,15 @@ class SGNavPopupVisualizer:
         if self.save_dir:
             self.save_dir.mkdir(parents=True, exist_ok=True)
 
-    def set_room_context(self, room_masks: Sequence[object], room_semantic_labels: Optional[Mapping[str, object]] = None) -> None:
+    def set_room_context(
+        self,
+        room_masks: Sequence[object],
+        room_semantic_labels: Optional[Mapping[str, object]] = None,
+        room_segmentation_debug: Optional[Mapping[str, object]] = None,
+    ) -> None:
         self._room_masks = list(room_masks or [])
         self._room_semantic_labels = dict(room_semantic_labels or {})
+        self._room_segmentation_debug = dict(room_segmentation_debug or {})
 
     def _try_open_window(self) -> None:
         if not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
@@ -421,6 +430,15 @@ class SGNavPopupVisualizer:
         base[occupancy.astype(bool)] = (24, 24, 24)
         base[~obs] = (base[~obs].astype(np.float32) * 0.45 + np.array([20, 24, 34], dtype=np.float32)).astype(np.uint8)
         active_room_masks = self._active_room_masks(occupancy.shape)
+        proposal_room_masks = self._proposal_room_masks(occupancy.shape)
+        proposal_room_cell_count = 0
+        if self.show_room_proposals and proposal_room_masks:
+            base, proposal_room_cell_count = self._apply_boolean_mask_overlay(
+                base,
+                proposal_room_masks,
+                alpha=0.16,
+                boundary_only=True,
+            )
         room_mask_cell_count = 0
         room_boundary_cell_count = 0
         if self.show_room_masks and active_room_masks:
@@ -450,24 +468,26 @@ class SGNavPopupVisualizer:
         draw = ImageDraw.Draw(image)
         layers: List[dict] = []
 
-        def record(name: str, enabled: bool, color: Tuple[int, int, int], count: int, note: str = "") -> None:
-            layers.append(
-                {
-                    "name": name,
-                    "enabled": bool(enabled),
-                    "color": [int(color[0]), int(color[1]), int(color[2])],
-                    "primitive_count": int(count),
-                    "green_like": bool(_is_green_like(color)),
-                    "note": note,
-                }
-            )
+        def record(name: str, enabled: bool, color: Tuple[int, int, int], count: int, note: str = "", **extra) -> None:
+            item = {
+                "name": name,
+                "enabled": bool(enabled),
+                "color": [int(color[0]), int(color[1]), int(color[2])],
+                "primitive_count": int(count),
+                "green_like": bool(_is_green_like(color)),
+                "note": note,
+            }
+            item.update(extra)
+            layers.append(item)
 
         def xy(cell: GridCell) -> Tuple[int, int]:
             r, c = int(cell[0]), int(cell[1])
             return int(ox + (c - c0 + 0.5) * scale), int(oy + (r - r0 + 0.5) * scale)
 
         room_color = (145, 110, 255)
+        record("proposal_room_masks", self.show_room_proposals, (150, 150, 160), proposal_room_cell_count, "watershed/proposal basins before doorway-constrained merge")
         record("room_masks", self.show_room_masks, room_color, room_mask_cell_count, "online geometry room mask fill")
+        record("final_room_masks", self.show_room_masks, room_color, room_mask_cell_count, "post-merge room masks used by SG-Nav")
         record("room_boundaries", self.show_room_masks, room_color, room_boundary_cell_count, "online geometry room mask boundary")
         room_label_count = self._draw_room_labels(
             draw,
@@ -476,6 +496,23 @@ class SGNavPopupVisualizer:
             crop_bounds=(r0, r1, c0, c1),
         ) if self.show_room_labels else 0
         record("room_labels", self.show_room_labels, (250, 250, 255), room_label_count, "VLM room category and reliability")
+        merged_count, doorway_count, merge_reasons = self._draw_room_adjacency_debug_lines(draw, xy, (r0, r1, c0, c1))
+        record(
+            "room_merged_boundaries",
+            merged_count > 0,
+            (150, 150, 155),
+            merged_count,
+            "dashed proposal boundaries removed by doorway-constrained merge",
+            adjacency_merge_reasons=merge_reasons,
+        )
+        record(
+            "room_doorway_cuts",
+            doorway_count > 0,
+            (255, 170, 40),
+            doorway_count,
+            "bold verified doorway/gateway cuts preserved as room splits",
+            adjacency_merge_reasons=[item for item in merge_reasons if item.get("verified_doorway")],
+        )
 
         goal_color = (30, 220, 80)
         goal_count = self._draw_cells(draw, goal_cells, xy, goal_color, radius=2, max_cells=500) if self.show_gt_goal_cells else 0
@@ -747,6 +784,40 @@ class SGNavPopupVisualizer:
             out.append(room)
         return out
 
+    def _proposal_room_masks(self, shape: Tuple[int, int]) -> List[np.ndarray]:
+        out: List[np.ndarray] = []
+        for item in list(self._room_segmentation_debug.get("proposal_room_masks") or []):
+            if not isinstance(item, Mapping):
+                continue
+            raw_mask = item.get("mask")
+            if raw_mask is None:
+                continue
+            arr = np.asarray(raw_mask, dtype=bool)
+            if arr.shape != tuple(shape) or not np.any(arr):
+                continue
+            out.append(arr)
+        return out
+
+    def _apply_boolean_mask_overlay(
+        self,
+        base: np.ndarray,
+        masks: Sequence[np.ndarray],
+        alpha: float,
+        boundary_only: bool = False,
+    ) -> Tuple[np.ndarray, int]:
+        out = np.asarray(base, dtype=np.uint8).copy()
+        total_cells = 0
+        for idx, mask in enumerate(masks[:96]):
+            arr = np.asarray(mask, dtype=bool)
+            if arr.shape != out.shape[:2] or not np.any(arr):
+                continue
+            draw_mask = self._mask_boundary(arr) if boundary_only else arr
+            total_cells += int(np.count_nonzero(draw_mask))
+            color = np.asarray(self._room_color(idx), dtype=np.float32)
+            blended = out[draw_mask].astype(np.float32) * (1.0 - float(alpha)) + color[None, :] * float(alpha)
+            out[draw_mask] = np.clip(blended, 0, 255).astype(np.uint8)
+        return out, total_cells
+
     def _apply_room_mask_overlay(self, base: np.ndarray, room_masks: Sequence[object]) -> Tuple[np.ndarray, int, int]:
         out = np.asarray(base, dtype=np.uint8).copy()
         total_mask_cells = 0
@@ -802,6 +873,45 @@ class SGNavPopupVisualizer:
             count += 1
         return count
 
+    def _draw_room_adjacency_debug_lines(self, draw: ImageDraw.ImageDraw, xy_func, crop_bounds: Tuple[int, int, int, int]) -> Tuple[int, int, List[dict]]:
+        r0, r1, c0, c1 = crop_bounds
+        merged_count = 0
+        doorway_count = 0
+        reasons: List[dict] = []
+        for item in list(self._room_segmentation_debug.get("adjacency_evidence") or []):
+            if not isinstance(item, Mapping):
+                continue
+            cells = []
+            for raw_cell in list(item.get("boundary_cells_sample") or []):
+                try:
+                    row, col = int(raw_cell[0]), int(raw_cell[1])
+                except Exception:
+                    continue
+                if r0 <= row < r1 and c0 <= col < c1:
+                    cells.append((row, col))
+            if not cells:
+                continue
+            verified = bool(item.get("verified_doorway", False))
+            reason = str(item.get("merge_reason", ""))
+            reasons.append(
+                {
+                    "room_a_label": item.get("room_a_label"),
+                    "room_b_label": item.get("room_b_label"),
+                    "verified_doorway": verified,
+                    "merge_reason": reason,
+                }
+            )
+            if verified:
+                for cell in cells:
+                    self._dot(draw, xy_func(cell), (255, 170, 40), radius=3)
+                    doorway_count += 1
+            else:
+                for idx, cell in enumerate(cells):
+                    if idx % 2 == 0:
+                        self._dot(draw, xy_func(cell), (150, 150, 155), radius=2)
+                        merged_count += 1
+        return merged_count, doorway_count, reasons
+
     def _room_center_cell(self, room: object) -> Optional[GridCell]:
         metadata = getattr(room, "metadata", {}) or {}
         if isinstance(metadata, Mapping) and metadata.get("centroid_grid") is not None:
@@ -830,11 +940,11 @@ class SGNavPopupVisualizer:
             category = str(getattr(label, "category", "unknown"))
             reliability = getattr(label, "label_reliability", getattr(label, "confidence", None))
         if reliability is None:
-            return "%s:%s" % (room_id, category)
+            return "%s | %s" % (room_id, category)
         try:
-            return "%s:%s %.2f" % (room_id, category, float(reliability))
+            return "%s | %s | reliability=%.2f" % (room_id, category, float(reliability))
         except Exception:
-            return "%s:%s" % (room_id, category)
+            return "%s | %s" % (room_id, category)
 
     @staticmethod
     def _room_color(idx: int) -> Tuple[int, int, int]:
