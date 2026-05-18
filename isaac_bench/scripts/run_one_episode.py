@@ -35,6 +35,11 @@ from isaac_bench.mapping.room_segmentation import (
     RoomSegmentationConfig,
 )
 from isaac_bench.mapping.rose2_room_segmentation import OnlineROSE2RoomSegmenter
+from isaac_bench.mapping.upstream_rose2_pure_python_adapter import (
+    UPSTREAM_ALGORITHM,
+    UpstreamROSE2Config,
+    UpstreamROSE2PurePythonSegmenter,
+)
 from isaac_bench.graph.room_semantics import (
     DEFAULT_ROOM_CATEGORIES,
     VLMRoomLabeler,
@@ -139,6 +144,13 @@ def apply_success_distance_override(episode: dict, args) -> dict:
     metadata["runtime_success_distance_override_m"] = success_distance
     updated["metadata"] = metadata
     return updated
+
+
+def effective_perception_every_steps(detector_name: str | None, requested_steps: int | None) -> int:
+    requested = max(1, int(requested_steps or 1))
+    if str(detector_name or "").strip().lower() == "yolo_world":
+        return 1
+    return requested
 
 
 def load_episode_goal_objects(scene_dir: Path, episode: Mapping[str, object]) -> List[Mapping[str, object]]:
@@ -623,6 +635,9 @@ def final_log_row(row: dict) -> dict:
         "gt_success_region_reached",
         "gt_success_without_sgnav_stop_steps",
         "stop_blocked_reason",
+        "mapping_latency_ms",
+        "mapping_latency_breakdown_avg_ms",
+        "mapping_latency_breakdown_counts",
     ):
         if key in row:
             out[key] = row.get(key)
@@ -816,6 +831,7 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
         min_geometry_confidence=float(args.min_geometry_confidence),
         partial_stability_min_observations=int(args.partial_stability_min_observations),
         mask_iou_association_threshold=float(args.mask_iou_association_threshold),
+        mask_containment_track_match_threshold=float(args.mask_containment_track_match_threshold),
         footprint_iou_association_threshold=float(args.footprint_iou_association_threshold),
         child_containment_threshold=float(args.child_containment_threshold),
         child_area_ratio_threshold=float(args.child_area_ratio_threshold),
@@ -899,6 +915,7 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
         max_wz=float(args.max_wz_radps),
         lookahead_m=float(args.lookahead_m),
     )
+    vertical_or_free_cfg = dict(getattr(args, "room_segmentation_config", {}).get("vertical_or_free", {}) or {})
     mapper = OnlineMapper(
         size_m=float(args.online_map_size_m),
         resolution_m=float(args.online_resolution_m),
@@ -909,6 +926,8 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
         obstacle_max_height_m=float(args.obstacle_max_height_m),
         free_min_height_m=float(args.free_min_height_m),
         free_max_height_m=float(args.free_max_height_m),
+        vertical_profile_free_min_height_m=float(vertical_or_free_cfg.get("z_min_m", 0.20)),
+        vertical_profile_free_max_height_m=float(vertical_or_free_cfg.get("z_max_m", 2.00)),
         splat_point_threshold=int(args.splat_point_threshold),
         free_splat_point_threshold=int(args.free_splat_point_threshold),
         robot_radius_m=float(args.robot_radius_m),
@@ -942,7 +961,7 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
     room_context_cache = RoomContextCache()
     last_room_context_result: Optional[RoomContextResult] = None
     last_room_context_metadata = room_context_not_invoked_metadata()
-    last_room_segmentation_debug = {"source": "rose2_structure", "algorithm": "rose2_structure", "room_count": 0, "rooms": []}
+    last_room_segmentation_debug = {"source": UPSTREAM_ALGORITHM, "algorithm": UPSTREAM_ALGORITHM, "room_count": 0, "rooms": []}
     last_room_semantics_debug = {
         "backend": "unavailable",
         "allowed_categories": list(getattr(args, "room_label_allowed_categories", DEFAULT_ROOM_CATEGORIES)),
@@ -951,11 +970,41 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
     if room_map_mode in {"observed_rooms_json", "rooms_json", "observed"}:
         if bool(getattr(args, "strict_benchmark", False)):
             raise BenchmarkAssetError(
-                "strict SG-Nav metric path requires online_rose2_structure room masks; rooms.json/oracle room maps are not allowed"
+                "strict SG-Nav metric path requires upstream_rose2_vertical_or_free room masks; rooms.json/oracle room maps are not allowed"
             )
         full_room_map = build_sgnav_room_map(scene_dir, dynamic_map_info)
         scenegraph.update(object_memory, room_map=full_room_map)
+    elif room_map_mode in {"upstream_rose2_vertical_or_free", "upstream_rose2_vertical_or_free_vlm", "upstream_rose2_pure_python", "upstream_rose2_pure_python_vlm"}:
+        upstream_cfg = UpstreamROSE2Config.from_mapping(
+            getattr(args, "room_segmentation_config", {}),
+            resolution_m=float(dynamic_map_info.resolution_m),
+            fail_on_missing_source=bool(getattr(args, "strict_benchmark", False))
+            and not bool(getattr(args, "allow_debug_fallbacks", False))
+            and bool(getattr(args, "room_segmentation_config", {}).get("require_upstream_source_for_strict", True)),
+        )
+        room_segmenter = UpstreamROSE2PurePythonSegmenter(upstream_cfg, dynamic_map_info)
+        room_label_client = (
+            getattr(scenegraph, "paper_llm_client", None)
+            if str(getattr(args, "room_label_backend", "vlm")).strip().lower() == "vlm"
+            else None
+        )
+        room_labeler = VLMRoomLabeler(
+            client=room_label_client,
+            allowed_categories=getattr(args, "room_label_allowed_categories", DEFAULT_ROOM_CATEGORIES),
+            min_confidence=float(getattr(args, "room_label_min_confidence", 0.60)),
+            ambiguity_margin=float(getattr(args, "room_label_ambiguity_margin", 0.15)),
+            min_reliable_objects=int(getattr(args, "room_label_min_reliable_objects", 2)),
+            unknown_category=str(getattr(args, "room_label_unknown_category", "unknown")),
+            require_backend=bool(getattr(args, "strict_benchmark", False))
+            and str(getattr(args, "room_label_backend", "vlm")).strip().lower() == "vlm",
+            max_room_objects_in_prompt=int(getattr(args, "max_room_objects_in_prompt", 25)),
+        )
+        last_room_semantics_debug["backend"] = room_labeler.backend
     elif room_map_mode in {"online_rose2_structure", "rose2_structure", "online_rose2_structure_vlm"}:
+        if bool(getattr(args, "strict_benchmark", False)) and str(getattr(args, "ablation_name", "") or "") != "local_rose2_lite_room_ablation":
+            raise BenchmarkAssetError(
+                "strict SG-Nav metric path requires upstream_rose2_vertical_or_free room masks; local ROSE2-lite is debug/ablation-only"
+            )
         room_cfg = RoomSegmentationConfig.from_mapping(
             getattr(args, "room_segmentation_config", {}),
             resolution_m=float(dynamic_map_info.resolution_m),
@@ -982,7 +1031,7 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
     elif room_map_mode in {"online_geometry_watershed", "online_geometry_watershed_vlm"}:
         if bool(getattr(args, "strict_benchmark", False)) and str(getattr(args, "ablation_name", "") or "") != "legacy_watershed_room_ablation":
             raise BenchmarkAssetError(
-                "strict SG-Nav metric path requires online_rose2_structure room masks; watershed is debug/ablation-only"
+                "strict SG-Nav metric path requires upstream_rose2_vertical_or_free room masks; watershed is debug/ablation-only"
             )
         room_cfg = RoomSegmentationConfig.from_mapping(
             getattr(args, "room_segmentation_config", {}),
@@ -1020,7 +1069,14 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
             goal_cells.append(dyn_goal)
     max_steps = int(args.max_control_steps)
     replan_every = max(1, int(args.replan_every_steps))
-    perception_every = max(1, int(args.perception_every_steps))
+    requested_perception_every = max(1, int(args.perception_every_steps))
+    perception_every = effective_perception_every_steps(args.detector, requested_perception_every)
+    if perception_every != requested_perception_every:
+        print(
+            "[sgnav-loop] YOLO-World requires every-frame perception; overriding perception_every_steps "
+            "%d -> %d" % (requested_perception_every, perception_every),
+            flush=True,
+        )
     success_distance = float(episode.get("success_distance_m", 1.0))
     current_path: List[Tuple[int, int]] = []
     full_path: List[Tuple[int, int]] = []
@@ -1077,10 +1133,25 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
         "planning": 0.0,
     }
     latency_counts = {key: 0 for key in latency_totals_ms}
+    mapping_breakdown_totals_ms: dict[str, float] = {}
+    mapping_breakdown_counts: dict[str, int] = {}
 
     def record_latency(name: str, started_at: float) -> None:
         latency_totals_ms[name] += max(0.0, (time.perf_counter() - started_at) * 1000.0)
         latency_counts[name] += 1
+
+    def record_mapping_timing(name: str, elapsed_ms: float) -> None:
+        key = str(name)
+        value = max(0.0, float(elapsed_ms))
+        mapping_breakdown_totals_ms[key] = mapping_breakdown_totals_ms.get(key, 0.0) + value
+        mapping_breakdown_counts[key] = mapping_breakdown_counts.get(key, 0) + 1
+
+    def record_mapping_breakdown(breakdown: Mapping[str, object]) -> None:
+        for key, value in dict(breakdown).items():
+            if key == "reason" or isinstance(value, bool):
+                continue
+            if isinstance(value, (int, float)):
+                record_mapping_timing(str(key), float(value))
 
     def total_llm_requests() -> int:
         vllm_scorer = getattr(scenegraph, "vllm_scorer", None)
@@ -1192,10 +1263,12 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
                 return None
             started_at = time.perf_counter()
             mapper.update(current_obs["depth"], intr, pose_local, current_obs["camera_pose_world"])
+            record_mapping_breakdown(getattr(mapper, "last_timing_stats", {}))
             mapper.last_debug_stats["depth_source"] = str(current_obs.get("depth_source", "unknown"))
             mapper.last_debug_stats["camera_frame_sync_updates"] = int(current_obs.get("camera_frame_sync_updates", 0) or 0)
             mapper.last_debug_stats["camera_rendering_time"] = current_obs.get("camera_rendering_time")
             if bool(getattr(args, "nearfield_depth", False)) and current_obs.get("has_nearfield_depth"):
+                nearfield_started_at = time.perf_counter()
                 nearfield_stats = mapper.update_nearfield_topdown(
                     current_obs["nearfield_depth"],
                     nearfield_intr,
@@ -1210,9 +1283,11 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
                     splat_point_threshold=int(args.nearfield_splat_point_threshold),
                     free_splat_point_threshold=int(args.nearfield_free_splat_point_threshold),
                 )
+                record_mapping_timing("nearfield_update_ms", (time.perf_counter() - nearfield_started_at) * 1000.0)
                 nearfield_stats["depth_source"] = str(current_obs.get("nearfield_depth_source", "unknown"))
                 mapper.last_debug_stats["nearfield"] = nearfield_stats
             if bool(getattr(args, "static_nearfield_map", False)):
+                static_nearfield_started_at = time.perf_counter()
                 static_nearfield_stats = mapper.update_static_nearfield(
                     static_occupancy,
                     static_navigable,
@@ -1221,6 +1296,7 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
                     radius_m=float(args.static_nearfield_radius_m),
                     static_openings=static_openings,
                 )
+                record_mapping_timing("static_nearfield_update_ms", (time.perf_counter() - static_nearfield_started_at) * 1000.0)
                 mapper.last_debug_stats["static_nearfield"] = static_nearfield_stats
             if bool(getattr(args, "mapping_debug", False)):
                 stats = mapper.last_debug_stats
@@ -1262,28 +1338,47 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
                     flush=True,
                 )
             dynamic_map_info = mapper.grid.map_info
+            array_export_started_at = time.perf_counter()
             occupancy_local = mapper.grid.occupied.astype(bool)
             free_local = mapper.grid.free.astype(bool)
             observed_local = mapper.grid.observed.astype(bool)
+            record_mapping_timing("array_export_ms", (time.perf_counter() - array_export_started_at) * 1000.0)
+            traversible_started_at = time.perf_counter()
             navigable_local = mapper.traversible(unknown_is_obstacle=True)
+            record_mapping_timing("traversible_ms", (time.perf_counter() - traversible_started_at) * 1000.0)
+            planner_init_started_at = time.perf_counter()
             nav_planner_local = GridAStarPlanner(navigable_local, dynamic_map_info.resolution_m, allow_diagonal=True)
+            record_mapping_timing("planner_init_ms", (time.perf_counter() - planner_init_started_at) * 1000.0)
+            snap_started_at = time.perf_counter()
             current_grid_local = nav_planner_local.snap_to_free(
                 world_xy_to_grid(float(pose_local[0]), float(pose_local[1]), dynamic_map_info)
             )
+            record_mapping_timing("snap_to_free_ms", (time.perf_counter() - snap_started_at) * 1000.0)
             if current_grid_local is None:
+                recovery_started_at = time.perf_counter()
                 mapper.update_simple_radius(pose_local, radius_m=max(float(args.robot_radius_m), float(args.online_resolution_m)))
+                record_mapping_timing("simple_radius_recovery_ms", (time.perf_counter() - recovery_started_at) * 1000.0)
+                array_export_started_at = time.perf_counter()
                 occupancy_local = mapper.grid.occupied.astype(bool)
                 free_local = mapper.grid.free.astype(bool)
                 observed_local = mapper.grid.observed.astype(bool)
+                record_mapping_timing("array_export_ms", (time.perf_counter() - array_export_started_at) * 1000.0)
+                traversible_started_at = time.perf_counter()
                 navigable_local = mapper.traversible(unknown_is_obstacle=True)
+                record_mapping_timing("traversible_ms", (time.perf_counter() - traversible_started_at) * 1000.0)
+                planner_init_started_at = time.perf_counter()
                 nav_planner_local = GridAStarPlanner(navigable_local, dynamic_map_info.resolution_m, allow_diagonal=True)
+                record_mapping_timing("planner_init_ms", (time.perf_counter() - planner_init_started_at) * 1000.0)
+                snap_started_at = time.perf_counter()
                 current_grid_local = nav_planner_local.snap_to_free(
                     world_xy_to_grid(float(pose_local[0]), float(pose_local[1]), dynamic_map_info)
                 )
+                record_mapping_timing("snap_to_free_ms", (time.perf_counter() - snap_started_at) * 1000.0)
             last_dynamic_occupancy = occupancy_local
             last_dynamic_free = free_local
             last_dynamic_navigable = navigable_local
             last_dynamic_observed = observed_local
+            record_mapping_timing("state_total_ms", (time.perf_counter() - started_at) * 1000.0)
             record_latency("mapping", started_at)
             return {
                 "pose": pose_local,
@@ -2281,6 +2376,9 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
         row["candidate_pair_distances_m"] = goal_candidate_pair_distances(object_memory, episode["goal_category"])
         row["candidate_duplicate_warning"] = any(float(pair["dist"]) < 0.75 for pair in row["candidate_pair_distances_m"])
         row["panorama_frames"] = int(panorama_frames)
+        row["requested_perception_every_steps"] = int(requested_perception_every)
+        row["effective_perception_every_steps"] = int(perception_every)
+        row["yolo_world_every_frame"] = bool(str(getattr(args, "detector", "")).strip().lower() == "yolo_world" and perception_every == 1)
         row["graph_object_nodes"] = int(len(getattr(scenegraph, "runtime_nodes", {})))
         row["graph_group_nodes"] = int(len(getattr(scenegraph, "runtime_groups", [])))
         row["graph_room_nodes"] = int(len(getattr(scenegraph, "runtime_rooms", {})))
@@ -2418,6 +2516,18 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
         row["llm_latency_ms"] = float(latency_totals_ms["llm"])
         row["planning_latency_ms"] = float(latency_totals_ms["planning"])
         row["latency_counts"] = {key: int(value) for key, value in latency_counts.items()}
+        row["mapping_latency_breakdown_ms"] = {
+            str(key): float(value) for key, value in sorted(mapping_breakdown_totals_ms.items())
+        }
+        row["mapping_latency_breakdown_counts"] = {
+            str(key): int(value) for key, value in sorted(mapping_breakdown_counts.items())
+        }
+        row["mapping_latency_breakdown_avg_ms"] = {
+            str(key): float(mapping_breakdown_totals_ms[key] / max(1, mapping_breakdown_counts.get(key, 0)))
+            for key in sorted(mapping_breakdown_totals_ms)
+        }
+        for key, value in row["mapping_latency_breakdown_ms"].items():
+            row["mapping_%s" % str(key)] = float(value)
         if args.save_debug_video or args.debug_map:
             debug_map = args.debug_map or str(Path(args.output).with_suffix(".png"))
             start = world_xy_to_grid(float(start_pose[0]), float(start_pose[1]), dynamic_map_info)
@@ -2658,6 +2768,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--min-geometry-confidence", type=float, default=None)
     parser.add_argument("--partial-stability-min-observations", type=int, default=None)
     parser.add_argument("--mask-iou-association-threshold", type=float, default=None)
+    parser.add_argument("--mask-containment-track-match-threshold", type=float, default=None)
     parser.add_argument("--footprint-iou-association-threshold", type=float, default=None)
     parser.add_argument("--child-containment-threshold", type=float, default=None)
     parser.add_argument("--child-area-ratio-threshold", type=float, default=None)
@@ -2784,22 +2895,27 @@ def main(argv: Optional[List[str]] = None) -> int:
     args.mask_iou_association_threshold = float(
         args.mask_iou_association_threshold
         if args.mask_iou_association_threshold is not None
-        else get_nested(cfg, "object_memory.mask_iou_association_threshold", 0.20)
+        else get_nested(cfg, "object_memory.mask_iou_association_threshold", get_nested(cfg, "object_memory.mask_iou_track_match_threshold", 0.25))
+    )
+    args.mask_containment_track_match_threshold = float(
+        args.mask_containment_track_match_threshold
+        if args.mask_containment_track_match_threshold is not None
+        else get_nested(cfg, "object_memory.mask_containment_track_match_threshold", 0.60)
     )
     args.footprint_iou_association_threshold = float(
         args.footprint_iou_association_threshold
         if args.footprint_iou_association_threshold is not None
-        else get_nested(cfg, "object_memory.footprint_iou_association_threshold", 0.15)
+        else get_nested(cfg, "object_memory.footprint_iou_association_threshold", get_nested(cfg, "object_memory.footprint_iou_track_match_threshold", 0.20))
     )
     args.child_containment_threshold = float(
         args.child_containment_threshold
         if args.child_containment_threshold is not None
-        else get_nested(cfg, "object_memory.child_containment_threshold", 0.60)
+        else get_nested(cfg, "object_memory.child_containment_threshold", 0.70)
     )
     args.child_area_ratio_threshold = float(
         args.child_area_ratio_threshold
         if args.child_area_ratio_threshold is not None
-        else get_nested(cfg, "object_memory.child_area_ratio_threshold", 0.35)
+        else get_nested(cfg, "object_memory.child_area_ratio_threshold", get_nested(cfg, "object_memory.child_object_area_ratio_max", 0.35))
     )
     args.headless = bool(get_nested(cfg, "isaac.headless", True) if args.headless is None else args.headless)
     viz_cfg = get_nested(cfg, "visualization.sgnav_popup", "auto")
@@ -3033,7 +3149,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         default_robot_radius_m = 0.5 * float(get_nested(cfg, "robot.footprint_width_m", 0.28))
     args.robot_radius_m = float(args.robot_radius_m if args.robot_radius_m is not None else default_robot_radius_m)
     args.online_inflation_radius_m = float(args.online_inflation_radius_m if args.online_inflation_radius_m is not None else get_nested(cfg, "mapping.inflation_radius_m", 0.0))
-    args.room_map_mode = str(args.room_map_mode or get_nested(cfg, "mapping.room_map_mode", "online_rose2_structure"))
+    args.room_map_mode = str(args.room_map_mode or get_nested(cfg, "mapping.room_map_mode", "upstream_rose2_vertical_or_free"))
     args.room_segmentation_config = dict(get_nested(cfg, "mapping.room_segmentation", {}) or {})
     room_semantics_cfg = dict(get_nested(cfg, "room_semantics", {}) or {})
     for key in (

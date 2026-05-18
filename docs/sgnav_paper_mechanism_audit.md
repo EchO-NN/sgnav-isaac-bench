@@ -13,7 +13,7 @@ are intentionally conservative: `faithful`, `optimized-equivalent`,
 | frontier extraction | Reachable frontiers are extracted at observed-free/unknown boundaries. | engineered-faithful | `isaac_bench/mapping/frontier.py::extract_frontiers` |
 | object nodes | Non-edge YOLO-World/SAM2/depth detections accumulate into object memory with track-level category confidence sums before `PaperSceneGraph` object nodes are emitted. | engineered-faithful | `FusedInstanceRegistry.update`, `ObjectMemory.update_fused_instances`, `PaperSceneGraph.update_from_object_memory` |
 | group nodes | Related object groups remain cluster-based in the online scene graph. | engineered-faithful | `PaperSceneGraph.update_group_nodes` |
-| room nodes | Room nodes are online geometry masks plus object/VLM semantics, not oracle `rooms.json` in strict mode. | approximate-but-justified | `isaac_bench/mapping/room_segmentation.py`, `isaac_bench/graph/room_semantics.py` |
+| room nodes | Room nodes are no-ROS upstream ROSE2 pure-Python room masks plus object/VLM semantics, not oracle `rooms.json` in strict mode. | engineered-faithful | `isaac_bench/mapping/upstream_rose2_pure_python_adapter.py`, `isaac_bench/graph/room_semantics.py` |
 | object-room edges | Objects are assigned to room masks by centroid or footprint overlap. | engineered-faithful | `assign_objects_to_room_masks`, `PaperSceneGraph.update_affiliation_edges` |
 | object-centered subgraphs | Subgraphs include central object, parent room, parent group, direct neighbors, and edges. | faithful | `isaac_bench/graph/subgraph_builder.py::build_object_centered_subgraphs` |
 | HCoT stage 1 | LLM predicts prior object-goal distance. | faithful | `build_hcot_prior_distance_prompt` |
@@ -28,18 +28,20 @@ are intentionally conservative: `faithful`, `optimized-equivalent`,
 
 ## T0 Room Merge And Object Memory Rules
 
-Room watershed labels are proposals, not final rooms. Before frontier scoring,
-premerge proposals are labeled only for open-plan merge decisions; final merged
-room masks are then labeled again for SG-Nav room nodes. Verified structural
-boundaries preserve splits. Weak/open boundaries preserve a functional split
-only when both proposal labels are reliable, non-unknown, and different. Object
-lists such as sink/fridge/sofa/TV are evidence to the room recognizer only, not
-authoritative split rules.
+Upstream ROSE2 physical room proposals are not final semantic rooms. Before
+frontier scoring, premerge proposals are labeled only for open-plan merge
+decisions; final merged room masks are then labeled again for SG-Nav room
+nodes. Verified structural boundaries preserve splits. Weak/open boundaries
+preserve a functional split only when both proposal labels are reliable,
+non-unknown, and different. Object lists such as sink/fridge/sofa/TV are
+evidence to the room recognizer only, not authoritative split rules.
 
-YOLO detections at or below `0.55` confidence, and YOLO boxes touching an image
-edge, are rejected before SAM2/depth fusion, object memory, candidate-goal
-logic, STOP, policy graph objects, and first-version GNN features. Rejected
-detections remain in raw debug logs. Object tracks expose the accumulated
+YOLO detections at or below `0.55` confidence are rejected before bbox drawing,
+SAM2/depth fusion, object memory, candidate-goal logic, STOP, policy graph
+objects, and first-version GNN policy features. Edge-touching YOLO/SAM2
+detections are not hard-discarded: they remain raw evidence, may associate to a
+stable full track by mask/footprint overlap, and otherwise stay tentative and
+ineligible for policy/room/goal/STOP. Object tracks expose the accumulated
 winner category plus `mean_confidence`, `detection_count`, and
 `winner_detection_count`.
 
@@ -64,9 +66,11 @@ confirmation. Candidate re-perception uses the latest cached graph context.
 - `mapping.frontier_min_distance_m: 1.0`
 - `sgnav.frontier_distance_weight: 0.2`
 - `llm.enabled: true`
-- `mapping.room_map_mode: online_rose2_structure`
-- `mapping.room_segmentation.algorithm: rose2_structure`
-- `sgnav.scene_graph.room_nodes.source: online_rose2_structure_vlm`
+- `mapping.room_map_mode: upstream_rose2_vertical_or_free`
+- `mapping.room_segmentation.algorithm: upstream_rose2_vertical_or_free`
+- `mapping.room_segmentation.source_mode: declutter_reconstruct_mit`
+- `mapping.room_segmentation.require_upstream_source_for_strict: true`
+- `sgnav.scene_graph.room_nodes.source: upstream_rose2_vertical_or_free_vlm`
 
 ## Benchmark Validity Notes
 

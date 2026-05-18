@@ -21,6 +21,20 @@ def _mask() -> np.ndarray:
     return mask
 
 
+def _intr20() -> CameraIntrinsics:
+    return CameraIntrinsics(width=20, height=20, fx=14.0, fy=14.0, cx=10.0, cy=10.0)
+
+
+def _depth20() -> np.ndarray:
+    return np.full((20, 20), 2.0, dtype=np.float32)
+
+
+def _mask20(r0: int, c0: int, r1: int, c1: int) -> np.ndarray:
+    mask = np.zeros((20, 20), dtype=bool)
+    mask[int(r0) : int(r1), int(c0) : int(c1)] = True
+    return mask
+
+
 def test_mask_projection_returns_point_cloud_and_detection3d_payload():
     det = Detection2D("chair", "chair", 0.9, (2.0, 2.0, 4.0, 4.0), mask=_mask())
 
@@ -117,3 +131,129 @@ def test_bbox_iou_3d_handles_flat_projected_surfaces():
     b = np.asarray([[0.5, 0.5, 1.0], [1.5, 1.5, 1.0]], dtype=np.float32)
 
     assert bbox_iou_3d(a, b) > 0.0
+
+
+def test_class_confidence_accumulation_pillow_case():
+    registry = FusedInstanceRegistry(merge_distance_m=0.75, merge_iou_3d=0.05, min_valid_confidence=0.55)
+    detections = [
+        Detection2D("pillow", "pillow", 0.60, (6, 6, 14, 14), mask=_mask20(6, 6, 14, 14)),
+        Detection2D("pillow", "pillow", 0.65, (6, 6, 14, 14), mask=_mask20(6, 6, 14, 14)),
+        Detection2D("pillow", "pillow", 0.63, (6, 6, 14, 14), mask=_mask20(6, 6, 14, 14)),
+        Detection2D("other", "other", 0.64, (6, 6, 14, 14), mask=_mask20(6, 6, 14, 14)),
+    ]
+
+    for step, det in enumerate(detections):
+        registry.update([det], _depth20(), _intr20(), (0.0, 0.0, 1.0, 0.0), step_id=step, min_points=1, stride=1)
+
+    track = registry.instances[0]
+    assert track.stable_category == "pillow"
+    assert abs(track.mean_confidence - ((0.60 + 0.65 + 0.63) / 3.0)) < 1e-6
+    assert track.winner_detection_count == 3
+    assert track.valid_detection_count == 4
+
+
+def test_edge_partial_overlaps_existing_track_inherits_full_geometry():
+    registry = FusedInstanceRegistry(
+        merge_distance_m=0.75,
+        merge_iou_3d=0.05,
+        mask_iou_association_threshold=0.25,
+        mask_containment_track_match_threshold=0.50,
+    )
+    full = Detection2D("cabinet", "cabinet", 0.90, (5, 5, 15, 15), mask=_mask20(5, 5, 15, 15))
+    registry.update([full], _depth20(), _intr20(), (0.0, 0.0, 1.0, 0.0), step_id=1, min_points=1, stride=1)
+    stable_center = registry.instances[0].center_world.copy()
+    partial = Detection2D("wardrobe", "wardrobe", 0.80, (0, 5, 10, 15), mask=_mask20(5, 0, 15, 10))
+
+    registry.update([partial], _depth20(), _intr20(), (0.0, 0.0, 1.0, 0.0), step_id=2, min_points=1, stride=1)
+    track = registry.instances[0]
+
+    assert len(registry.instances) == 1
+    assert track.stable_category == "cabinet"
+    assert np.allclose(track.center_world, stable_center)
+    assert track.center_estimation_mode == "inherited_full_mask"
+    assert track.used_for_policy_graph is True
+    assert registry.raw_detection_log[-1]["visibility_status"] == "partial_edge"
+
+
+def test_edge_partial_without_overlap_is_tentative_not_policy():
+    registry = FusedInstanceRegistry(merge_distance_m=0.75, merge_iou_3d=0.05)
+    partial = Detection2D("curtain", "curtain", 0.72, (0, 2, 5, 18), mask=_mask20(2, 0, 18, 5))
+
+    registry.update([partial], _depth20(), _intr20(), (0.0, 0.0, 1.0, 0.0), step_id=1, min_points=1, stride=1)
+    track = registry.instances[0]
+    snapshot = registry.gnn_snapshot()
+
+    assert track.is_stable is False
+    assert track.used_for_policy_graph is False
+    assert snapshot["raw_detection_count"] == 1
+    assert snapshot["tentative_track_count"] == 1
+    assert snapshot["raw_detections"][0]["raw_category"] == "curtain"
+    assert snapshot["raw_detections"][0]["visibility_status"] == "partial_edge"
+
+
+def test_large_curtain_edge_detection_not_discarded():
+    registry = FusedInstanceRegistry(merge_distance_m=0.75, merge_iou_3d=0.05, partial_stability_min_observations=2)
+    det = Detection2D("curtain", "curtain", 0.78, (0, 1, 8, 19), mask=_mask20(1, 0, 19, 8))
+
+    registry.update([det], _depth20(), _intr20(), (0.0, 0.0, 1.0, 0.0), step_id=1, min_points=1, stride=1)
+    registry.update([det], _depth20(), _intr20(), (0.0, 0.0, 1.0, 0.0), step_id=2, min_points=1, stride=1)
+    snapshot = registry.gnn_snapshot()
+
+    assert len(registry.instances) == 1
+    assert registry.instances[0].category == "curtain"
+    assert snapshot["raw_detection_count"] == 2
+    assert snapshot["partial_edge_count"] == 2
+    assert snapshot["object_tracks"][0]["used_for_policy_graph"] is False
+    assert snapshot["object_tracks"][0]["used_for_stop"] is False
+
+
+def test_edge_touch_large_object_not_discarded():
+    test_large_curtain_edge_detection_not_discarded()
+
+
+def test_partial_mask_overlap_inherits_existing_track_center_and_category():
+    test_edge_partial_overlaps_existing_track_inherits_full_geometry()
+
+
+def test_partial_no_overlap_tentative_not_policy_graph():
+    test_edge_partial_without_overlap_is_tentative_not_policy()
+
+
+def test_class_confidence_accumulation_keeps_pillow_winner():
+    test_class_confidence_accumulation_pillow_case()
+
+
+def test_occluded_center_patch_not_stable_from_single_view():
+    registry = FusedInstanceRegistry(merge_distance_m=0.75, merge_iou_3d=0.05)
+    occluded = Detection2D("plant", "plant", 0.82, (9, 9, 11, 11), mask=_mask20(9, 9, 11, 11))
+
+    registry.update([occluded], _depth20(), _intr20(), (0.0, 0.0, 1.0, 0.0), step_id=1, min_points=1, stride=1)
+    track = registry.instances[0]
+
+    assert track.visibility_status_counts["partial_occluded"] == 1
+    assert track.used_for_policy_graph is False
+    assert track.center_estimation_mode == "visible_extent_low_conf"
+
+
+def test_sofa_pillow_containment_creates_child_relation():
+    registry = FusedInstanceRegistry(
+        merge_distance_m=0.75,
+        merge_iou_3d=0.05,
+        child_containment_threshold=0.70,
+        child_area_ratio_threshold=0.35,
+    )
+    sofa = Detection2D("sofa", "sofa", 0.91, (3, 3, 17, 17), mask=_mask20(3, 3, 17, 17))
+    pillow = Detection2D("pillow", "pillow", 0.88, (7, 7, 10, 10), mask=_mask20(7, 7, 10, 10))
+
+    registry.update([sofa], _depth20(), _intr20(), (0.0, 0.0, 1.0, 0.0), step_id=1, min_points=1, stride=1)
+    registry.update([pillow], _depth20(), _intr20(), (0.0, 0.0, 1.0, 0.0), step_id=2, min_points=1, stride=1)
+
+    sofa_track, pillow_track = registry.instances
+    assert sofa_track.stable_category == "sofa"
+    assert pillow_track.stable_category == "pillow"
+    assert pillow_track.parent_track_id == sofa_track.instance_id
+    assert pillow_track.instance_id in sofa_track.child_track_ids
+
+
+def test_sofa_pillow_containment_creates_child_relation_alias():
+    test_sofa_pillow_containment_creates_child_relation()

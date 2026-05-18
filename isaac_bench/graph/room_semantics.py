@@ -241,26 +241,34 @@ class VLMRoomLabeler:
             room_mask,
             parsed,
         )
-        forced_reason = self._forced_unknown_reason(
+        quality_warning = self._label_quality_warning_reason(
             category,
             vlm_self_confidence,
             reliability_factors,
             parsed,
         )
-        if forced_reason is not None:
+        if quality_warning == "invalid_category":
             category = self.unknown_category
             reliability = 0.0
-            if forced_reason not in conflicting and forced_reason != "evidence_based_unknown":
-                conflicting.append(forced_reason)
-            unknown_reason = forced_reason
+            if quality_warning not in conflicting:
+                conflicting.append(quality_warning)
+            unknown_reason = quality_warning
+        elif quality_warning is not None:
+            if quality_warning not in conflicting:
+                conflicting.append(quality_warning)
+            reliability_factors["label_quality_warning"] = quality_warning
             if not rationale:
-                rationale = "Observed room evidence is insufficient or ambiguous."
+                rationale = "Room type kept from model output; reliability records weak or ambiguous evidence."
         if category == self.unknown_category and not unknown_reason:
             unknown_reason = "insufficient_or_ambiguous_evidence"
         if category not in self.allowed_categories:
             category = self.unknown_category
             reliability = 0.0
             unknown_reason = "invalid_category"
+            if "invalid_category" not in conflicting:
+                conflicting.append("invalid_category")
+            if not rationale:
+                rationale = "Observed room evidence is insufficient or ambiguous."
         return RoomSemanticLabel(
             room_id=str(parsed.get("room_id", room_mask.room_id)),
             category=category,
@@ -314,7 +322,7 @@ class VLMRoomLabeler:
         }
         return float(np.clip(reliability, 0.0, 1.0)), factors
 
-    def _forced_unknown_reason(
+    def _label_quality_warning_reason(
         self,
         category: str,
         vlm_self_confidence: float,
@@ -352,7 +360,7 @@ def build_room_label_prompt(
     payload = {
         "room_id": room_mask.room_id,
         "allowed_categories": list(allowed_categories),
-        "must_use_unknown_when_insufficient": True,
+        "must_use_unknown_when_insufficient": False,
         "geometry": {
             "area_m2": float(room_mask.area_m2),
             "boundary_unknown_fraction": float(room_mask.boundary_unknown_fraction),
@@ -367,7 +375,8 @@ def build_room_label_prompt(
         "You are assigning a semantic type to an online-discovered room region for a robot navigation scene graph.\n"
         "Use only the provided observed objects, room geometry summary, and optional images.\n"
         "Choose exactly one category from allowed_categories.\n"
-        "If evidence is weak, partial, ambiguous, contradictory, or not diagnostic, choose unknown.\n"
+        "Prefer the best supported room category when there is any useful evidence; use unknown only when no category can be justified.\n"
+        "When evidence is weak, partial, ambiguous, contradictory, or not diagnostic, keep the best category if possible but report low confidence and conflicting_evidence.\n"
         "Do not guess a room type just because one category is common.\n"
         "Do not use any dataset priors or ground-truth room labels.\n"
         "Return strict JSON only with schema:\n"

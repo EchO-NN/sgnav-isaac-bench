@@ -49,7 +49,7 @@ def _subgraph():
                 "category": "kitchen",
                 "confidence": 0.72,
                 "mask_id": "room_0001",
-                "mask_source": "rose2_structure",
+                "mask_source": "upstream_rose2_vertical_or_free",
             },
             {"id": "group:kitchen_table", "type": "group", "category": "counter, table", "object_ids": ["object:table", "object:counter"]},
         ],

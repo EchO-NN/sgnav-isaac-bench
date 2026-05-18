@@ -48,9 +48,9 @@ def _scene():
     return occupancy, navigable, observed, memory, frontiers, [room], {"room_0001": label}
 
 
-def _update(viz, tmp_path=None):
+def _update(viz, tmp_path=None, room_segmentation_debug=None):
     occupancy, navigable, observed, memory, frontiers, room_masks, room_labels = _scene()
-    viz.set_room_context(room_masks, room_labels)
+    viz.set_room_context(room_masks, room_labels, room_segmentation_debug)
     decision = NavigationDecision(
         mode="frontier",
         target_cells=[(8, 18)],
@@ -139,3 +139,64 @@ def test_disabling_object_nodes_removes_object_dot_primitives():
 
     assert layers["object_nodes"]["enabled"] is False
     assert layers["object_nodes"]["primitive_count"] == 0
+
+
+def test_rose_input_occupancy_map_is_rendered_below_runtime_map(tmp_path):
+    occupancy, _, _, _, _, _, _ = _scene()
+    structural = np.zeros_like(occupancy, dtype=bool)
+    structural[4:16, 8] = True
+    vertical_carved = np.zeros_like(occupancy, dtype=bool)
+    vertical_carved[10:13, 14:17] = True
+    wall_conf = np.zeros_like(occupancy, dtype=np.float32)
+    wall_conf[structural] = 0.92
+    rejected = np.zeros_like(occupancy, dtype=bool)
+    rejected[12:14, 18:21] = True
+    debug = {
+        "algorithm": "upstream_rose2_vertical_or_free",
+        "structural_wall_mask": structural,
+        "structural_component_rejected_mask": rejected,
+        "vertical_carved_map": vertical_carved,
+        "wall_confidence_map": wall_conf,
+        "wall_confidence_threshold": 0.55,
+        "repaired_window_gaps": [{"axis": "vertical", "index": 8, "start": 6, "end": 7, "kind": "window"}],
+        "verified_doorway_gaps": [{"axis": "vertical", "index": 8, "start": 12, "end": 13, "kind": "doorway"}],
+    }
+    viz = SGNavPopupVisualizer(enabled=False, save_dir=str(tmp_path), panel_size=(640, 360), save_every_steps=1)
+    panel = _update(viz, room_segmentation_debug=debug)
+    layers = {layer["name"]: layer for layer in viz.overlay_layer_metadata()["layers"]}
+
+    assert panel.shape == (360, 640, 3)
+    assert layers["rose_occupancy_map"]["primitive_count"] == int(np.count_nonzero(structural))
+    assert layers["rose_wall_confidence_map"]["primitive_count"] == int(np.count_nonzero(wall_conf >= 0.55))
+    assert layers["rose_vertical_carved_map"]["primitive_count"] == int(np.count_nonzero(vertical_carved))
+    assert layers["rose_structural_rejected_clutter"]["primitive_count"] == int(np.count_nonzero(rejected))
+    assert layers["rose_repaired_window_gaps"]["primitive_count"] == 1
+    assert layers["rose_verified_doorway_gaps"]["primitive_count"] == 1
+
+    sidecar = tmp_path / "sgnav_step_000000.layers.json"
+    saved = json.loads(sidecar.read_text(encoding="utf-8"))
+    saved_layers = {layer["name"]: layer for layer in saved["layers"]}
+    assert saved_layers["rose_occupancy_map"]["has_rose_input"] is True
+
+
+def test_rose_input_panel_waiting_state_is_not_black():
+    occupancy = np.zeros((20, 30), dtype=bool)
+    occupancy[4:16, 8] = True
+    navigable = np.zeros_like(occupancy, dtype=bool)
+    navigable[6:14, 10:22] = True
+    observed = np.zeros_like(occupancy, dtype=bool)
+    viz = SGNavPopupVisualizer(enabled=False, panel_size=(640, 360))
+    panel, layers = viz._render_rose_occupancy_panel(
+        occupancy=occupancy,
+        navigable=navigable,
+        observed=observed,
+        size=(360, 110),
+        crop_bounds=(0, 20, 0, 30),
+    )
+    layer_map = {layer["name"]: layer for layer in layers}
+    arr = np.asarray(panel)
+
+    assert layer_map["rose_occupancy_map"]["has_rose_input"] is False
+    assert layer_map["rose_occupancy_map"]["current_occupancy_underlay_cells"] == int(np.count_nonzero(occupancy))
+    assert int(arr.max()) > 180
+    assert len(np.unique(arr.reshape(-1, 3), axis=0)) > 3

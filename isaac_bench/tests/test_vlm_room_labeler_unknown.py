@@ -10,7 +10,7 @@ class FakeRoomLLM:
 
     def complete_json(self, prompt: str):
         assert "allowed_categories" in prompt
-        assert "choose unknown" in prompt.lower()
+        assert "use unknown only" in prompt.lower()
         return self.response
 
 
@@ -74,16 +74,18 @@ def test_invalid_category_from_vlm_is_forced_unknown():
     assert label.unknown_reason == "invalid_category"
 
 
-def test_low_confidence_vlm_label_is_forced_unknown():
+def test_low_confidence_vlm_label_keeps_category_with_warning():
     labeler = VLMRoomLabeler(client=FakeRoomLLM({"room_id": "room_0001", "category": "kitchen", "confidence": 0.3}))
 
     label = labeler.label_room(_room(), [ObjectEvidence("stove", hits=2), ObjectEvidence("sink", hits=2)], None)
 
-    assert label.category == "unknown"
-    assert label.unknown_reason == "low_confidence"
+    assert label.category == "kitchen"
+    assert label.unknown_reason is None
+    assert "low_confidence" in label.conflicting_evidence
+    assert label.reliability_factors["label_quality_warning"] == "low_confidence"
 
 
-def test_ambiguous_ranked_vlm_label_is_forced_unknown():
+def test_ambiguous_ranked_vlm_label_keeps_category_with_warning():
     labeler = VLMRoomLabeler(
         client=FakeRoomLLM(
             {
@@ -100,8 +102,10 @@ def test_ambiguous_ranked_vlm_label_is_forced_unknown():
 
     label = labeler.label_room(_room(), [ObjectEvidence("table", hits=2), ObjectEvidence("chair", hits=2)], None)
 
-    assert label.category == "unknown"
-    assert label.unknown_reason == "ambiguous_ranked_categories"
+    assert label.category == "kitchen"
+    assert label.unknown_reason is None
+    assert "ambiguous_ranked_categories" in label.conflicting_evidence
+    assert label.reliability_factors["label_quality_warning"] == "ambiguous_ranked_categories"
 
 
 def test_strict_missing_vlm_backend_raises():

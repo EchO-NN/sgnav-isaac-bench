@@ -34,6 +34,8 @@ def _args(**overrides):
         "allow_gt_goal_fallback": False,
         "static_nearfield_map": False,
         "frontier_allow_near_fallback": False,
+        "room_map_mode": "upstream_rose2_vertical_or_free",
+        "room_segmentation_config": {"require_upstream_source_for_strict": False},
         "yolo_world_model": "data/models/yolov8l-worldv2.pt",
         "sam2_checkpoint": "data/models/sam2.1_hiera_small.pt",
     }
@@ -173,12 +175,28 @@ def test_config_defaults_match_benchmark_contract():
     assert cfg["nearfield_static_map"]["enabled"] is False
     assert cfg["mapping"]["frontier_allow_near_fallback"] is False
     assert cfg["mapping"]["frontier_min_distance_m"] == 1.0
-    assert cfg["mapping"]["room_map_mode"] == "online_rose2_structure"
-    assert cfg["mapping"]["room_segmentation"]["algorithm"] == "rose2_structure"
+    assert cfg["mapping"]["room_map_mode"] == "upstream_rose2_vertical_or_free"
+    assert cfg["mapping"]["strict_no_oracle_rooms"] is True
+    assert cfg["mapping"]["room_segmentation"]["algorithm"] == "upstream_rose2_vertical_or_free"
+    assert cfg["mapping"]["room_segmentation"]["source_mode"] == "declutter_reconstruct_mit"
     assert cfg["mapping"]["room_segmentation"]["legacy_watershed_allowed"] == "debug_only"
-    assert cfg["mapping"]["room_segmentation"]["finalization_mode"] == "no_merge"
-    assert cfg["mapping"]["room_segmentation"]["open_boundary_merge"] is False
-    assert cfg["room_semantics"]["use_premerge_labels_for_open_plan_merge"] is False
+    assert cfg["mapping"]["room_segmentation"]["local_rose2_lite_allowed"] == "debug_only"
+    assert cfg["mapping"]["room_segmentation"]["require_upstream_source_for_strict"] is True
+    assert cfg["mapping"]["room_segmentation"]["upstream_repo_env"] == "ROSE2_SOURCE_ROOT"
+    assert cfg["mapping"]["room_segmentation"]["run_only_before_frontier_scoring"] is True
+    assert cfg["mapping"]["room_segmentation"]["finalization_mode"] == "doorway_constrained_merge"
+    assert cfg["mapping"]["room_segmentation"]["open_boundary_merge"] is True
+    assert cfg["mapping"]["room_segmentation"]["vertical_or_free"]["enabled"] is True
+    assert cfg["mapping"]["room_segmentation"]["vertical_or_free"]["z_min_m"] == 0.20
+    assert cfg["mapping"]["room_segmentation"]["vertical_or_free"]["z_max_m"] == 2.00
+    assert cfg["mapping"]["room_segmentation"]["wall_confidence_threshold"] == 0.55
+    assert cfg["mapping"]["room_segmentation"]["vertical_free_suppression_weight"] == 0.35
+    assert cfg["mapping"]["room_segmentation"]["furniture_suppression_radius_m"] == 0.90
+    assert cfg["mapping"]["room_segmentation"]["wall_like_aspect_ratio_min"] == 4.0
+    assert cfg["mapping"]["room_segmentation"]["rose2"]["wall_extension_enabled"] is True
+    assert cfg["mapping"]["room_segmentation"]["rose2"]["wall_extension_band_m"] == 0.45
+    assert cfg["mapping"]["room_segmentation"]["rose2"]["wall_extension_margin_m"] == 0.15
+    assert cfg["room_semantics"]["use_premerge_labels_for_open_plan_merge"] is True
     assert cfg["perception"]["yolo_world"]["reject_edge_touching_bboxes"] is False
     assert cfg["perception"]["yolo_world"]["mask_aware_partial_tracking"] is True
     assert cfg["object_memory"]["use_edge_touching_detections_for_policy"] is False
@@ -255,6 +273,17 @@ def test_check_assets_reports_required_missing_paths(tmp_path, capsys, monkeypat
 
     assert status == 2
     assert "MISSING yolo_world_model" in captured.out
+
+
+def test_check_assets_reports_missing_rose2_source(tmp_path, capsys, monkeypatch):
+    monkeypatch.setenv("ROSE2_SOURCE_ROOT", str(tmp_path / "missing-rose2"))
+
+    status = check_assets_main(["--require-rose2-source"])
+    captured = capsys.readouterr()
+
+    assert status == 2
+    assert "MISSING rose2_source_root" in captured.out
+    assert "declutter-reconstruct" in captured.out
 
 
 def test_asset_path_lookup_accepts_legacy_isaac_root_env(monkeypatch):

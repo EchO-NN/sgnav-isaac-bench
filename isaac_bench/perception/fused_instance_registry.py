@@ -50,6 +50,7 @@ class FusedInstanceRegistry:
         min_geometry_confidence: float = 0.50,
         partial_stability_min_observations: int = 3,
         mask_iou_association_threshold: float = 0.20,
+        mask_containment_track_match_threshold: float = 0.60,
         footprint_iou_association_threshold: float = 0.15,
         child_containment_threshold: float = 0.60,
         child_area_ratio_threshold: float = 0.35,
@@ -66,6 +67,7 @@ class FusedInstanceRegistry:
         self.min_geometry_confidence = float(min_geometry_confidence)
         self.partial_stability_min_observations = int(partial_stability_min_observations)
         self.mask_iou_association_threshold = float(mask_iou_association_threshold)
+        self.mask_containment_track_match_threshold = float(mask_containment_track_match_threshold)
         self.footprint_iou_association_threshold = float(footprint_iou_association_threshold)
         self.child_containment_threshold = float(child_containment_threshold)
         self.child_area_ratio_threshold = float(child_area_ratio_threshold)
@@ -203,8 +205,16 @@ class FusedInstanceRegistry:
             if instance.node_type != node_type:
                 continue
             dist = float(np.linalg.norm(np.asarray(instance.center_world[:2], dtype=np.float32) - np.asarray(center_world[:2], dtype=np.float32)))
-            mask_iou = _mask_iou(det.mask, instance.full_mask_reference if instance.full_mask_reference is not None else instance.last_mask) if det is not None else 0.0
+            reference_mask = instance.full_mask_reference if instance.full_mask_reference is not None else instance.last_mask
+            mask_iou = _mask_iou(det.mask, reference_mask) if det is not None else 0.0
+            mask_containment = _mask_containment(det.mask, reference_mask) if det is not None else 0.0
             det_is_partial = bool(det is not None and (det.bbox_touches_edge or mask_touches_image_edge(det.mask)))
+            if (
+                det_is_partial
+                and bool(instance.is_stable)
+                and mask_containment >= self.mask_containment_track_match_threshold
+            ):
+                return instance
             if mask_iou >= self.mask_iou_association_threshold and (dist <= self.merge_distance_m * 2.0 or det_is_partial):
                 return instance
             if dist > self.merge_distance_m or dist >= best_dist:
@@ -264,7 +274,12 @@ class FusedInstanceRegistry:
         instance.valid_detection_count = int(instance.valid_detection_count) + 1
         instance.total_conf_sum = float(instance.total_conf_sum) + float(det.confidence) * weight
         instance.category = instance.stable_category
-        instance.used_for_policy_graph = bool(instance.is_stable and float(instance.geometry_confidence) >= float(self.min_geometry_confidence))
+        has_full_or_prior_full_geometry = instance.full_mask_reference is not None and instance.center_world_stable is not None
+        instance.used_for_policy_graph = bool(
+            instance.is_stable
+            and has_full_or_prior_full_geometry
+            and float(instance.geometry_confidence) >= float(self.min_geometry_confidence)
+        )
 
     def _node_type_for_category(self, category: str) -> str:
         return "room" if normalize_category(category) in self.room_categories else "object"
@@ -300,6 +315,7 @@ class FusedInstanceRegistry:
             "frame_id": int(step_id),
             "step": int(step_id),
             "category": normalize_category(det.category),
+            "raw_category": normalize_category(det.category),
             "raw_label": str(det.raw_label),
             "confidence": float(det.confidence),
             "bbox_xyxy": [float(v) for v in det.bbox_xyxy],
@@ -472,6 +488,22 @@ def fused_instance_to_track_dict(instance: FusedInstance) -> dict:
         else [float(v) for v in np.asarray(instance.center_world_visible, dtype=np.float32).tolist()],
         "is_stable": bool(instance.is_stable),
         "used_for_policy_graph": bool(instance.used_for_policy_graph),
+        "used_for_room_label": bool(instance.used_for_policy_graph),
+        "used_for_goal_candidate": bool(instance.used_for_policy_graph),
+        "used_for_stop": bool(instance.used_for_policy_graph),
         "parent_track_id": instance.parent_track_id,
         "child_track_ids": list(instance.child_track_ids),
     }
+
+
+def _mask_containment(a: Optional[np.ndarray], b: Optional[np.ndarray]) -> float:
+    if a is None or b is None:
+        return 0.0
+    aa = np.asarray(a, dtype=bool)
+    bb = np.asarray(b, dtype=bool)
+    if aa.shape != bb.shape or aa.ndim != 2:
+        return 0.0
+    denom = int(np.count_nonzero(aa))
+    if denom <= 0:
+        return 0.0
+    return float(np.count_nonzero(aa & bb)) / float(denom)

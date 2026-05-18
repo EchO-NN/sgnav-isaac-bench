@@ -7,6 +7,11 @@ from pathlib import Path
 from typing import List, Optional, Sequence, Union
 
 from isaac_bench.config import get_nested, load_config
+from isaac_bench.mapping.upstream_rose2_pure_python_adapter import (
+    DEFAULT_SOURCE_ENV,
+    REQUIRED_SOURCE_FILES,
+    validate_upstream_rose2_source_root,
+)
 
 
 def _path_from_env_or_config(env_names: Union[str, Sequence[str]], cfg: dict, config_key: str, default: str) -> str:
@@ -33,6 +38,27 @@ def _check_path(kind: str, path: str, required: bool, allow_config_reference: bo
     }
 
 
+def _check_rose2_source(path: str, env_name: str, required: bool) -> dict:
+    try:
+        resolved = validate_upstream_rose2_source_root(path, env_name=env_name, fail=bool(required))
+        exists = resolved is not None
+        message = ""
+    except FileNotFoundError as exc:
+        resolved = None
+        exists = False
+        message = str(exc)
+    return {
+        "kind": "rose2_source_root",
+        "path": str(resolved or path or os.environ.get(env_name, "")),
+        "required": bool(required),
+        "exists": bool(exists),
+        "status": "ok" if exists else ("missing" if required else "optional_missing"),
+        "env": env_name,
+        "required_files": list(REQUIRED_SOURCE_FILES),
+        "message": message,
+    }
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="Check external SG-Nav Isaac benchmark assets.")
     parser.add_argument("--config", default="isaac_bench/configs/isaac_bench.yaml")
@@ -40,6 +66,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--require-sam2", action="store_true")
     parser.add_argument("--require-interioragent", action="store_true")
     parser.add_argument("--require-isaac", action="store_true")
+    parser.add_argument("--require-rose2-source", action="store_true")
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
 
@@ -76,6 +103,16 @@ def main(argv: Optional[List[str]] = None) -> int:
             args.require_sam2,
             allow_config_reference=True,
         ),
+        _check_rose2_source(
+            _path_from_env_or_config(
+                str(get_nested(cfg, "mapping.room_segmentation.upstream_repo_env", DEFAULT_SOURCE_ENV) or DEFAULT_SOURCE_ENV),
+                cfg,
+                "mapping.room_segmentation.source_root",
+                "",
+            ),
+            str(get_nested(cfg, "mapping.room_segmentation.upstream_repo_env", DEFAULT_SOURCE_ENV) or DEFAULT_SOURCE_ENV),
+            args.require_rose2_source,
+        ),
     ]
     missing_required = [item for item in checks if item["required"] and not item["exists"]]
     payload = {"ok": not missing_required, "checks": checks}
@@ -86,6 +123,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         for item in checks:
             prefix = "OK" if item["exists"] else ("MISSING" if item["required"] else "OPTIONAL_MISSING")
             print("%s %s: %s" % (prefix, item["kind"], item["path"]))
+            if item.get("message"):
+                print("  %s" % item["message"])
     return 0 if not missing_required else 2
 
 

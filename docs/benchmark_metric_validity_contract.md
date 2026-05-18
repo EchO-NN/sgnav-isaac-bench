@@ -67,10 +67,18 @@ Every episode result row must include:
 - `room_map_mode=observed_rooms_json`, `rooms_json`, or `observed` implies
   oracle room maps and is not valid for the strict SG-Nav metric path unless
   the run is explicitly named `oracle_room_ablation`.
+- `room_map_mode=upstream_rose2_vertical_or_free` is the strict default room
+  segmenter. It requires a no-ROS pure-Python ROSE2 source checkout from
+  `goldleaf3i/declutter-reconstruct`; by default `ROSE2_SOURCE_ROOT` must
+  contain `code/FFT_MQ.py`, `code/minibatch.py`, and `code/parameters.py`.
+  Missing source in strict mode is a clear failure, not a fallback.
+- `room_map_mode=online_rose2_structure`, `rose2_structure`, or
+  `online_rose2_structure_vlm` is the local ROSE2-lite debug/ablation path and
+  is not valid for the strict SG-Nav metric path unless the run is explicitly
+  named `local_rose2_lite_room_ablation`.
 - `room_map_mode=online_geometry_watershed` is a legacy debug/ablation room
   segmenter and is not valid for the strict SG-Nav metric path unless the run
-  is explicitly named `legacy_watershed_room_ablation`. The strict default room
-  segmenter is `online_rose2_structure`.
+  is explicitly named `legacy_watershed_room_ablation`.
 - Missing or unreachable room VLM backend is not the same as an evidence-based
   `unknown` room label. Backend failure must fail clearly or mark
   `metric_valid=false` with `room_vlm_unavailable` or
@@ -84,6 +92,11 @@ Every episode result row must include:
   sides. Same category, unknown, or unreliable labels must merge unless a
   verified structural boundary preserves the split. Direct hardcoded object
   lists must not be authoritative split rules.
+- Vertical free evidence in the `0.10-2.00 m` profile may suppress furniture
+  and clutter in `vertical_carved_map`, but it must not create a metric-valid
+  room doorway. A doorway requires floor-level traversability plus wall-line
+  support. Window/curtain/glass, high-band, and exterior/perimeter gaps are
+  closed as walls for room segmentation and must not create room adjacency.
 - Strict SG-Nav room segmentation/recognition is scoring-gated. Room VLM calls
   should be recorded only when a new frontier-scoring decision needs fresh room
   evidence; cached room context must be used for committed-frontier replans and
@@ -110,6 +123,8 @@ Rows must record all known debug or non-metric substitutions in
 - `room_vlm_unavailable`
 - `room_vlm_invalid_json`
 - `oracle_room_map`
+- `local_rose2_lite_room_segmentation`
+- `legacy_watershed_room_segmentation`
 - `static_map_planning`
 - `static_nearfield_map`
 - `frontier_near_fallback`

@@ -27,6 +27,9 @@ class StructureExtractionConfig:
     wall_cluster_gap_m: float = 0.50
     wall_min_support_ratio: float = 0.25
     wall_raster_radius_cells: int = 1
+    wall_extension_enabled: bool = True
+    wall_extension_band_m: float = 0.45
+    wall_extension_margin_m: float = 0.15
     clutter_component_max_area_m2: float = 1.2
     min_room_area_m2: float = 1.5
     topology_split_enabled: bool = True
@@ -92,6 +95,12 @@ def extract_rose2_structure(
             segments = fallback_segments
     clusters = cluster_wall_segments(segments, dominant, config)
     representative_lines = representative_lines_from_clusters(clusters, clean_structure_map.shape, config)
+    representative_lines = extend_representative_lines_to_free_boundary(
+        representative_lines,
+        free,
+        clean_structure_map.shape,
+        config,
+    )
     boundary_map = rasterize_representative_lines(representative_lines, clean_structure_map.shape, int(config.wall_raster_radius_cells))
     face_labels, faces = faces_from_boundary_map(free, boundary_map, config)
     topology_debug = topology_split_debug(face_labels, free, config) if bool(config.topology_split_enabled) else None
@@ -346,6 +355,79 @@ def representative_lines_from_clusters(clusters: Sequence[Mapping[str, object]],
             }
         )
     return reps
+
+
+def extend_representative_lines_to_free_boundary(
+    lines: Sequence[Mapping[str, object]],
+    free: np.ndarray,
+    shape: Tuple[int, int],
+    config: StructureExtractionConfig,
+) -> List[dict]:
+    """Extend ROSE2 wall hypotheses across the locally observed free domain.
+
+    Hough support only covers occupied wall pixels. In online RGB-D maps those
+    pixels are often short wall fragments, so using them directly leaves a
+    flood-fill path around the wall and collapses multiple rooms into one mask.
+    ROSE2-style structure extraction treats the line hypothesis as the room
+    boundary and extends it through nearby observed free space until the local
+    free-space support ends.
+    """
+
+    if not bool(getattr(config, "wall_extension_enabled", True)):
+        return [dict(line) for line in lines]
+    free_arr = np.asarray(free, dtype=bool)
+    rr, cc = np.nonzero(free_arr)
+    if rr.size == 0:
+        return [dict(line) for line in lines]
+    points = np.stack([rr.astype(np.float32), cc.astype(np.float32)], axis=1)
+    resolution = max(float(config.resolution_m), 1e-6)
+    band_cells = max(
+        int(getattr(config, "wall_raster_radius_cells", 1)) + 1,
+        int(round(float(getattr(config, "wall_extension_band_m", 0.45)) / resolution)),
+    )
+    margin_cells = max(0, int(round(float(getattr(config, "wall_extension_margin_m", 0.15)) / resolution)))
+    out: List[dict] = []
+    for line in lines:
+        row = dict(line)
+        p0 = np.asarray(row.get("p0", (0, 0)), dtype=np.float32)
+        p1 = np.asarray(row.get("p1", (0, 0)), dtype=np.float32)
+        direction = p1 - p0
+        norm = float(np.linalg.norm(direction))
+        if norm < 1.0:
+            out.append(row)
+            continue
+        direction = direction / norm
+        normal = np.asarray([-direction[1], direction[0]], dtype=np.float32)
+        offset = float(((p0 + p1) * 0.5) @ normal)
+        distances = np.abs(points @ normal - offset)
+        near = distances <= float(band_cells)
+        if int(np.count_nonzero(near)) < max(4, int(round(norm * 0.25))):
+            out.append(row)
+            continue
+        projections = points[near] @ direction
+        original_proj = np.asarray([float(p0 @ direction), float(p1 @ direction)], dtype=np.float32)
+        lo = min(float(np.min(projections)), float(np.min(original_proj))) - float(margin_cells)
+        hi = max(float(np.max(projections)), float(np.max(original_proj))) + float(margin_cells)
+        if hi - lo <= norm + 1.0:
+            out.append(row)
+            continue
+        ext0 = _clip_point_to_shape(direction * lo + normal * offset, shape)
+        ext1 = _clip_point_to_shape(direction * hi + normal * offset, shape)
+        extended_len = float(np.linalg.norm(ext1 - ext0))
+        if extended_len <= norm + 1.0:
+            out.append(row)
+            continue
+        row["support_p0"] = [int(v) for v in row.get("p0", (0, 0))]
+        row["support_p1"] = [int(v) for v in row.get("p1", (0, 0))]
+        row["p0"] = [int(round(float(ext0[0]))), int(round(float(ext0[1])))]
+        row["p1"] = [int(round(float(ext1[0]))), int(round(float(ext1[1])))]
+        row["pre_extension_length_m"] = float(norm * resolution)
+        row["length_m"] = float(extended_len * resolution)
+        row["extension_band_cells"] = int(band_cells)
+        row["extension_near_free_cells"] = int(np.count_nonzero(near))
+        row["extended_to_observed_free_boundary"] = True
+        out.append(row)
+    return out
 
 
 def rasterize_representative_lines(lines: Sequence[Mapping[str, object]], shape: Tuple[int, int], radius_cells: int = 1) -> np.ndarray:

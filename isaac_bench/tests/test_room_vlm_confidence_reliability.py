@@ -26,7 +26,7 @@ def _room(partial=False):
     )
 
 
-def test_high_vlm_self_confidence_without_evidence_is_forced_unknown():
+def test_high_vlm_self_confidence_without_evidence_keeps_category_with_low_reliability():
     labeler = VLMRoomLabeler(
         client=FakeRoomLLM(
             {
@@ -40,13 +40,17 @@ def test_high_vlm_self_confidence_without_evidence_is_forced_unknown():
 
     label = labeler.label_room(_room(), [ObjectEvidence("chair", hits=1, mean_confidence=0.4)], None)
 
-    assert label.category == "unknown"
+    assert label.category == "living_room"
     assert label.vlm_self_confidence == pytest.approx(0.99)
-    assert label.label_reliability == 0.0
-    assert label.unknown_reason in {"insufficient_or_ambiguous_evidence", "no_diagnostic_evidence"}
+    assert 0.0 < label.label_reliability < 0.65
+    assert label.unknown_reason is None
+    assert label.reliability_factors["label_quality_warning"] in {
+        "insufficient_or_ambiguous_evidence",
+        "no_diagnostic_evidence",
+    }
 
 
-def test_low_self_confidence_is_forced_unknown_even_with_diagnostic_objects():
+def test_low_self_confidence_keeps_category_even_with_warning():
     labeler = VLMRoomLabeler(
         client=FakeRoomLLM(
             {
@@ -60,8 +64,9 @@ def test_low_self_confidence_is_forced_unknown_even_with_diagnostic_objects():
 
     label = labeler.label_room(_room(), [ObjectEvidence("toilet", hits=3), ObjectEvidence("sink", hits=3)], None)
 
-    assert label.category == "unknown"
-    assert label.unknown_reason == "low_confidence"
+    assert label.category == "bathroom"
+    assert label.unknown_reason is None
+    assert label.reliability_factors["label_quality_warning"] == "low_confidence"
 
 
 def test_accepted_room_label_uses_evidence_reliability_not_raw_confidence():

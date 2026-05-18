@@ -8,6 +8,8 @@ from isaac_bench.perception.object_memory import ObjectMemory, ObjectNode
 
 
 class StableSegmenter:
+    context_source = "upstream_rose2_vertical_or_free_vlm"
+
     def __init__(self):
         self.update_count = 0
         self.last_debug = {}
@@ -29,7 +31,12 @@ class StableSegmenter:
             observed_free_cells=int(np.count_nonzero(mask)),
             mask_confidence=0.9,
         )
-        self.last_debug = {"source": "rose2_structure", "algorithm": "rose2_structure", "room_count": 1}
+        self.last_debug = {
+            "source": "upstream_rose2_vertical_or_free",
+            "algorithm": "upstream_rose2_vertical_or_free",
+            "source_mode": "declutter_reconstruct_mit",
+            "room_count": 1,
+        }
         return [room]
 
 

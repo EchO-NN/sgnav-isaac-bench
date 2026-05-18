@@ -43,7 +43,7 @@ visualization:
 isaac:
   headless: false
   control_dt: 0.2
-  perception_every_steps: 5
+  perception_every_steps: 1
   observed_radius_m: 3.0
   render_updates_per_step: 1
   read_depth: true
@@ -162,16 +162,32 @@ mapping:
   frontier_allow_near_fallback: false
   frontier_debug_dump: false
   frontier_debug_dir: data/debug_frontier
-  room_map_mode: online_rose2_structure
+  room_map_mode: upstream_rose2_vertical_or_free
+  strict_no_oracle_rooms: true
   room_segmentation:
     enabled: true
-    algorithm: rose2_structure
+    algorithm: upstream_rose2_vertical_or_free
+    source_mode: declutter_reconstruct_mit
     legacy_watershed_allowed: debug_only
+    local_rose2_lite_allowed: debug_only
+    require_upstream_source_for_strict: true
+    upstream_repo_env: ROSE2_SOURCE_ROOT
+    run_only_before_frontier_scoring: true
     source_grid: online_depth_observed
     proposal_mode: distance_watershed
-    finalization_mode: no_merge
+    finalization_mode: doorway_constrained_merge
     use_structural_obstacle_mask: true
     suppress_furniture_obstacles: true
+    vertical_or_free:
+      enabled: true
+      z_min_m: 0.20
+      z_max_m: 2.00
+      floor_band_m: [0.10, 0.35]
+      robot_body_band_m: [0.35, 0.80]
+      mid_band_m: [0.80, 1.30]
+      upper_band_m: [1.30, 2.00]
+      min_free_rays: 1
+      min_observed_rays: 1
     update_every_steps: 5
     min_observed_free_cells: 50
     min_room_area_m2: 1.5
@@ -190,19 +206,31 @@ mapping:
     doorway_unknown_support_max_ratio: 0.20
     doorway_endpoint_wall_distance_m: 0.35
     doorway_neck_ratio_max: 0.55
-    open_boundary_merge: false
-    merge_same_semantic_category: false
-    merge_unknown_into_open_labeled_region: false
-    use_premerge_labels_for_open_plan_merge: false
+    open_boundary_merge: true
+    merge_same_semantic_category: true
+    merge_unknown_into_open_labeled_region: true
+    use_premerge_labels_for_open_plan_merge: true
     min_label_reliability_for_functional_split: 0.65
     unknown_allows_functional_split: false
     final_label_after_merge: true
-    merge_wide_openings: false
+    merge_wide_openings: true
     small_segment_merge_area_m2: 1.2
     id_iou_threshold: 0.35
     unknown_boundary_confidence_penalty: true
-    debug_dump: false
-    debug_dir: debug/roomseg_rose2
+    debug_dump: true
+    debug_dir: debug/roomseg
+    wall_confidence_threshold: 0.55
+    vertical_free_suppression_weight: 0.35
+    object_overlap_suppression_weight: 0.45
+    line_support_weight: 0.25
+    continuity_weight: 0.45
+    persistence_weight: 0.10
+    single_view_penalty: 0.20
+    surrounded_by_free_penalty: 0.25
+    bulky_component_penalty: 0.25
+    furniture_suppression_radius_m: 0.90
+    wall_like_aspect_ratio_min: 4.0
+    exterior_margin_cells: 2
     rose2:
       dominant_direction_count: 2
       directional_filter_width_rad: 0.244346095
@@ -211,6 +239,9 @@ mapping:
       wall_cluster_distance_m: 0.35
       wall_cluster_gap_m: 0.50
       wall_min_support_ratio: 0.25
+      wall_extension_enabled: true
+      wall_extension_band_m: 0.45
+      wall_extension_margin_m: 0.15
       topology_split_enabled: true
 
 perception:
@@ -244,13 +275,17 @@ object_memory:
   partial_class_weight: 0.25
   min_geometry_confidence: 0.50
   partial_stability_min_observations: 3
-  mask_iou_association_threshold: 0.20
-  footprint_iou_association_threshold: 0.15
-  child_containment_threshold: 0.60
+  mask_iou_association_threshold: 0.25
+  mask_iou_track_match_threshold: 0.25
+  mask_containment_track_match_threshold: 0.60
+  footprint_iou_association_threshold: 0.20
+  footprint_iou_track_match_threshold: 0.20
+  child_containment_threshold: 0.70
   child_area_ratio_threshold: 0.35
+  child_object_area_ratio_max: 0.35
 
 room_semantics:
-  use_premerge_labels_for_open_plan_merge: false
+  use_premerge_labels_for_open_plan_merge: true
   min_label_reliability_for_functional_split: 0.65
   unknown_allows_functional_split: false
   final_label_after_merge: true
@@ -314,7 +349,7 @@ sgnav:
     long_edge_geometric_pruning: true
     group_nodes: true
     room_nodes:
-      source: online_rose2_structure_vlm
+      source: upstream_rose2_vertical_or_free_vlm
       use_dataset_room_labels_in_metric: false
       strict_no_oracle_rooms: true
       room_label_backend: vlm

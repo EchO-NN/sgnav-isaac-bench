@@ -18,9 +18,10 @@ enabled and reachable.
     `pytest` is not installed in the base shell.
   - Repository environment result: `./run_isaac_bench.sh -m pytest -q`
     passed with `127 passed`.
-- `./run_isaac_bench.sh -m isaac_bench.scripts.check_assets --require-yolo-world --require-sam2 --require-interioragent --require-isaac`
-  passed. It found Isaac Sim, InteriorAgent, `data/models/yolov8l-worldv2.pt`,
-  `data/models/sam2.1_hiera_small.pt`, and the SAM2 model config.
+- `./run_isaac_bench.sh -m isaac_bench.scripts.check_assets --require-yolo-world --require-sam2 --require-rose2-source --require-interioragent --require-isaac`
+  must pass before a strict metric run. It reports `MISSING rose2_source_root`
+  when `ROSE2_SOURCE_ROOT` is not set to a `goldleaf3i/declutter-reconstruct`
+  checkout containing the required source files.
 - `./scripts/run_sgnav_isaac_env.sh -m isaac_bench.scripts.preprocess_interioragent --dataset-root ${INTERIORAGENT_ROOT:-/home/echo/InteriorAgent} --out data/interioragent_preprocessed --resolution 0.05 --scene-id kujiale_0031`
   passed and wrote one preprocessed scene.
 - `./scripts/run_sgnav_isaac_env.sh -m isaac_bench.scripts.generate_episodes --preprocessed-dir data/interioragent_preprocessed --scene-id kujiale_0031 --episodes-per-scene 10 --out data/interioragent_episodes/debug.jsonl`
@@ -51,7 +52,7 @@ enabled and reachable.
 | Mask/depth backprojection into object memory | `isaac_bench/sensors/depth_backproject.py`, `isaac_bench/perception/fused_instance_registry.py`, `isaac_bench/perception/object_memory.py`, object-memory tests | implemented with synthetic/unit coverage |
 | Online occupancy/free-space map | `isaac_bench/mapping/online_mapper.py`, strict smoke row `mapping_source=depth_ray_online` | implemented, short integration passed |
 | Reachable frontier extraction from observed-free/unknown boundary | `isaac_bench/mapping/frontier.py`, `isaac_bench/tests/test_frontier.py`, strict smoke row `frontier_unknown_source=observed` | implemented, short integration passed |
-| Object/group/room scene graph where feasible | `isaac_bench/graph/paper_scene_graph.py`, `isaac_bench/graph/sgnav_scenegraph_adapter.py`, `isaac_bench/tests/test_paper_scene_graph.py` | implemented with online evidence and debug counts |
+| Object/group/room scene graph where feasible | `isaac_bench/graph/paper_scene_graph.py`, `isaac_bench/graph/sgnav_scenegraph_adapter.py`, `isaac_bench/mapping/upstream_rose2_pure_python_adapter.py`, `isaac_bench/tests/test_paper_scene_graph.py` | implemented with online evidence and debug counts |
 | SG-Nav-compatible subgraph text/payloads | `isaac_bench/graph/subgraph_builder.py`, `isaac_bench/tests/test_subgraph_hcot.py`, decision dump contract | implemented with tests |
 | LLM or declared LLM-compatible scorer | `isaac_bench/graph/hcot_scorer.py`, strict JSON parser/retry, contract labels deterministic local scorer non-metric | implemented; metric-valid real LLM run remains external-service blocked |
 | Subgraph probability to frontier interpolation | `isaac_bench/graph/frontier_interpolation.py`, `isaac_bench/tests/test_frontier_score_calibration.py`, strict smoke `paper_frontier_interpolation.mode=paper_subgraph_interpolation` | implemented |

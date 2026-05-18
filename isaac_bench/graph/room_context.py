@@ -57,7 +57,7 @@ class RoomContextResult:
     object_evidence_hash: str = ""
     room_mask_geometry_hash: str = ""
     room_object_evidence_hash: str = ""
-    source: str = "online_rose2_structure_vlm"
+    source: str = "upstream_rose2_pure_python_vlm"
 
     def metadata(self, *, full_order: bool = True) -> dict:
         trace = list(SCORING_ROOM_CALL_ORDER_FULL if full_order else self.call_order_trace)
@@ -73,7 +73,7 @@ class RoomContextResult:
             "room_label_cache_hits": int(self.label_cache_hits),
             "room_call_order_trace": trace,
             "room_segmentation_called_for": "frontier_scoring_pre_hook",
-            "room_segmentation_algorithm": str(self.room_segmentation_debug.get("algorithm", "rose2_structure")),
+            "room_segmentation_algorithm": str(self.room_segmentation_debug.get("algorithm", "upstream_rose2_pure_python")),
             "room_segmentation_step_index": self.room_segmentation_debug.get("step"),
             "room_vlm_called": bool(self.labeling_ran),
             "scenegraph_updated_after_room_context": True,
@@ -110,7 +110,7 @@ def prepare_room_context_for_frontier_scoring(
 ) -> RoomContextResult:
     """Prepare online room masks and VLM labels immediately before frontier scoring."""
     cache = previous_room_context or RoomContextCache()
-    source = str(getattr(room_segmenter, "context_source", "online_rose2_structure_vlm") or "online_rose2_structure_vlm") if room_segmenter is not None else "online_rose2_structure_vlm"
+    source = str(getattr(room_segmenter, "context_source", "upstream_rose2_pure_python_vlm") or "upstream_rose2_pure_python_vlm") if room_segmenter is not None else "upstream_rose2_pure_python_vlm"
     allowed = list(allowed_categories or DEFAULT_ROOM_CATEGORIES)
     if room_segmenter is None:
         if strict_benchmark:
@@ -172,13 +172,22 @@ def prepare_room_context_for_frontier_scoring(
     else:
         use_premerge = hasattr(room_segmenter, "build_proposals") and hasattr(room_segmenter, "finalize_proposals")
         if use_premerge:
+            build_kwargs = {
+                "step": int(step_idx),
+                "object_memory": getattr(object_memory, "nodes", []),
+            }
+            try:
+                build_params = inspect.signature(room_segmenter.build_proposals).parameters
+            except (TypeError, ValueError):
+                build_params = {}
+            if "vertical_profile" in build_params:
+                build_kwargs["vertical_profile"] = getattr(mapper, "vertical_profile", None)
             proposal_rooms, proposal_state = room_segmenter.build_proposals(
                 occupancy_arr,
                 free_arr,
                 obstacle_arr,
                 unknown_arr,
-                step=int(step_idx),
-                object_memory=getattr(object_memory, "nodes", []),
+                **build_kwargs,
             )
             proposal_assignments = assign_objects_to_room_masks(getattr(object_memory, "nodes", []), proposal_rooms, map_info)
             for proposal in proposal_rooms:
@@ -208,6 +217,8 @@ def prepare_room_context_for_frontier_scoring(
                 update_params = {}
             if "object_memory" in update_params:
                 update_kwargs["object_memory"] = getattr(object_memory, "nodes", [])
+            if "vertical_profile" in update_params:
+                update_kwargs["vertical_profile"] = getattr(mapper, "vertical_profile", None)
             room_masks = room_segmenter.update(
                 occupancy_arr,
                 free_arr,
@@ -223,6 +234,8 @@ def prepare_room_context_for_frontier_scoring(
             update_params = {}
         if "object_memory" in update_params:
             update_kwargs["object_memory"] = getattr(object_memory, "nodes", [])
+        if "vertical_profile" in update_params:
+            update_kwargs["vertical_profile"] = getattr(mapper, "vertical_profile", None)
         room_masks = room_segmenter.update(
             occupancy_arr,
             free_arr,

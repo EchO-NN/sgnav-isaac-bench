@@ -28,6 +28,11 @@ def _is_green_like(color: Tuple[int, int, int]) -> bool:
     return bool(g >= 150 and g > r + 25 and g >= b)
 
 
+def _cell_in_crop(cell: GridCell, r0: int, r1: int, c0: int, c1: int) -> bool:
+    row, col = int(cell[0]), int(cell[1])
+    return bool(r0 <= row < r1 and c0 <= col < c1)
+
+
 class SGNavPopupVisualizer:
     def __init__(
         self,
@@ -43,6 +48,7 @@ class SGNavPopupVisualizer:
         show_room_proposals: bool = True,
         show_room_masks: bool = True,
         show_room_labels: bool = True,
+        show_rose_occupancy_map: bool = True,
         show_frontier_member_cells: bool = True,
         show_object_nodes: bool = True,
         show_candidate_markers: bool = True,
@@ -61,6 +67,7 @@ class SGNavPopupVisualizer:
         self.show_room_proposals = bool(show_room_proposals)
         self.show_room_masks = bool(show_room_masks)
         self.show_room_labels = bool(show_room_labels)
+        self.show_rose_occupancy_map = bool(show_rose_occupancy_map)
         self.show_frontier_member_cells = bool(show_frontier_member_cells)
         self.show_object_nodes = bool(show_object_nodes)
         self.show_candidate_markers = bool(show_candidate_markers)
@@ -421,6 +428,14 @@ class SGNavPopupVisualizer:
         size: Tuple[int, int],
     ) -> Image.Image:
         width, height = size
+        rose_panel_enabled = bool(self.show_rose_occupancy_map)
+        rose_h = 0
+        divider_h = 0
+        map_h_available = int(height)
+        if rose_panel_enabled and height >= 180:
+            rose_h = min(max(96, int(round(height * 0.28))), max(1, height // 2))
+            divider_h = 2
+            map_h_available = max(1, int(height) - rose_h - divider_h)
         h, w = occupancy.shape
         base = np.zeros((h, w, 3), dtype=np.uint8)
         nav = navigable.astype(bool)
@@ -459,10 +474,10 @@ class SGNavPopupVisualizer:
         crop = base[r0:r1, c0:c1]
         crop_h, crop_w = crop.shape[:2]
         margin = 12
-        scale = min((width - 2 * margin) / max(crop_w, 1), (height - 2 * margin) / max(crop_h, 1))
+        scale = min((width - 2 * margin) / max(crop_w, 1), (map_h_available - 2 * margin) / max(crop_h, 1))
         map_w, map_h = max(1, int(crop_w * scale)), max(1, int(crop_h * scale))
-        ox, oy = (width - map_w) // 2, (height - map_h) // 2
-        image = Image.new("RGB", (width, height), (18, 20, 24))
+        ox, oy = (width - map_w) // 2, (map_h_available - map_h) // 2
+        image = Image.new("RGB", (width, map_h_available), (18, 20, 24))
         map_img = Image.fromarray(crop).resize((map_w, map_h), Image.NEAREST)
         image.paste(map_img, (ox, oy))
         draw = ImageDraw.Draw(image)
@@ -575,9 +590,269 @@ class SGNavPopupVisualizer:
         zoom = max(1.0, min(w / max(crop_w, 1), h / max(crop_h, 1)))
         target_count = len(nav_decision.target_cells) if nav_decision is not None else 0
         self._label(draw, (10, 8), "Map / frontiers / A* / goal candidates  zoom %.1fx target_cells=%d" % (zoom, target_count), (255, 255, 255))
-        self._legend(draw, (10, max(32, height - 120)))
+        self._legend(draw, (10, max(32, map_h_available - 120)))
+        if rose_panel_enabled and rose_h > 0:
+            rose_panel, rose_layers = self._render_rose_occupancy_panel(
+                occupancy=occupancy,
+                navigable=navigable,
+                observed=observed,
+                size=(width, rose_h),
+                crop_bounds=(r0, r1, c0, c1),
+            )
+            final = Image.new("RGB", (width, height), (18, 20, 24))
+            final.paste(image, (0, 0))
+            final_draw = ImageDraw.Draw(final)
+            final_draw.line([(0, map_h_available), (width, map_h_available)], fill=(70, 74, 80), width=divider_h)
+            final.paste(rose_panel, (0, map_h_available + divider_h))
+            layers.extend(rose_layers)
+            self._last_overlay_layers = layers if self.debug_overlay_layers else []
+            return final
         self._last_overlay_layers = layers if self.debug_overlay_layers else []
         return image
+
+    def _render_rose_occupancy_panel(
+        self,
+        *,
+        occupancy: np.ndarray,
+        navigable: np.ndarray,
+        observed: np.ndarray,
+        size: Tuple[int, int],
+        crop_bounds: Tuple[int, int, int, int],
+    ) -> Tuple[Image.Image, List[dict]]:
+        width, height = size
+        shape = tuple(np.asarray(occupancy).shape[:2])
+        occ = np.asarray(occupancy, dtype=bool)
+        nav = np.asarray(navigable, dtype=bool)
+        obs = np.asarray(observed, dtype=bool)
+        roomseg_free = self._room_debug_array("initial_roomseg_free", shape, bool)
+        roomseg_occupied = self._room_debug_array("initial_roomseg_occupied", shape, bool)
+        vertical_or_free = self._room_debug_array("vertical_or_free_map", shape, bool)
+        vertical_carved = self._room_debug_array("vertical_carved_map", shape, bool)
+        structural = self._room_debug_array("structural_wall_mask", shape, bool)
+        clean_structure = self._room_debug_array("clean_structure_map", shape, bool)
+        rejected_structure = self._room_debug_array("structural_component_rejected_mask", shape, bool)
+        interior_clutter = self._room_debug_array("interior_clutter_suppression_mask", shape, bool)
+        furniture_suppressed = self._room_debug_array("furniture_suppression_mask", shape, bool)
+        suppressed_clutter = rejected_structure | interior_clutter | furniture_suppressed
+        wall_conf = self._room_debug_array("wall_confidence_map", shape, np.float32)
+        threshold = float(self._room_segmentation_debug.get("wall_confidence_threshold", 0.55) or 0.55)
+        wall_conf_hot = wall_conf >= threshold if wall_conf.shape == shape else np.zeros(shape, dtype=bool)
+
+        has_rose_input = bool(
+            np.any(roomseg_free)
+            or np.any(roomseg_occupied)
+            or np.any(vertical_or_free)
+            or np.any(vertical_carved)
+            or np.any(structural)
+            or np.any(clean_structure)
+            or np.any(suppressed_clutter)
+            or np.any(wall_conf > 0.0)
+        )
+        rose_occupied = roomseg_occupied if np.any(roomseg_occupied) else (structural if np.any(structural) else (clean_structure | wall_conf_hot))
+        vertical_free_overridden_occupied = occ & vertical_or_free & ~roomseg_occupied
+        canvas = np.zeros((shape[0], shape[1], 3), dtype=np.uint8)
+        canvas[:, :] = (36, 40, 48)
+        canvas[nav] = (86, 92, 96)
+        canvas[obs & nav] = (118, 126, 130)
+        canvas[obs & ~nav] = (54, 56, 60)
+        if not has_rose_input:
+            canvas[occ] = (8, 8, 8)
+        canvas[roomseg_free] = (150, 156, 160)
+        canvas[suppressed_clutter] = (58, 82, 132)
+        canvas[vertical_or_free] = (116, 96, 74)
+        canvas[vertical_carved] = (126, 104, 75)
+        canvas[vertical_free_overridden_occupied] = (225, 132, 45)
+        canvas[wall_conf_hot] = (255, 105, 75)
+        canvas[rose_occupied] = (0, 0, 0)
+        canvas[clean_structure] = (255, 190, 70)
+
+        r0, r1, c0, c1 = crop_bounds
+        crop = canvas[r0:r1, c0:c1]
+        crop_h, crop_w = crop.shape[:2]
+        label_h = 22
+        margin = 8
+        available_h = max(1, int(height) - label_h - margin)
+        scale = min((width - 2 * margin) / max(crop_w, 1), available_h / max(crop_h, 1))
+        map_w, map_h = max(1, int(crop_w * scale)), max(1, int(crop_h * scale))
+        ox = (width - map_w) // 2
+        oy = label_h + max(0, (available_h - map_h) // 2)
+        image = Image.new("RGB", (width, height), (15, 17, 21))
+        image.paste(Image.fromarray(crop).resize((map_w, map_h), Image.NEAREST), (ox, oy))
+        draw = ImageDraw.Draw(image)
+
+        def xy(cell: GridCell) -> Tuple[int, int]:
+            r, c = int(cell[0]), int(cell[1])
+            return int(ox + (c - c0 + 0.5) * scale), int(oy + (r - r0 + 0.5) * scale)
+
+        window_gap_count = self._draw_rose_gap_markers(
+            draw,
+            list(self._room_segmentation_debug.get("repaired_window_gaps") or []),
+            xy,
+            crop_bounds,
+            (255, 80, 130),
+        )
+        doorway_gap_count = self._draw_rose_gap_markers(
+            draw,
+            list(self._room_segmentation_debug.get("verified_doorway_gaps") or []),
+            xy,
+            crop_bounds,
+            (80, 255, 130),
+        )
+        title = "ROSE roomseg input after vertical-free operation"
+        if has_rose_input:
+            title += " | occupied=%d free=%d overridden_occ=%d conf>%.2f=%d win=%d door=%d" % (
+                int(np.count_nonzero(rose_occupied)),
+                int(np.count_nonzero(roomseg_free)),
+                int(np.count_nonzero(vertical_free_overridden_occupied)),
+                threshold,
+                int(np.count_nonzero(wall_conf_hot)),
+                int(window_gap_count),
+                int(doorway_gap_count),
+            )
+        else:
+            title += " | waiting for ROSE debug; showing current map underlay"
+        self._label(draw, (8, 5), title[:120], (255, 255, 255))
+        self._rose_legend(draw, (8, max(label_h + 4, height - 50)))
+
+        layers = [
+            self._overlay_record(
+                "rose_occupancy_map",
+                True,
+                (0, 0, 0),
+                int(np.count_nonzero(rose_occupied)),
+                "room segmentation occupancy after vertical-free operation, shown below the runtime occupancy map",
+                has_rose_input=has_rose_input,
+                current_occupancy_underlay_cells=int(np.count_nonzero(occ)),
+                current_navigable_underlay_cells=int(np.count_nonzero(nav)),
+                roomseg_free_cells=int(np.count_nonzero(roomseg_free)),
+                vertical_free_overridden_occupied_cells=int(np.count_nonzero(vertical_free_overridden_occupied)),
+            ),
+            self._overlay_record(
+                "rose_roomseg_free_map",
+                True,
+                (150, 156, 160),
+                int(np.count_nonzero(roomseg_free)),
+                "free cells in the ROSE room segmentation input after applying vertical-free evidence",
+            ),
+            self._overlay_record(
+                "rose_vertical_free_overrides",
+                True,
+                (225, 132, 45),
+                int(np.count_nonzero(vertical_free_overridden_occupied)),
+                "runtime occupied cells changed to free in the ROSE-only room segmentation input",
+            ),
+            self._overlay_record(
+                "rose_vertical_carved_map",
+                True,
+                (126, 104, 75),
+                int(np.count_nonzero(vertical_carved)),
+                "furniture-suppressed vertical carved map passed into ROSE preprocessing",
+            ),
+            self._overlay_record(
+                "rose_wall_confidence_map",
+                True,
+                (255, 105, 75),
+                int(np.count_nonzero(wall_conf_hot)),
+                "wall-confidence cells above room segmentation threshold",
+                threshold=threshold,
+            ),
+            self._overlay_record(
+                "rose_structural_rejected_clutter",
+                True,
+                (58, 82, 132),
+                int(np.count_nonzero(suppressed_clutter)),
+                "occupied clutter/furniture components rejected before ROSE structural occupancy",
+            ),
+            self._overlay_record(
+                "rose_repaired_window_gaps",
+                True,
+                (255, 80, 130),
+                int(window_gap_count),
+                "window/non-traversable gaps closed as walls for room segmentation",
+            ),
+            self._overlay_record(
+                "rose_verified_doorway_gaps",
+                True,
+                (80, 255, 130),
+                int(doorway_gap_count),
+                "floor-traversable doorway gaps recorded as portals",
+            ),
+        ]
+        return image, layers
+
+    def _room_debug_array(self, key: str, shape: Tuple[int, int], dtype) -> np.ndarray:
+        raw = self._room_segmentation_debug.get(key)
+        if raw is None:
+            return np.zeros(shape, dtype=dtype)
+        try:
+            arr = np.asarray(raw, dtype=dtype)
+        except Exception:
+            return np.zeros(shape, dtype=dtype)
+        if arr.shape != tuple(shape):
+            return np.zeros(shape, dtype=dtype)
+        return arr
+
+    def _overlay_record(
+        self,
+        name: str,
+        enabled: bool,
+        color: Tuple[int, int, int],
+        count: int,
+        note: str = "",
+        **extra,
+    ) -> dict:
+        item = {
+            "name": name,
+            "enabled": bool(enabled),
+            "color": [int(color[0]), int(color[1]), int(color[2])],
+            "primitive_count": int(count),
+            "green_like": bool(_is_green_like(color)),
+            "note": note,
+        }
+        item.update(extra)
+        return item
+
+    def _draw_rose_gap_markers(
+        self,
+        draw: ImageDraw.ImageDraw,
+        gaps: Sequence[object],
+        xy_func,
+        crop_bounds: Tuple[int, int, int, int],
+        color: Tuple[int, int, int],
+    ) -> int:
+        r0, r1, c0, c1 = crop_bounds
+        count = 0
+        for gap in gaps[:128]:
+            if not isinstance(gap, Mapping):
+                continue
+            axis = str(gap.get("axis", "vertical"))
+            index = int(gap.get("index", 0) or 0)
+            start = int(gap.get("start", 0) or 0)
+            end = int(gap.get("end", start) or start)
+            p0 = (start, index) if axis == "vertical" else (index, start)
+            p1 = (end, index) if axis == "vertical" else (index, end)
+            if not (_cell_in_crop(p0, r0, r1, c0, c1) or _cell_in_crop(p1, r0, r1, c0, c1)):
+                continue
+            draw.line([xy_func(p0), xy_func(p1)], fill=color, width=3)
+            count += 1
+        return count
+
+    def _rose_legend(self, draw: ImageDraw.ImageDraw, xy: Tuple[int, int]) -> None:
+        x, y = xy
+        items = [
+            ((0, 0, 0), "ROSE roomseg occupied"),
+            ((150, 156, 160), "ROSE roomseg free"),
+            ((225, 132, 45), "occupied -> free"),
+            ((58, 82, 132), "rejected clutter"),
+            ((126, 104, 75), "vertical-carved"),
+            ((255, 190, 70), "ROSE line"),
+            ((255, 80, 130), "closed window"),
+            ((80, 255, 130), "doorway portal"),
+        ]
+        for color, label in items:
+            self._dot(draw, (x + 5, y + 7), color, radius=4)
+            draw.text((x + 14, y), label, fill=(230, 232, 235), font=self._font)
+            y += 10
 
     def _map_crop_bounds(
         self,

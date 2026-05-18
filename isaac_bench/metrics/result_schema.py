@@ -3,6 +3,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Iterable, Mapping, MutableMapping, Optional
 
+from isaac_bench.mapping.upstream_rose2_pure_python_adapter import validate_upstream_rose2_source_root
+
 
 REQUIRED_RESULT_FIELDS = [
     "metric_valid",
@@ -155,12 +157,27 @@ def validate_strict_benchmark_assets(args: object) -> None:
     ablation_name = str(_get_arg(args, "ablation_name", "") or "").strip().lower()
     if room_map_mode in {"observed_rooms_json", "rooms_json", "observed"} and ablation_name != "oracle_room_ablation":
         raise BenchmarkAssetError(
-            "strict SG-Nav metric path requires online_rose2_structure room masks; rooms.json/oracle room maps are not allowed"
+            "strict SG-Nav metric path requires upstream_rose2_vertical_or_free room masks; rooms.json/oracle room maps are not allowed"
         )
     if room_map_mode in {"online_geometry_watershed", "online_geometry_watershed_vlm"} and ablation_name != "legacy_watershed_room_ablation":
         raise BenchmarkAssetError(
-            "strict SG-Nav metric path requires online_rose2_structure room masks; watershed is debug/ablation-only"
+            "strict SG-Nav metric path requires upstream_rose2_vertical_or_free room masks; watershed is debug/ablation-only"
         )
+    if room_map_mode in {"online_rose2_structure", "rose2_structure", "online_rose2_structure_vlm"} and ablation_name != "local_rose2_lite_room_ablation":
+        raise BenchmarkAssetError(
+            "strict SG-Nav metric path requires upstream_rose2_vertical_or_free room masks; local ROSE2-lite is debug/ablation-only"
+        )
+    if room_map_mode in {"upstream_rose2_vertical_or_free", "upstream_rose2_vertical_or_free_vlm", "upstream_rose2_pure_python", "upstream_rose2_pure_python_vlm"}:
+        room_cfg = dict(_get_arg(args, "room_segmentation_config", {}) or {})
+        if bool(room_cfg.get("require_upstream_source_for_strict", True)) and not bool(_get_arg(args, "allow_debug_fallbacks", False)):
+            try:
+                validate_upstream_rose2_source_root(
+                    room_cfg.get("source_root"),
+                    env_name=str(room_cfg.get("upstream_repo_env", "ROSE2_SOURCE_ROOT") or "ROSE2_SOURCE_ROOT"),
+                    fail=True,
+                )
+            except FileNotFoundError as exc:
+                raise BenchmarkAssetError(str(exc)) from exc
 
 
 def empty_sgnav_step_dump(metadata: Optional[Mapping[str, object]] = None) -> dict:
@@ -170,8 +187,8 @@ def empty_sgnav_step_dump(metadata: Optional[Mapping[str, object]] = None) -> di
         "rooms": [],
         "room_context": {},
         "room_segmentation": {
-            "source": "rose2_structure",
-            "algorithm": "rose2_structure",
+            "source": "upstream_rose2_vertical_or_free",
+            "algorithm": "upstream_rose2_vertical_or_free",
             "room_count": 0,
             "rooms": [],
         },
@@ -291,6 +308,8 @@ def _infer_fallbacks(row: Mapping[str, object], args: object | None) -> list[str
     room_map_mode = str(row.get("room_map_mode", _get_arg(args, "room_map_mode", "")) or "").strip().lower()
     if room_map_mode in {"observed_rooms_json", "rooms_json", "observed"} and str(ablation_name or "") != "oracle_room_ablation":
         fallbacks.append("oracle_room_map")
+    if room_map_mode in {"online_rose2_structure", "rose2_structure", "online_rose2_structure_vlm"} and str(ablation_name or "") != "local_rose2_lite_room_ablation":
+        fallbacks.append("local_rose2_lite_room_segmentation")
     if room_map_mode in {"online_geometry_watershed", "online_geometry_watershed_vlm"} and str(ablation_name or "") != "legacy_watershed_room_ablation":
         fallbacks.append("legacy_watershed_room_segmentation")
     if sim_backend == "map":

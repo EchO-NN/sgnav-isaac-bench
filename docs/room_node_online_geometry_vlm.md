@@ -12,25 +12,41 @@ trigger room segmentation or VLM room labeling.
 
 ## Geometry Stage
 
-`isaac_bench.mapping.rose2_room_segmentation.OnlineROSE2RoomSegmenter`
-consumes only the online RGB-D occupancy/free-space state:
+`isaac_bench.mapping.upstream_rose2_pure_python_adapter.UpstreamROSE2PurePythonSegmenter`
+is the strict default. It consumes only the online RGB-D occupancy/free-space
+state:
 
 - `observed_free_mask`
 - `obstacle_mask`
 - `unknown_mask`
 
-It first performs a CPU ROSE2-style robust structure extraction pass: remove
+It wraps the no-ROS MIT `goldleaf3i/declutter-reconstruct` source contract
+through an in-memory CPU ROSE2-style robust structure extraction pass: remove
 isolated clutter, estimate dominant wall directions from the 2D FFT spectrum,
 directionally filter structural frequencies, inverse-transform to a structural
 score, auto-threshold, detect Hough wall segments, cluster collinear wall
-support, rasterize representative walls, and derive grid-face room masks.
+support, rasterize representative walls, and derive room masks/polygons.
 Furniture and movable-object clutter are suppressed by structural support and,
 when stable object memory is available, object footprints only penalize wall
 support. Unknown cells are not treated as structural wall support.
 
-The old distance-transform watershed path remains only as debug or
-`legacy_watershed_room_ablation`; it is rejected for strict metric runs. Final
-ROSE2 room masks still pass through the same open-plan merge/split policy:
+The structure pass is assisted by a multi-height vertical profile. For each
+grid cell, the mapper tracks `occupied_count`, `free_ray_count`,
+`observed_count`, and `unknown_count` in `low`, `robot_body`, `mid`, and
+`upper` bands. This produces a `vertical_carved_map` and
+`wall_confidence_map`. Free evidence at height can reduce structural obstacle
+confidence and suppress furniture, but it never creates a doorway by itself.
+Doorways require floor-level traversability plus wall-line support. Windows,
+curtains, glass, high-band gaps with blocked floors, and exterior/perimeter
+gaps are repaired as walls for room segmentation.
+
+Strict mode requires `ROSE2_SOURCE_ROOT` or
+`mapping.room_segmentation.source_root` to point at a checkout containing
+`code/FFT_MQ.py`, `code/minibatch.py`, and `code/parameters.py`. The local
+ROSE2-lite path remains only as `local_rose2_lite_room_ablation`; the old
+distance-transform watershed path remains only as debug or
+`legacy_watershed_room_ablation`. Both are rejected for strict metric runs.
+Final ROSE2 room masks pass through the open-plan merge/split policy:
 
 - verified structural walls, doorways, or gateways preserve a physical split
   regardless of room type;
@@ -47,7 +63,7 @@ only for merge/split decisions; final room masks are labeled again before they
 become SG-Nav room nodes. Stable room IDs are then preserved by mask
 IoU/centroid matching.
 
-Each `RoomMask` records `source=rose2_structure`, area, centroid,
+Each `RoomMask` records `source=upstream_rose2_vertical_or_free`, area, centroid,
 observed cells, boundary unknown fraction, doorway edges, confidence, partial
 state, and stable room id.
 
@@ -98,13 +114,16 @@ the split.
 
 The default strict path uses:
 
-- `mapping.room_map_mode: online_rose2_structure`
-- `mapping.room_segmentation.algorithm: rose2_structure`
+- `mapping.room_map_mode: upstream_rose2_vertical_or_free`
+- `mapping.room_segmentation.algorithm: upstream_rose2_vertical_or_free`
+- `mapping.room_segmentation.source_mode: declutter_reconstruct_mit`
+- `mapping.room_segmentation.require_upstream_source_for_strict: true`
+- `mapping.room_segmentation.upstream_repo_env: ROSE2_SOURCE_ROOT`
 - `room_semantics.use_premerge_labels_for_open_plan_merge: true`
 - `room_semantics.min_label_reliability_for_functional_split: 0.65`
 - `room_semantics.unknown_allows_functional_split: false`
 - `room_semantics.final_label_after_merge: true`
-- `sgnav.scene_graph.room_nodes.source: online_rose2_structure_vlm`
+- `sgnav.scene_graph.room_nodes.source: upstream_rose2_vertical_or_free_vlm`
 - `sgnav.scene_graph.room_nodes.strict_no_oracle_rooms: true`
 
 `rooms.json` remains allowed for episode generation, sanity checks, debug

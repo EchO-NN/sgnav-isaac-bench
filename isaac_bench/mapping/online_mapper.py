@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import math
+import time
 from typing import List, Tuple
 
 import numpy as np
 
 from isaac_bench.mapping.coordinate_transform import MapInfo, grid_to_world_xy, is_inside_grid, world_xy_to_grid
 from isaac_bench.mapping.grid_map import OnlineGridMap
+from isaac_bench.mapping.vertical_profile import VerticalProfileMap
 from isaac_bench.sensors.camera_geometry import CameraIntrinsics
 from isaac_bench.sensors.depth_backproject import backproject_pixels, transform_points
 
@@ -24,6 +26,8 @@ class OnlineMapper:
         obstacle_max_height_m: float = 0.90,
         free_min_height_m: float = -1.50,
         free_max_height_m: float = 0.10,
+        vertical_profile_free_min_height_m: float = 0.20,
+        vertical_profile_free_max_height_m: float = 2.00,
         splat_point_threshold: int = 6,
         free_splat_point_threshold: int | None = None,
         robot_radius_m: float = 0.14,
@@ -41,6 +45,8 @@ class OnlineMapper:
         self.obstacle_max_height_m = float(obstacle_max_height_m)
         self.free_min_height_m = float(free_min_height_m)
         self.free_max_height_m = float(free_max_height_m)
+        self.vertical_profile_free_min_height_m = float(vertical_profile_free_min_height_m)
+        self.vertical_profile_free_max_height_m = float(vertical_profile_free_max_height_m)
         self.splat_point_threshold = max(1, int(splat_point_threshold))
         self.free_splat_point_threshold = (
             max(1, int(free_splat_point_threshold))
@@ -55,16 +61,20 @@ class OnlineMapper:
         self.last_debug_stats: dict = {"reason": "not_updated"}
         self.last_nearfield_debug_stats: dict = {"reason": "not_updated"}
         self.last_static_nearfield_debug_stats: dict = {"reason": "not_updated"}
+        self.last_timing_stats: dict = {"reason": "not_updated"}
         self.static_nearfield_mask = np.zeros_like(self.grid.free, dtype=np.uint8)
         self.depth_free_mask = np.zeros_like(self.grid.free, dtype=np.uint8)
+        self.vertical_profile = VerticalProfileMap.zeros(self.grid.free.shape)
 
     def reset(self, start_xy: Tuple[float, float]) -> None:
         self.grid = OnlineGridMap.centered(start_xy[0], start_xy[1], self.size_m, self.resolution_m)
         self.last_debug_stats = {"reason": "reset"}
         self.last_nearfield_debug_stats = {"reason": "reset"}
         self.last_static_nearfield_debug_stats = {"reason": "reset"}
+        self.last_timing_stats = {"reason": "reset"}
         self.static_nearfield_mask = np.zeros_like(self.grid.free, dtype=np.uint8)
         self.depth_free_mask = np.zeros_like(self.grid.free, dtype=np.uint8)
+        self.vertical_profile = VerticalProfileMap.zeros(self.grid.free.shape)
 
     def update_simple_radius(self, base_pose_world: Tuple[float, float, float, float], radius_m: float = 1.5) -> OnlineGridMap:
         # Conservative fallback mapping for smoke tests: mark a local disk free.
@@ -77,20 +87,31 @@ class OnlineMapper:
         return self.grid
 
     def update(self, depth: np.ndarray, intr: CameraIntrinsics, base_pose_world: Tuple[float, float, float, float], camera_pose_world: Tuple[float, float, float, float]) -> OnlineGridMap:
+        total_started_at = time.perf_counter()
+        timings: dict[str, float] = {}
+        stage_started_at = total_started_at
         depth_arr = np.asarray(depth, dtype=np.float32)
         if depth_arr.ndim == 3:
             depth_arr = depth_arr[:, :, 0]
         if depth_arr.ndim != 2 or depth_arr.size == 0:
+            timings["depth_prepare_ms"] = _elapsed_ms(stage_started_at)
+            stage_started_at = time.perf_counter()
             self.last_debug_stats = {"reason": "invalid_depth_shape", "depth_shape": list(depth_arr.shape)}
             self._mark_robot_footprint_free(base_pose_world)
+            timings["robot_footprint_ms"] = _elapsed_ms(stage_started_at)
+            self._finish_timing_stats(timings, total_started_at, reason="invalid_depth_shape")
             return self.grid
 
         stride = self.depth_stride_px
         vs = np.arange(stride // 2, min(depth_arr.shape[0], intr.height), stride, dtype=np.int32)
         us = np.arange(stride // 2, min(depth_arr.shape[1], intr.width), stride, dtype=np.int32)
         if len(vs) == 0 or len(us) == 0:
+            timings["depth_prepare_ms"] = _elapsed_ms(stage_started_at)
+            stage_started_at = time.perf_counter()
             self.last_debug_stats = {"reason": "no_sample_pixels", "depth_shape": list(depth_arr.shape)}
             self._mark_robot_footprint_free(base_pose_world)
+            timings["robot_footprint_ms"] = _elapsed_ms(stage_started_at)
+            self._finish_timing_stats(timings, total_started_at, reason="no_sample_pixels")
             return self.grid
 
         uu, vv = np.meshgrid(us, vs)
@@ -98,16 +119,22 @@ class OnlineMapper:
         sampled_depth = depth_arr[pixels[:, 1].astype(np.int64), pixels[:, 0].astype(np.int64)]
         valid = np.isfinite(sampled_depth) & (sampled_depth > self.depth_min_m) & (sampled_depth < self.depth_max_m)
         if int(valid.sum()) == 0:
+            timings["depth_prepare_ms"] = _elapsed_ms(stage_started_at)
+            stage_started_at = time.perf_counter()
             self.last_debug_stats = {
                 "reason": "no_valid_depth",
                 "sampled_pixels": int(len(pixels)),
                 "depth_shape": list(depth_arr.shape),
             }
             self._mark_robot_footprint_free(base_pose_world)
+            timings["robot_footprint_ms"] = _elapsed_ms(stage_started_at)
+            self._finish_timing_stats(timings, total_started_at, reason="no_valid_depth")
             return self.grid
 
         valid_pixels = pixels[valid]
         valid_depth = sampled_depth[valid]
+        timings["depth_prepare_ms"] = _elapsed_ms(stage_started_at)
+        stage_started_at = time.perf_counter()
         points_cam = backproject_pixels(depth_arr, valid_pixels, intr)
         points_world = transform_points(points_cam, camera_pose_world)
         floor_z = float(base_pose_world[2])
@@ -123,6 +150,7 @@ class OnlineMapper:
             & (rows_cols[:, 1] >= 0)
             & (rows_cols[:, 1] < self.grid.map_info.width)
         )
+        timings["depth_project_ms"] = _elapsed_ms(stage_started_at)
         if int(np.count_nonzero(in_bounds)) == 0:
             self.last_debug_stats = {
                 "reason": "no_points_in_map_bounds",
@@ -130,6 +158,7 @@ class OnlineMapper:
                 "depth_shape": list(depth_arr.shape),
                 "depth_m_percentiles": _percentiles(valid_depth),
             }
+            self._finish_timing_stats(timings, total_started_at, reason="no_points_in_map_bounds")
             return self.grid
 
         origin_cell = self.grid.world_to_grid(float(camera_pose_world[0]), float(camera_pose_world[1]))
@@ -144,43 +173,91 @@ class OnlineMapper:
                 "camera_pose_world": [float(v) for v in camera_pose_world],
                 "base_pose_world": [float(v) for v in base_pose_world],
             }
+            self._finish_timing_stats(timings, total_started_at, reason="ray_origin_out_of_bounds")
             return self.grid
 
         in_bounds_pixels = valid_pixels[in_bounds]
         in_bounds_depth = valid_depth[in_bounds]
         rows_cols = rows_cols[in_bounds]
         rel_z = rel_z[in_bounds]
+        stage_started_at = time.perf_counter()
+        self.vertical_profile.mark_occupied_points(rows_cols, rel_z)
+        timings["vertical_profile_occupied_ms"] = _elapsed_ms(stage_started_at)
         obstacle_mask = (rel_z >= self.obstacle_min_height_m) & (rel_z <= self.obstacle_max_height_m)
         free_mask = (rel_z >= self.free_min_height_m) & (rel_z <= self.free_max_height_m)
         ray_clear_mask = (rel_z >= self.free_min_height_m) & (rel_z <= self.obstacle_max_height_m)
-        free_cells: set[Tuple[int, int]] = set()
-        occupied_cells: set[Tuple[int, int]] = set()
+        vertical_profile_ray_clear_mask = (
+            (rel_z >= self.vertical_profile_free_min_height_m)
+            & (rel_z <= self.vertical_profile_free_max_height_m)
+        )
+        map_width = int(self.grid.map_info.width)
+        free_flat_values: list[int] = []
+        occupied_flat_values: list[int] = []
+        free_flat_by_band: list[list[int]] = [[] for _ in self.vertical_profile.band_names]
         ray_count = 0
         skipped_height_rays = 0
-        for endpoint, endpoint_is_obstacle, ray_can_clear in zip(rows_cols, obstacle_mask, ray_clear_mask):
-            if not bool(ray_can_clear):
+        vertical_profile_ray_count = 0
+        vertical_profile_skipped_height_rays = 0
+        stage_started_at = time.perf_counter()
+        for endpoint, endpoint_rel_z, endpoint_is_obstacle, ray_can_clear, vertical_profile_can_clear in zip(
+            rows_cols,
+            rel_z,
+            obstacle_mask,
+            ray_clear_mask,
+            vertical_profile_ray_clear_mask,
+        ):
+            nav_can_clear = bool(ray_can_clear)
+            profile_can_clear = bool(vertical_profile_can_clear)
+            if not nav_can_clear:
                 skipped_height_rays += 1
+            if not profile_can_clear:
+                vertical_profile_skipped_height_rays += 1
+            if not nav_can_clear and not profile_can_clear:
                 continue
             end_cell = (int(endpoint[0]), int(endpoint[1]))
             line = _bresenham_cells((int(origin_cell[0]), int(origin_cell[1])), end_cell)
             if not line:
                 continue
-            ray_count += 1
-            free_line = line[:-1] if bool(endpoint_is_obstacle) else line
-            for row, col in free_line:
-                if is_inside_grid(row, col, self.grid.map_info):
-                    free_cells.add((int(row), int(col)))
+            band_idx = self.vertical_profile.band_index_for_height(float(endpoint_rel_z))
+            if nav_can_clear:
+                ray_count += 1
+                free_line = line[:-1] if bool(endpoint_is_obstacle) else line
+                for row, col in free_line:
+                    flat_idx = int(row) * map_width + int(col)
+                    free_flat_values.append(flat_idx)
+            if profile_can_clear and band_idx is not None:
+                vertical_profile_ray_count += 1
+                # The depth endpoint is the observed surface, so only cells
+                # before the hit are free at this height band.
+                for row, col in line[:-1]:
+                    flat_idx = int(row) * map_width + int(col)
+                    free_flat_by_band[band_idx].append(flat_idx)
             if bool(endpoint_is_obstacle):
-                for dr, dc in _disk_offsets(0):
-                    row, col = int(end_cell[0] + dr), int(end_cell[1] + dc)
-                    if is_inside_grid(row, col, self.grid.map_info):
-                        occupied_cells.add((row, col))
+                occupied_flat_values.append(int(end_cell[0]) * map_width + int(end_cell[1]))
+        self._mark_vertical_profile_free_flat(free_flat_by_band)
+        timings["ray_cast_ms"] = _elapsed_ms(stage_started_at)
 
-        for row, col in free_cells:
-            self._set_free_cell(row, col, mark_mask=self.depth_free_mask)
-        for row, col in occupied_cells:
-            self._set_occupied_cell(row, col)
+        stage_started_at = time.perf_counter()
+        free_unique = _unique_flat(free_flat_values)
+        if free_unique.size:
+            rows = free_unique // map_width
+            cols = free_unique % map_width
+            self.grid.free[rows, cols] = 1
+            self.grid.occupied[rows, cols] = 0
+            self.grid.observed[rows, cols] = 1
+            self.depth_free_mask[rows, cols] = 1
+        occupied_unique = _unique_flat(occupied_flat_values)
+        if occupied_unique.size:
+            rows = occupied_unique // map_width
+            cols = occupied_unique % map_width
+            self.grid.free[rows, cols] = 0
+            self.grid.occupied[rows, cols] = 1
+            self.grid.observed[rows, cols] = 1
+        timings["grid_write_ms"] = _elapsed_ms(stage_started_at)
+        stage_started_at = time.perf_counter()
         self._mark_robot_footprint_free(base_pose_world)
+        timings["robot_footprint_ms"] = _elapsed_ms(stage_started_at)
+        stage_started_at = time.perf_counter()
         self.last_debug_stats = self._build_debug_stats(
             depth_arr=depth_arr,
             valid_depth=in_bounds_depth,
@@ -188,14 +265,18 @@ class OnlineMapper:
             rel_z=rel_z,
             obstacle_mask=obstacle_mask,
             free_mask=free_mask,
-            occupied_endpoint_cells=len(occupied_cells),
-            free_ray_cells=len(free_cells),
+            occupied_endpoint_cells=int(occupied_unique.size),
+            free_ray_cells=int(free_unique.size),
             ray_count=ray_count,
             skipped_height_rays=skipped_height_rays,
+            vertical_profile_ray_count=vertical_profile_ray_count,
+            vertical_profile_skipped_height_rays=vertical_profile_skipped_height_rays,
             base_pose_world=base_pose_world,
             camera_pose_world=camera_pose_world,
             ray_origin_cell=origin_cell,
         )
+        timings["debug_stats_ms"] = _elapsed_ms(stage_started_at)
+        self._finish_timing_stats(timings, total_started_at, reason="ok")
         return self.grid
 
     def update_nearfield_topdown(
@@ -477,6 +558,29 @@ class OnlineMapper:
             self.grid.occupied[rr, cc] = 1
             self.grid.observed[rr, cc] = 1
 
+    def _finish_timing_stats(self, timings: dict[str, float], total_started_at: float, *, reason: str) -> None:
+        out = {str(key): float(value) for key, value in timings.items()}
+        out["update_total_ms"] = _elapsed_ms(total_started_at)
+        out["reason"] = str(reason)
+        self.last_timing_stats = out
+
+    def _mark_vertical_profile_free_flat(self, flat_indices_by_band: List[List[int]]) -> None:
+        h, w = self.grid.occupied.shape
+        total_cells = int(h * w)
+        uint16_max = int(np.iinfo(np.uint16).max)
+        for band_idx, flat_values in enumerate(flat_indices_by_band):
+            flat = _valid_flat_array(flat_values, total_cells)
+            if flat.size == 0:
+                continue
+            counts = np.bincount(flat, minlength=total_cells).reshape(h, w).astype(np.uint32)
+            free_updated = np.asarray(self.vertical_profile.free_ray_count[band_idx], dtype=np.uint32) + counts
+            observed_updated = np.asarray(self.vertical_profile.observed_count[band_idx], dtype=np.uint32) + counts
+            self.vertical_profile.free_ray_count[band_idx][:, :] = np.minimum(free_updated, uint16_max).astype(np.uint16)
+            self.vertical_profile.observed_count[band_idx][:, :] = np.minimum(observed_updated, uint16_max).astype(np.uint16)
+            touched = np.flatnonzero(counts.reshape(-1) > 0)
+            if touched.size:
+                self.vertical_profile.unknown_count[band_idx].reshape(-1)[touched] = 0
+
     def _robot_footprint_radius_cells(self) -> int:
         if self.resolution_m <= 0:
             raise ValueError("resolution_m must be positive")
@@ -522,6 +626,8 @@ class OnlineMapper:
         free_ray_cells: int,
         ray_count: int,
         skipped_height_rays: int,
+        vertical_profile_ray_count: int,
+        vertical_profile_skipped_height_rays: int,
         base_pose_world: Tuple[float, float, float, float],
         camera_pose_world: Tuple[float, float, float, float],
         ray_origin_cell: Tuple[int, int],
@@ -543,6 +649,8 @@ class OnlineMapper:
             "valid_points": int(len(rel_z)),
             "ray_count": int(ray_count),
             "skipped_height_rays": int(skipped_height_rays),
+            "vertical_profile_ray_count": int(vertical_profile_ray_count),
+            "vertical_profile_skipped_height_rays": int(vertical_profile_skipped_height_rays),
             "free_band_points": int(np.count_nonzero(free_mask)),
             "obstacle_band_points": int(np.count_nonzero(obstacle_mask)),
             "below_free_min_points": int(np.count_nonzero(rel_z < self.free_min_height_m)),
@@ -566,7 +674,10 @@ class OnlineMapper:
                 "free_max": float(self.free_max_height_m),
                 "obstacle_min": float(self.obstacle_min_height_m),
                 "obstacle_max": float(self.obstacle_max_height_m),
+                "vertical_profile_free_min": float(self.vertical_profile_free_min_height_m),
+                "vertical_profile_free_max": float(self.vertical_profile_free_max_height_m),
             },
+            "vertical_profile": self.vertical_profile.to_debug_dict(),
             "splat_thresholds": {
                 "free": int(self.free_splat_point_threshold),
                 "obstacle": int(self.splat_point_threshold),
@@ -595,6 +706,24 @@ def _percentiles(values: np.ndarray) -> dict:
     keys = [0, 1, 5, 25, 50, 75, 95, 99, 100]
     vals = np.percentile(arr, keys)
     return {"p%d" % int(key): float(val) for key, val in zip(keys, vals)}
+
+
+def _elapsed_ms(started_at: float) -> float:
+    return max(0.0, (time.perf_counter() - float(started_at)) * 1000.0)
+
+
+def _valid_flat_array(values: List[int], total_cells: int) -> np.ndarray:
+    if not values:
+        return np.zeros((0,), dtype=np.int64)
+    arr = np.asarray(values, dtype=np.int64)
+    return arr[(arr >= 0) & (arr < int(total_cells))]
+
+
+def _unique_flat(values: List[int]) -> np.ndarray:
+    if not values:
+        return np.zeros((0,), dtype=np.int64)
+    return np.unique(np.asarray(values, dtype=np.int64))
+
 
 def _disk_offsets(radius_cells: int) -> List[Tuple[int, int]]:
     rr = int(max(0, radius_cells))

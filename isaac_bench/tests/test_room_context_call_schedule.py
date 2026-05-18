@@ -12,6 +12,8 @@ from isaac_bench.perception.object_memory import ObjectMemory, ObjectNode
 
 
 class CountingSegmenter:
+    context_source = "upstream_rose2_vertical_or_free_vlm"
+
     def __init__(self):
         self.update_count = 0
         self.last_debug = {}
@@ -31,7 +33,12 @@ class CountingSegmenter:
             observed_free_cells=9,
             mask_confidence=0.9,
         )
-        self.last_debug = {"source": "rose2_structure", "algorithm": "rose2_structure", "room_count": 1}
+        self.last_debug = {
+            "source": "upstream_rose2_vertical_or_free",
+            "algorithm": "upstream_rose2_vertical_or_free",
+            "source_mode": "declutter_reconstruct_mit",
+            "room_count": 1,
+        }
         return [room]
 
 
@@ -100,6 +107,24 @@ def test_room_context_not_called_by_mapper_or_perception_only_updates():
     assert labeler.request_count == 0
 
 
+def test_mapper_update_does_not_call_roomseg():
+    segmenter = CountingSegmenter()
+    labeler = CountingLabeler()
+    _free, _occ, _unknown = _masks()
+
+    assert segmenter.update_count == 0
+    assert labeler.request_count == 0
+
+
+def test_reperception_does_not_call_roomseg_or_room_vlm():
+    segmenter = CountingSegmenter()
+    labeler = CountingLabeler()
+    _ = _object_memory()
+
+    assert segmenter.update_count == 0
+    assert labeler.request_count == 0
+
+
 def test_room_context_called_immediately_before_frontier_scoring_order():
     segmenter = CountingSegmenter()
     labeler = CountingLabeler()
@@ -141,3 +166,34 @@ def test_committed_frontier_replan_does_not_trigger_room_context():
 
     assert segmenter.update_count == 0
     assert labeler.request_count == 0
+
+
+def test_room_segmentation_called_only_before_frontier_scoring():
+    segmenter = CountingSegmenter()
+    labeler = CountingLabeler()
+    free, occ, unknown = _masks()
+
+    # Perception-only, mapper-only, replan-only, and reperception-only phases
+    # are represented by ordinary state updates that do not enter the scoring
+    # pre-hook. The only allowed invocation is the explicit frontier-scoring
+    # preparation call below.
+    phases_without_roomseg = ["mapper_update", "perception_update", "committed_replan", "reperception_stop_check"]
+    for _phase in phases_without_roomseg:
+        assert segmenter.update_count == 0
+
+    prepare_room_context_for_frontier_scoring(
+        step_idx=3,
+        object_memory=_object_memory(),
+        room_segmenter=segmenter,
+        room_labeler=labeler,
+        map_info=_map_info(),
+        previous_room_context=RoomContextCache(),
+        strict_benchmark=True,
+        occupancy=occ,
+        observed_free_mask=free,
+        obstacle_mask=occ,
+        unknown_mask=unknown,
+    )
+
+    assert segmenter.update_count == 1
+    assert labeler.request_count == 1

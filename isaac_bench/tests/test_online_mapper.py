@@ -2,6 +2,7 @@ import numpy as np
 import math
 
 from isaac_bench.mapping.online_mapper import OnlineMapper
+from isaac_bench.mapping.vertical_profile import band_index
 from isaac_bench.sensors.camera_geometry import CameraIntrinsics
 
 
@@ -35,6 +36,19 @@ def test_online_mapper_ray_casts_depth_obstacle_and_floor_free_cells():
     assert mapper.last_debug_stats["ray_count"] == 2
     assert mapper.last_debug_stats["free_ray_cells"] >= 1
     assert mapper.last_debug_stats["occupied_endpoint_cells"] >= 1
+    assert mapper.last_timing_stats["reason"] == "ok"
+    for key in (
+        "depth_prepare_ms",
+        "depth_project_ms",
+        "vertical_profile_occupied_ms",
+        "ray_cast_ms",
+        "grid_write_ms",
+        "robot_footprint_ms",
+        "debug_stats_ms",
+        "update_total_ms",
+    ):
+        assert key in mapper.last_timing_stats
+        assert mapper.last_timing_stats[key] >= 0.0
 
 
 def test_online_mapper_ignores_ceiling_height_points_for_occupancy():
@@ -63,6 +77,10 @@ def test_online_mapper_ignores_ceiling_height_points_for_occupancy():
     assert mapper.last_debug_stats["obstacle_band_points"] == 0
     assert mapper.last_debug_stats["ray_count"] == 0
     assert mapper.last_debug_stats["skipped_height_rays"] == 1
+    assert mapper.last_debug_stats["vertical_profile_ray_count"] == 1
+    assert mapper.last_debug_stats["vertical_profile_skipped_height_rays"] == 0
+    assert int(np.count_nonzero(mapper.vertical_profile.free_ray_count[band_index("mid")])) > 0
+    assert mapper.last_debug_stats["height_filters_m"]["vertical_profile_free_max"] == 2.0
     assert np.isclose(mapper.last_debug_stats["rel_z_m_percentiles"]["p50"], 1.2)
 
 

@@ -1,7 +1,8 @@
 # External Assets
 
 This repository does not vendor Isaac Sim, InteriorAgent scenes, YOLO-World
-weights, SAM2 checkpoints, or LLM model/server assets.
+weights, SAM2 checkpoints, the upstream ROSE2/declutter-reconstruct source
+checkout, or LLM model/server assets.
 
 ## Default Asset Paths
 
@@ -15,6 +16,9 @@ The default config uses:
   a package/Hydra config reference; it does not need to exist as a repo-local
   file when the installed SAM2 package can resolve it)
 - OpenAI-compatible LLM endpoint: `http://127.0.0.1:8000/v1`
+- Upstream no-ROS ROSE2 source root: `${ROSE2_SOURCE_ROOT}` pointing at a
+  `goldleaf3i/declutter-reconstruct` checkout that contains
+  `code/FFT_MQ.py`, `code/minibatch.py`, and `code/parameters.py`
 
 ## Environment Overrides
 
@@ -28,6 +32,7 @@ Use these environment variables or config fields to point at local assets:
 - `SAM2_CHECKPOINT` or `perception.sam2_checkpoint`
 - `SAM2_MODEL_CFG` or `perception.sam2_model_cfg`
 - `LLM_BASE_URL` or `llm.base_url`
+- `ROSE2_SOURCE_ROOT` or `mapping.room_segmentation.source_root`
 
 ## Asset Check Command
 
@@ -37,6 +42,7 @@ Run:
 python -m isaac_bench.scripts.check_assets \
   --require-yolo-world \
   --require-sam2 \
+  --require-rose2-source \
   --require-interioragent \
   --require-isaac
 ```
