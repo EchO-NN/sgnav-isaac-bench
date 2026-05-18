@@ -1,4 +1,4 @@
-# Online Geometry Room Nodes And VLM Labels
+# ROSE2 Online Room Nodes And VLM Labels
 
 Strict SG-Nav room nodes are built online. They do not use InteriorAgent
 `rooms.json`, dataset room labels, or oracle room masks.
@@ -12,22 +12,25 @@ trigger room segmentation or VLM room labeling.
 
 ## Geometry Stage
 
-`isaac_bench.mapping.room_segmentation.OnlineRoomSegmenter` consumes only the
-online RGB-D occupancy/free-space state:
+`isaac_bench.mapping.rose2_room_segmentation.OnlineROSE2RoomSegmenter`
+consumes only the online RGB-D occupancy/free-space state:
 
 - `observed_free_mask`
 - `obstacle_mask`
 - `unknown_mask`
 
-It first builds a structural obstacle/free-space mask from observed free cells.
-Furniture and movable-object clutter are suppressed before room segmentation:
-compact depth blobs and object-memory detections such as chairs, sofas, tables,
-beds, TVs, plants, pictures, lamps, and cabinets are not allowed to split
-rooms. Unknown cells are not treated as structural wall support.
+It first performs a CPU ROSE2-style robust structure extraction pass: remove
+isolated clutter, estimate dominant wall directions from the 2D FFT spectrum,
+directionally filter structural frequencies, inverse-transform to a structural
+score, auto-threshold, detect Hough wall segments, cluster collinear wall
+support, rasterize representative walls, and derive grid-face room masks.
+Furniture and movable-object clutter are suppressed by structural support and,
+when stable object memory is available, object footprints only penalize wall
+support. Unknown cells are not treated as structural wall support.
 
-Distance-transform watershed or deterministic seeded region growing is used
-only to create premerge room proposals. Final room masks come from a
-doorway-constrained merge pass:
+The old distance-transform watershed path remains only as debug or
+`legacy_watershed_room_ablation`; it is rejected for strict metric runs. Final
+ROSE2 room masks still pass through the same open-plan merge/split policy:
 
 - verified structural walls, doorways, or gateways preserve a physical split
   regardless of room type;
@@ -44,7 +47,7 @@ only for merge/split decisions; final room masks are labeled again before they
 become SG-Nav room nodes. Stable room IDs are then preserved by mask
 IoU/centroid matching.
 
-Each `RoomMask` records `source=online_geometry_watershed`, area, centroid,
+Each `RoomMask` records `source=rose2_structure`, area, centroid,
 observed cells, boundary unknown fraction, doorway edges, confidence, partial
 state, and stable room id.
 
@@ -95,12 +98,13 @@ the split.
 
 The default strict path uses:
 
-- `mapping.room_map_mode: online_geometry_watershed`
+- `mapping.room_map_mode: online_rose2_structure`
+- `mapping.room_segmentation.algorithm: rose2_structure`
 - `room_semantics.use_premerge_labels_for_open_plan_merge: true`
 - `room_semantics.min_label_reliability_for_functional_split: 0.65`
 - `room_semantics.unknown_allows_functional_split: false`
 - `room_semantics.final_label_after_merge: true`
-- `sgnav.scene_graph.room_nodes.source: online_geometry_watershed_vlm`
+- `sgnav.scene_graph.room_nodes.source: online_rose2_structure_vlm`
 - `sgnav.scene_graph.room_nodes.strict_no_oracle_rooms: true`
 
 `rooms.json` remains allowed for episode generation, sanity checks, debug

@@ -8,7 +8,7 @@ def test_dump_sgnav_step_includes_room_context_reperception_and_stop_state(tmp_p
     result_row = tmp_path / "results.jsonl"
     out = tmp_path / "sgnav_step.json"
     room_context = {
-        "room_context_source": "online_geometry_watershed_vlm",
+        "room_context_source": "online_rose2_structure_vlm",
         "room_update_invoked_for_frontier_scoring": True,
         "room_segmentation_ran": True,
         "room_labeling_ran": False,

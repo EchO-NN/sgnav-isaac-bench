@@ -14,7 +14,8 @@ def test_dump_sgnav_step_includes_room_segmentation_and_semantics(tmp_path):
                 "rooms": [{"id": "room:room_0001", "caption": "unknown"}],
                 "edges": [],
                 "room_segmentation": {
-                    "source": "online_geometry_watershed",
+                    "source": "rose2_structure",
+                    "algorithm": "rose2_structure",
                     "room_count": 1,
                     "rooms": [{"room_id": "room_0001", "area_m2": 3.0}],
                 },

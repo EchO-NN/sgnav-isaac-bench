@@ -57,7 +57,7 @@ class RoomContextResult:
     object_evidence_hash: str = ""
     room_mask_geometry_hash: str = ""
     room_object_evidence_hash: str = ""
-    source: str = "online_geometry_watershed_vlm"
+    source: str = "online_rose2_structure_vlm"
 
     def metadata(self, *, full_order: bool = True) -> dict:
         trace = list(SCORING_ROOM_CALL_ORDER_FULL if full_order else self.call_order_trace)
@@ -72,6 +72,12 @@ class RoomContextResult:
             "room_label_requests": int(self.label_requests),
             "room_label_cache_hits": int(self.label_cache_hits),
             "room_call_order_trace": trace,
+            "room_segmentation_called_for": "frontier_scoring_pre_hook",
+            "room_segmentation_algorithm": str(self.room_segmentation_debug.get("algorithm", "rose2_structure")),
+            "room_segmentation_step_index": self.room_segmentation_debug.get("step"),
+            "room_vlm_called": bool(self.labeling_ran),
+            "scenegraph_updated_after_room_context": True,
+            "frontier_scoring_after_room_context": True,
             "room_map_observed_hash": self.map_observed_hash,
             "room_object_evidence_hash": self.object_evidence_hash,
             "room_mask_geometry_hash": self.room_mask_geometry_hash,
@@ -104,7 +110,7 @@ def prepare_room_context_for_frontier_scoring(
 ) -> RoomContextResult:
     """Prepare online room masks and VLM labels immediately before frontier scoring."""
     cache = previous_room_context or RoomContextCache()
-    source = "online_geometry_watershed_vlm"
+    source = str(getattr(room_segmenter, "context_source", "online_rose2_structure_vlm") or "online_rose2_structure_vlm") if room_segmenter is not None else "online_rose2_structure_vlm"
     allowed = list(allowed_categories or DEFAULT_ROOM_CATEGORIES)
     if room_segmenter is None:
         if strict_benchmark:
@@ -290,6 +296,12 @@ def room_context_not_invoked_metadata() -> dict:
         "room_label_requests": 0,
         "room_label_cache_hits": 0,
         "room_call_order_trace": [],
+        "room_segmentation_called_for": "not_invoked",
+        "room_segmentation_algorithm": "not_invoked",
+        "room_segmentation_step_index": None,
+        "room_vlm_called": False,
+        "scenegraph_updated_after_room_context": False,
+        "frontier_scoring_after_room_context": False,
     }
 
 

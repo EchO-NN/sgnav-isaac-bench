@@ -145,7 +145,11 @@ def validate_strict_benchmark_assets(args: object) -> None:
     ablation_name = str(_get_arg(args, "ablation_name", "") or "").strip().lower()
     if room_map_mode in {"observed_rooms_json", "rooms_json", "observed"} and ablation_name != "oracle_room_ablation":
         raise BenchmarkAssetError(
-            "strict SG-Nav metric path requires online_geometry_watershed room masks; rooms.json/oracle room maps are not allowed"
+            "strict SG-Nav metric path requires online_rose2_structure room masks; rooms.json/oracle room maps are not allowed"
+        )
+    if room_map_mode in {"online_geometry_watershed", "online_geometry_watershed_vlm"} and ablation_name != "legacy_watershed_room_ablation":
+        raise BenchmarkAssetError(
+            "strict SG-Nav metric path requires online_rose2_structure room masks; watershed is debug/ablation-only"
         )
 
 
@@ -156,9 +160,18 @@ def empty_sgnav_step_dump(metadata: Optional[Mapping[str, object]] = None) -> di
         "rooms": [],
         "room_context": {},
         "room_segmentation": {
-            "source": "online_geometry_watershed",
+            "source": "rose2_structure",
+            "algorithm": "rose2_structure",
             "room_count": 0,
             "rooms": [],
+        },
+        "object_memory": {
+            "raw_detection_count": 0,
+            "stable_track_count": 0,
+            "tentative_track_count": 0,
+            "mask_association_count": 0,
+            "partial_edge_count": 0,
+            "contained_child_count": 0,
         },
         "room_semantics": {
             "backend": "unavailable",
@@ -268,6 +281,8 @@ def _infer_fallbacks(row: Mapping[str, object], args: object | None) -> list[str
     room_map_mode = str(row.get("room_map_mode", _get_arg(args, "room_map_mode", "")) or "").strip().lower()
     if room_map_mode in {"observed_rooms_json", "rooms_json", "observed"} and str(ablation_name or "") != "oracle_room_ablation":
         fallbacks.append("oracle_room_map")
+    if room_map_mode in {"online_geometry_watershed", "online_geometry_watershed_vlm"} and str(ablation_name or "") != "legacy_watershed_room_ablation":
+        fallbacks.append("legacy_watershed_room_segmentation")
     if sim_backend == "map":
         fallbacks.append("static_map_planning")
     if bool(_get_arg(args, "static_nearfield_map", row.get("static_nearfield_map", False))):

@@ -106,6 +106,9 @@ class RuntimeGraphNode:
     observed_count: int = 0
     members: List[str] = field(default_factory=list)
     room: Optional[str] = None
+    source_instance_id: str = ""
+    parent_track_id: Optional[str] = None
+    child_track_ids: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -848,9 +851,11 @@ class SGNavSceneGraphAdapter:
             self._rebuild_room_nodes()
         if self.object_memory is None:
             return
+        track_to_node_id: Dict[str, str] = {}
         for fallback_id, mem_node in enumerate(self.object_memory.nodes):
             room_name = self.room_name_at_grid(mem_node.center_grid)
             node_id = "object:%d" % int(getattr(mem_node, "node_id", fallback_id))
+            source_instance_id = str(getattr(mem_node, "source_instance_id", "") or "")
             self.runtime_nodes[node_id] = RuntimeGraphNode(
                 node_id=node_id,
                 kind="object",
@@ -863,13 +868,31 @@ class SGNavSceneGraphAdapter:
                 winner_detection_count=int(getattr(mem_node, "winner_detection_count", mem_node.observed_count)),
                 observed_count=int(mem_node.observed_count),
                 room=room_name,
+                source_instance_id=source_instance_id,
+                parent_track_id=getattr(mem_node, "parent_track_id", None),
+                child_track_ids=list(getattr(mem_node, "child_track_ids", ()) or ()),
             )
+            if source_instance_id:
+                track_to_node_id[source_instance_id] = node_id
             if room_name:
                 room_id = self._runtime_room_id_for_name(room_name)
                 if room_id in self.runtime_rooms:
                     self._append_runtime_edge(node_id, room_id, "belongs to", 1.0)
         self._rebuild_object_edges_and_groups()
+        self._append_parent_child_edges(track_to_node_id)
         self._append_room_doorway_edges()
+
+    def _append_parent_child_edges(self, track_to_node_id: Mapping[str, str]) -> None:
+        if not track_to_node_id:
+            return
+        for node_id, node in list(self.runtime_nodes.items()):
+            if node.kind != "object" or not node.parent_track_id:
+                continue
+            parent_id = track_to_node_id.get(str(node.parent_track_id))
+            if parent_id is None or parent_id == node_id:
+                continue
+            self._append_runtime_edge(node_id, parent_id, "supported by", 1.0)
+            self._append_runtime_edge(node_id, parent_id, "inside or on", 1.0)
 
     def _runtime_room_id_for_name(self, room_name: str) -> str:
         if str(room_name).startswith("room_"):

@@ -46,12 +46,13 @@ Every episode result row must include:
 - A YOLO/SAM detection is a valid online object detection only when
   `confidence > 0.55`. Detections at or below 0.55 must not draw RGB bboxes,
   enter object memory, form object scene-graph nodes, or seed goal candidates.
-- YOLO-World boxes that touch an image edge are raw debug detections only:
-  `used_for_object_track=false` and
-  `reject_reason=bbox_touches_image_edge`. They must not update SAM2/depth
-  fusion, object-memory centers, category accumulators, room evidence, goal
-  candidates, STOP, SG-Nav policy graph objects, or first-version GNN object
-  features.
+- YOLO-World boxes or SAM2 masks that touch an image edge are raw partial
+  evidence, not a hard discard condition. They must be logged with
+  `visibility_status=partial_edge`; if mask/footprint overlap matches a prior
+  stable full track, they may update support/category evidence with partial
+  weight while inheriting stable geometry. If they have no stable association,
+  they remain tentative and must not enter room evidence, goal candidates,
+  STOP, SG-Nav policy graph objects, or first-version GNN policy features.
 - Object-memory categories must use track-level accumulated confidence
   (`class_conf_sums` / `class_hits`). A single recent class switch must not
   overwrite the stable category when another class has higher accumulated
@@ -66,6 +67,10 @@ Every episode result row must include:
 - `room_map_mode=observed_rooms_json`, `rooms_json`, or `observed` implies
   oracle room maps and is not valid for the strict SG-Nav metric path unless
   the run is explicitly named `oracle_room_ablation`.
+- `room_map_mode=online_geometry_watershed` is a legacy debug/ablation room
+  segmenter and is not valid for the strict SG-Nav metric path unless the run
+  is explicitly named `legacy_watershed_room_ablation`. The strict default room
+  segmenter is `online_rose2_structure`.
 - Missing or unreachable room VLM backend is not the same as an evidence-based
   `unknown` room label. Backend failure must fail clearly or mark
   `metric_valid=false` with `room_vlm_unavailable` or

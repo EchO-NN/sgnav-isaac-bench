@@ -173,10 +173,13 @@ def test_config_defaults_match_benchmark_contract():
     assert cfg["nearfield_static_map"]["enabled"] is False
     assert cfg["mapping"]["frontier_allow_near_fallback"] is False
     assert cfg["mapping"]["frontier_min_distance_m"] == 1.0
-    assert cfg["mapping"]["room_map_mode"] == "online_geometry_watershed"
+    assert cfg["mapping"]["room_map_mode"] == "online_rose2_structure"
+    assert cfg["mapping"]["room_segmentation"]["algorithm"] == "rose2_structure"
+    assert cfg["mapping"]["room_segmentation"]["legacy_watershed_allowed"] == "debug_only"
     assert cfg["mapping"]["room_segmentation"]["finalization_mode"] == "doorway_constrained_merge"
     assert cfg["room_semantics"]["use_premerge_labels_for_open_plan_merge"] is True
-    assert cfg["perception"]["yolo_world"]["reject_edge_touching_bboxes"] is True
+    assert cfg["perception"]["yolo_world"]["reject_edge_touching_bboxes"] is False
+    assert cfg["perception"]["yolo_world"]["mask_aware_partial_tracking"] is True
     assert cfg["object_memory"]["use_edge_touching_detections_for_policy"] is False
     assert cfg["sgnav"]["frontier_distance_weight"] == 0.2
     assert cfg["llm"]["enabled"] is True

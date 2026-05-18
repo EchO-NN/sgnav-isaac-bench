@@ -17,6 +17,8 @@ GridCell = Tuple[int, int]
 @dataclass
 class RoomSegmentationConfig:
     enabled: bool = True
+    algorithm: str = "rose2_structure"
+    legacy_watershed_allowed: str = "debug_only"
     source_grid: str = "online_depth_observed"
     update_every_steps: int = 5
     proposal_mode: str = "distance_watershed"
@@ -53,7 +55,8 @@ class RoomSegmentationConfig:
     unknown_boundary_confidence_penalty: bool = True
     stale_ttl_steps: int = 2
     debug_dump: bool = False
-    debug_dir: str = "debug/room_segmentation"
+    debug_dir: str = "debug/roomseg_rose2"
+    rose2: Dict[str, object] = field(default_factory=dict)
     resolution_m: float = 0.05
     map_info: Optional[MapInfo] = None
 
@@ -74,7 +77,7 @@ class RoomMask:
     boundary_unknown_fraction: float
     doorway_edges: List[dict]
     confidence: float
-    source: str = "online_geometry_watershed"
+    source: str = "rose2_structure"
     observed_free_cells: int = 0
     mask_confidence: float = 0.0
     is_partial: bool = False
@@ -1360,6 +1363,9 @@ def _room_from_mask(room_id: str, mask: np.ndarray, unknown: np.ndarray, doorway
         boundary_unknown_fraction=unknown_fraction,
         doorway_edges=[dict(edge) for edge in doorway_edges],
         confidence=confidence,
+        source="online_geometry_watershed"
+        if "watershed" in str(getattr(config, "algorithm", "")).lower()
+        else "rose2_structure",
         observed_free_cells=cells,
         mask_confidence=mask_confidence,
         is_partial=partial,

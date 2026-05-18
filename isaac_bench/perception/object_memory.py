@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import math
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -36,6 +37,12 @@ class ObjectNode:
     total_conf_sum: float = 0.0
     edge_rejected_count: int = 0
     raw_rejected_detections_count: int = 0
+    visibility_status_counts: Dict[str, int] = field(default_factory=dict)
+    geometry_confidence: float = 1.0
+    center_estimation_mode: str = "full_mask"
+    used_for_policy_graph: bool = True
+    parent_track_id: Optional[str] = None
+    child_track_ids: Tuple[str, ...] = ()
 
     @property
     def stable_category(self) -> str:
@@ -52,6 +59,18 @@ class ObjectNode:
         hits = max(1, int(self.winner_detection_count))
         return float(self.class_conf_sums.get(self.stable_category, float(self.confidence) * hits)) / float(hits)
 
+    @property
+    def label_entropy(self) -> float:
+        total = float(sum(max(0.0, float(v)) for v in self.class_conf_sums.values()))
+        if total <= 1e-9:
+            return 0.0
+        entropy = 0.0
+        for value in self.class_conf_sums.values():
+            p = max(0.0, float(value)) / total
+            if p > 1e-12:
+                entropy -= p * math.log(p)
+        return float(entropy)
+
     def to_dict(self) -> dict:
         return {
             "node_id": int(self.node_id),
@@ -63,6 +82,7 @@ class ObjectNode:
             "confidence": float(self.confidence),
             "mean_confidence": float(self.mean_confidence),
             "detection_count": int(self.valid_detection_count or self.observed_count),
+            "valid_detection_count": int(self.valid_detection_count or self.observed_count),
             "winner_detection_count": int(self.winner_detection_count),
             "observed_count": int(self.observed_count),
             "last_seen_step": int(self.last_seen_step),
@@ -73,6 +93,13 @@ class ObjectNode:
             "source": self.source,
             "class_conf_sums": {str(k): float(v) for k, v in sorted(self.class_conf_sums.items())},
             "class_hits": {str(k): int(v) for k, v in sorted(self.class_hits.items())},
+            "label_entropy": float(self.label_entropy),
+            "visibility_status_counts": {str(k): int(v) for k, v in sorted(self.visibility_status_counts.items())},
+            "geometry_confidence": float(self.geometry_confidence),
+            "center_estimation_mode": str(self.center_estimation_mode),
+            "used_for_policy_graph": bool(self.used_for_policy_graph),
+            "parent_track_id": self.parent_track_id,
+            "child_track_ids": list(self.child_track_ids),
             "edge_rejected_count": int(self.edge_rejected_count),
             "raw_rejected_detections_count": int(self.raw_rejected_detections_count),
         }
@@ -178,6 +205,8 @@ class ObjectMemory:
         for instance in instances:
             if instance.node_type != "object":
                 continue
+            if not bool(getattr(instance, "used_for_policy_graph", True)):
+                continue
             if not detection_confidence_is_valid(float(instance.confidence), self.min_valid_confidence):
                 continue
             category = self._category_key(instance.category)
@@ -206,6 +235,15 @@ class ObjectMemory:
                     total_conf_sum=float(total_conf_sum),
                     edge_rejected_count=int(getattr(instance, "edge_rejected_count", 0)),
                     raw_rejected_detections_count=int(getattr(instance, "edge_rejected_count", 0)),
+                    visibility_status_counts={
+                        str(k): int(v)
+                        for k, v in dict(getattr(instance, "visibility_status_counts", {}) or {}).items()
+                    },
+                    geometry_confidence=float(getattr(instance, "geometry_confidence", 1.0)),
+                    center_estimation_mode=str(getattr(instance, "center_estimation_mode", "full_mask")),
+                    used_for_policy_graph=bool(getattr(instance, "used_for_policy_graph", True)),
+                    parent_track_id=getattr(instance, "parent_track_id", None),
+                    child_track_ids=tuple(str(v) for v in getattr(instance, "child_track_ids", ()) or ()),
                 )
                 node.category = node.stable_category
                 self._next_id += 1
@@ -229,6 +267,15 @@ class ObjectMemory:
             matched.total_conf_sum = float(total_conf_sum)
             matched.edge_rejected_count = int(getattr(instance, "edge_rejected_count", matched.edge_rejected_count))
             matched.raw_rejected_detections_count = int(getattr(instance, "edge_rejected_count", matched.raw_rejected_detections_count))
+            matched.visibility_status_counts = {
+                str(k): int(v)
+                for k, v in dict(getattr(instance, "visibility_status_counts", {}) or {}).items()
+            }
+            matched.geometry_confidence = float(getattr(instance, "geometry_confidence", matched.geometry_confidence))
+            matched.center_estimation_mode = str(getattr(instance, "center_estimation_mode", matched.center_estimation_mode))
+            matched.used_for_policy_graph = bool(getattr(instance, "used_for_policy_graph", True))
+            matched.parent_track_id = getattr(instance, "parent_track_id", matched.parent_track_id)
+            matched.child_track_ids = tuple(str(v) for v in getattr(instance, "child_track_ids", ()) or ())
             matched.category = matched.stable_category
             changed.append(matched)
         self.dedupe(map_info=map_info)
@@ -361,6 +408,16 @@ def _merge_category_accumulators(target: ObjectNode, duplicate: ObjectNode) -> N
     target.total_conf_sum = float(target.total_conf_sum) + float(duplicate.total_conf_sum)
     target.edge_rejected_count = int(target.edge_rejected_count) + int(duplicate.edge_rejected_count)
     target.raw_rejected_detections_count = int(target.raw_rejected_detections_count) + int(duplicate.raw_rejected_detections_count)
+    for status, count in duplicate.visibility_status_counts.items():
+        key = str(status)
+        target.visibility_status_counts[key] = int(target.visibility_status_counts.get(key, 0)) + int(count)
+    target.geometry_confidence = max(float(target.geometry_confidence), float(duplicate.geometry_confidence))
+    if target.center_estimation_mode != "full_mask" and duplicate.center_estimation_mode == "full_mask":
+        target.center_estimation_mode = duplicate.center_estimation_mode
+    target.used_for_policy_graph = bool(target.used_for_policy_graph and duplicate.used_for_policy_graph)
+    if not target.parent_track_id and duplicate.parent_track_id:
+        target.parent_track_id = duplicate.parent_track_id
+    target.child_track_ids = tuple(sorted(set(tuple(target.child_track_ids) + tuple(duplicate.child_track_ids))))
 
 
 def _category_accumulators_from_instance(instance: FusedInstance) -> Tuple[Dict[str, float], Dict[str, int], int, float]:

@@ -88,23 +88,28 @@ Strict SG-Nav requires YOLO-World and SAM2. A row is metric-valid only when no
 debug fallback is used. Local deterministic LLM scoring is non-metric unless a
 named ablation is explicitly declared; configure a real OpenAI-compatible LLM
 for metric SG-Nav scoring. The default config uses `llm.enabled: true`,
-`mapping.room_map_mode: online_geometry_watershed`,
-`sgnav.scene_graph.room_nodes.source: online_geometry_watershed_vlm`,
+`mapping.room_map_mode: online_rose2_structure`,
+`mapping.room_segmentation.algorithm: rose2_structure`,
+`sgnav.scene_graph.room_nodes.source: online_rose2_structure_vlm`,
 `mapping.frontier_min_distance_m: 1.0`, and
 `sgnav.frontier_distance_weight: 0.2`.
 
-Room nodes in strict SG-Nav come from online occupancy/free-space room masks and
-VLM labels over objects inside those masks. `unknown` is the correct room label
-when the evidence is insufficient. `rooms.json` labels are rejected in strict
-metric mode except for a named `oracle_room_ablation`.
+Room nodes in strict SG-Nav come from ROSE2-style robust structure extraction on
+the online occupancy/free-space map, followed by VLM labels over objects inside
+those masks. `unknown` is the correct room label when the evidence is
+insufficient. `rooms.json` labels are rejected in strict metric mode except for
+a named `oracle_room_ablation`. The old watershed room segmentation is kept only
+for debug or the explicit `legacy_watershed_room_ablation`.
 
-Room segmentation is two-stage. Geometry first creates premerge proposals;
-proposal labels are used only to decide weak/open-plan merges. Verified
-structural walls, doorways, or gateways preserve splits regardless of room
-labels. Open-plan proposal boundaries preserve a functional split only when
-both premerge labels are reliable, non-unknown, and different; same, unknown,
-or unreliable labels merge. Final merged room masks are labeled again before
-they become SG-Nav room nodes. Objects such as sinks, fridges, sofas, or TVs are
+Room segmentation is two-stage. ROSE2 first separates structural wall evidence
+from clutter with DFT dominant directions, directional filtering, Hough wall
+segments, wall clustering, representative walls, and grid-face room masks.
+Premerge proposal labels are used only to decide weak/open-plan functional
+splits. Verified structural walls preserve splits regardless of room labels.
+Open-plan proposal boundaries preserve a functional split only when both
+premerge labels are reliable, non-unknown, and different; same, unknown, or
+unreliable labels merge. Final merged room masks are labeled again before they
+become SG-Nav room nodes. Objects such as sinks, fridges, sofas, or TVs are
 room-recognition evidence, not direct hardcoded split rules.
 
 Room segmentation and room recognition are lazy and scoring-gated: they run
@@ -112,8 +117,9 @@ only immediately before a new SG-Nav frontier-scoring decision, after reachable
 frontiers are extracted and before scene-graph/HCoT scoring. They do not run
 for mapper-only updates, perception-only updates, committed-frontier local A*
 replans, or candidate re-perception/STOP confirmation. Result rows expose
-`room_update_invoked_for_frontier_scoring`, `room_segmentation_ran`,
-`room_labeling_ran`, `room_context_cache_hit`, and `room_call_order_trace`.
+`room_update_invoked_for_frontier_scoring`, `room_segmentation_called_for`,
+`room_segmentation_algorithm`, `room_segmentation_ran`, `room_labeling_ran`,
+`room_context_cache_hit`, and `room_call_order_trace`.
 
 Room VLM `confidence` is stored as `vlm_self_confidence`, a self-reported weak
 signal rather than a calibrated probability. Room node confidence uses
@@ -242,13 +248,15 @@ appear in strict visualization.
 YOLO/SAM detections are treated as valid only when `confidence > 0.55`. Lower
 or equal detections are filtered before bbox rendering, mask/depth fusion,
 object memory insertion, scene-graph object nodes, and goal-candidate logic.
-YOLO boxes touching an image edge are also rejected from SAM2, depth
-backprojection, object memory, room evidence, candidate goals, STOP, and policy
-graph objects, while still being written as raw debug detections with
-`reject_reason=bbox_touches_image_edge`. Object tracks use accumulated
-`class_conf_sums` and `class_hits`; the stable category is the accumulated
-winner and graph/debug dumps expose `mean_confidence`, `detection_count`, and
-`winner_detection_count`.
+YOLO boxes or SAM2 masks touching an image edge are no longer discarded. They
+are logged as `visibility_status=partial_edge`, associated to prior full/stable
+tracks by SAM2 mask or 3D footprint overlap when possible, and otherwise kept
+as tentative raw evidence. Tentative partial tracks do not enter room evidence,
+goal candidates, STOP, or SG-Nav policy graph objects until they become stable.
+Object tracks use accumulated `class_conf_sums` and `class_hits`; the stable
+category is the accumulated winner and graph/debug dumps expose
+`mean_confidence`, `detection_count`, `winner_detection_count`, visibility
+counts, geometry confidence, and parent/child track ids.
 
 Convert one graph step into the SG-Nav decision dump contract:
 

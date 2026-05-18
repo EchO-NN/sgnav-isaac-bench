@@ -31,7 +31,7 @@ class CountingSegmenter:
             observed_free_cells=9,
             mask_confidence=0.9,
         )
-        self.last_debug = {"source": "online_geometry_watershed", "room_count": 1}
+        self.last_debug = {"source": "rose2_structure", "algorithm": "rose2_structure", "room_count": 1}
         return [room]
 
 

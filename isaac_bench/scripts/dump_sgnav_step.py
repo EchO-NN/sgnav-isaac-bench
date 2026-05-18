@@ -13,10 +13,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(
         description="Write an SG-Nav decision dump JSON artifact with the contract-required keys."
     )
-    parser.add_argument("--output", required=True, help="Path to the JSON artifact to write.")
+    parser.add_argument("--output", "--out", dest="output", required=True, help="Path to the JSON artifact to write.")
     parser.add_argument("--episode-id", default=None)
     parser.add_argument("--scene-id", default=None)
     parser.add_argument("--goal-category", default=None)
+    parser.add_argument("--episode-file", default=None, help="Optional episode JSONL used only for metadata compatibility.")
+    parser.add_argument("--episode-index", type=int, default=0, help="Episode row index for --episode-file metadata.")
     parser.add_argument("--graph-debug-dump", default=None, help="Optional graph_step_*.json from --debug-graph-dump.")
     parser.add_argument("--result-row", default=None, help="Optional JSON/JSONL result row to enrich candidate and STOP state.")
     parser.add_argument("--pretty", action="store_true")
@@ -24,15 +26,18 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     graph_debug = _read_json_artifact(args.graph_debug_dump) if args.graph_debug_dump else None
     result_row = _read_json_artifact(args.result_row) if args.result_row else None
+    episode_metadata = _read_episode_metadata(args.episode_file, int(args.episode_index)) if args.episode_file else {}
     metadata = {
         key: value
         for key, value in {
-            "episode_id": args.episode_id,
-            "scene_id": args.scene_id,
-            "goal_category": args.goal_category,
+            "episode_id": args.episode_id or episode_metadata.get("episode_id"),
+            "scene_id": args.scene_id or episode_metadata.get("scene_id"),
+            "goal_category": args.goal_category or episode_metadata.get("goal_category"),
             "schema_only": graph_debug is None and result_row is None,
             "graph_debug_dump": args.graph_debug_dump,
             "result_row": args.result_row,
+            "episode_file": args.episode_file,
+            "episode_index": int(args.episode_index) if args.episode_file else None,
         }.items()
         if value is not None
     }
@@ -63,6 +68,23 @@ def _read_json_artifact(path: str) -> dict:
     return {}
 
 
+def _read_episode_metadata(path: str, index: int) -> dict:
+    try:
+        lines = [line for line in Path(path).read_text(encoding="utf-8").splitlines() if line.strip()]
+        if not lines:
+            return {}
+        row = json.loads(lines[max(0, min(int(index), len(lines) - 1))])
+        if not isinstance(row, dict):
+            return {}
+        return {
+            "episode_id": row.get("episode_id") or row.get("id"),
+            "scene_id": row.get("scene_id"),
+            "goal_category": row.get("goal_category") or row.get("goal"),
+        }
+    except Exception:
+        return {}
+
+
 def _decision_dump_from_runtime_artifacts(graph_debug: dict, result_row: dict) -> dict:
     score_debug = dict(graph_debug.get("score_debug") or result_row.get("paper_frontier_interpolation") or {})
     frontiers = list(graph_debug.get("frontiers") or [])
@@ -78,8 +100,9 @@ def _decision_dump_from_runtime_artifacts(graph_debug: dict, result_row: dict) -
         "room_segmentation": dict(
             graph_debug.get("room_segmentation")
             or result_row.get("room_segmentation")
-            or {"source": "online_geometry_watershed", "room_count": 0, "rooms": []}
+            or {"source": "rose2_structure", "algorithm": "rose2_structure", "room_count": 0, "rooms": []}
         ),
+        "object_memory": dict(result_row.get("object_memory_gnn_snapshot") or _object_memory_summary_from_row(result_row)),
         "room_semantics": dict(
             graph_debug.get("room_semantics")
             or result_row.get("room_semantics")
@@ -174,6 +197,21 @@ def _room_context_from_row(result_row: dict) -> dict:
         "room_call_order_trace",
     )
     return {key: result_row.get(key) for key in keys if key in result_row}
+
+
+def _object_memory_summary_from_row(result_row: dict) -> dict:
+    tracks = list(result_row.get("object_memory_tracks") or [])
+    raw = list(result_row.get("raw_detection_log") or [])
+    return {
+        "raw_detection_count": int(len(raw)),
+        "stable_track_count": int(len([item for item in tracks if bool(item.get("used_for_policy_graph", True))])),
+        "tentative_track_count": int(len([item for item in tracks if not bool(item.get("used_for_policy_graph", True))])),
+        "mask_association_count": int(len([item for item in raw if item.get("associated_track_id")])),
+        "partial_edge_count": int(len([item for item in raw if item.get("visibility_status") == "partial_edge"])),
+        "contained_child_count": int(len([item for item in tracks if item.get("parent_track_id")])),
+        "raw_detections": raw[:128],
+        "object_tracks": tracks[:128],
+    }
 
 
 def _reperception_state_from_metadata(decision_metadata: dict, result_row: dict) -> dict:

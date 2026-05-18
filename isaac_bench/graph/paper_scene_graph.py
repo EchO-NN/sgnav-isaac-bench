@@ -69,6 +69,9 @@ class ObjectNode:
     is_new_node: bool = False
     is_goal_node: bool = False
     room_assignment_metadata: Dict[str, object] = field(default_factory=dict)
+    source_instance_id: str = ""
+    parent_track_id: Optional[str] = None
+    child_track_ids: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -184,13 +187,35 @@ class PaperSceneGraph:
                 winner_detection_count=int(getattr(mem_node, "winner_detection_count", mem_node.observed_count)),
                 center_grid=tuple(int(v) for v in mem_node.center_grid),
                 is_new_node=is_new,
+                source_instance_id=str(getattr(mem_node, "source_instance_id", "") or ""),
+                parent_track_id=getattr(mem_node, "parent_track_id", None),
+                child_track_ids=list(getattr(mem_node, "child_track_ids", ()) or ()),
             )
             if is_new:
                 self.new_object_ids.append(node_id)
+        self._append_containment_edges_from_tracks()
         if not self.room_nodes:
             self._ensure_unknown_room()
         self.update_affiliation_edges(map_info=map_info)
         self.version += 1
+
+    def _append_containment_edges_from_tracks(self) -> None:
+        track_to_node = {
+            str(node.source_instance_id): node_id
+            for node_id, node in self.object_nodes.items()
+            if str(node.source_instance_id or "")
+        }
+        existing = {(edge.src_id, edge.dst_id, edge.relation) for edge in self.object_edges}
+        for node_id, node in self.object_nodes.items():
+            parent_track_id = str(node.parent_track_id or "")
+            parent_node_id = track_to_node.get(parent_track_id)
+            if not parent_node_id or parent_node_id == node_id:
+                continue
+            for relation in ("supported_by", "inside_or_on"):
+                key = (node_id, parent_node_id, relation)
+                if key not in existing:
+                    self.object_edges.append(ObjectEdge(src_id=node_id, dst_id=parent_node_id, relation=relation, confidence=1.0, is_short_edge=True, source="mask_containment"))
+                    existing.add(key)
 
     def update_room_nodes_from_room_map(self, room_map: np.ndarray, map_info, room_names: Sequence[str]) -> None:
         arr = np.asarray(room_map)
@@ -363,6 +388,9 @@ class PaperSceneGraph:
             detection_count=int(getattr(instance, "valid_detection_count", instance.observed_count) or instance.observed_count),
             winner_detection_count=int(getattr(instance, "winner_detection_count", instance.observed_count)),
             is_new_node=node_id not in self.object_nodes,
+            source_instance_id=str(getattr(instance, "instance_id", "") or ""),
+            parent_track_id=getattr(instance, "parent_track_id", None),
+            child_track_ids=list(getattr(instance, "child_track_ids", ()) or ()),
         )
         self.object_nodes[node_id] = node
         return node

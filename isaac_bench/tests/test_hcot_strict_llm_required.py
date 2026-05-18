@@ -31,7 +31,7 @@ def _args(**overrides):
         "planner": "astar",
         "sgnav_mode": "paper",
         "llm_enabled": False,
-        "room_map_mode": "online_geometry_watershed",
+        "room_map_mode": "online_rose2_structure",
         "ablation_name": None,
         "seed_gt_object_memory": False,
         "allow_gt_goal_fallback": False,

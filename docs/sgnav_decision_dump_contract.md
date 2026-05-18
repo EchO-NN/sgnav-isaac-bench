@@ -12,6 +12,7 @@ Every dump artifact must include:
 - `objects`
 - `groups`
 - `rooms`
+- `object_memory`
 - `room_context`
 - `room_segmentation`
 - `room_semantics`
@@ -32,19 +33,22 @@ Every dump artifact must include:
   state used by the decision. Object entries should expose the stable
   accumulated category plus simple policy/GNN fields such as
   `mean_confidence`, `detection_count`, and `winner_detection_count`; raw
-  rejected detections stay in episode/debug logs rather than becoming graph
-  objects.
+  partial/tentative detections stay in `object_memory` snapshots rather than
+  becoming policy graph objects.
+- `object_memory` records raw detections, stable/tentative track counts,
+  partial-edge counts, mask associations, class accumulators, visibility
+  counts, geometry confidence, and parent/child track ids for GNN data
+  collection.
 - `room_context` records whether room context was invoked for frontier scoring,
   whether segmentation or VLM labeling ran, cache hit state, label request/cache
   counts, and the testable call order
   `frontier_extraction -> room_context_for_frontier_scoring -> scenegraph_update
   -> hcot_subgraph_scoring -> frontier_interpolation -> frontier_selection`.
-- `room_segmentation` records online geometry room masks, structural obstacle
-  filtering, proposal/final room counts, doorway metadata, adjacency evidence,
-  merge operations, proposal-vs-final debug layers, partial state, and mask
-  confidence. For open-plan merges it records premerge room categories,
-  reliability gates, structural-boundary decisions, and final merged room
-  counts.
+- `room_segmentation` records ROSE2-style online structure extraction and room
+  masks: dominant wall directions, clean structure map, Hough segments, wall
+  clusters, representative wall lines, physical/final room counts, topology
+  split debug, open-plan merge/split decisions, partial state, and mask
+  confidence.
 - `room_semantics` records VLM/LLM room labels, allowed categories, `unknown`
   reasons, `vlm_self_confidence`, evidence-derived `label_reliability`,
   reliability factors, and backend state.

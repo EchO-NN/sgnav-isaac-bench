@@ -34,6 +34,7 @@ from isaac_bench.mapping.room_segmentation import (
     OnlineRoomSegmenter,
     RoomSegmentationConfig,
 )
+from isaac_bench.mapping.rose2_room_segmentation import OnlineROSE2RoomSegmenter
 from isaac_bench.graph.room_semantics import (
     DEFAULT_ROOM_CATEGORIES,
     VLMRoomLabeler,
@@ -446,12 +447,14 @@ def filter_edge_touching_detections(
             and not detection_confidence_is_valid(float(det.confidence), float(min_confidence))
         )
         det.bbox_touches_edge = bool(touches)
-        rejected = bool(low_confidence or (touches and reject_edge_touching_bboxes))
+        # Edge-touching YOLO/SAM2 detections are partial visual evidence, not a
+        # discard condition. The legacy flag is kept for CLI compatibility and
+        # recorded below, but strict object tracking now decides policy use from
+        # mask/depth association and track stability.
+        rejected = bool(low_confidence)
         det.used_for_object_track = not rejected
         if low_confidence:
             det.reject_reason = "low_confidence"
-        elif touches and reject_edge_touching_bboxes:
-            det.reject_reason = "bbox_touches_image_edge"
         else:
             det.reject_reason = None
         record = {
@@ -462,6 +465,8 @@ def filter_edge_touching_detections(
             "confidence": float(det.confidence),
             "bbox_xyxy": [float(v) for v in det.bbox_xyxy],
             "bbox_touches_edge": bool(touches),
+            "legacy_reject_edge_touching_bboxes_requested": bool(reject_edge_touching_bboxes),
+            "visibility_status": "partial_edge" if touches else "unknown",
             "used_for_object_track": not rejected,
             "reject_reason": det.reject_reason,
         }
@@ -782,6 +787,13 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
         reject_edge_touching_bboxes=bool(args.reject_edge_touching_bboxes),
         bbox_edge_margin_px=float(args.bbox_edge_margin_px),
         bbox_edge_margin_ratio=float(args.bbox_edge_margin_ratio),
+        partial_class_weight=float(args.partial_class_weight),
+        min_geometry_confidence=float(args.min_geometry_confidence),
+        partial_stability_min_observations=int(args.partial_stability_min_observations),
+        mask_iou_association_threshold=float(args.mask_iou_association_threshold),
+        footprint_iou_association_threshold=float(args.footprint_iou_association_threshold),
+        child_containment_threshold=float(args.child_containment_threshold),
+        child_area_ratio_threshold=float(args.child_area_ratio_threshold),
     )
     if args.seed_gt_object_memory:
         print("[sgnav-loop] seed_gt_object_memory ignored for depth-online mapping", flush=True)
@@ -905,7 +917,7 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
     room_context_cache = RoomContextCache()
     last_room_context_result: Optional[RoomContextResult] = None
     last_room_context_metadata = room_context_not_invoked_metadata()
-    last_room_segmentation_debug = {"source": "online_geometry_watershed", "room_count": 0, "rooms": []}
+    last_room_segmentation_debug = {"source": "rose2_structure", "algorithm": "rose2_structure", "room_count": 0, "rooms": []}
     last_room_semantics_debug = {
         "backend": "unavailable",
         "allowed_categories": list(getattr(args, "room_label_allowed_categories", DEFAULT_ROOM_CATEGORIES)),
@@ -914,16 +926,45 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
     if room_map_mode in {"observed_rooms_json", "rooms_json", "observed"}:
         if bool(getattr(args, "strict_benchmark", False)):
             raise BenchmarkAssetError(
-                "strict SG-Nav metric path requires online_geometry_watershed room masks; rooms.json/oracle room maps are not allowed"
+                "strict SG-Nav metric path requires online_rose2_structure room masks; rooms.json/oracle room maps are not allowed"
             )
         full_room_map = build_sgnav_room_map(scene_dir, dynamic_map_info)
         scenegraph.update(object_memory, room_map=full_room_map)
-    elif room_map_mode in {"online_geometry_watershed", "online_geometry_watershed_vlm"}:
+    elif room_map_mode in {"online_rose2_structure", "rose2_structure", "online_rose2_structure_vlm"}:
         room_cfg = RoomSegmentationConfig.from_mapping(
             getattr(args, "room_segmentation_config", {}),
             resolution_m=float(dynamic_map_info.resolution_m),
             map_info=dynamic_map_info,
         )
+        room_segmenter = OnlineROSE2RoomSegmenter(room_cfg)
+        room_label_client = (
+            getattr(scenegraph, "paper_llm_client", None)
+            if str(getattr(args, "room_label_backend", "vlm")).strip().lower() == "vlm"
+            else None
+        )
+        room_labeler = VLMRoomLabeler(
+            client=room_label_client,
+            allowed_categories=getattr(args, "room_label_allowed_categories", DEFAULT_ROOM_CATEGORIES),
+            min_confidence=float(getattr(args, "room_label_min_confidence", 0.60)),
+            ambiguity_margin=float(getattr(args, "room_label_ambiguity_margin", 0.15)),
+            min_reliable_objects=int(getattr(args, "room_label_min_reliable_objects", 2)),
+            unknown_category=str(getattr(args, "room_label_unknown_category", "unknown")),
+            require_backend=bool(getattr(args, "strict_benchmark", False))
+            and str(getattr(args, "room_label_backend", "vlm")).strip().lower() == "vlm",
+            max_room_objects_in_prompt=int(getattr(args, "max_room_objects_in_prompt", 25)),
+        )
+        last_room_semantics_debug["backend"] = room_labeler.backend
+    elif room_map_mode in {"online_geometry_watershed", "online_geometry_watershed_vlm"}:
+        if bool(getattr(args, "strict_benchmark", False)) and str(getattr(args, "ablation_name", "") or "") != "legacy_watershed_room_ablation":
+            raise BenchmarkAssetError(
+                "strict SG-Nav metric path requires online_rose2_structure room masks; watershed is debug/ablation-only"
+            )
+        room_cfg = RoomSegmentationConfig.from_mapping(
+            getattr(args, "room_segmentation_config", {}),
+            resolution_m=float(dynamic_map_info.resolution_m),
+            map_info=dynamic_map_info,
+        )
+        room_cfg.algorithm = "legacy_watershed_ablation"
         room_segmenter = OnlineRoomSegmenter(room_cfg)
         room_label_client = (
             getattr(scenegraph, "paper_llm_client", None)
@@ -2141,9 +2182,17 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
             for key, value in sorted(detection_category_counts.items(), key=lambda item: (-item[1], item[0]))
         }
         row["goal_detection_history"] = list(goal_detection_history)
-        row["raw_detection_log"] = list(raw_detection_debug_log)
+        object_memory_gnn_snapshot = fused_instance_registry.gnn_snapshot()
+        row["object_memory_gnn_snapshot"] = object_memory_gnn_snapshot
+        registry_raw_detections = list(object_memory_gnn_snapshot.get("raw_detections") or [])
+        pre_registry_rejections = [item for item in raw_detection_debug_log if item.get("reject_reason")]
+        row["raw_detection_log"] = (
+            pre_registry_rejections + registry_raw_detections
+            if registry_raw_detections
+            else list(raw_detection_debug_log)
+        )
         row["raw_rejected_detections_count"] = int(
-            len([item for item in raw_detection_debug_log if not bool(item.get("used_for_object_track", True))])
+            len([item for item in row["raw_detection_log"] if item.get("reject_reason")])
         )
         row["object_memory_tracks"] = object_memory.to_dicts()
         row["selected_candidate"] = last_selected_candidate.to_dict() if last_selected_candidate is not None else None
@@ -2260,6 +2309,12 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
             "room_label_requests",
             "room_label_cache_hits",
             "room_call_order_trace",
+            "room_segmentation_called_for",
+            "room_segmentation_algorithm",
+            "room_segmentation_step_index",
+            "room_vlm_called",
+            "scenegraph_updated_after_room_context",
+            "frontier_scoring_after_room_context",
         ):
             row[key] = room_context_row.get(key)
         row["room_segmentation"] = dict(last_room_segmentation_debug)
@@ -2522,6 +2577,13 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--object-merge-radius-m", type=float, default=None)
     parser.add_argument("--instance-merge-distance-m", type=float, default=None)
     parser.add_argument("--instance-merge-iou-3d", type=float, default=None)
+    parser.add_argument("--partial-class-weight", type=float, default=None)
+    parser.add_argument("--min-geometry-confidence", type=float, default=None)
+    parser.add_argument("--partial-stability-min-observations", type=int, default=None)
+    parser.add_argument("--mask-iou-association-threshold", type=float, default=None)
+    parser.add_argument("--footprint-iou-association-threshold", type=float, default=None)
+    parser.add_argument("--child-containment-threshold", type=float, default=None)
+    parser.add_argument("--child-area-ratio-threshold", type=float, default=None)
     parser.add_argument("--frontier-distance-weight", type=float, default=None)
     parser.add_argument("--frontier-scenegraph-score-norm", "--frontier_scenegraph_score_norm", default=None, choices=["none", "minmax", "zscore"])
     parser.add_argument("--semantic-priors-path", "--semantic_priors_path", default=None)
@@ -2626,6 +2688,41 @@ def main(argv: Optional[List[str]] = None) -> int:
         args.bbox_edge_margin_ratio
         if args.bbox_edge_margin_ratio is not None
         else get_nested(cfg, "perception.yolo_world.bbox_edge_margin_ratio", 0.0)
+    )
+    args.partial_class_weight = float(
+        args.partial_class_weight
+        if args.partial_class_weight is not None
+        else get_nested(cfg, "object_memory.partial_class_weight", 0.25)
+    )
+    args.min_geometry_confidence = float(
+        args.min_geometry_confidence
+        if args.min_geometry_confidence is not None
+        else get_nested(cfg, "object_memory.min_geometry_confidence", 0.50)
+    )
+    args.partial_stability_min_observations = int(
+        args.partial_stability_min_observations
+        if args.partial_stability_min_observations is not None
+        else get_nested(cfg, "object_memory.partial_stability_min_observations", 3)
+    )
+    args.mask_iou_association_threshold = float(
+        args.mask_iou_association_threshold
+        if args.mask_iou_association_threshold is not None
+        else get_nested(cfg, "object_memory.mask_iou_association_threshold", 0.20)
+    )
+    args.footprint_iou_association_threshold = float(
+        args.footprint_iou_association_threshold
+        if args.footprint_iou_association_threshold is not None
+        else get_nested(cfg, "object_memory.footprint_iou_association_threshold", 0.15)
+    )
+    args.child_containment_threshold = float(
+        args.child_containment_threshold
+        if args.child_containment_threshold is not None
+        else get_nested(cfg, "object_memory.child_containment_threshold", 0.60)
+    )
+    args.child_area_ratio_threshold = float(
+        args.child_area_ratio_threshold
+        if args.child_area_ratio_threshold is not None
+        else get_nested(cfg, "object_memory.child_area_ratio_threshold", 0.35)
     )
     args.headless = bool(get_nested(cfg, "isaac.headless", True) if args.headless is None else args.headless)
     viz_cfg = get_nested(cfg, "visualization.sgnav_popup", "auto")
@@ -2859,7 +2956,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         default_robot_radius_m = 0.5 * float(get_nested(cfg, "robot.footprint_width_m", 0.28))
     args.robot_radius_m = float(args.robot_radius_m if args.robot_radius_m is not None else default_robot_radius_m)
     args.online_inflation_radius_m = float(args.online_inflation_radius_m if args.online_inflation_radius_m is not None else get_nested(cfg, "mapping.inflation_radius_m", 0.0))
-    args.room_map_mode = str(args.room_map_mode or get_nested(cfg, "mapping.room_map_mode", "online_geometry_watershed"))
+    args.room_map_mode = str(args.room_map_mode or get_nested(cfg, "mapping.room_map_mode", "online_rose2_structure"))
     args.room_segmentation_config = dict(get_nested(cfg, "mapping.room_segmentation", {}) or {})
     room_semantics_cfg = dict(get_nested(cfg, "room_semantics", {}) or {})
     for key in (

@@ -22,7 +22,7 @@ def _mask() -> np.ndarray:
 
 
 def test_mask_projection_returns_point_cloud_and_detection3d_payload():
-    det = Detection2D("chair", "chair", 0.9, (2.0, 2.0, 5.0, 5.0), mask=_mask())
+    det = Detection2D("chair", "chair", 0.9, (2.0, 2.0, 4.0, 4.0), mask=_mask())
 
     points = detection_to_world_points(det, _depth(), _intr(), (0.0, 0.0, 1.0, 0.0), min_points=1, stride=1)
     dets3d = detections_to_3d([det], _depth(), _intr(), (0.0, 0.0, 1.0, 0.0), min_points=1)
@@ -37,8 +37,8 @@ def test_mask_projection_returns_point_cloud_and_detection3d_payload():
 
 def test_fused_instance_registry_registers_and_merges_close_instances():
     registry = FusedInstanceRegistry(merge_distance_m=0.75, merge_iou_3d=0.05)
-    det1 = Detection2D("chair", "chair", 0.7, (2.0, 2.0, 5.0, 5.0), mask=_mask())
-    det2 = Detection2D("chair", "chair", 0.9, (2.0, 2.0, 5.0, 5.0), mask=_mask())
+    det1 = Detection2D("chair", "chair", 0.7, (2.0, 2.0, 4.0, 4.0), mask=_mask())
+    det2 = Detection2D("chair", "chair", 0.9, (2.0, 2.0, 4.0, 4.0), mask=_mask())
 
     registry.update([det1], _depth(), _intr(), (0.0, 0.0, 1.0, 0.0), step_id=1, min_points=1, stride=1)
     instances = registry.update([det2], _depth(), _intr(), (0.1, 0.0, 1.0, 0.0), step_id=2, min_points=1, stride=1)
@@ -53,7 +53,7 @@ def test_fused_instance_registry_registers_and_merges_close_instances():
 
 def test_fused_instance_registry_ignores_detections_beyond_depth_max():
     registry = FusedInstanceRegistry(merge_distance_m=0.75, merge_iou_3d=0.05)
-    det = Detection2D("chair", "chair", 0.9, (2.0, 2.0, 5.0, 5.0), mask=_mask())
+    det = Detection2D("chair", "chair", 0.9, (2.0, 2.0, 4.0, 4.0), mask=_mask())
     far_depth = np.full((6, 6), 4.0, dtype=np.float32)
 
     instances = registry.update([det], far_depth, _intr(), (0.0, 0.0, 1.0, 0.0), step_id=1, depth_max_m=3.0, min_points=1, stride=1)
@@ -63,7 +63,7 @@ def test_fused_instance_registry_ignores_detections_beyond_depth_max():
 
 def test_fused_instance_registry_keeps_far_instances_separate_and_exports_objects():
     registry = FusedInstanceRegistry(merge_distance_m=0.75, merge_iou_3d=0.05)
-    det = Detection2D("chair", "chair", 0.8, (2.0, 2.0, 5.0, 5.0), mask=_mask())
+    det = Detection2D("chair", "chair", 0.8, (2.0, 2.0, 4.0, 4.0), mask=_mask())
 
     registry.update([det], _depth(), _intr(), (0.0, 0.0, 1.0, 0.0), step_id=1, min_points=1, stride=1)
     instances = registry.update([det], _depth(), _intr(), (3.0, 0.0, 1.0, 0.0), step_id=2, min_points=1, stride=1)
@@ -77,7 +77,7 @@ def test_fused_instance_registry_keeps_far_instances_separate_and_exports_object
 
 def test_room_prompt_registers_room_instance():
     registry = FusedInstanceRegistry(merge_distance_m=0.75, merge_iou_3d=0.05)
-    det = Detection2D("living room", "living room", 0.7, (2.0, 2.0, 5.0, 5.0), mask=_mask())
+    det = Detection2D("living room", "living room", 0.7, (2.0, 2.0, 4.0, 4.0), mask=_mask())
 
     instances = registry.update([det], _depth(), _intr(), (0.0, 0.0, 1.0, 0.0), step_id=1, min_points=1, stride=1)
 
@@ -87,8 +87,8 @@ def test_room_prompt_registers_room_instance():
 
 def test_fused_instance_registry_rejects_low_confidence_detections():
     registry = FusedInstanceRegistry(merge_distance_m=0.75, merge_iou_3d=0.05)
-    low = Detection2D("chair", "chair", 0.55, (2.0, 2.0, 5.0, 5.0), mask=_mask())
-    high = Detection2D("chair", "chair", 0.56, (2.0, 2.0, 5.0, 5.0), mask=_mask())
+    low = Detection2D("chair", "chair", 0.55, (2.0, 2.0, 4.0, 4.0), mask=_mask())
+    high = Detection2D("chair", "chair", 0.56, (2.0, 2.0, 4.0, 4.0), mask=_mask())
 
     assert registry.update([low], _depth(), _intr(), (0.0, 0.0, 1.0, 0.0), step_id=1, min_points=1, stride=1) == []
     instances = registry.update([high], _depth(), _intr(), (0.0, 0.0, 1.0, 0.0), step_id=2, min_points=1, stride=1)
@@ -99,7 +99,7 @@ def test_fused_instance_registry_rejects_low_confidence_detections():
 
 def test_object_memory_can_register_fused_instances_with_geometry():
     registry = FusedInstanceRegistry(merge_distance_m=0.75, merge_iou_3d=0.05)
-    det = Detection2D("chair", "chair", 0.8, (2.0, 2.0, 5.0, 5.0), mask=_mask())
+    det = Detection2D("chair", "chair", 0.8, (2.0, 2.0, 4.0, 4.0), mask=_mask())
     instances = registry.update([det], _depth(), _intr(), (0.0, 0.0, 1.0, 0.0), step_id=1, min_points=1, stride=1)
     memory = ObjectMemory(merge_radius_m=0.75)
 

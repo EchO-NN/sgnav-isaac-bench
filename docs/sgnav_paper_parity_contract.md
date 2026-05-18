@@ -15,14 +15,15 @@ Metric-path SG-Nav runs must use the following pipeline:
    or below 0.55 must not draw RGB bboxes, enter mask/depth fusion, create
    object-memory nodes, create scene-graph object nodes, seed candidate goals,
    or support STOP confirmation.
-5. YOLO-World boxes that touch the image edge are raw-detection debug records
-   only. They must not be sent to SAM2/depth backprojection, update object
-   memory, create goal candidates, support STOP, or become SG-Nav/GNN object
-   nodes.
+5. YOLO-World boxes or SAM2 masks that touch the image edge are partial raw
+   evidence, not hard-discarded detections. They are logged with
+   `visibility_status=partial_edge`, associated to prior full/stable tracks by
+   mask/footprint overlap when possible, and otherwise kept as tentative
+   tracks that cannot create goal candidates, support STOP, or become SG-Nav
+   policy graph nodes until stable.
 6. SAM2 mask pixels and RGB-D depth are backprojected into online 3D object
-   memory for non-edge detections only. Object tracks maintain accumulated
-   `class_conf_sums`/`class_hits`; the current category is the accumulated
-   winner, not the most recent frame.
+   memory. Object tracks maintain accumulated `class_conf_sums`/`class_hits`;
+   the current category is the accumulated winner, not the most recent frame.
 7. Online occupancy and free-space maps are updated from live RGB-D evidence.
 8. Reachable frontiers are extracted from the observed-free and unknown-space
    boundary.
@@ -35,15 +36,16 @@ Metric-path SG-Nav runs must use the following pipeline:
    HCoT/subgraph frontier interpolation. Mapper-only updates, perception-only
    updates, committed-frontier local replans, and candidate re-perception/STOP
    confirmation must use cached context and must not trigger room VLM calls.
-11. Room masks come from traditional online occupancy/free-space segmentation:
-   observed-free structural masks, distance-transform seeds, watershed or
-   seeded region growing, doorway-aware refinement, stable IDs, and two-stage
-   room recognition. Premerge room labels can preserve weak/open-plan
-   functional splits only when both sides are reliable, non-unknown, and
-   different; final room masks are labeled again for SG-Nav room nodes.
-   `unknown` is a valid first-class room category when evidence is weak or
-   ambiguous, but it does not create functional splits without a structural
-   boundary.
+11. Strict room masks come from `online_rose2_structure`: ROSE2-style robust
+   structure extraction on the online 2D occupancy grid, DFT dominant wall
+   directions, directional structure scoring, Hough/clustered representative
+   wall lines, grid-face room masks, topology split checks, stable IDs, and
+   two-stage room recognition. The old watershed segmenter is debug/ablation
+   only. Premerge room labels can preserve weak/open-plan functional splits
+   only when both sides are reliable, non-unknown, and different; final room
+   masks are labeled again for SG-Nav room nodes. `unknown` is a valid
+   first-class room category when evidence is weak or ambiguous, but it does
+   not create functional splits without a structural boundary.
 12. VLM room-label `confidence` is only `vlm_self_confidence`, not calibrated
    probability. Room node confidence must use evidence-derived
    `label_reliability`; evidence-gated `unknown` remains metric-valid.

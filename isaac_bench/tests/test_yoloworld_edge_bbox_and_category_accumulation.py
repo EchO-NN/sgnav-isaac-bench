@@ -32,7 +32,7 @@ def test_bbox_touches_image_edge_helper():
     assert not bbox_touches_image_edge((3.0, 3.0, 4.0, 4.0), 8, 8, margin_px=2)
 
 
-def test_edge_bbox_rejected_from_track_but_logged_raw():
+def test_edge_bbox_kept_as_partial_tentative_track_and_logged_raw():
     registry = FusedInstanceRegistry(
         merge_distance_m=0.75,
         merge_iou_3d=0.0,
@@ -43,11 +43,12 @@ def test_edge_bbox_rejected_from_track_but_logged_raw():
 
     instances = registry.update([edge], _depth(), _intr(), (0.0, 0.0, 1.0, 0.0), step_id=1, min_points=1, stride=1)
 
-    assert instances == []
-    assert registry.raw_rejected_detections_count == 1
+    assert len(instances) == 1
     assert registry.raw_detection_log[0]["bbox_touches_edge"] is True
-    assert registry.raw_detection_log[0]["used_for_object_track"] is False
-    assert registry.raw_detection_log[0]["reject_reason"] == "bbox_touches_image_edge"
+    assert registry.raw_detection_log[0]["used_for_object_track"] is True
+    assert registry.raw_detection_log[0]["visibility_status"] == "partial_edge"
+    assert registry.raw_detection_log[0]["reject_reason"] is None
+    assert instances[0].used_for_policy_graph is False
 
 
 def test_low_confidence_detection_is_logged_but_not_forwarded_to_sam_or_memory():
@@ -121,8 +122,9 @@ def test_edge_touching_high_confidence_wrong_label_does_not_overwrite_track():
 
     assert len(instances) == 1
     assert instances[0].category == "pillow"
-    assert instances[0].class_conf_sums == {"pillow": pytest.approx(0.8)}
-    assert instances[0].edge_rejected_count == 1
+    assert instances[0].class_conf_sums["pillow"] == pytest.approx(0.8)
+    assert instances[0].class_conf_sums["chair"] == pytest.approx(0.99 * registry.partial_class_weight)
+    assert instances[0].visibility_status_counts["partial_edge"] == 1
 
 
 def test_edge_bbox_does_not_create_goal_candidate_or_stop():
@@ -156,8 +158,9 @@ def test_edge_bbox_does_not_create_goal_candidate_or_stop():
         (2.0, 2.0, 0.0, 0.0),
     )
 
-    assert kept == []
-    assert raw_log[0]["reject_reason"] == "bbox_touches_image_edge"
+    assert kept == [edge]
+    assert raw_log[0]["reject_reason"] is None
+    assert raw_log[0]["visibility_status"] == "partial_edge"
     assert memory.nodes == []
     assert nav.stop is False
     assert nav.selected_candidate is None

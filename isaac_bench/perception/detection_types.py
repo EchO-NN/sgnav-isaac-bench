@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import math
 from typing import Dict, Literal, Optional, Tuple
 
 import numpy as np
@@ -56,6 +57,40 @@ class Detection3D:
 
 
 @dataclass
+class RawObjectDetection:
+    frame_id: int
+    category: str
+    confidence: float
+    bbox_xyxy: Tuple[float, float, float, float]
+    mask: Optional[np.ndarray] = None
+    mask_area_px: int = 0
+    bbox_touches_image_edge: bool = False
+    mask_touches_image_edge: bool = False
+    depth_support_ratio: float = 0.0
+    projected_footprint: Optional[np.ndarray] = None
+    visibility_status: str = "unknown"
+    associated_track_id: Optional[str] = None
+    used_for_policy_graph: bool = False
+    reject_reason: Optional[str] = None
+
+    def to_dict(self) -> dict:
+        return {
+            "frame_id": int(self.frame_id),
+            "category": self.category,
+            "confidence": float(self.confidence),
+            "bbox_xyxy": [float(v) for v in self.bbox_xyxy],
+            "mask_area_px": int(self.mask_area_px),
+            "bbox_touches_image_edge": bool(self.bbox_touches_image_edge),
+            "mask_touches_image_edge": bool(self.mask_touches_image_edge),
+            "depth_support_ratio": float(self.depth_support_ratio),
+            "visibility_status": self.visibility_status,
+            "associated_track_id": self.associated_track_id,
+            "used_for_policy_graph": bool(self.used_for_policy_graph),
+            "reject_reason": self.reject_reason,
+        }
+
+
+@dataclass
 class FusedInstance:
     instance_id: str
     category: str
@@ -73,6 +108,17 @@ class FusedInstance:
     valid_detection_count: int = 0
     total_conf_sum: float = 0.0
     edge_rejected_count: int = 0
+    visibility_status_counts: Dict[str, int] = field(default_factory=dict)
+    geometry_confidence: float = 1.0
+    center_world_stable: Optional[np.ndarray] = None
+    center_world_visible: Optional[np.ndarray] = None
+    full_mask_reference: Optional[np.ndarray] = None
+    last_visible_mask: Optional[np.ndarray] = None
+    center_estimation_mode: str = "full_mask"
+    is_stable: bool = True
+    used_for_policy_graph: bool = True
+    parent_track_id: Optional[str] = None
+    child_track_ids: Tuple[str, ...] = ()
 
     @property
     def stable_category(self) -> str:
@@ -88,3 +134,15 @@ class FusedInstance:
     def mean_confidence(self) -> float:
         hits = max(1, self.winner_detection_count)
         return float(self.class_conf_sums.get(self.stable_category, float(self.confidence) * hits)) / float(hits)
+
+    @property
+    def label_entropy(self) -> float:
+        total = float(sum(max(0.0, float(v)) for v in self.class_conf_sums.values()))
+        if total <= 1e-9:
+            return 0.0
+        entropy = 0.0
+        for value in self.class_conf_sums.values():
+            p = max(0.0, float(value)) / total
+            if p > 1e-12:
+                entropy -= p * math.log(p)
+        return float(entropy)

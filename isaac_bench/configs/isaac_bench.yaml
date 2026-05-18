@@ -162,9 +162,11 @@ mapping:
   frontier_allow_near_fallback: false
   frontier_debug_dump: false
   frontier_debug_dir: data/debug_frontier
-  room_map_mode: online_geometry_watershed
+  room_map_mode: online_rose2_structure
   room_segmentation:
     enabled: true
+    algorithm: rose2_structure
+    legacy_watershed_allowed: debug_only
     source_grid: online_depth_observed
     proposal_mode: distance_watershed
     finalization_mode: doorway_constrained_merge
@@ -200,7 +202,16 @@ mapping:
     id_iou_threshold: 0.35
     unknown_boundary_confidence_penalty: true
     debug_dump: false
-    debug_dir: debug/room_segmentation
+    debug_dir: debug/roomseg_rose2
+    rose2:
+      dominant_direction_count: 2
+      directional_filter_width_rad: 0.244346095
+      hough_min_line_length_m: 1.0
+      hough_line_gap_m: 0.25
+      wall_cluster_distance_m: 0.35
+      wall_cluster_gap_m: 0.50
+      wall_min_support_ratio: 0.25
+      topology_split_enabled: true
 
 perception:
   yolo_world_model: data/models/yolov8l-worldv2.pt
@@ -219,16 +230,24 @@ perception:
   object_forget_after_steps: 100
   min_depth_points_per_detection: 20
   yolo_world:
-    reject_edge_touching_bboxes: true
+    reject_edge_touching_bboxes: false
     bbox_edge_margin_px: 2
     bbox_edge_margin_ratio: 0.0
     category_accumulation: true
+    mask_aware_partial_tracking: true
 
 object_memory:
   category_update_mode: confidence_sum
   expose_mean_confidence: true
   expose_detection_count: true
   use_edge_touching_detections_for_policy: false
+  partial_class_weight: 0.25
+  min_geometry_confidence: 0.50
+  partial_stability_min_observations: 3
+  mask_iou_association_threshold: 0.20
+  footprint_iou_association_threshold: 0.15
+  child_containment_threshold: 0.60
+  child_area_ratio_threshold: 0.35
 
 room_semantics:
   use_premerge_labels_for_open_plan_merge: true
@@ -295,7 +314,7 @@ sgnav:
     long_edge_geometric_pruning: true
     group_nodes: true
     room_nodes:
-      source: online_geometry_watershed_vlm
+      source: online_rose2_structure_vlm
       use_dataset_room_labels_in_metric: false
       strict_no_oracle_rooms: true
       room_label_backend: vlm

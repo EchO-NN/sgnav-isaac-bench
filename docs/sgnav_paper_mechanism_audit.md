@@ -64,8 +64,9 @@ confirmation. Candidate re-perception uses the latest cached graph context.
 - `mapping.frontier_min_distance_m: 1.0`
 - `sgnav.frontier_distance_weight: 0.2`
 - `llm.enabled: true`
-- `mapping.room_map_mode: online_geometry_watershed`
-- `sgnav.scene_graph.room_nodes.source: online_geometry_watershed_vlm`
+- `mapping.room_map_mode: online_rose2_structure`
+- `mapping.room_segmentation.algorithm: rose2_structure`
+- `sgnav.scene_graph.room_nodes.source: online_rose2_structure_vlm`
 
 ## Benchmark Validity Notes
 
