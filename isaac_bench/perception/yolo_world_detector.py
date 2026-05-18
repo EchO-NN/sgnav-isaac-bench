@@ -104,9 +104,29 @@ class YOLOWorldDetector(DetectorBase):
         return out
 
 
-def build_detector(name: str, model: str, conf: float = 0.7, iou: float = 0.5) -> DetectorBase:
+def build_detector(
+    name: str,
+    model: str,
+    conf: float = 0.7,
+    iou: float = 0.5,
+    *,
+    grounding_dino_config: str | None = None,
+    grounding_dino_text_threshold: float = 0.25,
+    grounding_dino_device: str = "cuda",
+) -> DetectorBase:
     if name in ("dry_run", "none"):
         return DryRunDetector()
     if name == "yolo_world":
         return YOLOWorldDetector(model, conf=conf, iou=iou)
+    if name == "grounding_dino":
+        from isaac_bench.perception.grounding_dino_detector import GroundingDINODetector
+
+        return GroundingDINODetector(
+            model,
+            config_path=grounding_dino_config,
+            conf=conf,
+            iou=iou,
+            text_threshold=grounding_dino_text_threshold,
+            device=grounding_dino_device,
+        )
     raise ValueError("Unsupported detector: %s" % name)

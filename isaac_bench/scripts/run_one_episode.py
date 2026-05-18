@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import sys
 import time
 from collections import Counter
@@ -17,6 +18,7 @@ from isaac_bench.dataset.category_normalizer import normalize_category
 from isaac_bench.dataset.episode_generator import point_to_bbox_2d_distance, read_jsonl
 from isaac_bench.env.habitat_like_env import MapSimHabitatLikeEnv
 from isaac_bench.debug.graph_debug_dump import save_graph_debug_dump
+from isaac_bench.debug.roomseg_layer_dump import save_roomseg_layer_dump
 from isaac_bench.graph.decision import NavigationDecision, SGNavDecision
 from isaac_bench.graph.room_context import (
     RoomContextCache,
@@ -27,6 +29,7 @@ from isaac_bench.graph.room_context import (
 from isaac_bench.graph.sgnav_scenegraph_adapter import SGNAV_ROOM_NAMES, SGNavSceneGraphAdapter
 from isaac_bench.mapping.coordinate_transform import MapInfo, grid_to_world_xy, is_inside_grid, world_xy_to_grid
 from isaac_bench.mapping.frontier import extract_frontiers, frontier_debug_layers
+from isaac_bench.mapping.frontier_room_context import assign_frontier_room_context
 from isaac_bench.mapping.frontier_debug import save_frontier_debug_snapshot
 from isaac_bench.mapping.online_mapper import OnlineMapper
 from isaac_bench.mapping.room_map_from_rooms_json import build_room_index_map, load_rooms
@@ -148,7 +151,7 @@ def apply_success_distance_override(episode: dict, args) -> dict:
 
 def effective_perception_every_steps(detector_name: str | None, requested_steps: int | None) -> int:
     requested = max(1, int(requested_steps or 1))
-    if str(detector_name or "").strip().lower() == "yolo_world":
+    if str(detector_name or "").strip().lower() in {"yolo_world", "grounding_dino"}:
         return 1
     return requested
 
@@ -212,16 +215,32 @@ def maybe_build_detector(
     allow_ipc_fallback: bool = False,
 ):
     try:
-        detector = build_detector(detector_name, model_path, conf=conf, iou=iou)
+        detector = build_detector(
+            detector_name,
+            model_path,
+            conf=conf,
+            iou=iou,
+            grounding_dino_config=getattr(maybe_build_detector, "grounding_dino_config", None),
+            grounding_dino_text_threshold=float(getattr(maybe_build_detector, "grounding_dino_text_threshold", 0.25)),
+            grounding_dino_device=str(getattr(maybe_build_detector, "grounding_dino_device", "cuda")),
+        )
     except Exception as exc:
-        if detector_name != "yolo_world" or not allow_ipc_fallback:
+        if detector_name not in {"yolo_world", "grounding_dino"} or not allow_ipc_fallback:
             raise
         print(
-            "[detector-ipc] direct YOLO-World load failed in this process; using external SG-Nav env worker: %s"
-            % exc,
+            "[detector-ipc] direct %s load failed in this process; using external SG-Nav env worker: %s"
+            % (detector_name, exc),
             flush=True,
         )
-        detector = SubprocessDetector(detector_name, model_path, conf=conf, iou=iou)
+        detector = SubprocessDetector(
+            detector_name,
+            model_path,
+            conf=conf,
+            iou=iou,
+            grounding_dino_config=str(getattr(maybe_build_detector, "grounding_dino_config", "") or ""),
+            grounding_dino_text_threshold=float(getattr(maybe_build_detector, "grounding_dino_text_threshold", 0.25)),
+            grounding_dino_device=str(getattr(maybe_build_detector, "grounding_dino_device", "cuda")),
+        )
     detector.set_vocabulary(categories)
     return detector
 
@@ -243,7 +262,21 @@ def ensure_detector_loaded(args, scene_dir: Path, allow_ipc_fallback: bool = Fal
     categories = load_scene_categories(scene_dir)
     conf = max(float(getattr(args, "detector_conf", 0.7)), float(getattr(args, "min_valid_detection_confidence", MIN_VALID_DETECTION_CONFIDENCE)))
     iou = float(getattr(args, "detector_iou", 0.5))
-    key = (str(args.detector), str(args.yolo_world_model), conf, iou, bool(allow_ipc_fallback), tuple(categories))
+    model_path = detector_model_path(args)
+    grounding_dino_config = str(getattr(args, "grounding_dino_config", "") or "")
+    grounding_dino_text_threshold = float(getattr(args, "grounding_dino_text_threshold", 0.25))
+    grounding_dino_device = str(getattr(args, "grounding_dino_device", "cuda") or "cuda")
+    key = (
+        str(args.detector),
+        str(model_path),
+        conf,
+        iou,
+        grounding_dino_config,
+        grounding_dino_text_threshold,
+        grounding_dino_device,
+        bool(allow_ipc_fallback),
+        tuple(categories),
+    )
     if getattr(args, "_detector_key", None) == key:
         return
     old_detector = getattr(args, "_detector_instance", None)
@@ -251,15 +284,90 @@ def ensure_detector_loaded(args, scene_dir: Path, allow_ipc_fallback: bool = Fal
         old_detector.close()
     args._detector_instance = None
     args._detector_key = None
+    maybe_build_detector.grounding_dino_config = grounding_dino_config
+    maybe_build_detector.grounding_dino_text_threshold = grounding_dino_text_threshold
+    maybe_build_detector.grounding_dino_device = grounding_dino_device
     args._detector_instance = maybe_build_detector(
         args.detector,
-        args.yolo_world_model,
+        model_path,
         categories,
         conf=conf,
         iou=iou,
         allow_ipc_fallback=allow_ipc_fallback,
     )
     args._detector_key = key
+
+
+def detector_model_path(args) -> str:
+    detector = str(getattr(args, "detector", "") or "").strip().lower()
+    if detector == "grounding_dino":
+        return str(getattr(args, "grounding_dino_checkpoint", "") or "")
+    return str(getattr(args, "yolo_world_model", "") or "")
+
+
+def frontier_room_contexts_for_debug(
+    *,
+    frontiers: Sequence[object],
+    room_debug: Mapping[str, object],
+    room_masks: Sequence[object],
+    room_semantic_labels: Mapping[str, object],
+    observed_free: np.ndarray,
+    unknown: np.ndarray,
+    agent_grid: Tuple[int, int],
+    resolution_m: float,
+    config: Mapping[str, object],
+) -> list[dict]:
+    cfg = dict(config or {})
+    if not bool(cfg.get("enabled", True)) or not bool(cfg.get("use_known_free_side", True)):
+        return []
+    label_map_key = "context_room_label_map" if bool(cfg.get("use_context_overlay_labels", True)) else "final_room_label_map"
+    labels = np.asarray(room_debug.get(label_map_key, room_debug.get("final_room_label_map", [])), dtype=np.int32)
+    if labels.shape != np.asarray(observed_free).shape:
+        return []
+    label_to_room = _label_id_to_room_metadata(room_masks, room_semantic_labels)
+    out: list[dict] = []
+    for index, frontier in enumerate(frontiers):
+        members = getattr(frontier, "members", [])
+        context = assign_frontier_room_context(
+            members,
+            labels,
+            observed_free,
+            unknown,
+            agent_grid,
+            resolution_m,
+            local_radius_m=float(cfg.get("local_radius_m", 0.35)),
+            nearest_fallback_radius_m=float(cfg.get("nearest_fallback_radius_m", 1.25)),
+            min_label_ratio=float(cfg.get("min_label_ratio", 0.20)),
+        )
+        meta = label_to_room.get(int(context["room_id"])) if context.get("room_id") is not None else None
+        out.append(
+            {
+                "frontier_id": int(index),
+                "center_grid": [int(v) for v in getattr(frontier, "center_grid", (-1, -1))],
+                "room_context": {
+                    **context,
+                    "room_id": meta.get("room_id") if meta else context.get("room_id"),
+                    "room_label_id": int(context["room_id"]) if context.get("room_id") is not None else None,
+                    "room_label": meta.get("category", "unknown") if meta else "unknown",
+                },
+            }
+        )
+    return out
+
+
+def _label_id_to_room_metadata(room_masks: Sequence[object], room_semantic_labels: Mapping[str, object]) -> dict[int, dict]:
+    out: dict[int, dict] = {}
+    for room in room_masks:
+        label_id = int((getattr(room, "metadata", {}) or {}).get("label_id", 0) or 0)
+        if label_id <= 0:
+            continue
+        room_id = str(getattr(room, "room_id", ""))
+        semantic = room_semantic_labels.get(room_id)
+        out[label_id] = {
+            "room_id": room_id,
+            "category": str(getattr(semantic, "category", "unknown") if semantic is not None else "unknown"),
+        }
+    return out
 
 
 def ensure_segmenter_loaded(args) -> None:
@@ -459,7 +567,7 @@ def filter_edge_touching_detections(
             and not detection_confidence_is_valid(float(det.confidence), float(min_confidence))
         )
         det.bbox_touches_edge = bool(touches)
-        # Edge-touching YOLO/SAM2 detections are partial visual evidence, not a
+        # Edge-touching detector/SAM2 detections are partial visual evidence, not a
         # discard condition. The legacy flag is kept for CLI compatibility and
         # recorded below, but strict object tracking now decides policy use from
         # mask/depth association and track stability.
@@ -1073,7 +1181,7 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
     perception_every = effective_perception_every_steps(args.detector, requested_perception_every)
     if perception_every != requested_perception_every:
         print(
-            "[sgnav-loop] YOLO-World requires every-frame perception; overriding perception_every_steps "
+            "[sgnav-loop] open-vocabulary detector requires every-frame perception; overriding perception_every_steps "
             "%d -> %d" % (requested_perception_every, perception_every),
             flush=True,
         )
@@ -1448,7 +1556,7 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
                     if str(getattr(args, "segmenter", "none")).strip().lower() == "sam2":
                         raise
                     if not sam2_failure_logged:
-                        print("[sam2] segmentation failed; continuing with YOLO boxes only: %s" % exc, flush=True)
+                        print("[sam2] segmentation failed; continuing with detector boxes only: %s" % exc, flush=True)
                         sam2_failure_logged = True
                     segmenter = None
             last_detections_2d = list(detections_2d)
@@ -1460,7 +1568,7 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
             if goal_detection_history and goal_detection_history[-1]["step"] == int(step_idx):
                 recent = [row for row in goal_detection_history if row["step"] == int(step_idx)]
                 print(
-                    "[sgnav-loop] YOLO goal detections step=%s: %s"
+                    "[sgnav-loop] detector goal detections step=%s: %s"
                     % (
                         step_idx,
                         ", ".join(
@@ -1519,6 +1627,7 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
                     merge_radius_m=max(float(args.object_merge_radius_m), 0.75),
                     map_info=map_info_local,
                 )
+            evaluator.num_detector_calls += 1
             evaluator.num_yolo_calls += 1
             record_latency("perception", started_at)
             return obs_local
@@ -1792,11 +1901,79 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
                     )
                     if room_context_result is not None:
                         last_room_context_metadata = room_context_result.metadata(full_order=True)
+                        frontier_room_contexts = frontier_room_contexts_for_debug(
+                            frontiers=frontiers,
+                            room_debug=last_room_segmentation_debug,
+                            room_masks=last_room_masks,
+                            room_semantic_labels=room_semantic_labels,
+                            observed_free=free,
+                            unknown=~np.asarray(observed, dtype=bool),
+                            agent_grid=current_grid,
+                            resolution_m=float(dynamic_map_info.resolution_m),
+                            config=dict(getattr(args, "room_segmentation_config", {}).get("frontier_room_context", {}) or {}),
+                        )
+                        selected_frontier = (
+                            nav_decision.frontier_decision.selected_frontier
+                            if nav_decision.frontier_decision is not None
+                            else None
+                        )
+                        selected_index = (
+                            nav_decision.frontier_decision.selected_index
+                            if nav_decision.frontier_decision is not None
+                            else None
+                        )
+                        selected_room_context = None
+                        if selected_index is not None:
+                            for item in frontier_room_contexts:
+                                if int(item.get("frontier_id", -1)) == int(selected_index):
+                                    selected_room_context = dict(item.get("room_context") or {})
+                                    break
+                        last_room_context_metadata = {
+                            **dict(last_room_context_metadata),
+                            "frontier_room_contexts": frontier_room_contexts,
+                            "selected_frontier_room_context": selected_room_context,
+                        }
                         setattr(scenegraph, "room_context_debug", dict(last_room_context_metadata))
                         nav_decision.metadata = {
                             **dict(nav_decision.metadata or {}),
                             **dict(last_room_context_metadata),
                         }
+                        if bool(getattr(args, "debug_roomseg_layers", False)):
+                            selected_members = getattr(selected_frontier, "members", None) if selected_frontier is not None else None
+                            selected_center = getattr(selected_frontier, "center_grid", None) if selected_frontier is not None else None
+                            dump = save_roomseg_layer_dump(
+                                out_dir=str(getattr(args, "debug_roomseg_dir", "debug/roomseg_layers")),
+                                step=int(step),
+                                room_debug=last_room_segmentation_debug,
+                                occupancy_map=occupancy,
+                                observed_free_mask=free,
+                                obstacle_mask=occupancy,
+                                unknown_mask=~np.asarray(observed, dtype=bool),
+                                frontier_map=frontier_layers["frontier"],
+                                selected_frontier_members=selected_members,
+                                selected_frontier_center_rc=selected_center,
+                                agent_rc=current_grid,
+                                max_saves=int(getattr(args, "debug_roomseg_max_saves", 50)),
+                                save_npz=bool(dict(getattr(args, "room_segmentation_config", {}).get("debug_layers", {}) or {}).get("save_npz", True)),
+                                save_png=bool(dict(getattr(args, "room_segmentation_config", {}).get("debug_layers", {}) or {}).get("save_png", True)),
+                                save_summary_json=bool(dict(getattr(args, "room_segmentation_config", {}).get("debug_layers", {}) or {}).get("save_summary_json", True)),
+                                include_selected_frontier_sector=bool(dict(getattr(args, "room_segmentation_config", {}).get("debug_layers", {}) or {}).get("include_selected_frontier_sector", True)),
+                            )
+                            last_room_segmentation_debug = {
+                                **dict(last_room_segmentation_debug),
+                                "roomseg_debug_layers": dict(dump.get("paths", {})),
+                                "roomseg_debug_summary": dict(dump.get("summary", {})),
+                            }
+                            last_room_context_metadata["roomseg_debug_layers"] = dict(dump.get("paths", {}))
+                            last_room_context_metadata["roomseg_debug_likely_cause"] = dict(dump.get("summary", {})).get("likely_cause")
+                            nav_decision.metadata = {
+                                **dict(nav_decision.metadata or {}),
+                                "roomseg_debug_layers": dict(dump.get("paths", {})),
+                                "roomseg_debug_likely_cause": dict(dump.get("summary", {})).get("likely_cause"),
+                            }
+                            setattr(scenegraph, "room_context_debug", dict(last_room_context_metadata))
+                            if viz is not None:
+                                viz.set_room_context(last_room_masks, room_semantic_labels, last_room_segmentation_debug)
                 if frontier_commitment is not None and nav_decision.mode == "frontier" and not locked_goal_used:
                     frontier_decision = nav_decision.frontier_decision
                     proposed_frontier = frontier_decision.selected_frontier if frontier_decision is not None else None
@@ -2378,6 +2555,7 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
         row["panorama_frames"] = int(panorama_frames)
         row["requested_perception_every_steps"] = int(requested_perception_every)
         row["effective_perception_every_steps"] = int(perception_every)
+        row["open_vocab_detector_every_frame"] = bool(str(getattr(args, "detector", "")).strip().lower() in {"yolo_world", "grounding_dino"} and perception_every == 1)
         row["yolo_world_every_frame"] = bool(str(getattr(args, "detector", "")).strip().lower() == "yolo_world" and perception_every == 1)
         row["graph_object_nodes"] = int(len(getattr(scenegraph, "runtime_nodes", {})))
         row["graph_group_nodes"] = int(len(getattr(scenegraph, "runtime_groups", [])))
@@ -2641,8 +2819,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--episode-index", type=int, default=0)
     parser.add_argument("--success-distance-m", type=float, default=None)
     parser.add_argument("--planner", default=None, choices=["astar", "nav2"])
-    parser.add_argument("--detector", default=None, choices=["dry_run", "yolo_world", "none"])
+    parser.add_argument("--detector", default=None, choices=["dry_run", "yolo_world", "grounding_dino", "none"])
     parser.add_argument("--yolo-world-model", default=None)
+    parser.add_argument("--grounding-dino-checkpoint", default=None)
+    parser.add_argument("--grounding-dino-config", default=None)
+    parser.add_argument("--grounding-dino-text-threshold", type=float, default=None)
+    parser.add_argument("--grounding-dino-device", default=None, choices=["cpu", "cuda"])
     parser.add_argument("--detector-conf", type=float, default=None)
     parser.add_argument("--min-valid-detection-confidence", type=float, default=None)
     parser.add_argument("--detector-iou", type=float, default=None)
@@ -2748,6 +2930,14 @@ def main(argv: Optional[List[str]] = None) -> int:
         help="Deprecated compatibility option; online traversal inflation is footprint-only.",
     )
     parser.add_argument("--room-map-mode", default=None)
+    parser.add_argument("--debug-roomseg-layers", action="store_true", default=None)
+    parser.add_argument("--debug-roomseg-dir", default=None)
+    parser.add_argument("--debug-roomseg-max-saves", type=int, default=None)
+    parser.add_argument("--enable-roomseg-nav-free-overlay", dest="roomseg_nav_free_overlay", action="store_true", default=None)
+    parser.add_argument("--disable-roomseg-nav-free-overlay", dest="roomseg_nav_free_overlay", action="store_false")
+    parser.add_argument("--enable-frontier-room-known-free-side", dest="frontier_room_known_free_side", action="store_true", default=None)
+    parser.add_argument("--disable-frontier-room-known-free-side", dest="frontier_room_known_free_side", action="store_false")
+    parser.add_argument("--roomseg-wall-gating-fix", action="store_true", default=None)
     parser.add_argument("--room-label-backend", default=None, choices=["vlm", "deterministic_debug", "unavailable"])
     parser.add_argument("--room-label-min-confidence", type=float, default=None)
     parser.add_argument("--room-label-ambiguity-margin", type=float, default=None)
@@ -2852,6 +3042,26 @@ def main(argv: Optional[List[str]] = None) -> int:
     args.planner = args.planner or get_nested(cfg, "repo.planner", "astar")
     args.detector = args.detector or get_nested(cfg, "repo.detector", "dry_run")
     args.yolo_world_model = args.yolo_world_model or get_nested(cfg, "paths.yolo_world_model", get_nested(cfg, "perception.yolo_world_model", "data/models/yolov8l-worldv2.pt"))
+    args.grounding_dino_checkpoint = args.grounding_dino_checkpoint or os.environ.get("GROUNDING_DINO_CHECKPOINT") or get_nested(
+        cfg,
+        "paths.grounding_dino_checkpoint",
+        get_nested(cfg, "perception.grounding_dino.checkpoint", "data/models/groundingdino_swinb_cogcoor.pth"),
+    )
+    args.grounding_dino_config = args.grounding_dino_config or os.environ.get("GROUNDING_DINO_CONFIG") or get_nested(
+        cfg,
+        "paths.grounding_dino_config",
+        get_nested(cfg, "perception.grounding_dino.config", ""),
+    )
+    args.grounding_dino_text_threshold = float(
+        args.grounding_dino_text_threshold
+        if args.grounding_dino_text_threshold is not None
+        else get_nested(cfg, "perception.grounding_dino.text_threshold", 0.25)
+    )
+    args.grounding_dino_device = str(
+        args.grounding_dino_device
+        if args.grounding_dino_device is not None
+        else get_nested(cfg, "perception.grounding_dino.device", "cuda")
+    )
     args.min_valid_detection_confidence = float(
         args.min_valid_detection_confidence
         if args.min_valid_detection_confidence is not None
@@ -3151,6 +3361,32 @@ def main(argv: Optional[List[str]] = None) -> int:
     args.online_inflation_radius_m = float(args.online_inflation_radius_m if args.online_inflation_radius_m is not None else get_nested(cfg, "mapping.inflation_radius_m", 0.0))
     args.room_map_mode = str(args.room_map_mode or get_nested(cfg, "mapping.room_map_mode", "upstream_rose2_vertical_or_free"))
     args.room_segmentation_config = dict(get_nested(cfg, "mapping.room_segmentation", {}) or {})
+    roomseg_debug_layers_cfg = dict(args.room_segmentation_config.get("debug_layers", {}) or {})
+    roomseg_overlay_cfg = dict(args.room_segmentation_config.get("navigation_free_context_overlay", {}) or {})
+    roomseg_frontier_context_cfg = dict(args.room_segmentation_config.get("frontier_room_context", {}) or {})
+    roomseg_wall_gating_fix_cfg = dict(args.room_segmentation_config.get("wall_gating_fix", {}) or {})
+    if args.debug_roomseg_layers is not None:
+        roomseg_debug_layers_cfg["enabled"] = bool(args.debug_roomseg_layers)
+    if args.debug_roomseg_dir is not None:
+        roomseg_debug_layers_cfg["output_dir"] = str(args.debug_roomseg_dir)
+    if args.debug_roomseg_max_saves is not None:
+        roomseg_debug_layers_cfg["max_saves"] = int(args.debug_roomseg_max_saves)
+    if args.roomseg_nav_free_overlay is not None:
+        roomseg_overlay_cfg["enabled"] = bool(args.roomseg_nav_free_overlay)
+    if args.frontier_room_known_free_side is not None:
+        roomseg_frontier_context_cfg["use_known_free_side"] = bool(args.frontier_room_known_free_side)
+        roomseg_frontier_context_cfg["enabled"] = bool(args.frontier_room_known_free_side)
+    if args.roomseg_wall_gating_fix is not None:
+        roomseg_wall_gating_fix_cfg["enabled"] = bool(args.roomseg_wall_gating_fix)
+    args.room_segmentation_config["debug_layers"] = roomseg_debug_layers_cfg
+    args.room_segmentation_config["navigation_free_context_overlay"] = roomseg_overlay_cfg
+    args.room_segmentation_config["frontier_room_context"] = roomseg_frontier_context_cfg
+    args.room_segmentation_config["wall_gating_fix"] = roomseg_wall_gating_fix_cfg
+    args.debug_roomseg_layers = bool(roomseg_debug_layers_cfg.get("enabled", False))
+    args.debug_roomseg_dir = str(roomseg_debug_layers_cfg.get("output_dir", "debug/roomseg_layers"))
+    args.debug_roomseg_max_saves = int(roomseg_debug_layers_cfg.get("max_saves", 50))
+    args.roomseg_nav_free_overlay = bool(roomseg_overlay_cfg.get("enabled", False))
+    args.frontier_room_known_free_side = bool(roomseg_frontier_context_cfg.get("enabled", True) and roomseg_frontier_context_cfg.get("use_known_free_side", True))
     room_semantics_cfg = dict(get_nested(cfg, "room_semantics", {}) or {})
     for key in (
         "use_premerge_labels_for_open_plan_merge",
@@ -3220,7 +3456,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     args.runtime_planning_clearance_m = float(args.runtime_planning_clearance_m if args.runtime_planning_clearance_m is not None else get_nested(cfg, "astar.runtime_planning_clearance_m", 0.0))
     args.candidate_min_detector_hits = int(args.candidate_min_detector_hits if args.candidate_min_detector_hits is not None else get_nested(cfg, "sgnav.candidate_min_detector_hits", 2))
     args.candidate_start_min_confidence = max(
-        float(args.candidate_start_min_confidence if args.candidate_start_min_confidence is not None else get_nested(cfg, "sgnav.candidate_start_min_confidence", 0.55)),
+        float(args.candidate_start_min_confidence if args.candidate_start_min_confidence is not None else get_nested(cfg, "sgnav.candidate_start_min_confidence", MIN_VALID_DETECTION_CONFIDENCE)),
         float(args.min_valid_detection_confidence),
     )
     args.candidate_start_min_hits = int(args.candidate_start_min_hits if args.candidate_start_min_hits is not None else get_nested(cfg, "sgnav.candidate_start_min_hits", 2))

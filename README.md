@@ -2,7 +2,7 @@
 
 This repository wraps SG-Nav ObjectNav evaluation on Isaac Sim and
 InteriorAgent scenes. The metric path is intentionally strict: Isaac RGB-D,
-YOLO-World detections, SAM2 masks, mask/depth object memory, online mapping,
+GroundingDINO-B/Swin-B detections, SAM2 masks, mask/depth object memory, online mapping,
 scene-graph subgraph reasoning, frontier interpolation, candidate
 re-perception, STOP confirmation, and deterministic A*/FMM-equivalent local
 planning.
@@ -23,15 +23,15 @@ External assets are not vendored. By default the project expects:
 
 - Isaac Sim: `/home/echo/isaac-sim-standalone-5.1.0-linux-x86_64`
 - InteriorAgent: `/home/echo/InteriorAgent`
-- YOLO-World: `data/models/yolov8l-worldv2.pt`
+- GroundingDINO-B/Swin-B: `data/models/groundingdino_swinb_cogcoor.pth`
 - SAM2: `data/models/sam2.1_hiera_small.pt`
 - No-ROS ROSE2 source: `ROSE2_SOURCE_ROOT` pointing at
   `goldleaf3i/declutter-reconstruct`
 - Optional OpenAI-compatible LLM endpoint: `http://127.0.0.1:8000/v1`
 
 Override paths with `ISAAC_SIM_ROOT`, `INTERIORAGENT_ROOT`,
-`YOLO_WORLD_MODEL`, `SAM2_CHECKPOINT`, `SAM2_MODEL_CFG`,
-`ROSE2_SOURCE_ROOT`, and `LLM_BASE_URL`.
+`GROUNDING_DINO_CHECKPOINT`, `GROUNDING_DINO_CONFIG`, `GROUNDING_DINO_ROOT`,
+`SAM2_CHECKPOINT`, `SAM2_MODEL_CFG`, `ROSE2_SOURCE_ROOT`, and `LLM_BASE_URL`.
 `ISAAC_ROOT` remains a legacy alias for `ISAAC_SIM_ROOT`.
 
 ```bash
@@ -42,8 +42,10 @@ source ./scripts/activate_sgnav_isaac_env.sh
 Check required assets:
 
 ```bash
+./run_isaac_bench.sh -m isaac_bench.scripts.download_grounding_dino
+
 python -m isaac_bench.scripts.check_assets \
-  --require-yolo-world \
+  --require-grounding-dino \
   --require-sam2 \
   --require-rose2-source \
   --require-interioragent \
@@ -89,7 +91,7 @@ This command is for smoke/debug only. It must produce `metric_valid=false`.
 
 ## Strict Isaac SG-Nav
 
-Strict SG-Nav requires YOLO-World and SAM2. A row is metric-valid only when no
+Strict SG-Nav requires GroundingDINO-B/Swin-B and SAM2. A row is metric-valid only when no
 debug fallback is used. Local deterministic LLM scoring is non-metric unless a
 named ablation is explicitly declared; configure a real OpenAI-compatible LLM
 for metric SG-Nav scoring. The default config uses `llm.enabled: true`,
@@ -150,7 +152,7 @@ or non-diagnostic evidence is labeled `unknown`.
   --episode-index 0 \
   --planner astar \
   --policy sgnav_original \
-  --detector yolo_world \
+  --detector grounding_dino \
   --segmenter sam2 \
   --sim-backend isaac \
   --headless true \
@@ -172,7 +174,7 @@ For a headed Isaac window with saved SG-Nav visualization panels:
   --episode-index 0 \
   --planner astar \
   --policy sgnav_original \
-  --detector yolo_world \
+  --detector grounding_dino \
   --segmenter sam2 \
   --sim-backend isaac \
   --headless false \
@@ -197,7 +199,7 @@ For a short integration check on machines with Isaac/model assets:
   --episode-index 0 \
   --planner astar \
   --policy sgnav_original \
-  --detector yolo_world \
+  --detector grounding_dino \
   --segmenter sam2 \
   --sim-backend isaac \
   --headless true \
@@ -217,19 +219,19 @@ For a short integration check on machines with Isaac/model assets:
   --episode-file data/interioragent_episodes/debug.jsonl \
   --planner astar \
   --policy sgnav_original \
-  --detector yolo_world \
+  --detector grounding_dino \
   --segmenter sam2 \
   --sim-backend isaac \
   --headless true \
   --strict-benchmark true \
-  --output-dir data/isaac_bench_runs/sgnav_yolo_sam2_debug
+  --output-dir data/isaac_bench_runs/sgnav_grounding_dino_sam2_debug
 ```
 
 ```bash
 ./scripts/run_sgnav_isaac_env.sh \
   -m isaac_bench.metrics.summarize \
-  --input data/isaac_bench_runs/sgnav_yolo_sam2_debug/results.jsonl \
-  --out data/isaac_bench_runs/sgnav_yolo_sam2_debug/summary.json
+  --input data/isaac_bench_runs/sgnav_grounding_dino_sam2_debug/results.jsonl \
+  --out data/isaac_bench_runs/sgnav_grounding_dino_sam2_debug/summary.json
 ```
 
 ## Debug Artifacts
@@ -244,7 +246,7 @@ Enable saved panels and graph dumps:
   --episode-index 0 \
   --planner astar \
   --policy sgnav_original \
-  --detector yolo_world \
+  --detector grounding_dino \
   --segmenter sam2 \
   --sim-backend isaac \
   --headless true \
@@ -264,10 +266,10 @@ online geometry room segmentation and VLM room labels by default; use
 clutter. GT goal cells are disabled by default so oracle goal markers do not
 appear in strict visualization.
 
-YOLO/SAM detections are treated as valid only when `confidence > 0.55`. Lower
+GroundingDINO/SAM detections are treated as valid only when `confidence > 0.45`. Lower
 or equal detections are filtered before bbox rendering, mask/depth fusion,
 object memory insertion, scene-graph object nodes, and goal-candidate logic.
-YOLO boxes or SAM2 masks touching an image edge are no longer discarded. They
+GroundingDINO boxes or SAM2 masks touching an image edge are no longer discarded. They
 are logged as `visibility_status=partial_edge`, associated to prior full/stable
 tracks by SAM2 mask or 3D footprint overlap when possible, and otherwise kept
 as tentative raw evidence. Tentative partial tracks do not enter room evidence,

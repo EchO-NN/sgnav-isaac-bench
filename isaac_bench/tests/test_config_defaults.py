@@ -8,9 +8,13 @@ def test_required_sgnav_defaults():
     assert cfg["mapping"]["frontier_min_distance_m"] == 1.0
     assert cfg["sgnav"]["frontier_distance_weight"] == 0.2
     assert cfg["llm"]["enabled"] is True
-    assert cfg["perception"]["confidence_threshold"] == 0.55
-    assert cfg["perception"]["min_valid_detection_confidence"] == 0.55
-    assert cfg["sgnav"]["candidate_start_min_confidence"] == 0.55
+    assert cfg["perception"]["confidence_threshold"] == 0.45
+    assert cfg["perception"]["min_valid_detection_confidence"] == 0.45
+    assert cfg["repo"]["detector"] == "grounding_dino"
+    assert cfg["perception"]["grounding_dino"]["variant"] == "GroundingDINO-B/Swin-B"
+    assert cfg["perception"]["grounding_dino"]["checkpoint"].endswith("groundingdino_swinb_cogcoor.pth")
+    assert cfg["perception"]["grounding_dino"]["config"].endswith("GroundingDINO_SwinB.cfg.py")
+    assert cfg["sgnav"]["candidate_start_min_confidence"] == 0.45
     assert cfg["mapping"]["room_map_mode"] == "upstream_rose2_vertical_or_free"
     assert cfg["mapping"]["strict_no_oracle_rooms"] is True
     assert cfg["mapping"]["room_segmentation"]["algorithm"] == "upstream_rose2_vertical_or_free"
@@ -57,7 +61,9 @@ def test_required_sgnav_defaults():
     assert cfg["isaac"]["perception_every_steps"] == 1
 
 
-def test_yolo_world_forces_every_frame_perception():
+def test_open_vocab_detector_forces_every_frame_perception():
+    assert effective_perception_every_steps("grounding_dino", 5) == 1
+    assert effective_perception_every_steps("grounding_dino", 1) == 1
     assert effective_perception_every_steps("yolo_world", 5) == 1
     assert effective_perception_every_steps("yolo_world", 1) == 1
     assert effective_perception_every_steps("dry_run", 5) == 5

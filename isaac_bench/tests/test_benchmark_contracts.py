@@ -23,7 +23,7 @@ def _args(**overrides):
     data = {
         "strict_benchmark": True,
         "ablation_name": None,
-        "detector": "yolo_world",
+        "detector": "grounding_dino",
         "segmenter": "sam2",
         "sim_backend": "isaac",
         "planner": "astar",
@@ -37,6 +37,8 @@ def _args(**overrides):
         "room_map_mode": "upstream_rose2_vertical_or_free",
         "room_segmentation_config": {"require_upstream_source_for_strict": False},
         "yolo_world_model": "data/models/yolov8l-worldv2.pt",
+        "grounding_dino_checkpoint": "data/models/groundingdino_swinb_cogcoor.pth",
+        "grounding_dino_config": "data/models/GroundingDINO_SwinB.cfg.py",
         "sam2_checkpoint": "data/models/sam2.1_hiera_small.pt",
     }
     data.update(overrides)
@@ -98,63 +100,78 @@ def test_named_ablation_can_carry_local_deterministic_scorer():
     assert row["ablation_name"] == "local_deterministic_llm"
 
 
-def test_strict_missing_yolo_world_model_fails_clearly(tmp_path):
-    args = _args(yolo_world_model=str(tmp_path / "missing-yolo.pt"))
+def test_strict_missing_grounding_dino_checkpoint_fails_clearly(tmp_path):
+    args = _args(grounding_dino_checkpoint=str(tmp_path / "missing-grounding-dino.pth"))
 
-    with pytest.raises(BenchmarkAssetError, match="Missing YOLO-World model"):
+    with pytest.raises(BenchmarkAssetError, match="Missing GroundingDINO-B/Swin-B checkpoint"):
         validate_strict_benchmark_assets(args)
 
 
-def test_strict_missing_yolo_world_cli_fails_without_traceback(tmp_path, capsys):
+def test_strict_yolo_world_requires_named_legacy_ablation(tmp_path):
+    yolo = tmp_path / "yolo.pt"
+    yolo.write_bytes(b"placeholder")
+    args = _args(detector="yolo_world", yolo_world_model=str(yolo), llm_enabled=True)
+
+    with pytest.raises(BenchmarkAssetError, match="requires GroundingDINO-B/Swin-B"):
+        validate_strict_benchmark_assets(args)
+
+
+def test_strict_missing_grounding_dino_cli_fails_without_traceback(tmp_path, capsys):
     status = run_one_episode_main(
         [
             "--episode-file",
             str(tmp_path / "episodes.jsonl"),
             "--detector",
-            "yolo_world",
+            "grounding_dino",
             "--segmenter",
             "sam2",
             "--sim-backend",
             "map",
             "--strict-benchmark",
             "true",
-            "--yolo-world-model",
-            str(tmp_path / "missing-yolo.pt"),
+            "--grounding-dino-checkpoint",
+            str(tmp_path / "missing-grounding-dino.pth"),
+            "--grounding-dino-config",
+            str(tmp_path / "missing-grounding-dino.py"),
         ]
     )
     captured = capsys.readouterr()
 
     assert status == 2
-    assert "Missing YOLO-World model" in captured.err
+    assert "Missing GroundingDINO-B/Swin-B checkpoint" in captured.err
     assert "Traceback" not in captured.err
 
 
-def test_strict_missing_yolo_world_batch_cli_fails_without_traceback(tmp_path, capsys):
+def test_strict_missing_grounding_dino_batch_cli_fails_without_traceback(tmp_path, capsys):
     status = run_benchmark_main(
         [
             "--episode-file",
             str(tmp_path / "episodes.jsonl"),
             "--detector",
-            "yolo_world",
+            "grounding_dino",
             "--sim-backend",
             "isaac",
             "--strict-benchmark",
             "true",
-            "--yolo-world-model",
-            str(tmp_path / "missing-yolo.pt"),
+            "--grounding-dino-checkpoint",
+            str(tmp_path / "missing-grounding-dino.pth"),
+            "--grounding-dino-config",
+            str(tmp_path / "missing-grounding-dino.py"),
         ]
     )
     captured = capsys.readouterr()
 
     assert status == 2
-    assert "Missing YOLO-World model" in captured.err
+    assert "Missing GroundingDINO-B/Swin-B checkpoint" in captured.err
     assert "Traceback" not in captured.err
 
 
 def test_strict_missing_sam2_checkpoint_fails_clearly(tmp_path):
-    yolo = tmp_path / "yolo.pt"
-    yolo.write_bytes(b"placeholder")
-    args = _args(yolo_world_model=str(yolo), sam2_checkpoint=str(tmp_path / "missing-sam2.pt"))
+    gdino = tmp_path / "groundingdino.pth"
+    gdino.write_bytes(b"placeholder")
+    cfg = tmp_path / "GroundingDINO_SwinB.cfg.py"
+    cfg.write_text("modelname='groundingdino'\n", encoding="utf-8")
+    args = _args(grounding_dino_checkpoint=str(gdino), grounding_dino_config=str(cfg), sam2_checkpoint=str(tmp_path / "missing-sam2.pt"))
 
     with pytest.raises(BenchmarkAssetError, match="Missing SAM2 checkpoint"):
         validate_strict_benchmark_assets(args)
@@ -166,10 +183,13 @@ def test_config_defaults_match_benchmark_contract():
     assert cfg["benchmark"]["strict_benchmark"] is True
     assert cfg["benchmark"]["allow_debug_fallbacks"] is False
     assert cfg["benchmark"]["policy"] == "sgnav_original"
-    assert cfg["repo"]["detector"] == "yolo_world"
+    assert cfg["repo"]["detector"] == "grounding_dino"
+    assert cfg["perception"]["grounding_dino"]["variant"] == "GroundingDINO-B/Swin-B"
+    assert cfg["perception"]["grounding_dino"]["checkpoint"].endswith("groundingdino_swinb_cogcoor.pth")
+    assert cfg["perception"]["grounding_dino"]["config"].endswith("GroundingDINO_SwinB.cfg.py")
     assert cfg["perception"]["segmenter"] == "sam2"
-    assert cfg["perception"]["confidence_threshold"] == 0.55
-    assert cfg["perception"]["min_valid_detection_confidence"] == 0.55
+    assert cfg["perception"]["confidence_threshold"] == 0.45
+    assert cfg["perception"]["min_valid_detection_confidence"] == 0.45
     assert cfg["sgnav"]["seed_gt_object_memory"] is False
     assert cfg["sgnav"]["allow_gt_goal_fallback"] is False
     assert cfg["nearfield_static_map"]["enabled"] is False
@@ -266,13 +286,13 @@ def test_dump_sgnav_step_can_convert_runtime_debug_artifacts(tmp_path):
 
 
 def test_check_assets_reports_required_missing_paths(tmp_path, capsys, monkeypatch):
-    monkeypatch.setenv("YOLO_WORLD_MODEL", str(tmp_path / "missing-yolo.pt"))
+    monkeypatch.setenv("GROUNDING_DINO_CHECKPOINT", str(tmp_path / "missing-grounding-dino.pth"))
 
-    status = check_assets_main(["--require-yolo-world"])
+    status = check_assets_main(["--require-grounding-dino"])
     captured = capsys.readouterr()
 
     assert status == 2
-    assert "MISSING yolo_world_model" in captured.out
+    assert "MISSING grounding_dino_checkpoint" in captured.out
 
 
 def test_check_assets_reports_missing_rose2_source(tmp_path, capsys, monkeypatch):
@@ -301,7 +321,7 @@ def test_policy_and_allow_debug_fallback_flags_parse_before_asset_check(tmp_path
             "--episode-file",
             str(tmp_path / "episodes.jsonl"),
             "--detector",
-            "yolo_world",
+            "grounding_dino",
             "--segmenter",
             "sam2",
             "--sim-backend",
@@ -309,11 +329,13 @@ def test_policy_and_allow_debug_fallback_flags_parse_before_asset_check(tmp_path
             "--policy",
             "sgnav_original",
             "--allow-debug-fallbacks",
-            "--yolo-world-model",
-            str(tmp_path / "missing-yolo.pt"),
+            "--grounding-dino-checkpoint",
+            str(tmp_path / "missing-grounding-dino.pth"),
+            "--grounding-dino-config",
+            str(tmp_path / "missing-grounding-dino.py"),
         ]
     )
     captured = capsys.readouterr()
 
     assert status == 2
-    assert "Missing YOLO-World model" in captured.err
+    assert "Missing GroundingDINO-B/Swin-B checkpoint" in captured.err

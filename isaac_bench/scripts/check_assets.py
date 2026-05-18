@@ -63,6 +63,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="Check external SG-Nav Isaac benchmark assets.")
     parser.add_argument("--config", default="isaac_bench/configs/isaac_bench.yaml")
     parser.add_argument("--require-yolo-world", action="store_true")
+    parser.add_argument("--require-grounding-dino", action="store_true")
     parser.add_argument("--require-sam2", action="store_true")
     parser.add_argument("--require-interioragent", action="store_true")
     parser.add_argument("--require-isaac", action="store_true")
@@ -91,6 +92,26 @@ def main(argv: Optional[List[str]] = None) -> int:
             "yolo_world_model",
             _path_from_env_or_config("YOLO_WORLD_MODEL", cfg, "paths.yolo_world_model", "data/models/yolov8l-worldv2.pt"),
             args.require_yolo_world,
+        ),
+        _check_path(
+            "grounding_dino_checkpoint",
+            _path_from_env_or_config(
+                "GROUNDING_DINO_CHECKPOINT",
+                cfg,
+                "paths.grounding_dino_checkpoint",
+                "data/models/groundingdino_swinb_cogcoor.pth",
+            ),
+            args.require_grounding_dino,
+        ),
+        _check_path(
+            "grounding_dino_config",
+            _path_from_env_or_config(
+                "GROUNDING_DINO_CONFIG",
+                cfg,
+                "paths.grounding_dino_config",
+                "/home/echo/SG-Nav/GroundingDINO/groundingdino/config/GroundingDINO_SwinB.py",
+            ),
+            args.require_grounding_dino,
         ),
         _check_path(
             "sam2_checkpoint",

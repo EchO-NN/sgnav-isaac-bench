@@ -21,10 +21,13 @@ def _write_error(message: str) -> None:
 
 def main(argv: List[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--detector", default="yolo_world", choices=["dry_run", "yolo_world", "none"])
-    parser.add_argument("--model", default="data/models/yolov8l-worldv2.pt")
+    parser.add_argument("--detector", default="grounding_dino", choices=["dry_run", "yolo_world", "grounding_dino", "none"])
+    parser.add_argument("--model", default="data/models/groundingdino_swinb_cogcoor.pth")
     parser.add_argument("--conf", type=float, default=0.7)
     parser.add_argument("--iou", type=float, default=0.5)
+    parser.add_argument("--grounding-dino-config", default="")
+    parser.add_argument("--grounding-dino-text-threshold", type=float, default=0.25)
+    parser.add_argument("--grounding-dino-device", default="cuda")
     parser.add_argument("--categories-json", default="[]")
     parser.add_argument("--segmenter", default="none", choices=["none", "auto", "sam2"])
     parser.add_argument("--sam2-checkpoint", default="")
@@ -37,7 +40,15 @@ def main(argv: List[str] | None = None) -> int:
         if not isinstance(categories, list):
             categories = []
         with contextlib.redirect_stdout(sys.stderr):
-            detector = build_detector(args.detector, args.model, conf=args.conf, iou=args.iou)
+            detector = build_detector(
+                args.detector,
+                args.model,
+                conf=args.conf,
+                iou=args.iou,
+                grounding_dino_config=args.grounding_dino_config or None,
+                grounding_dino_text_threshold=args.grounding_dino_text_threshold,
+                grounding_dino_device=args.grounding_dino_device,
+            )
             segmenter = build_sam2_segmenter(
                 args.segmenter,
                 checkpoint=args.sam2_checkpoint,

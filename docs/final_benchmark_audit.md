@@ -5,7 +5,7 @@ Date: 2026-05-16
 Overall status: partially complete. The repository now has the strict SG-Nav
 Isaac/InteriorAgent benchmark stack implemented and guarded by contracts,
 schema tests, asset checks, synthetic/unit coverage, dry-run smoke coverage,
-and a short Isaac integration smoke with YOLO-World plus SAM2. In this local
+and a short Isaac integration smoke with GroundingDINO-B/Swin-B plus SAM2. In this local
 environment the strict Isaac row is intentionally `metric_valid=false` because
 it used the deterministic local LLM-compatible scorer, which is a benchmark
 fallback unless a named ablation is declared or a real OpenAI-compatible LLM is
@@ -18,7 +18,7 @@ enabled and reachable.
     `pytest` is not installed in the base shell.
   - Repository environment result: `./run_isaac_bench.sh -m pytest -q`
     passed with `127 passed`.
-- `./run_isaac_bench.sh -m isaac_bench.scripts.check_assets --require-yolo-world --require-sam2 --require-rose2-source --require-interioragent --require-isaac`
+- `./run_isaac_bench.sh -m isaac_bench.scripts.check_assets --require-grounding-dino --require-sam2 --require-rose2-source --require-interioragent --require-isaac`
   must pass before a strict metric run. It reports `MISSING rose2_source_root`
   when `ROSE2_SOURCE_ROOT` is not set to a `goldleaf3i/declutter-reconstruct`
   checkout containing the required source files.
@@ -29,14 +29,14 @@ enabled and reachable.
 - Dry-run smoke command with map backend, A*, and `--allow-debug-fallbacks`
   passed. Its result row has `metric_valid=false` and fallback labels
   `dry_run_detector`, `llm_deterministic_local`, and `static_map_planning`.
-- Short Isaac strict smoke command with YOLO-World, SAM2, Isaac backend,
+- Short Isaac strict smoke command with GroundingDINO-B/Swin-B, SAM2, Isaac backend,
   `--strict-benchmark true`, `--max-control-steps 1`, and `--panorama-steps 0`
-  passed. Its result row has `detector_backend=yolo_world`,
+  passed. Its result row has `detector_backend=grounding_dino`,
   `segmenter_backend=sam2`, `sim_backend=isaac`,
   `map_source=depth_ray_online`, `frontier_count=4`,
   `object_memory_count=11`, graph object/group/room counts, latency fields,
   and `metric_valid=false` because `llm_backend=deterministic_local`.
-- Missing strict YOLO-World and SAM2 model paths fail before runtime with clear
+- Missing strict GroundingDINO-B/Swin-B and SAM2 model paths fail before runtime with clear
   status-2 errors. This behavior is covered by
   `isaac_bench/tests/test_benchmark_contracts.py`.
 - Batch runner and summarizer smoke passed on dry-run map rows. The summary
@@ -47,7 +47,7 @@ enabled and reachable.
 | Requirement | Evidence | Status |
 | --- | --- | --- |
 | Isaac RGB-D observations | `isaac_bench/env/isaac_process.py`, `isaac_bench/env/observation_adapter.py`, strict smoke row `read_depth=true` | implemented, short integration passed |
-| YOLO-World detector | `isaac_bench/perception/yolo_world_detector.py`, `isaac_bench/configs/yolo_world.yaml`, strict asset checks | implemented, short integration passed |
+| GroundingDINO-B/Swin-B detector | `isaac_bench/perception/grounding_dino_detector.py`, `isaac_bench/configs/isaac_bench.yaml`, strict asset checks | implemented, short integration passed |
 | SAM2 segmenter | `isaac_bench/perception/sam2_segmenter.py`, `isaac_bench/tests/test_sam2_segmenter_contract.py`, strict asset checks | implemented, short integration passed |
 | Mask/depth backprojection into object memory | `isaac_bench/sensors/depth_backproject.py`, `isaac_bench/perception/fused_instance_registry.py`, `isaac_bench/perception/object_memory.py`, object-memory tests | implemented with synthetic/unit coverage |
 | Online occupancy/free-space map | `isaac_bench/mapping/online_mapper.py`, strict smoke row `mapping_source=depth_ray_online` | implemented, short integration passed |
@@ -79,7 +79,7 @@ following are always non-metric or rejected:
   `metric_valid=false`, unless the run is an explicitly named ablation.
 - Static-map planning produces `static_map_planning` and is valid only for
   smoke or baseline rows, not the SG-Nav metric path.
-- Missing YOLO-World, SAM2, Isaac, InteriorAgent, or model files fail clearly
+- Missing GroundingDINO-B/Swin-B, SAM2, Isaac, InteriorAgent, or model files fail clearly
   or skip clearly; they never silently downgrade into metric rows.
 
 ## Remaining Risks

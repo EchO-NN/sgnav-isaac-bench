@@ -34,7 +34,7 @@ DEFAULT_ROOM_CATEGORIES = {
 
 
 class FusedInstanceRegistry:
-    """Cross-frame registry for YOLO-World + SAM2 + RGB-D projected instances."""
+    """Cross-frame registry for GroundingDINO/YOLO + SAM2 + RGB-D projected instances."""
 
     def __init__(
         self,

@@ -43,10 +43,10 @@ Every episode result row must include:
 - `strict_benchmark=true` means `metric_valid` can be true only when
   `fallbacks_used` is empty.
 - `dry_run` detector implies `metric_valid=false`.
-- A YOLO/SAM detection is a valid online object detection only when
-  `confidence > 0.55`. Detections at or below 0.55 must not draw RGB bboxes,
+- A GroundingDINO/SAM detection is a valid online object detection only when
+  `confidence > 0.45`. Detections at or below 0.45 must not draw RGB bboxes,
   enter object memory, form object scene-graph nodes, or seed goal candidates.
-- YOLO-World boxes or SAM2 masks that touch an image edge are raw partial
+- GroundingDINO boxes or SAM2 masks that touch an image edge are raw partial
   evidence, not a hard discard condition. They must be logged with
   `visibility_status=partial_edge`; if mask/footprint overlap matches a prior
   stable full track, they may update support/category evidence with partial
@@ -64,6 +64,8 @@ Every episode result row must include:
   the run is explicitly marked as a named ablation.
 - Static-map planning may be used for smoke or baseline results only. It is not
   valid for the SG-Nav metric path.
+- YOLO-World may remain as a named `legacy_yolo_world_ablation`, but it is not
+  the strict detector path after the GroundingDINO-B/Swin-B replacement.
 - `room_map_mode=observed_rooms_json`, `rooms_json`, or `observed` implies
   oracle room maps and is not valid for the strict SG-Nav metric path unless
   the run is explicitly named `oracle_room_ablation`.
@@ -103,7 +105,7 @@ Every episode result row must include:
   candidate re-perception/STOP confirmation.
 - The configured strict SG-Nav paper path requires `llm.enabled=true`; an
   unavailable HCoT endpoint may not silently become deterministic local scoring.
-- YOLO-World, SAM2, LLM, model, Isaac, and InteriorAgent missing assets must
+- GroundingDINO-B/Swin-B, SAM2, LLM, model, Isaac, and InteriorAgent missing assets must
   fail clearly or skip clearly. They must never silently fall back to another
   benchmark path.
 
@@ -114,6 +116,7 @@ Rows must record all known debug or non-metric substitutions in
 
 - `dry_run_detector`
 - `detector_none`
+- `legacy_yolo_world_detector`
 - `seeded_gt_object_memory`
 - `gt_goal_fallback_allowed`
 - `gt_goal_fallback_used`
@@ -134,7 +137,7 @@ must be stable once result files have been produced.
 
 ## Strict Asset Rule
 
-When a strict metric-capable run requests YOLO-World or SAM2 and the configured
+When a strict metric-capable run requests GroundingDINO-B/Swin-B or SAM2 and the configured
 model/checkpoint asset is missing, the command must fail before writing a
 metric row. The error message must include the missing asset kind and path.
 

@@ -7,11 +7,11 @@ are intentionally conservative: `faithful`, `optimized-equivalent`,
 | SG-Nav paper mechanism | Current implementation | Status | Evidence |
 | --- | --- | --- | --- |
 | RGB-D observation | Isaac closed loop reads RGB-D observations before online mapping and perception. | faithful | `isaac_bench/scripts/run_one_episode.py::run_episode_isaac_closed_loop` |
-| GLIP open-vocabulary detection | YOLO-World replaces GLIP as the open-vocabulary detector in the metric path. | optimized-equivalent | `isaac_bench/perception/yolo_world_detector.py`, `ensure_detector_loaded` |
+| GLIP open-vocabulary detection | GroundingDINO-B/Swin-B replaces GLIP as the open-vocabulary detector in the metric path. | optimized-equivalent | `isaac_bench/perception/grounding_dino_detector.py`, `ensure_detector_loaded` |
 | SAM mask refinement | SAM2 replaces SAM mask refinement and attaches box-prompt masks. | optimized-equivalent | `isaac_bench/perception/sam2_segmenter.py`, `ensure_segmenter_loaded` |
 | online occupancy/free map | Live depth is fused into online occupied/free/observed grids. | engineered-faithful | `isaac_bench/mapping/online_mapper.py::OnlineMapper` |
 | frontier extraction | Reachable frontiers are extracted at observed-free/unknown boundaries. | engineered-faithful | `isaac_bench/mapping/frontier.py::extract_frontiers` |
-| object nodes | Non-edge YOLO-World/SAM2/depth detections accumulate into object memory with track-level category confidence sums before `PaperSceneGraph` object nodes are emitted. | engineered-faithful | `FusedInstanceRegistry.update`, `ObjectMemory.update_fused_instances`, `PaperSceneGraph.update_from_object_memory` |
+| object nodes | Non-edge GroundingDINO-B/Swin-B/SAM2/depth detections accumulate into object memory with track-level category confidence sums before `PaperSceneGraph` object nodes are emitted. | engineered-faithful | `FusedInstanceRegistry.update`, `ObjectMemory.update_fused_instances`, `PaperSceneGraph.update_from_object_memory` |
 | group nodes | Related object groups remain cluster-based in the online scene graph. | engineered-faithful | `PaperSceneGraph.update_group_nodes` |
 | room nodes | Room nodes are no-ROS upstream ROSE2 pure-Python room masks plus object/VLM semantics, not oracle `rooms.json` in strict mode. | engineered-faithful | `isaac_bench/mapping/upstream_rose2_pure_python_adapter.py`, `isaac_bench/graph/room_semantics.py` |
 | object-room edges | Objects are assigned to room masks by centroid or footprint overlap. | engineered-faithful | `assign_objects_to_room_masks`, `PaperSceneGraph.update_affiliation_edges` |
@@ -36,9 +36,9 @@ preserve a functional split only when both proposal labels are reliable,
 non-unknown, and different. Object lists such as sink/fridge/sofa/TV are
 evidence to the room recognizer only, not authoritative split rules.
 
-YOLO detections at or below `0.55` confidence are rejected before bbox drawing,
+GroundingDINO detections at or below `0.45` confidence are rejected before bbox drawing,
 SAM2/depth fusion, object memory, candidate-goal logic, STOP, policy graph
-objects, and first-version GNN policy features. Edge-touching YOLO/SAM2
+objects, and first-version GNN policy features. Edge-touching GroundingDINO/SAM2
 detections are not hard-discarded: they remain raw evidence, may associate to a
 stable full track by mask/footprint overlap, and otherwise stay tentative and
 ineligible for policy/room/goal/STOP. Object tracks expose the accumulated

@@ -186,10 +186,7 @@ class OnlineMapper:
         obstacle_mask = (rel_z >= self.obstacle_min_height_m) & (rel_z <= self.obstacle_max_height_m)
         free_mask = (rel_z >= self.free_min_height_m) & (rel_z <= self.free_max_height_m)
         ray_clear_mask = (rel_z >= self.free_min_height_m) & (rel_z <= self.obstacle_max_height_m)
-        vertical_profile_ray_clear_mask = (
-            (rel_z >= self.vertical_profile_free_min_height_m)
-            & (rel_z <= self.vertical_profile_free_max_height_m)
-        )
+        camera_rel_z = float(camera_pose_world[2]) - floor_z
         map_width = int(self.grid.map_info.width)
         free_flat_values: list[int] = []
         occupied_flat_values: list[int] = []
@@ -199,39 +196,43 @@ class OnlineMapper:
         vertical_profile_ray_count = 0
         vertical_profile_skipped_height_rays = 0
         stage_started_at = time.perf_counter()
-        for endpoint, endpoint_rel_z, endpoint_is_obstacle, ray_can_clear, vertical_profile_can_clear in zip(
+        for endpoint, endpoint_rel_z, endpoint_is_obstacle, ray_can_clear in zip(
             rows_cols,
             rel_z,
             obstacle_mask,
             ray_clear_mask,
-            vertical_profile_ray_clear_mask,
         ):
             nav_can_clear = bool(ray_can_clear)
-            profile_can_clear = bool(vertical_profile_can_clear)
             if not nav_can_clear:
                 skipped_height_rays += 1
-            if not profile_can_clear:
-                vertical_profile_skipped_height_rays += 1
-            if not nav_can_clear and not profile_can_clear:
-                continue
             end_cell = (int(endpoint[0]), int(endpoint[1]))
             line = _bresenham_cells((int(origin_cell[0]), int(origin_cell[1])), end_cell)
             if not line:
                 continue
-            band_idx = self.vertical_profile.band_index_for_height(float(endpoint_rel_z))
             if nav_can_clear:
                 ray_count += 1
                 free_line = line[:-1] if bool(endpoint_is_obstacle) else line
                 for row, col in free_line:
                     flat_idx = int(row) * map_width + int(col)
                     free_flat_values.append(flat_idx)
-            if profile_can_clear and band_idx is not None:
+            include_free_endpoint_column = bool(
+                nav_can_clear and not bool(endpoint_is_obstacle) and float(endpoint_rel_z) <= self.free_max_height_m
+            )
+            profile_free_line = line if include_free_endpoint_column else line[:-1]
+            added_profile_cells = _append_vertical_profile_free_ray_cells(
+                free_flat_by_band,
+                profile_free_line,
+                map_width=map_width,
+                origin_rel_z_m=camera_rel_z,
+                endpoint_rel_z_m=float(endpoint_rel_z),
+                z_min_m=self.vertical_profile_free_min_height_m,
+                z_max_m=self.vertical_profile_free_max_height_m,
+                vertical_profile=self.vertical_profile,
+            )
+            if added_profile_cells > 0:
                 vertical_profile_ray_count += 1
-                # The depth endpoint is the observed surface, so only cells
-                # before the hit are free at this height band.
-                for row, col in line[:-1]:
-                    flat_idx = int(row) * map_width + int(col)
-                    free_flat_by_band[band_idx].append(flat_idx)
+            else:
+                vertical_profile_skipped_height_rays += 1
             if bool(endpoint_is_obstacle):
                 occupied_flat_values.append(int(end_cell[0]) * map_width + int(end_cell[1]))
         self._mark_vertical_profile_free_flat(free_flat_by_band)
@@ -539,8 +540,18 @@ class OnlineMapper:
     def _mark_robot_footprint_free(self, base_pose_world: Tuple[float, float, float, float]) -> None:
         radius_cells = max(1, self._robot_footprint_radius_cells())
         center = self.grid.world_to_grid(float(base_pose_world[0]), float(base_pose_world[1]))
+        profile_cells: List[Tuple[int, int]] = []
         for dr, dc in _disk_offsets(radius_cells):
-            self._set_free_cell(center[0] + dr, center[1] + dc, mark_mask=self.depth_free_mask)
+            row, col = int(center[0] + dr), int(center[1] + dc)
+            self._set_free_cell(row, col, mark_mask=self.depth_free_mask)
+            if 0 <= row < self.grid.map_info.height and 0 <= col < self.grid.map_info.width:
+                profile_cells.append((row, col))
+        if profile_cells:
+            free_z = min(
+                max(float(self.vertical_profile_free_min_height_m), 0.80),
+                max(float(self.vertical_profile_free_min_height_m), float(self.vertical_profile_free_max_height_m) - 1e-3),
+            )
+            self.vertical_profile.mark_free_ray_cells(profile_cells, rel_z_m=free_z)
 
     def _set_free_cell(self, row: int, col: int, mark_mask: np.ndarray | None = None) -> None:
         if 0 <= int(row) < self.grid.map_info.height and 0 <= int(col) < self.grid.map_info.width:
@@ -723,6 +734,50 @@ def _unique_flat(values: List[int]) -> np.ndarray:
     if not values:
         return np.zeros((0,), dtype=np.int64)
     return np.unique(np.asarray(values, dtype=np.int64))
+
+
+def _append_vertical_profile_free_ray_cells(
+    flat_indices_by_band: List[List[int]],
+    free_cells: List[Tuple[int, int]],
+    *,
+    map_width: int,
+    origin_rel_z_m: float,
+    endpoint_rel_z_m: float,
+    z_min_m: float,
+    z_max_m: float,
+    vertical_profile: VerticalProfileMap,
+) -> int:
+    """Mark vertical free evidence for xy columns crossed by a free ray.
+
+    The room-segmentation vertical profile asks: for this xy column, did any
+    ray pass through free space between z_min and z_max? Using only the depth
+    endpoint height drops valid rays that hit the floor or a low object, even
+    though the same ray crossed 0.2-2.0 m free space before the hit. Therefore
+    each crossed xy cell receives the clipped free vertical interval spanned by
+    the camera origin and the depth endpoint.
+    """
+
+    if not free_cells:
+        return 0
+    width = int(map_width)
+    lo = max(float(z_min_m), min(float(origin_rel_z_m), float(endpoint_rel_z_m)))
+    hi = min(float(z_max_m), max(float(origin_rel_z_m), float(endpoint_rel_z_m)))
+    if hi < lo:
+        return 0
+    band_indices: list[int] = []
+    for band_idx, (_name, (band_lo, band_hi)) in enumerate(zip(vertical_profile.band_names, vertical_profile.band_ranges_m)):
+        if float(band_hi) <= lo or float(band_lo) >= hi:
+            continue
+        band_indices.append(int(band_idx))
+    if not band_indices:
+        return 0
+    added = 0
+    for row, col in free_cells:
+        flat = int(row) * width + int(col)
+        for band_idx in band_indices:
+            flat_indices_by_band[int(band_idx)].append(flat)
+            added += 1
+    return int(added)
 
 
 def _disk_offsets(radius_cells: int) -> List[Tuple[int, int]]:

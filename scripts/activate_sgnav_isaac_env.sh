@@ -62,6 +62,30 @@ if [[ -z "${INTERIORAGENT_ROOT:-}" ]]; then
   done
 fi
 
+if [[ -z "${GROUNDING_DINO_ROOT:-}" ]]; then
+  for candidate in \
+    "$HOME/SG-Nav/GroundingDINO" \
+    "$REPO_ROOT/../SG-Nav/GroundingDINO" \
+    "/home/echo/SG-Nav/GroundingDINO" \
+    "/home/joey/SG-Nav/GroundingDINO"; do
+    if [[ -f "$candidate/groundingdino/config/GroundingDINO_SwinB.py" || -f "$candidate/groundingdino/config/GroundingDINO_SwinB.cfg.py" ]]; then
+      export GROUNDING_DINO_ROOT="$candidate"
+      break
+    fi
+  done
+fi
+
+if [[ -z "${GROUNDING_DINO_CHECKPOINT:-}" && -f "$REPO_ROOT/data/models/groundingdino_swinb_cogcoor.pth" ]]; then
+  export GROUNDING_DINO_CHECKPOINT="$REPO_ROOT/data/models/groundingdino_swinb_cogcoor.pth"
+fi
+if [[ -z "${GROUNDING_DINO_CONFIG:-}" ]]; then
+  if [[ -f "$REPO_ROOT/data/models/GroundingDINO_SwinB.cfg.py" ]]; then
+    export GROUNDING_DINO_CONFIG="$REPO_ROOT/data/models/GroundingDINO_SwinB.cfg.py"
+  elif [[ -n "${GROUNDING_DINO_ROOT:-}" && -f "$GROUNDING_DINO_ROOT/groundingdino/config/GroundingDINO_SwinB.py" ]]; then
+    export GROUNDING_DINO_CONFIG="$GROUNDING_DINO_ROOT/groundingdino/config/GroundingDINO_SwinB.py"
+  fi
+fi
+
 if [[ ! -f "$CONDA_SH" ]]; then
   echo "conda shell hook not found: $CONDA_SH" >&2
   return 1 2>/dev/null || exit 1

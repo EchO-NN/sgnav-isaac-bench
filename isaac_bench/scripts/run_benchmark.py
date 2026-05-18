@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from pathlib import Path
 from typing import List, Optional
@@ -16,7 +17,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--config", default="isaac_bench/configs/isaac_bench.yaml")
     parser.add_argument("--episode-file", required=True)
     parser.add_argument("--planner", default=None, choices=["astar", "nav2"])
-    parser.add_argument("--detector", default=None, choices=["dry_run", "yolo_world", "none"])
+    parser.add_argument("--detector", default=None, choices=["dry_run", "yolo_world", "grounding_dino", "none"])
     parser.add_argument("--headless", nargs="?", const=True, default=None, type=str_to_bool)
     parser.add_argument("--no-headless", dest="headless", action="store_false")
     parser.add_argument("--output", default=None)
@@ -31,6 +32,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--use-original-scenegraph", action="store_true", default=None)
     parser.add_argument("--sim-backend", default=None, choices=["map", "isaac"])
     parser.add_argument("--yolo-world-model", default=None)
+    parser.add_argument("--grounding-dino-checkpoint", default=None)
+    parser.add_argument("--grounding-dino-config", default=None)
+    parser.add_argument("--grounding-dino-text-threshold", type=float, default=None)
+    parser.add_argument("--grounding-dino-device", default=None, choices=["cpu", "cuda"])
     parser.add_argument("--segmenter", default=None, choices=["none", "auto", "sam2"])
     parser.add_argument("--sam2-checkpoint", default=None)
     parser.add_argument("--save-debug-video", action="store_true")
@@ -56,9 +61,13 @@ def main(argv: Optional[List[str]] = None) -> int:
     args.headless = bool(get_nested(cfg, "isaac.headless", True) if args.headless is None else args.headless)
     if args.output_dir and not args.output:
         args.output = str(Path(args.output_dir) / "results.jsonl")
-    args.output = args.output or str(Path(get_nested(cfg, "project.output_dir", "data/isaac_bench_runs")) / "astar_yoloworld" / "results.jsonl")
+    args.output = args.output or str(Path(get_nested(cfg, "project.output_dir", "data/isaac_bench_runs")) / "astar_grounding_dino" / "results.jsonl")
     args.sgnav_repo = args.sgnav_repo or get_nested(cfg, "paths.sgnav_repo", "/home/echo/SG-Nav")
     args.yolo_world_model = args.yolo_world_model or get_nested(cfg, "paths.yolo_world_model", get_nested(cfg, "perception.yolo_world_model", "data/models/yolov8l-worldv2.pt"))
+    args.grounding_dino_checkpoint = args.grounding_dino_checkpoint or os.environ.get("GROUNDING_DINO_CHECKPOINT") or get_nested(cfg, "paths.grounding_dino_checkpoint", get_nested(cfg, "perception.grounding_dino.checkpoint", "data/models/groundingdino_swinb_cogcoor.pth"))
+    args.grounding_dino_config = args.grounding_dino_config or os.environ.get("GROUNDING_DINO_CONFIG") or get_nested(cfg, "paths.grounding_dino_config", get_nested(cfg, "perception.grounding_dino.config", ""))
+    args.grounding_dino_text_threshold = float(args.grounding_dino_text_threshold if args.grounding_dino_text_threshold is not None else get_nested(cfg, "perception.grounding_dino.text_threshold", 0.25))
+    args.grounding_dino_device = str(args.grounding_dino_device or get_nested(cfg, "perception.grounding_dino.device", "cuda"))
     args.segmenter = args.segmenter or get_nested(cfg, "perception.segmenter", "none")
     args.sam2_checkpoint = args.sam2_checkpoint or get_nested(cfg, "perception.sam2_checkpoint", "")
     args.sgnav_mode = str(get_nested(cfg, "sgnav.mode", "legacy"))
@@ -107,6 +116,14 @@ def main(argv: Optional[List[str]] = None) -> int:
             args.output,
             "--yolo-world-model",
             args.yolo_world_model,
+            "--grounding-dino-checkpoint",
+            args.grounding_dino_checkpoint,
+            "--grounding-dino-config",
+            args.grounding_dino_config,
+            "--grounding-dino-text-threshold",
+            str(args.grounding_dino_text_threshold),
+            "--grounding-dino-device",
+            args.grounding_dino_device,
             "--segmenter",
             args.segmenter,
             "--sam2-checkpoint",

@@ -15,7 +15,7 @@ def _strict_args() -> Namespace:
     return Namespace(
         strict_benchmark=True,
         ablation_name="local_deterministic_llm",
-        detector="yolo_world",
+        detector="grounding_dino",
         segmenter="sam2",
         sim_backend="isaac",
         planner="astar",

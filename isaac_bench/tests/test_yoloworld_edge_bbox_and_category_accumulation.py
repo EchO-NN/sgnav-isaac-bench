@@ -53,7 +53,7 @@ def test_edge_bbox_kept_as_partial_tentative_track_and_logged_raw():
 
 def test_low_confidence_detection_is_logged_but_not_forwarded_to_sam_or_memory():
     raw_log = []
-    low = Detection2D("pillow", "pillow", 0.55, (3.0, 3.0, 4.0, 4.0), mask=_mask())
+    low = Detection2D("pillow", "pillow", 0.45, (3.0, 3.0, 4.0, 4.0), mask=_mask())
 
     kept = filter_edge_touching_detections(
         [low],
@@ -63,12 +63,12 @@ def test_low_confidence_detection_is_logged_but_not_forwarded_to_sam_or_memory()
         reject_edge_touching_bboxes=True,
         margin_px=2,
         margin_ratio=0.0,
-        min_confidence=0.55,
+        min_confidence=0.45,
         raw_log=raw_log,
     )
 
     assert kept == []
-    assert raw_log[0]["confidence"] == pytest.approx(0.55)
+    assert raw_log[0]["confidence"] == pytest.approx(0.45)
     assert raw_log[0]["used_for_object_track"] is False
     assert raw_log[0]["reject_reason"] == "low_confidence"
 

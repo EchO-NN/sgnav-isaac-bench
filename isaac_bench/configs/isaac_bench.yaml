@@ -8,10 +8,12 @@ paths:
   interioragent_root: /home/echo/InteriorAgent
   isaac_sim_root: /home/echo/isaac-sim-standalone-5.1.0-linux-x86_64
   yolo_world_model: data/models/yolov8l-worldv2.pt
+  grounding_dino_checkpoint: data/models/groundingdino_swinb_cogcoor.pth
+  grounding_dino_config: data/models/GroundingDINO_SwinB.cfg.py
 
 repo:
   backend: isaac
-  detector: yolo_world
+  detector: grounding_dino
   planner: astar
   use_original_scenegraph: false
 
@@ -188,6 +190,41 @@ mapping:
       upper_band_m: [1.30, 2.00]
       min_free_rays: 1
       min_observed_rays: 1
+    debug_layers:
+      enabled: false
+      output_dir: debug/roomseg_layers
+      max_saves: 50
+      save_npz: true
+      save_png: true
+      save_summary_json: true
+      include_selected_frontier_sector: true
+    navigation_free_context_overlay:
+      enabled: false
+      use_for_room_nodes: true
+      use_for_visualization: true
+      use_for_frontier_room_assignment: true
+      max_absorb_distance_m: 1.25
+      min_seed_room_area_cells: 20
+      protect_unknown: true
+      do_not_cross_structural_boundary: true
+      do_not_cross_obstacle: true
+      reliability_for_absorbed_cells: 0.35
+    frontier_room_context:
+      enabled: true
+      use_known_free_side: true
+      local_radius_m: 0.35
+      nearest_fallback_radius_m: 1.25
+      min_label_ratio: 0.20
+      use_context_overlay_labels: true
+    wall_gating_debug:
+      enabled: true
+    wall_gating_fix:
+      enabled: false
+      mode: candidate_wall_component_gate
+      keep_perimeter_walls: true
+      keep_high_confidence_walls: true
+      keep_line_supported_walls: true
+      min_component_area_cells: 4
     update_every_steps: 5
     min_observed_free_cells: 50
     min_room_area_m2: 1.5
@@ -246,14 +283,21 @@ mapping:
 
 perception:
   yolo_world_model: data/models/yolov8l-worldv2.pt
+  grounding_dino:
+    variant: GroundingDINO-B/Swin-B
+    repo_id: ShilongLiu/GroundingDINO
+    checkpoint: data/models/groundingdino_swinb_cogcoor.pth
+    config: data/models/GroundingDINO_SwinB.cfg.py
+    device: cuda
+    text_threshold: 0.25
   use_ultralytics: true
   detection_localization: depth
   segmenter: sam2
   sam2_checkpoint: data/models/sam2.1_hiera_small.pt
   sam2_model_cfg: configs/sam2.1/sam2.1_hiera_s.yaml
   sam2_device: cuda
-  confidence_threshold: 0.55
-  min_valid_detection_confidence: 0.55
+  confidence_threshold: 0.45
+  min_valid_detection_confidence: 0.45
   nms_iou_threshold: 0.5
   prompt_mode: global_dataset_vocab
   max_detections_per_frame: 100
@@ -313,7 +357,7 @@ sgnav:
   debug_graph_dump: false
   debug_graph_dump_dir: debug/graphs
   candidate_min_detector_hits: 2
-  candidate_start_min_confidence: 0.55
+  candidate_start_min_confidence: 0.45
   candidate_start_min_hits: 2
   candidate_recent_max_age_steps: 30
   candidate_match_substring: false
@@ -334,7 +378,7 @@ sgnav:
   stop_verification_min_hits: 2
   found_goal_stop_distance_m: 0.35
   perception:
-    instance_source: yolo_world_sam2_depth_fusion
+    instance_source: grounding_dino_sam2_depth_fusion
     instance_merge_distance_m: 0.75
     instance_merge_iou_3d: 0.15
   scene_graph:

@@ -21,6 +21,7 @@ class EpisodeEvaluator:
     num_steps: int = 0
     num_collisions: int = 0
     num_yolo_calls: int = 0
+    num_detector_calls: int = 0
     num_scenegraph_updates: int = 0
     num_frontier_decisions: int = 0
     final_distance_to_goal: float = math.inf
@@ -59,6 +60,7 @@ class EpisodeEvaluator:
             "elapsed_wall_time_s": float(time.time() - self.start_wall_time),
             "collisions": int(self.num_collisions),
             "num_collisions": int(self.num_collisions),
+            "num_detector_calls": int(self.num_detector_calls or self.num_yolo_calls),
             "num_yolo_calls": int(self.num_yolo_calls),
             "num_scenegraph_updates": int(self.num_scenegraph_updates),
             "num_frontier_decisions": int(self.num_frontier_decisions),

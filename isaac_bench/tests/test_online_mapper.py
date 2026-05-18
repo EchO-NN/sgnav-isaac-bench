@@ -127,6 +127,35 @@ def test_online_mapper_free_ray_ignores_legacy_splat_thresholds():
     assert mapper.last_debug_stats["splat_thresholds"]["unused_for_mapping_mode"] == "depth_ray_cast"
 
 
+def test_online_mapper_vertical_profile_free_uses_ray_height_not_floor_endpoint_height():
+    mapper = OnlineMapper(
+        size_m=8.0,
+        resolution_m=0.1,
+        depth_max_m=2.0,
+        depth_min_m=0.1,
+        depth_stride_px=1,
+        free_min_height_m=-1.5,
+        free_max_height_m=0.1,
+        vertical_profile_free_min_height_m=0.20,
+        vertical_profile_free_max_height_m=2.00,
+        splat_point_threshold=1,
+        robot_radius_m=0.1,
+    )
+    mapper.reset((0.0, 0.0))
+    intr = CameraIntrinsics(width=5, height=5, fx=2.0, fy=2.0, cx=2.0, cy=2.0)
+    depth = np.full((5, 5), np.inf, dtype=np.float32)
+    depth[4, 2] = 1.0  # bottom ray hits floor-level z=0, but crosses 0.2-1.0 m first
+
+    mapper.update(depth, intr, (0.0, 0.0, 0.0, 0.0), (0.0, 0.0, 1.0, 0.0))
+
+    assert mapper.last_debug_stats["vertical_profile_ray_count"] == 1
+    assert mapper.last_debug_stats["vertical_profile_skipped_height_rays"] == 0
+    assert int(np.count_nonzero(mapper.vertical_profile.free_ray_count[band_index("robot_body")])) > 0
+    assert int(np.count_nonzero(mapper.vertical_profile.free_ray_count[band_index("mid")])) > 0
+    floor_endpoint_cell = mapper.grid.world_to_grid(1.0, 0.0)
+    assert int(np.sum(mapper.vertical_profile.free_ray_count[:, floor_endpoint_cell[0], floor_endpoint_cell[1]])) > 0
+
+
 def test_online_mapper_nearfield_topdown_fills_blind_spot_from_depth():
     mapper = OnlineMapper(
         size_m=8.0,
@@ -267,4 +296,6 @@ def test_online_mapper_invalid_depth_only_marks_robot_footprint():
     mapper.update(depth, intr, (0.0, 0.0, 0.0, 0.0), (0.0, 0.0, 1.0, 0.0))
 
     assert mapper.grid.free[mapper.grid.world_to_grid(0.0, 0.0)] == 1
+    robot_cell = mapper.grid.world_to_grid(0.0, 0.0)
+    assert int(np.sum(mapper.vertical_profile.free_ray_count[:, robot_cell[0], robot_cell[1]])) > 0
     assert mapper.grid.free[mapper.grid.world_to_grid(1.0, 0.0)] == 0

@@ -9,13 +9,13 @@ tests and debug tools.
 Metric-path SG-Nav runs must use the following pipeline:
 
 1. Isaac RGB-D observations are the only online perception and mapping input.
-2. YOLO-World detections provide metric-path open-vocabulary object boxes.
-3. SAM2 masks are prompted from YOLO-World boxes for metric-path segmentation.
-4. A YOLO/SAM detection is valid only when `confidence > 0.55`. Detections at
-   or below 0.55 must not draw RGB bboxes, enter mask/depth fusion, create
+2. GroundingDINO-B/Swin-B detections provide metric-path open-vocabulary object boxes.
+3. SAM2 masks are prompted from GroundingDINO boxes for metric-path segmentation.
+4. A GroundingDINO/SAM detection is valid only when `confidence > 0.45`. Detections at
+   or below 0.45 must not draw RGB bboxes, enter mask/depth fusion, create
    object-memory nodes, create scene-graph object nodes, seed candidate goals,
    or support STOP confirmation.
-5. YOLO-World boxes or SAM2 masks that touch the image edge are partial raw
+5. GroundingDINO boxes or SAM2 masks that touch the image edge are partial raw
    evidence, not hard-discarded detections. They are logged with
    `visibility_status=partial_edge`, associated to prior full/stable tracks by
    mask/footprint overlap when possible, and otherwise kept as tentative
@@ -77,7 +77,7 @@ Metric-path SG-Nav runs must use the following pipeline:
 
 ## Forbidden Metric-Path Substitutions
 
-- Ground-truth object memory must not replace YOLO-World plus SAM2 perception.
+- Ground-truth object memory must not replace GroundingDINO-B/Swin-B plus SAM2 perception.
 - Static map knowledge must not replace online RGB-D occupancy/free-space
   mapping for SG-Nav exploration decisions.
 - Nearest-frontier, distance-only, or category-only heuristics must not replace

@@ -146,6 +146,16 @@ def validate_strict_benchmark_assets(args: object) -> None:
         return
     detector = str(_get_arg(args, "detector", "") or "").strip().lower()
     segmenter = str(_get_arg(args, "segmenter", "") or "").strip().lower()
+    ablation_name = str(_get_arg(args, "ablation_name", "") or "").strip().lower()
+    if detector == "yolo_world" and ablation_name != "legacy_yolo_world_ablation":
+        raise BenchmarkAssetError(
+            "strict SG-Nav metric path now requires GroundingDINO-B/Swin-B; YOLO-World is legacy/debug unless --ablation-name legacy_yolo_world_ablation"
+        )
+    if detector == "grounding_dino":
+        _require_existing_asset("GroundingDINO-B/Swin-B checkpoint", _get_arg(args, "grounding_dino_checkpoint", ""))
+        _require_existing_asset("GroundingDINO-B/Swin-B config", _get_arg(args, "grounding_dino_config", ""))
+        if segmenter == "sam2":
+            _require_existing_asset("SAM2 checkpoint", _get_arg(args, "sam2_checkpoint", ""))
     if detector == "yolo_world":
         _require_existing_asset("YOLO-World model", _get_arg(args, "yolo_world_model", ""))
         if segmenter == "sam2":
@@ -154,7 +164,6 @@ def validate_strict_benchmark_assets(args: object) -> None:
     if sgnav_mode == "paper" and not bool(_get_arg(args, "llm_enabled", False)):
         raise BenchmarkAssetError("strict SG-Nav paper mode requires --llm-enabled true and a reachable LLM/VLM endpoint")
     room_map_mode = str(_get_arg(args, "room_map_mode", "") or "").strip().lower()
-    ablation_name = str(_get_arg(args, "ablation_name", "") or "").strip().lower()
     if room_map_mode in {"observed_rooms_json", "rooms_json", "observed"} and ablation_name != "oracle_room_ablation":
         raise BenchmarkAssetError(
             "strict SG-Nav metric path requires upstream_rose2_vertical_or_free room masks; rooms.json/oracle room maps are not allowed"
@@ -286,8 +295,10 @@ def _infer_fallbacks(row: Mapping[str, object], args: object | None) -> list[str
         fallbacks.append("dry_run_detector")
     if detector == "none":
         fallbacks.append("detector_none")
-    if detector == "yolo_world" and segmenter != "sam2":
+    if detector in {"yolo_world", "grounding_dino"} and segmenter != "sam2":
         fallbacks.append("sam2_missing_or_disabled")
+    if detector == "yolo_world" and str(ablation_name or "") != "legacy_yolo_world_ablation":
+        fallbacks.append("legacy_yolo_world_detector")
     if bool(_get_arg(args, "seed_gt_object_memory", row.get("seed_gt_object_memory", False))):
         fallbacks.append("seeded_gt_object_memory")
     if int(row.get("seeded_object_memory_count", 0) or 0) > 0:

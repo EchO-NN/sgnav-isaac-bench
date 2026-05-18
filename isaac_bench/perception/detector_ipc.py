@@ -105,6 +105,9 @@ class SubprocessDetector(DetectorBase):
         sam2_checkpoint: str = "",
         sam2_model_cfg: str = "",
         sam2_device: str = "cuda",
+        grounding_dino_config: str = "",
+        grounding_dino_text_threshold: float = 0.25,
+        grounding_dino_device: str = "cuda",
     ) -> None:
         self.detector_name = str(detector_name)
         self.model_name = str(model_name)
@@ -118,6 +121,9 @@ class SubprocessDetector(DetectorBase):
         self.sam2_checkpoint = str(sam2_checkpoint or "")
         self.sam2_model_cfg = str(sam2_model_cfg or "")
         self.sam2_device = str(sam2_device or "cuda")
+        self.grounding_dino_config = str(grounding_dino_config or "")
+        self.grounding_dino_text_threshold = float(grounding_dino_text_threshold)
+        self.grounding_dino_device = str(grounding_dino_device or "cuda")
         self._ipc_dir = Path(tempfile.gettempdir()) / ("sgnav_detector_%d" % os.getpid())
         self._frame_path = self._ipc_dir / "latest.jpg"
         self.vocab: List[str] = []
@@ -189,6 +195,12 @@ class SubprocessDetector(DetectorBase):
             str(self.conf),
             "--iou",
             str(self.iou),
+            "--grounding-dino-config",
+            self.grounding_dino_config,
+            "--grounding-dino-text-threshold",
+            str(self.grounding_dino_text_threshold),
+            "--grounding-dino-device",
+            self.grounding_dino_device,
             "--categories-json",
             json.dumps(self.vocab, ensure_ascii=False),
             "--segmenter",

@@ -237,7 +237,7 @@ class SGNavPopupVisualizer:
     def overlay_layer_metadata(self, frame_id: int = 0) -> dict:
         layers = [dict(item) for item in self._last_overlay_layers]
         green_like = sum(int(item.get("primitive_count", 0)) for item in layers if bool(item.get("green_like", False)))
-        return {
+        payload = {
             "frame_id": int(frame_id),
             "layers": layers,
             "green_like_primitive_count": int(green_like),
@@ -247,6 +247,24 @@ class SGNavPopupVisualizer:
                 and green_like > self.max_green_like_primitives_before_warning
             ),
         }
+        if isinstance(self._room_segmentation_debug, Mapping):
+            if self._room_segmentation_debug.get("roomseg_debug_layers"):
+                payload["roomseg_debug_layers"] = dict(self._room_segmentation_debug.get("roomseg_debug_layers") or {})
+                summary = dict(self._room_segmentation_debug.get("roomseg_debug_summary") or {})
+                payload["roomseg_debug_summary"] = {
+                    "counts": dict(summary.get("counts") or {}),
+                    "likely_cause": summary.get("likely_cause"),
+                }
+            overlay = self._room_segmentation_debug.get("navigation_free_context_overlay")
+            if isinstance(overlay, Mapping):
+                payload["context_overlay"] = {
+                    "enabled": bool(overlay.get("nav_free_overlay_enabled", False)),
+                    "absorbed_cells": int(overlay.get("absorbed_cells", 0) or 0),
+                    "remaining_unlabeled_nav_free_cells": int(overlay.get("remaining_unlabeled_nav_free_cells", 0) or 0),
+                    "used_for_frontier_room_assignment": True,
+                    "used_for_room_nodes": bool(overlay.get("nav_free_overlay_enabled", False)),
+                }
+        return payload
 
     def _read_ready(self, timeout_s: float) -> None:
         if self._proc is None or self._proc.stdout is None:
@@ -407,7 +425,7 @@ class SGNavPopupVisualizer:
             draw.rectangle(box, outline=color, width=2)
             label = "%s %.2f" % (det.category, float(det.confidence))
             self._label(draw, (box[0], max(0, box[1] - 14)), label, color)
-        self._label(draw, (8, 8), "RGB / YOLO detections: %d  green=normal red=goal" % len(valid_detections), (255, 255, 255))
+        self._label(draw, (8, 8), "RGB / detector detections: %d  green=normal red=goal" % len(valid_detections), (255, 255, 255))
         return image
 
     def _render_map(
@@ -635,6 +653,9 @@ class SGNavPopupVisualizer:
         furniture_suppressed = self._room_debug_array("furniture_suppression_mask", shape, bool)
         suppressed_clutter = rejected_structure | interior_clutter | furniture_suppressed
         wall_conf = self._room_debug_array("wall_confidence_map", shape, np.float32)
+        context_labels = self._room_debug_array("context_room_label_map", shape, np.int32)
+        final_labels = self._room_debug_array("final_room_label_map", shape, np.int32)
+        context_absorbed = (context_labels > 0) & (final_labels <= 0)
         threshold = float(self._room_segmentation_debug.get("wall_confidence_threshold", 0.55) or 0.55)
         wall_conf_hot = wall_conf >= threshold if wall_conf.shape == shape else np.zeros(shape, dtype=bool)
 
@@ -665,6 +686,7 @@ class SGNavPopupVisualizer:
         canvas[wall_conf_hot] = (255, 105, 75)
         canvas[rose_occupied] = (0, 0, 0)
         canvas[clean_structure] = (255, 190, 70)
+        canvas[context_absorbed] = (120, 210, 255)
 
         r0, r1, c0, c1 = crop_bounds
         crop = canvas[r0:r1, c0:c1]
@@ -776,6 +798,13 @@ class SGNavPopupVisualizer:
                 (80, 255, 130),
                 int(doorway_gap_count),
                 "floor-traversable doorway gaps recorded as portals",
+            ),
+            self._overlay_record(
+                "roomseg_context_absorbed_nav_free",
+                bool(np.any(context_absorbed)),
+                (120, 210, 255),
+                int(np.count_nonzero(context_absorbed)),
+                "navigation-free cells absorbed only into room context overlay",
             ),
         ]
         return image, layers

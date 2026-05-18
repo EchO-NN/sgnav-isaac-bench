@@ -7,7 +7,7 @@ from typing import Dict, Literal, Optional, Tuple
 import numpy as np
 
 
-MIN_VALID_DETECTION_CONFIDENCE = 0.55
+MIN_VALID_DETECTION_CONFIDENCE = 0.45
 
 
 def detection_confidence_is_valid(confidence: float, min_confidence: float = MIN_VALID_DETECTION_CONFIDENCE) -> bool:
@@ -102,7 +102,7 @@ class FusedInstance:
     last_mask: Optional[np.ndarray]
     last_seen_step: int
     observed_count: int
-    source: str = "yolo_world_sam2_depth_fusion"
+    source: str = "grounding_dino_sam2_depth_fusion"
     class_conf_sums: Dict[str, float] = field(default_factory=dict)
     class_hits: Dict[str, int] = field(default_factory=dict)
     valid_detection_count: int = 0

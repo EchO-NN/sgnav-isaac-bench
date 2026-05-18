@@ -1,7 +1,7 @@
-# Mask-Aware YOLO-World Object Memory
+# Mask-Aware GroundingDINO-B/Swin-B Object Memory
 
-Metric perception keeps YOLO-World plus SAM2 as the real path. Detections with
-`confidence <= 0.55` are not valid detections: they must not draw RGB bboxes,
+Metric perception keeps GroundingDINO-B/Swin-B plus SAM2 as the real path. Detections with
+`confidence <= 0.45` are not valid detections: they must not draw RGB bboxes,
 enter SAM2/depth fusion, create object-memory nodes, create scene-graph object
 nodes, seed candidate goals, or support STOP.
 
@@ -35,4 +35,3 @@ Object-memory debug/GNN snapshots expose raw detections and object tracks with:
 - `used_for_policy_graph`, `used_for_room_label`,
   `used_for_goal_candidate`, and `used_for_stop`
 - parent/child relations for containment cases
-

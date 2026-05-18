@@ -17,6 +17,7 @@ from isaac_bench.mapping.room_segmentation import (
     RoomSegmentationConfig,
     merge_open_plan_proposals,
 )
+from isaac_bench.mapping.room_context_overlay import build_navigation_free_room_context_overlay
 from isaac_bench.mapping.structure_extraction import (
     StructureExtractionConfig,
     StructureExtractionResult,
@@ -84,6 +85,22 @@ class UpstreamROSE2Config:
     vertical_or_free_z_max_m: float = 2.00
     vertical_or_free_min_free_rays: int = 1
     vertical_or_free_min_observed_rays: int = 1
+    navigation_free_context_overlay_enabled: bool = False
+    navigation_free_context_overlay_use_for_room_nodes: bool = True
+    navigation_free_context_overlay_use_for_visualization: bool = True
+    navigation_free_context_overlay_use_for_frontier_room_assignment: bool = True
+    navigation_free_context_overlay_max_absorb_distance_m: float = 1.25
+    navigation_free_context_overlay_min_seed_room_area_cells: int = 20
+    navigation_free_context_overlay_protect_unknown: bool = True
+    navigation_free_context_overlay_do_not_cross_structural_boundary: bool = True
+    navigation_free_context_overlay_do_not_cross_obstacle: bool = True
+    navigation_free_context_overlay_reliability_for_absorbed_cells: float = 0.35
+    wall_gating_fix_enabled: bool = False
+    wall_gating_fix_mode: str = "candidate_wall_component_gate"
+    wall_gating_fix_keep_perimeter_walls: bool = True
+    wall_gating_fix_keep_high_confidence_walls: bool = True
+    wall_gating_fix_keep_line_supported_walls: bool = True
+    wall_gating_fix_min_component_area_cells: int = 4
 
     @classmethod
     def from_mapping(cls, data: Optional[Mapping[str, object]] = None, **overrides) -> "UpstreamROSE2Config":
@@ -94,6 +111,10 @@ class UpstreamROSE2Config:
         vertical_or_free = dict(raw.get("vertical_or_free", {}) or {})
         for key, value in vertical_or_free.items():
             raw.setdefault("vertical_or_free_%s" % key, value)
+        for section in ("navigation_free_context_overlay", "wall_gating_fix"):
+            nested = dict(raw.get(section, {}) or {})
+            for key, value in nested.items():
+                raw.setdefault("%s_%s" % (section, key), value)
         if "source_root" not in raw:
             env_name = str(raw.get("upstream_repo_env", DEFAULT_SOURCE_ENV) or DEFAULT_SOURCE_ENV)
             raw["source_root"] = os.environ.get(env_name)
@@ -365,9 +386,43 @@ class UpstreamROSE2PurePythonSegmenter:
             structural_free_mask=proposal_state.structural_free_mask,
             unknown_mask=proposal_state.unknown_mask,
         )
-        rooms = self._rooms_from_labels(final_labels, proposal_state.unknown_mask, doorway_edges, int(proposal_state.step), source_labels=labels)
-        rooms = self._assign_stable_ids(rooms)
         input_occupancy = np.asarray(proposal_state.debug.get("_input_occupancy_map", proposal_state.structural_obstacle_mask), dtype=bool)
+        context_labels = np.asarray(final_labels, dtype=np.int32).copy()
+        context_reliability = np.zeros_like(context_labels, dtype=np.float32)
+        context_reliability[context_labels > 0] = 1.0
+        overlay_debug = {"nav_free_overlay_enabled": False}
+        if bool(self.config.navigation_free_context_overlay_enabled):
+            context_labels, context_reliability, overlay_debug = build_navigation_free_room_context_overlay(
+                final_labels,
+                navigation_free=np.asarray(proposal_state.debug.get("navigation_free_room_domain", proposal_state.structural_free_mask), dtype=bool),
+                unknown=proposal_state.unknown_mask,
+                obstacle=input_occupancy if bool(self.config.navigation_free_context_overlay_do_not_cross_obstacle) else None,
+                structural_boundary=proposal_state.structural_obstacle_mask
+                if bool(self.config.navigation_free_context_overlay_do_not_cross_structural_boundary)
+                else None,
+                resolution_m=float(self.config.resolution_m),
+                max_absorb_distance_m=float(self.config.navigation_free_context_overlay_max_absorb_distance_m),
+                min_seed_room_area_cells=int(self.config.navigation_free_context_overlay_min_seed_room_area_cells),
+                protect_unknown=bool(self.config.navigation_free_context_overlay_protect_unknown),
+                do_not_cross_structural_boundary=bool(self.config.navigation_free_context_overlay_do_not_cross_structural_boundary),
+                do_not_cross_obstacle=bool(self.config.navigation_free_context_overlay_do_not_cross_obstacle),
+                absorbed_reliability=float(self.config.navigation_free_context_overlay_reliability_for_absorbed_cells),
+            )
+        room_labels_for_nodes = context_labels if (
+            bool(self.config.navigation_free_context_overlay_enabled)
+            and bool(self.config.navigation_free_context_overlay_use_for_room_nodes)
+        ) else final_labels
+        rooms = self._rooms_from_labels(room_labels_for_nodes, proposal_state.unknown_mask, doorway_edges, int(proposal_state.step), source_labels=labels)
+        if bool(self.config.navigation_free_context_overlay_enabled):
+            for room in rooms:
+                label_id = int((room.metadata or {}).get("label_id", 0) or 0)
+                strict_cells = int(np.count_nonzero(final_labels == label_id))
+                context_cells = int(np.count_nonzero(context_labels == label_id))
+                room.metadata["context_overlay_applied"] = bool(self.config.navigation_free_context_overlay_use_for_room_nodes)
+                room.metadata["strict_mask_area_cells"] = int(strict_cells)
+                room.metadata["context_mask_area_cells"] = int(context_cells)
+                room.metadata["absorbed_context_cells"] = int(max(0, context_cells - strict_cells))
+        rooms = self._assign_stable_ids(rooms)
         debug = {
             key: value
             for key, value in dict(proposal_state.debug or {}).items()
@@ -403,6 +458,10 @@ class UpstreamROSE2PurePythonSegmenter:
                 "absorbed_structural_free_cells": int(free_absorption_debug["absorbed_free_cells"]),
                 "unlabeled_structural_free_cells_after_absorb": int(free_absorption_debug["after_unlabeled_free_cells"]),
                 "final_room_label_map": np.asarray(final_labels, dtype=np.int32),
+                "room_labels_after_merge": np.asarray(final_labels, dtype=np.int32),
+                "context_room_label_map": np.asarray(context_labels, dtype=np.int32),
+                "context_room_reliability_map": np.asarray(context_reliability, dtype=np.float32),
+                "navigation_free_context_overlay": dict(overlay_debug),
             }
         )
         self.last_debug = debug
@@ -467,6 +526,7 @@ class UpstreamROSE2PurePythonSegmenter:
             "dominant_directions_rad": [float(v) for v in structure.dominant_directions_rad],
             "main_directions": [float(v) for v in structure.dominant_directions_rad],
             "clean_structure_map": np.asarray(structure.clean_structure_map, dtype=bool),
+            "boundary_map": np.asarray(structure.boundary_map, dtype=bool),
             "hough_segments": list(structure.hough_segments),
             "wall_lines": list(structure.hough_segments),
             "wall_clusters": list(structure.wall_clusters),
@@ -483,6 +543,7 @@ class UpstreamROSE2PurePythonSegmenter:
             "num_physical_rooms": int(len([v for v in np.unique(proposal_labels) if int(v) > 0])),
             "proposal_room_count": int(len([v for v in np.unique(proposal_labels) if int(v) > 0])),
             "proposal_room_masks": _proposal_masks_debug(proposal_labels),
+            "room_proposal_labels_before_merge": np.asarray(proposal_labels, dtype=np.int32),
         }
 
     def _empty_debug(self, step: int) -> dict:
@@ -926,7 +987,27 @@ def _vertical_profile_structural_maps(
         config,
     )
     pre_repair_wall = initial_roomseg_occupied.copy()
-    repaired_occupied = pre_repair_wall.copy()
+    if bool(config.wall_gating_fix_enabled):
+        repaired_occupied, wall_gating_fix_debug = _apply_wall_gating_fix(
+            initial_occupied=pre_repair_wall,
+            candidate_wall=candidate_wall,
+            component_gate=component_gate,
+            wall_confidence=confidence,
+            perimeter_support=perimeter_support,
+            line_support=line_support,
+            surrounded_free=surrounded_free,
+            bulky=bulky,
+            config=config,
+        )
+    else:
+        repaired_occupied = pre_repair_wall.copy()
+        wall_gating_fix_debug = {
+            "enabled": False,
+            "initial_occupied_count": int(np.count_nonzero(pre_repair_wall)),
+            "candidate_wall_count": int(np.count_nonzero(candidate_wall)),
+            "suppressed_occupied_count": 0,
+            "repaired_occupied_count": int(np.count_nonzero(repaired_occupied)),
+        }
     closed_gap_mask = np.zeros_like(occ, dtype=bool)
     repaired_free = np.asarray(initial_roomseg_free, dtype=bool).copy()
     repaired_unknown = unknown_arr & ~(repaired_occupied | repaired_free)
@@ -961,8 +1042,11 @@ def _vertical_profile_structural_maps(
         "repaired_roomseg_free": repaired_free,
         "repaired_roomseg_occupied": repaired_occupied,
         "repaired_roomseg_unknown": repaired_unknown,
+        "structural_free_mask": repaired_free,
         "vertical_carved_map": vertical_carved,
         "wall_confidence_map": confidence,
+        "candidate_wall": candidate_wall,
+        "component_gate": component_gate,
         "structural_wall_mask": repaired_occupied,
         "pre_repair_structural_wall_mask": pre_repair_wall,
         "furniture_suppression_mask": object_overlap,
@@ -981,6 +1065,7 @@ def _vertical_profile_structural_maps(
         "interior_clutter_suppressed_cells": int(np.count_nonzero(interior_clutter & occ)),
         "structural_component_rejected_cells": int(np.count_nonzero(candidate_wall & ~component_gate)),
         "wall_confidence_stats": _array_stats(confidence[occ]) if np.any(occ) else {},
+        "wall_gating_fix": wall_gating_fix_debug,
     }
 
 
@@ -1456,6 +1541,58 @@ def _structural_wall_component_gate(
             continue
         for r, c in comp:
             out[r, c] = True
+    return out
+
+
+def _apply_wall_gating_fix(
+    *,
+    initial_occupied: np.ndarray,
+    candidate_wall: np.ndarray,
+    component_gate: np.ndarray,
+    wall_confidence: np.ndarray,
+    perimeter_support: np.ndarray,
+    line_support: np.ndarray,
+    surrounded_free: np.ndarray,
+    bulky: np.ndarray,
+    config: UpstreamROSE2Config,
+) -> tuple[np.ndarray, dict]:
+    initial = np.asarray(initial_occupied, dtype=bool)
+    candidate = np.asarray(candidate_wall, dtype=bool)
+    gate = np.asarray(component_gate, dtype=bool)
+    confidence = np.asarray(wall_confidence, dtype=np.float32)
+    perimeter = np.asarray(perimeter_support, dtype=np.float32) > 0.0
+    line = np.asarray(line_support, dtype=np.float32) > 0.0
+    clutter_like = np.asarray(surrounded_free, dtype=bool) | np.asarray(bulky, dtype=bool)
+    threshold = float(config.wall_confidence_threshold)
+    suppress = initial & ~candidate & ~gate & (confidence < threshold) & clutter_like
+    if bool(config.wall_gating_fix_keep_perimeter_walls):
+        suppress &= ~perimeter
+    if bool(config.wall_gating_fix_keep_line_supported_walls):
+        suppress &= ~line
+    if bool(config.wall_gating_fix_keep_high_confidence_walls):
+        suppress &= confidence < max(0.0, threshold - 0.05)
+    suppress &= _small_component_mask(suppress, min_area_cells=int(config.wall_gating_fix_min_component_area_cells))
+    repaired = initial & ~suppress
+    return repaired.astype(bool), {
+        "enabled": True,
+        "mode": str(config.wall_gating_fix_mode),
+        "initial_occupied_count": int(np.count_nonzero(initial)),
+        "candidate_wall_count": int(np.count_nonzero(candidate)),
+        "component_gate_count": int(np.count_nonzero(gate)),
+        "suppressed_occupied_count": int(np.count_nonzero(suppress)),
+        "repaired_occupied_count": int(np.count_nonzero(repaired)),
+    }
+
+
+def _small_component_mask(mask: np.ndarray, min_area_cells: int) -> np.ndarray:
+    src = np.asarray(mask, dtype=bool)
+    out = np.zeros(src.shape, dtype=bool)
+    if not np.any(src):
+        return out
+    for comp in connected_components(src):
+        if len(comp) <= max(1, int(min_area_cells)):
+            for r, c in comp:
+                out[int(r), int(c)] = True
     return out
 
 
