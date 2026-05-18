@@ -116,6 +116,16 @@ def complete_result_row(row: Mapping[str, object], args: object | None = None) -
     ):
         out[key] = float(out.get(key, 0.0) or 0.0)
 
+    if (
+        bool(out.get("success", False))
+        and bool(out.get("success_requires_sgnav_stop", False))
+        and not bool(out.get("policy_stop_confirmed", False))
+    ):
+        out["success"] = False
+        out["spl"] = 0.0
+        out["failure_reason"] = out.get("failure_reason") or "sgnav_stop_required"
+        out["stop_reason"] = "sgnav_stop_required"
+
     fallbacks = _stable_unique([*list(out.get("fallbacks_used", []) or []), *_infer_fallbacks(out, args)])
     out["fallbacks_used"] = fallbacks
     explicit_invalid = out.get("metric_valid") is False

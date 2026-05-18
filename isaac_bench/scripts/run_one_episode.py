@@ -546,7 +546,9 @@ def build_stop_state_payload(nav_decision: Optional[NavigationDecision], row: Ma
     metadata = dict(getattr(nav_decision, "metadata", {}) or {}) if nav_decision is not None else {}
     stop_allowed = bool(getattr(nav_decision, "stop", False)) if nav_decision is not None else False
     candidate_confirmed = bool(metadata.get("candidate_accepted", False)) or str(getattr(nav_decision, "mode", "")) == "stop"
-    if not stop_allowed and not candidate_confirmed:
+    if row.get("stop_blocked_reason"):
+        reason = str(row["stop_blocked_reason"])
+    elif not stop_allowed and not candidate_confirmed:
         reason = "candidate_not_confirmed"
     else:
         reason = str(row.get("stop_reason") or metadata.get("stop_reason") or getattr(nav_decision, "reason", ""))
@@ -554,10 +556,27 @@ def build_stop_state_payload(nav_decision: Optional[NavigationDecision], row: Ma
         "stop_allowed": bool(stop_allowed),
         "stop_reason": reason,
         "candidate_confirmed": bool(candidate_confirmed),
+        "policy_stop_confirmed": bool(row.get("policy_stop_confirmed", False)),
+        "success_requires_sgnav_stop": bool(row.get("success_requires_sgnav_stop", False)),
+        "gt_success_region_reached": bool(row.get("gt_success_region_reached", False)),
+        "stop_blocked_reason": row.get("stop_blocked_reason"),
         "mode": getattr(nav_decision, "mode", None) if nav_decision is not None else None,
         "success": bool(row.get("success", False)),
         "distance_to_goal": row.get("distance_to_goal"),
     }
+
+
+def success_region_can_finish(
+    distance_to_goal: float,
+    success_distance: float,
+    *,
+    require_sgnav_stop: bool,
+    policy_stop_confirmed: bool,
+) -> bool:
+    inside_success_region = float(distance_to_goal) <= float(success_distance)
+    if not inside_success_region:
+        return False
+    return bool(policy_stop_confirmed or not require_sgnav_stop)
 
 
 def final_log_row(row: dict) -> dict:
@@ -598,6 +617,12 @@ def final_log_row(row: dict) -> dict:
         "hcot_llm_last_error",
         "hc_p_num_subgraphs_total",
         "hc_p_num_subgraphs_scored",
+        "stop_called",
+        "policy_stop_confirmed",
+        "success_requires_sgnav_stop",
+        "gt_success_region_reached",
+        "gt_success_without_sgnav_stop_steps",
+        "stop_blocked_reason",
     ):
         if key in row:
             out[key] = row.get(key)
@@ -1001,6 +1026,11 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
     full_path: List[Tuple[int, int]] = []
     failure_reason = None
     stop_called = False
+    policy_stop_confirmed = False
+    gt_success_region_reached = False
+    gt_success_without_sgnav_stop_steps = 0
+    stop_blocked_reason = None
+    logged_gt_success_without_sgnav_stop = False
     last_detections_2d: List[Detection2D] = []
     detection_category_counts = Counter()
     goal_detection_history = []
@@ -1529,9 +1559,25 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
                 failure_reason = "agent_off_static_metric_map"
                 break
             evaluator.update_pose(pose, metric_grid, collided=bool(obs.get("collided", False)))
-            if evaluator.final_distance_to_goal <= success_distance and not bool(args.require_sgnav_stop):
+            if evaluator.final_distance_to_goal <= success_distance:
+                gt_success_region_reached = True
+            if success_region_can_finish(
+                evaluator.final_distance_to_goal,
+                success_distance,
+                require_sgnav_stop=bool(args.require_sgnav_stop),
+                policy_stop_confirmed=False,
+            ):
                 stop_called = True
                 break
+            if evaluator.final_distance_to_goal <= success_distance and bool(args.require_sgnav_stop):
+                gt_success_without_sgnav_stop_steps += 1
+                stop_blocked_reason = "sgnav_stop_required"
+                if not logged_gt_success_without_sgnav_stop:
+                    print(
+                        "[sgnav-loop] inside GT success radius, but strict SG-Nav STOP is not confirmed; continuing perception/replanning",
+                        flush=True,
+                    )
+                    logged_gt_success_without_sgnav_stop = True
 
             perception_due = detector is not None and (step % perception_every == 0 or force_perception_step)
             if perception_due:
@@ -1802,7 +1848,16 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
                     ]
                 )
                 if nav_decision.stop:
+                    policy_stop_confirmed = True
+                    stop_blocked_reason = None
                     if evaluator.final_distance_to_goal <= success_distance:
+                        gt_success_region_reached = True
+                    if success_region_can_finish(
+                        evaluator.final_distance_to_goal,
+                        success_distance,
+                        require_sgnav_stop=bool(args.require_sgnav_stop),
+                        policy_stop_confirmed=True,
+                    ):
                         stop_called = True
                     else:
                         failure_reason = "sgnav_stop_outside_goal_region"
@@ -1999,6 +2054,13 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
             path_world = path_cells_to_world(current_path[1: min(len(current_path), 20)], dynamic_map_info)
             if not path_world:
                 if evaluator.final_distance_to_goal <= success_distance:
+                    gt_success_region_reached = True
+                if success_region_can_finish(
+                    evaluator.final_distance_to_goal,
+                    success_distance,
+                    require_sgnav_stop=bool(args.require_sgnav_stop),
+                    policy_stop_confirmed=policy_stop_confirmed,
+                ):
                     stop_called = True
                     if viz is not None:
                         viz.update(
@@ -2024,6 +2086,15 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
                             failure_reason=failure_reason,
                         )
                     break
+                if evaluator.final_distance_to_goal <= success_distance and bool(args.require_sgnav_stop):
+                    gt_success_without_sgnav_stop_steps += 1
+                    stop_blocked_reason = "sgnav_stop_required"
+                    if not logged_gt_success_without_sgnav_stop:
+                        print(
+                            "[sgnav-loop] local path ended inside GT success radius, but SG-Nav STOP is not confirmed; continuing",
+                            flush=True,
+                        )
+                        logged_gt_success_without_sgnav_stop = True
                 if last_decision_mode in {"candidate", "frontier"}:
                     if paper_mode:
                         long_term_goal.clear("reached")
@@ -2151,6 +2222,12 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
         row["sim_backend"] = "isaac"
         row["closed_loop"] = True
         row["control_mode"] = "kinematic_holonomic"
+        row["stop_called"] = bool(stop_called)
+        row["policy_stop_confirmed"] = bool(policy_stop_confirmed)
+        row["success_requires_sgnav_stop"] = bool(args.require_sgnav_stop)
+        row["gt_success_region_reached"] = bool(gt_success_region_reached)
+        row["gt_success_without_sgnav_stop_steps"] = int(gt_success_without_sgnav_stop_steps)
+        row["stop_blocked_reason"] = stop_blocked_reason
         row["seeded_object_memory_count"] = int(seeded)
         row["object_memory_count"] = int(len(object_memory.nodes))
         row["goal_candidate_count"] = int(goal_candidate_count)
