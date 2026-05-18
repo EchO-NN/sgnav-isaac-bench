@@ -169,7 +169,7 @@ mapping:
     legacy_watershed_allowed: debug_only
     source_grid: online_depth_observed
     proposal_mode: distance_watershed
-    finalization_mode: doorway_constrained_merge
+    finalization_mode: no_merge
     use_structural_obstacle_mask: true
     suppress_furniture_obstacles: true
     update_every_steps: 5
@@ -190,14 +190,14 @@ mapping:
     doorway_unknown_support_max_ratio: 0.20
     doorway_endpoint_wall_distance_m: 0.35
     doorway_neck_ratio_max: 0.55
-    open_boundary_merge: true
-    merge_same_semantic_category: true
-    merge_unknown_into_open_labeled_region: true
-    use_premerge_labels_for_open_plan_merge: true
+    open_boundary_merge: false
+    merge_same_semantic_category: false
+    merge_unknown_into_open_labeled_region: false
+    use_premerge_labels_for_open_plan_merge: false
     min_label_reliability_for_functional_split: 0.65
     unknown_allows_functional_split: false
     final_label_after_merge: true
-    merge_wide_openings: true
+    merge_wide_openings: false
     small_segment_merge_area_m2: 1.2
     id_iou_threshold: 0.35
     unknown_boundary_confidence_penalty: true
@@ -250,7 +250,7 @@ object_memory:
   child_area_ratio_threshold: 0.35
 
 room_semantics:
-  use_premerge_labels_for_open_plan_merge: true
+  use_premerge_labels_for_open_plan_merge: false
   min_label_reliability_for_functional_split: 0.65
   unknown_allows_functional_split: false
   final_label_after_merge: true

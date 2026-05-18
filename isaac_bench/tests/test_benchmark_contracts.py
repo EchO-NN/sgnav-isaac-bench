@@ -176,8 +176,9 @@ def test_config_defaults_match_benchmark_contract():
     assert cfg["mapping"]["room_map_mode"] == "online_rose2_structure"
     assert cfg["mapping"]["room_segmentation"]["algorithm"] == "rose2_structure"
     assert cfg["mapping"]["room_segmentation"]["legacy_watershed_allowed"] == "debug_only"
-    assert cfg["mapping"]["room_segmentation"]["finalization_mode"] == "doorway_constrained_merge"
-    assert cfg["room_semantics"]["use_premerge_labels_for_open_plan_merge"] is True
+    assert cfg["mapping"]["room_segmentation"]["finalization_mode"] == "no_merge"
+    assert cfg["mapping"]["room_segmentation"]["open_boundary_merge"] is False
+    assert cfg["room_semantics"]["use_premerge_labels_for_open_plan_merge"] is False
     assert cfg["perception"]["yolo_world"]["reject_edge_touching_bboxes"] is False
     assert cfg["perception"]["yolo_world"]["mask_aware_partial_tracking"] is True
     assert cfg["object_memory"]["use_edge_touching_detections_for_policy"] is False

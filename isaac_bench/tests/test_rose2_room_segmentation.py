@@ -6,7 +6,7 @@ import pytest
 
 from isaac_bench.graph.room_context import RoomContextCache, prepare_room_context_for_frontier_scoring
 from isaac_bench.mapping.coordinate_transform import MapInfo
-from isaac_bench.mapping.room_segmentation import RoomMask, RoomSegmentationConfig
+from isaac_bench.mapping.room_segmentation import RoomMask, RoomProposalState, RoomSegmentationConfig
 from isaac_bench.mapping.room_segmentation_debug import save_rose2_roomseg_debug
 from isaac_bench.mapping.rose2_room_segmentation import OnlineROSE2RoomSegmenter
 from isaac_bench.metrics.result_schema import BenchmarkAssetError, validate_strict_benchmark_assets
@@ -63,6 +63,47 @@ def test_rose2_kitchen_living_structural_boundary_preserved():
     assert len([room for room in rooms if not room.stale]) == 2
     assert segmenter.last_debug["num_representative_lines"] >= 1
     assert all(room.source == "rose2_structure" for room in rooms)
+
+
+def test_rose2_no_merge_finalization_keeps_proposals_separate():
+    labels = np.zeros((12, 20), dtype=np.int32)
+    labels[2:10, 2:10] = 1
+    labels[2:10, 10:18] = 2
+    free = labels > 0
+    segmenter = OnlineROSE2RoomSegmenter(
+        RoomSegmentationConfig(
+            resolution_m=0.10,
+            min_room_area_m2=0.1,
+            finalization_mode="no_merge",
+            open_boundary_merge=False,
+            use_premerge_labels_for_open_plan_merge=False,
+        )
+    )
+    state = RoomProposalState(
+        proposal_labels=labels,
+        structural_free_mask=free,
+        structural_obstacle_mask=np.zeros_like(free),
+        unknown_mask=~free,
+        distance_m=np.ones_like(labels, dtype=np.float32),
+        step=3,
+        debug={"algorithm": "rose2_structure", "source": "rose2_structure"},
+    )
+
+    rooms = segmenter.finalize_proposals(
+        state,
+        proposal_semantic_labels={
+            1: {"category": "living_room", "label_reliability": 0.9},
+            2: {"category": "living_room", "label_reliability": 0.9},
+        },
+    )
+
+    assert len([room for room in rooms if not room.stale]) == 2
+    assert segmenter.last_debug["finalization_mode"] == "no_merge"
+    assert segmenter.last_debug["merge_disabled"] is True
+    assert segmenter.last_debug["proposal_room_count"] == 2
+    assert segmenter.last_debug["final_room_count"] == 2
+    assert segmenter.last_debug["merge_operations"] == []
+    assert all(room.metadata["proposal_labels"] == [idx] for idx, room in enumerate(rooms, start=1))
 
 
 def test_rose2_visualization_outputs_layer_json(tmp_path):

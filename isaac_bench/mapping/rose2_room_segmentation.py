@@ -152,15 +152,35 @@ class OnlineROSE2RoomSegmenter:
         if not np.any(labels > 0):
             self.last_debug = self._empty_debug()
             return []
-        final_labels, merge_debug, doorway_edges = merge_open_plan_proposals(
-            proposal_labels=labels,
-            structural_free_mask=proposal_state.structural_free_mask,
-            structural_obstacle_mask=proposal_state.structural_obstacle_mask,
-            unknown_mask=proposal_state.unknown_mask,
-            distance_m=proposal_state.distance_m,
-            config=self.config,
-            proposal_semantic_labels=proposal_semantic_labels,
-        )
+        finalization_mode = str(self.config.finalization_mode or "doorway_constrained_merge").strip().lower()
+        if finalization_mode in {"no_merge", "proposal_only", "premerge_proposals"}:
+            final_labels = labels.copy()
+            doorway_edges: List[dict] = []
+            merge_debug = {
+                "proposal_mode": str(self.config.proposal_mode),
+                "finalization_mode": finalization_mode,
+                "proposal_room_count": int(len([v for v in np.unique(labels) if int(v) > 0])),
+                "final_room_count": int(len([v for v in np.unique(final_labels) if int(v) > 0])),
+                "proposal_room_masks": _proposal_masks_debug(labels),
+                "merge_disabled": True,
+                "merge_operations": [],
+                "doorway_edges": [],
+                "functional_split_edges": [],
+                "adjacency_evidence": [],
+                "adjacency_decisions": [],
+            }
+        elif finalization_mode == "doorway_constrained_merge":
+            final_labels, merge_debug, doorway_edges = merge_open_plan_proposals(
+                proposal_labels=labels,
+                structural_free_mask=proposal_state.structural_free_mask,
+                structural_obstacle_mask=proposal_state.structural_obstacle_mask,
+                unknown_mask=proposal_state.unknown_mask,
+                distance_m=proposal_state.distance_m,
+                config=self.config,
+                proposal_semantic_labels=proposal_semantic_labels,
+            )
+        else:
+            raise ValueError("unsupported ROSE2 room finalization_mode: %s" % self.config.finalization_mode)
         rooms: List[RoomMask] = []
         for label_id in sorted(int(v) for v in np.unique(final_labels) if int(v) > 0):
             mask = final_labels == label_id
@@ -180,6 +200,8 @@ class OnlineROSE2RoomSegmenter:
                 "final_room_count": int(len(rooms)),
                 "room_count": int(len(rooms)),
                 "rooms": [room_mask_to_debug(room) for room in rooms],
+                "finalization_mode": finalization_mode,
+                "merge_disabled": bool(merge_debug.get("merge_disabled", False)),
                 "merge_split_decisions": list(merge_debug.get("adjacency_decisions") or []),
                 "merge_operations": list(merge_debug.get("merge_operations") or []),
                 "functional_split_edges": list(merge_debug.get("functional_split_edges") or []),
