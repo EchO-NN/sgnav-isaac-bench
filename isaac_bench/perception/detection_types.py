@@ -6,7 +6,7 @@ from typing import Dict, Literal, Optional, Tuple
 import numpy as np
 
 
-MIN_VALID_DETECTION_CONFIDENCE = 0.65
+MIN_VALID_DETECTION_CONFIDENCE = 0.55
 
 
 def detection_confidence_is_valid(confidence: float, min_confidence: float = MIN_VALID_DETECTION_CONFIDENCE) -> bool:

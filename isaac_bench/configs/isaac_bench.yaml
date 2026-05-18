@@ -210,8 +210,8 @@ perception:
   sam2_checkpoint: data/models/sam2.1_hiera_small.pt
   sam2_model_cfg: configs/sam2.1/sam2.1_hiera_s.yaml
   sam2_device: cuda
-  confidence_threshold: 0.65
-  min_valid_detection_confidence: 0.65
+  confidence_threshold: 0.55
+  min_valid_detection_confidence: 0.55
   nms_iou_threshold: 0.5
   prompt_mode: global_dataset_vocab
   max_detections_per_frame: 100
@@ -259,7 +259,7 @@ sgnav:
   debug_graph_dump: false
   debug_graph_dump_dir: debug/graphs
   candidate_min_detector_hits: 2
-  candidate_start_min_confidence: 0.65
+  candidate_start_min_confidence: 0.55
   candidate_start_min_hits: 2
   candidate_recent_max_age_steps: 30
   candidate_match_substring: false

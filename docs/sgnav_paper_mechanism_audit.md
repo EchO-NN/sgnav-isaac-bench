@@ -36,7 +36,7 @@ only when both proposal labels are reliable, non-unknown, and different. Object
 lists such as sink/fridge/sofa/TV are evidence to the room recognizer only, not
 authoritative split rules.
 
-YOLO detections at or below `0.65` confidence, and YOLO boxes touching an image
+YOLO detections at or below `0.55` confidence, and YOLO boxes touching an image
 edge, are rejected before SAM2/depth fusion, object memory, candidate-goal
 logic, STOP, policy graph objects, and first-version GNN features. Rejected
 detections remain in raw debug logs. Object tracks expose the accumulated

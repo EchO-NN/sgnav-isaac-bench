@@ -11,8 +11,8 @@ Metric-path SG-Nav runs must use the following pipeline:
 1. Isaac RGB-D observations are the only online perception and mapping input.
 2. YOLO-World detections provide metric-path open-vocabulary object boxes.
 3. SAM2 masks are prompted from YOLO-World boxes for metric-path segmentation.
-4. A YOLO/SAM detection is valid only when `confidence > 0.65`. Detections at
-   or below 0.65 must not draw RGB bboxes, enter mask/depth fusion, create
+4. A YOLO/SAM detection is valid only when `confidence > 0.55`. Detections at
+   or below 0.55 must not draw RGB bboxes, enter mask/depth fusion, create
    object-memory nodes, create scene-graph object nodes, seed candidate goals,
    or support STOP confirmation.
 5. YOLO-World boxes that touch the image edge are raw-detection debug records

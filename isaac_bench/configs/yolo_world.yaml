@@ -1,4 +1,4 @@
 model: data/models/yolov8l-worldv2.pt
-confidence_threshold: 0.7
+confidence_threshold: 0.55
 nms_iou_threshold: 0.5
 prompt_mode: global_dataset_vocab

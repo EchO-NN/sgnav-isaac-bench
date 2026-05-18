@@ -87,14 +87,14 @@ def test_room_prompt_registers_room_instance():
 
 def test_fused_instance_registry_rejects_low_confidence_detections():
     registry = FusedInstanceRegistry(merge_distance_m=0.75, merge_iou_3d=0.05)
-    low = Detection2D("chair", "chair", 0.65, (2.0, 2.0, 5.0, 5.0), mask=_mask())
-    high = Detection2D("chair", "chair", 0.66, (2.0, 2.0, 5.0, 5.0), mask=_mask())
+    low = Detection2D("chair", "chair", 0.55, (2.0, 2.0, 5.0, 5.0), mask=_mask())
+    high = Detection2D("chair", "chair", 0.56, (2.0, 2.0, 5.0, 5.0), mask=_mask())
 
     assert registry.update([low], _depth(), _intr(), (0.0, 0.0, 1.0, 0.0), step_id=1, min_points=1, stride=1) == []
     instances = registry.update([high], _depth(), _intr(), (0.0, 0.0, 1.0, 0.0), step_id=2, min_points=1, stride=1)
 
     assert len(instances) == 1
-    assert instances[0].confidence == 0.66
+    assert instances[0].confidence == 0.56
 
 
 def test_object_memory_can_register_fused_instances_with_geometry():

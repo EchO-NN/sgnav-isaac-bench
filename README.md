@@ -239,7 +239,7 @@ online geometry room segmentation and VLM room labels by default; use
 clutter. GT goal cells are disabled by default so oracle goal markers do not
 appear in strict visualization.
 
-YOLO/SAM detections are treated as valid only when `confidence > 0.65`. Lower
+YOLO/SAM detections are treated as valid only when `confidence > 0.55`. Lower
 or equal detections are filtered before bbox rendering, mask/depth fusion,
 object memory insertion, scene-graph object nodes, and goal-candidate logic.
 YOLO boxes touching an image edge are also rejected from SAM2, depth

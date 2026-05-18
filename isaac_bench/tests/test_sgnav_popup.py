@@ -73,8 +73,8 @@ def test_sgnav_popup_does_not_draw_low_confidence_bbox():
     image = viz._render_rgb(
         np.zeros((80, 100, 3), dtype=np.uint8),
         [
-            Detection2D("chair", "chair", 0.65, (20, 20, 40, 40), 0),
-            Detection2D("mirror", "mirror", 0.66, (60, 20, 80, 40), 1),
+            Detection2D("chair", "chair", 0.55, (20, 20, 40, 40), 0),
+            Detection2D("mirror", "mirror", 0.56, (60, 20, 80, 40), 1),
         ],
         (100, 80),
         goal_category="mirror",

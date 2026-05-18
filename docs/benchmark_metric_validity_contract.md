@@ -44,7 +44,7 @@ Every episode result row must include:
   `fallbacks_used` is empty.
 - `dry_run` detector implies `metric_valid=false`.
 - A YOLO/SAM detection is a valid online object detection only when
-  `confidence > 0.65`. Detections at or below 0.65 must not draw RGB bboxes,
+  `confidence > 0.55`. Detections at or below 0.55 must not draw RGB bboxes,
   enter object memory, form object scene-graph nodes, or seed goal candidates.
 - YOLO-World boxes that touch an image edge are raw debug detections only:
   `used_for_object_track=false` and
