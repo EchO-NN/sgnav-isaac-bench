@@ -267,7 +267,7 @@ def test_strict_mode_does_not_use_watershed_fallback(tmp_path):
     segmenter = _segmenter(tmp_path, occupied.shape)
     segmenter.update(occupied, free, occupied, unknown, step=1, vertical_profile=profile)
 
-    assert segmenter.last_debug["algorithm"] == "rose2_source_form"
+    assert segmenter.last_debug["algorithm"] == "rose2_source_form_v2"
     assert segmenter.last_debug["strict_fallback_used"] is False
 
 

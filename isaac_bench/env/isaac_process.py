@@ -346,11 +346,13 @@ class IsaacSimServer:
         except Exception as exc:
             self.log("[isaac] viewport camera binding skipped: %s" % exc)
 
-    def set_pose_world(self, pose_world: Tuple[float, float, float, float]) -> None:
+    def set_pose_world(self, pose_world: Tuple[float, float, float, float], *, sync_robot: bool = True) -> None:
         x, y, z, yaw = [float(v) for v in pose_world]
+        if not all(math.isfinite(v) for v in (x, y, z, yaw)):
+            raise ValueError("Isaac kinematic pose contains non-finite values: %r" % (pose_world,))
         self.kinematic_pose = (x, y, z, yaw)
         quat = yaw_to_quat_wxyz(yaw)
-        if self.robot is not None:
+        if bool(sync_robot) and self.robot is not None:
             try:
                 self.robot.set_world_pose(
                     position=np.asarray([x, y, z], dtype=np.float32),
@@ -448,15 +450,26 @@ class IsaacSimServer:
         rgb_device: Optional[str] = None,
     ) -> dict:
         previous_frame_token = self._camera_frame_token()
+        vx, vy, wz, dt = float(vx), float(vy), float(wz), float(dt)
+        if not all(math.isfinite(v) for v in (vx, vy, wz, dt)):
+            raise ValueError("Isaac kinematic command contains non-finite values: %r" % ((vx, vy, wz, dt),))
+        if dt < 0.0:
+            raise ValueError("Isaac kinematic dt must be non-negative, got %.6f" % dt)
         x, y, z, yaw = self.get_pose_world()
-        dx = math.cos(yaw) * float(vx) - math.sin(yaw) * float(vy)
-        dy = math.sin(yaw) * float(vx) + math.cos(yaw) * float(vy)
-        yaw = yaw + float(wz) * float(dt)
+        if not all(math.isfinite(float(v)) for v in (x, y, z, yaw)):
+            raise ValueError("Isaac kinematic pose contains non-finite values before step: %r" % ((x, y, z, yaw),))
+        dx = math.cos(yaw) * vx - math.sin(yaw) * vy
+        dy = math.sin(yaw) * vx + math.cos(yaw) * vy
+        yaw = yaw + wz * dt
         while yaw > math.pi:
             yaw -= 2.0 * math.pi
         while yaw < -math.pi:
             yaw += 2.0 * math.pi
-        self.set_pose_world((x + dx * float(dt), y + dy * float(dt), z, yaw))
+        # Closed-loop SG-Nav uses a kinematic observation pose.  Moving the
+        # PhysX Kaya articulation every frame with set_world_pose can corrupt
+        # the articulation transform/broadphase state after repeated updates.
+        # Keep the robot prim at its reset pose and move only the sensor pose.
+        self.set_pose_world((x + dx * dt, y + dy * dt, z, yaw), sync_robot=False)
         for _ in range(int(render_updates)):
             self.app.update()
         self._wait_for_fresh_camera_frame(previous_frame_token, read_depth=self.enable_depth if read_depth is None else bool(read_depth))

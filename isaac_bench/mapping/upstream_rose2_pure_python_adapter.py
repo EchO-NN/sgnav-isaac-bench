@@ -32,12 +32,15 @@ from isaac_bench.mapping.rose2_source_form import (
     ROSE2SourceFormConfig,
     ROSE2SourceResult,
     SOURCE_EXTERNAL_BACKEND,
+    SOURCE_EXTERNAL_RUNNER_BACKEND,
     SOURCE_FORM_BACKEND,
     run_rose2_source_external,
     run_rose2_source_form,
+    run_rose2_source_form_v2,
     save_rose2_source_debug,
     source_result_summary,
 )
+from isaac_bench.mapping.rose2_source_external_runner import run_rose2_source_external_runner
 from isaac_bench.mapping.vertical_profile import VerticalProfileMap, band_index, ensure_vertical_profile
 
 
@@ -47,6 +50,7 @@ UPSTREAM_CONTEXT_SOURCE = "%s_vlm" % SOURCE_FORM_BACKEND
 UPSTREAM_ALGORITHM_ALIASES = {
     SOURCE_FORM_BACKEND,
     UPSTREAM_CONTEXT_SOURCE,
+    SOURCE_EXTERNAL_RUNNER_BACKEND,
     "upstream_rose2_vertical_or_free",
     "upstream_rose2_vertical_or_free_vlm",
     "upstream_rose2_pure_python",
@@ -130,6 +134,20 @@ class UpstreamROSE2Config:
     source_form_min_cut_spacing_m: float = 0.45
     source_form_axis_snap_angle_rad: float = 0.488692191
     source_form_max_cuts_per_axis: int = 96
+    source_form_thin_wall_separator_enabled: bool = True
+    source_form_thin_wall_min_length_m: float = 0.45
+    source_form_thin_wall_max_width_m: float = 0.25
+    source_form_thin_wall_min_aspect_ratio: float = 3.0
+    source_form_thin_wall_free_support_band_m: float = 0.30
+    source_form_thin_wall_min_free_support_ratio: float = 0.25
+    source_form_topology_effective_separator_enabled: bool = True
+    source_form_topology_effective_min_largest_component_drop: float = 0.08
+    source_form_topology_effective_max_candidates: int = 128
+    source_form_doorway_partition_enabled: bool = True
+    source_form_doorway_width_min_m: float = 0.45
+    source_form_doorway_width_max_m: float = 1.60
+    source_form_doorway_min_wall_support_on_sides_m: float = 0.35
+    source_form_merge_guard_enabled: bool = True
 
     @classmethod
     def from_mapping(cls, data: Optional[Mapping[str, object]] = None, **overrides) -> "UpstreamROSE2Config":
@@ -179,7 +197,7 @@ class UpstreamROSE2PurePythonSegmenter:
         self.source_root = validate_upstream_rose2_source_root(
             config.source_root,
             env_name=config.upstream_repo_env,
-            fail=bool(config.fail_on_missing_source and backend == SOURCE_EXTERNAL_BACKEND),
+            fail=bool(config.fail_on_missing_source and backend in {SOURCE_EXTERNAL_BACKEND, SOURCE_EXTERNAL_RUNNER_BACKEND}),
         )
         self._room_config = RoomSegmentationConfig(
             algorithm=UPSTREAM_ALGORITHM,
@@ -218,6 +236,20 @@ class UpstreamROSE2PurePythonSegmenter:
             wall_raster_radius_cells=int(self._structure_config.wall_raster_radius_cells),
             debug_dump=bool(config.debug_rose2_source),
             debug_dir=str(config.rose2_source_work_dir),
+            thin_wall_separator_enabled=bool(config.source_form_thin_wall_separator_enabled),
+            thin_wall_min_length_m=float(config.source_form_thin_wall_min_length_m),
+            thin_wall_max_width_m=float(config.source_form_thin_wall_max_width_m),
+            thin_wall_min_aspect_ratio=float(config.source_form_thin_wall_min_aspect_ratio),
+            thin_wall_free_support_band_m=float(config.source_form_thin_wall_free_support_band_m),
+            thin_wall_min_free_support_ratio=float(config.source_form_thin_wall_min_free_support_ratio),
+            topology_effective_separator_enabled=bool(config.source_form_topology_effective_separator_enabled),
+            topology_effective_min_largest_component_drop=float(config.source_form_topology_effective_min_largest_component_drop),
+            topology_effective_max_candidates=int(config.source_form_topology_effective_max_candidates),
+            doorway_partition_enabled=bool(config.source_form_doorway_partition_enabled),
+            doorway_width_min_m=float(config.source_form_doorway_width_min_m),
+            doorway_width_max_m=float(config.source_form_doorway_width_max_m),
+            doorway_min_wall_support_on_sides_m=float(config.source_form_doorway_min_wall_support_on_sides_m),
+            merge_guard_enabled=bool(config.source_form_merge_guard_enabled),
         )
         self.last_debug: dict = {}
         self.last_result: UpstreamROSE2Result | None = None
@@ -307,6 +339,8 @@ class UpstreamROSE2PurePythonSegmenter:
             config=self.config,
             room_config=self._room_config,
         )
+        if int(structural.get("navigation_free_added_to_strict_roomseg_cells", -1)) != 0:
+            raise AssertionError("strict room segmentation must not add navigation-free cells to vertical-free input")
         backend = str(self.config.backend or SOURCE_FORM_BACKEND).strip().lower()
         source_result, legacy_structure = self._run_source_backend(
             backend=backend,
@@ -345,17 +379,28 @@ class UpstreamROSE2PurePythonSegmenter:
         unknown = np.asarray(structural["repaired_roomseg_unknown"], dtype=bool)
         backend_name = str(backend or SOURCE_FORM_BACKEND).strip().lower()
         legacy_structure: StructureExtractionResult | None = None
-        if backend_name == SOURCE_FORM_BACKEND:
-            source_result = run_rose2_source_form(
+        if backend_name in {SOURCE_FORM_BACKEND, "rose2_source_form"}:
+            source_result = run_rose2_source_form_v2(
                 observed_occupied=occupied,
                 observed_free=free,
                 unknown=unknown,
+                vertical_observed=np.asarray(structural.get("vertical_observed_map", structural.get("vertical_observed")), dtype=bool),
+                vertical_free=np.asarray(structural.get("vertical_free_room_domain", free), dtype=bool),
+                wall_confidence_map=np.asarray(structural.get("wall_confidence_map", np.zeros_like(occupied, dtype=np.float32)), dtype=np.float32),
                 structure_config=self._structure_config,
                 source_config=self._source_form_config,
                 object_memory=object_memory,
             )
         elif backend_name == SOURCE_EXTERNAL_BACKEND:
             source_result = run_rose2_source_external(
+                source_root=self.source_root,
+                observed_occupied=occupied,
+                observed_free=free,
+                unknown=unknown,
+                work_dir=str(self.config.rose2_source_work_dir),
+            )
+        elif backend_name == SOURCE_EXTERNAL_RUNNER_BACKEND:
+            source_result = run_rose2_source_external_runner(
                 source_root=self.source_root,
                 observed_occupied=occupied,
                 observed_free=free,
@@ -378,8 +423,8 @@ class UpstreamROSE2PurePythonSegmenter:
             source_result = _source_result_from_legacy_structure(legacy_structure)
         else:
             raise ValueError(
-                "unsupported roomseg backend %s; expected %s, %s, or %s"
-                % (backend_name, SOURCE_FORM_BACKEND, SOURCE_EXTERNAL_BACKEND, LEGACY_STYLE_BACKEND)
+                "unsupported roomseg backend %s; expected %s, %s, %s, or %s"
+                % (backend_name, SOURCE_FORM_BACKEND, SOURCE_EXTERNAL_BACKEND, SOURCE_EXTERNAL_RUNNER_BACKEND, LEGACY_STYLE_BACKEND)
             )
         if bool(self.config.rose2_compare_legacy) and backend_name != LEGACY_STYLE_BACKEND:
             legacy_structure = extract_rose2_structure(
@@ -395,6 +440,18 @@ class UpstreamROSE2PurePythonSegmenter:
                 "legacy_wall_line_count": int(len(legacy_structure.representative_lines)),
                 "legacy_connected_component_rooms_used": False,
             }
+        source_result.debug.update(
+            {
+                "vertical_free_room_domain": np.asarray(structural.get("vertical_free_room_domain", free), dtype=bool),
+                "vertical_observed": np.asarray(structural.get("vertical_observed_map", structural.get("vertical_observed", occupied | free)), dtype=bool),
+                "observed_not_vertical_free": np.asarray(structural.get("vertical_observed_map", occupied | free), dtype=bool)
+                & ~np.asarray(structural.get("vertical_free_room_domain", free), dtype=bool),
+                "repaired_roomseg_free": free,
+                "repaired_roomseg_occupied": occupied,
+                "repaired_roomseg_unknown": unknown,
+                "wall_confidence_map": np.asarray(structural.get("wall_confidence_map", np.zeros_like(occupied, dtype=np.float32)), dtype=np.float32),
+            }
+        )
         if bool(self.config.debug_rose2_source):
             dump = save_rose2_source_debug(
                 out_dir=str(self.config.rose2_source_work_dir),
@@ -491,6 +548,8 @@ class UpstreamROSE2PurePythonSegmenter:
                 "functional_split_edges": [],
                 "adjacency_evidence": [],
                 "adjacency_decisions": [],
+                "merge_guard_enabled": bool(self.config.source_form_merge_guard_enabled),
+                "merge_blocked_by_strong_boundary_count": 0,
             }
         elif finalization_mode == "doorway_constrained_merge":
             final_labels, finalization_debug, doorway_edges = merge_open_plan_proposals(
@@ -573,6 +632,8 @@ class UpstreamROSE2PurePythonSegmenter:
                 "room_masks": [room_mask_to_debug(room) for room in rooms],
                 "room_labels": [],
                 "merge_operations": list(finalization_debug.get("merge_operations") or []),
+                "merge_guard_enabled": bool(finalization_debug.get("merge_guard_enabled", self.config.source_form_merge_guard_enabled)),
+                "merge_blocked_by_strong_boundary_count": int(finalization_debug.get("merge_blocked_by_strong_boundary_count", 0) or 0),
                 "merge_split_decisions": list(finalization_debug.get("adjacency_decisions") or []),
                 "functional_split_edges": list(finalization_debug.get("functional_split_edges") or []),
                 "adjacency_evidence": list(finalization_debug.get("adjacency_evidence") or []),
@@ -1241,11 +1302,14 @@ def _vertical_profile_structural_maps(
         ),
         "vertical_or_free_z_min_m": float(config.vertical_or_free_z_min_m),
         "vertical_or_free_z_max_m": float(config.vertical_or_free_z_max_m),
+        "vertical_free_source": "vertical_profile_0p2_2p0",
         "vertical_free_overrides_occupied": True,
         "vertical_free_overridden_occupied_cells": int(np.count_nonzero(occ & vertical_or_free)),
         "roomseg_input_source": "vertical_profile_only",
         "vertical_observed_map": vertical_observed,
         "vertical_observed_cells": int(np.count_nonzero(vertical_observed)),
+        "observed_not_vertical_free": vertical_observed & ~vertical_free_room_domain,
+        "observed_not_vertical_free_cells": int(np.count_nonzero(vertical_observed & ~vertical_free_room_domain)),
         "vertical_or_free_map": vertical_or_free,
         "vertical_or_free_cells": int(np.count_nonzero(vertical_or_free)),
         "vertical_free_conflict_map": vertical_free_conflict > 0.0,
@@ -1255,6 +1319,7 @@ def _vertical_profile_structural_maps(
         "vertical_free_room_domain": vertical_free_room_domain,
         "vertical_free_added_to_roomseg_cells": int(np.count_nonzero(vertical_free_room_domain)),
         "navigation_free_added_to_roomseg_cells": 0,
+        "navigation_free_added_to_strict_roomseg_cells": 0,
         "navigation_free_not_added_to_roomseg_cells": int(np.count_nonzero(nav_free_room_domain & ~vertical_free_room_domain)),
         "initial_roomseg_free": initial_roomseg_free,
         "initial_roomseg_occupied": initial_roomseg_occupied,
@@ -1278,6 +1343,8 @@ def _vertical_profile_structural_maps(
         "closed_gap_mask": closed_gap_mask,
         "doorway_virtual_boundary_mask": np.zeros_like(occ, dtype=bool),
         "wall_confidence_threshold": float(config.wall_confidence_threshold),
+        "repaired_roomseg_free_cells": int(np.count_nonzero(repaired_free)),
+        "repaired_roomseg_occupied_cells": int(np.count_nonzero(repaired_occupied)),
         "vertical_carved_cells": int(np.count_nonzero(vertical_carved)),
         "structural_wall_cells": int(np.count_nonzero(repaired_occupied)),
         "furniture_suppressed_cells": int(np.count_nonzero(object_overlap & occ)),

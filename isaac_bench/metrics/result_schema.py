@@ -166,33 +166,35 @@ def validate_strict_benchmark_assets(args: object) -> None:
     room_map_mode = str(_get_arg(args, "room_map_mode", "") or "").strip().lower()
     if room_map_mode in {"observed_rooms_json", "rooms_json", "observed"} and ablation_name != "oracle_room_ablation":
         raise BenchmarkAssetError(
-            "strict SG-Nav metric path requires rose2_source_form room masks; rooms.json/oracle room maps are not allowed"
+            "strict SG-Nav metric path requires rose2_source_form_v2 room masks; rooms.json/oracle room maps are not allowed"
         )
     if room_map_mode in {"online_geometry_watershed", "online_geometry_watershed_vlm"} and ablation_name != "legacy_watershed_room_ablation":
         raise BenchmarkAssetError(
-            "strict SG-Nav metric path requires rose2_source_form room masks; watershed is debug/ablation-only"
+            "strict SG-Nav metric path requires rose2_source_form_v2 room masks; watershed is debug/ablation-only"
         )
     if room_map_mode in {"online_rose2_structure", "rose2_structure", "online_rose2_structure_vlm"} and ablation_name != "local_rose2_lite_room_ablation":
         raise BenchmarkAssetError(
-            "strict SG-Nav metric path requires rose2_source_form room masks; local ROSE2-lite is debug/ablation-only"
+            "strict SG-Nav metric path requires rose2_source_form_v2 room masks; local ROSE2-lite is debug/ablation-only"
         )
     if room_map_mode in {
         "rose2_source_form",
         "rose2_source_form_vlm",
+        "rose2_source_form_v2",
+        "rose2_source_form_v2_vlm",
         "upstream_rose2_vertical_or_free",
         "upstream_rose2_vertical_or_free_vlm",
         "upstream_rose2_pure_python",
         "upstream_rose2_pure_python_vlm",
     }:
         room_cfg = dict(_get_arg(args, "room_segmentation_config", {}) or {})
-        backend = str(room_cfg.get("backend", "rose2_source_form") or "rose2_source_form").strip().lower()
+        backend = str(room_cfg.get("backend", "rose2_source_form_v2") or "rose2_source_form_v2").strip().lower()
         if (
             backend == "legacy_rose2_style_debug"
             and ablation_name != "legacy_rose2_style_room_ablation"
             and not bool(_get_arg(args, "allow_debug_fallbacks", False))
         ):
-            raise BenchmarkAssetError("strict SG-Nav metric path requires rose2_source_form or rose2_source_external; legacy_rose2_style_debug is ablation/debug-only")
-        requires_external_source = backend == "rose2_source_external" and bool(room_cfg.get("require_upstream_source_for_strict", True))
+            raise BenchmarkAssetError("strict SG-Nav metric path requires rose2_source_form_v2 or rose2_source_external_runner; legacy_rose2_style_debug is ablation/debug-only")
+        requires_external_source = backend in {"rose2_source_external", "rose2_source_external_runner"} and bool(room_cfg.get("require_upstream_source_for_strict", True))
         if requires_external_source and not bool(_get_arg(args, "allow_debug_fallbacks", False)):
             try:
                 validate_upstream_rose2_source_root(
@@ -211,8 +213,8 @@ def empty_sgnav_step_dump(metadata: Optional[Mapping[str, object]] = None) -> di
         "rooms": [],
         "room_context": {},
         "room_segmentation": {
-            "source": "rose2_source_form",
-            "algorithm": "rose2_source_form",
+            "source": "rose2_source_form_v2",
+            "algorithm": "rose2_source_form_v2",
             "room_count": 0,
             "rooms": [],
         },

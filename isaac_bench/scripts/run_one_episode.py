@@ -1085,18 +1085,20 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
     elif room_map_mode in {
         "rose2_source_form",
         "rose2_source_form_vlm",
+        "rose2_source_form_v2",
+        "rose2_source_form_v2_vlm",
         "upstream_rose2_vertical_or_free",
         "upstream_rose2_vertical_or_free_vlm",
         "upstream_rose2_pure_python",
         "upstream_rose2_pure_python_vlm",
     }:
-        roomseg_backend = str(getattr(args, "room_segmentation_config", {}).get("backend", "rose2_source_form") or "rose2_source_form").strip().lower()
+        roomseg_backend = str(getattr(args, "room_segmentation_config", {}).get("backend", "rose2_source_form_v2") or "rose2_source_form_v2").strip().lower()
         upstream_cfg = UpstreamROSE2Config.from_mapping(
             getattr(args, "room_segmentation_config", {}),
             resolution_m=float(dynamic_map_info.resolution_m),
             fail_on_missing_source=bool(getattr(args, "strict_benchmark", False))
             and not bool(getattr(args, "allow_debug_fallbacks", False))
-            and roomseg_backend == "rose2_source_external"
+            and roomseg_backend in {"rose2_source_external", "rose2_source_external_runner"}
             and bool(getattr(args, "room_segmentation_config", {}).get("require_upstream_source_for_strict", True)),
         )
         room_segmenter = UpstreamROSE2PurePythonSegmenter(upstream_cfg, dynamic_map_info)
@@ -2942,7 +2944,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--debug-roomseg-layers", action="store_true", default=None)
     parser.add_argument("--debug-roomseg-dir", default=None)
     parser.add_argument("--debug-roomseg-max-saves", type=int, default=None)
-    parser.add_argument("--roomseg-backend", default=None, choices=["rose2_source_form", "rose2_source_external", "legacy_rose2_style_debug"])
+    parser.add_argument("--roomseg-backend", default=None, choices=["rose2_source_form", "rose2_source_form_v2", "rose2_source_external", "rose2_source_external_runner", "legacy_rose2_style_debug"])
     parser.add_argument("--debug-rose2-source", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--rose2-source-work-dir", default=None)
     parser.add_argument("--rose2-compare-legacy", action=argparse.BooleanOptionalAction, default=None)
@@ -3377,7 +3379,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         default_robot_radius_m = 0.5 * float(get_nested(cfg, "robot.footprint_width_m", 0.28))
     args.robot_radius_m = float(args.robot_radius_m if args.robot_radius_m is not None else default_robot_radius_m)
     args.online_inflation_radius_m = float(args.online_inflation_radius_m if args.online_inflation_radius_m is not None else get_nested(cfg, "mapping.inflation_radius_m", 0.0))
-    args.room_map_mode = str(args.room_map_mode or get_nested(cfg, "mapping.room_map_mode", "rose2_source_form_vlm"))
+    args.room_map_mode = str(args.room_map_mode or get_nested(cfg, "mapping.room_map_mode", "rose2_source_form_v2_vlm"))
     args.room_segmentation_config = dict(get_nested(cfg, "mapping.room_segmentation", {}) or {})
     roomseg_debug_layers_cfg = dict(args.room_segmentation_config.get("debug_layers", {}) or {})
     roomseg_overlay_cfg = dict(args.room_segmentation_config.get("navigation_free_context_overlay", {}) or {})
@@ -3413,7 +3415,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     args.debug_roomseg_layers = bool(roomseg_debug_layers_cfg.get("enabled", False))
     args.debug_roomseg_dir = str(roomseg_debug_layers_cfg.get("output_dir", "debug/roomseg_layers"))
     args.debug_roomseg_max_saves = int(roomseg_debug_layers_cfg.get("max_saves", 50))
-    args.roomseg_backend = str(args.room_segmentation_config.get("backend", "rose2_source_form"))
+    args.roomseg_backend = str(args.room_segmentation_config.get("backend", "rose2_source_form_v2"))
     args.debug_rose2_source = bool(args.room_segmentation_config.get("debug_rose2_source", False))
     args.rose2_source_work_dir = str(args.room_segmentation_config.get("rose2_source_work_dir", "debug/rose2_source"))
     args.rose2_compare_legacy = bool(args.room_segmentation_config.get("rose2_compare_legacy", False))

@@ -15,10 +15,10 @@ def test_required_sgnav_defaults():
     assert cfg["perception"]["grounding_dino"]["checkpoint"].endswith("groundingdino_swinb_cogcoor.pth")
     assert cfg["perception"]["grounding_dino"]["config"].endswith("GroundingDINO_SwinB.cfg.py")
     assert cfg["sgnav"]["candidate_start_min_confidence"] == 0.45
-    assert cfg["mapping"]["room_map_mode"] == "rose2_source_form_vlm"
+    assert cfg["mapping"]["room_map_mode"] == "rose2_source_form_v2_vlm"
     assert cfg["mapping"]["strict_no_oracle_rooms"] is True
-    assert cfg["mapping"]["room_segmentation"]["algorithm"] == "rose2_source_form"
-    assert cfg["mapping"]["room_segmentation"]["backend"] == "rose2_source_form"
+    assert cfg["mapping"]["room_segmentation"]["algorithm"] == "rose2_source_form_v2"
+    assert cfg["mapping"]["room_segmentation"]["backend"] == "rose2_source_form_v2"
     assert cfg["mapping"]["room_segmentation"]["source_mode"] == "source_form_no_ros"
     assert cfg["mapping"]["room_segmentation"]["legacy_watershed_allowed"] == "debug_only"
     assert cfg["mapping"]["room_segmentation"]["local_rose2_lite_allowed"] == "debug_only"
@@ -29,6 +29,10 @@ def test_required_sgnav_defaults():
     assert cfg["mapping"]["room_segmentation"]["finalization_mode"] == "no_merge_until_source_backend_verified"
     assert cfg["mapping"]["room_segmentation"]["strict_disallow_legacy_fallback"] is True
     assert cfg["mapping"]["room_segmentation"]["source_form"]["min_cell_area_m2"] == 0.35
+    assert cfg["mapping"]["room_segmentation"]["source_form"]["thin_wall_separator_enabled"] is True
+    assert cfg["mapping"]["room_segmentation"]["source_form"]["topology_effective_separator_enabled"] is True
+    assert cfg["mapping"]["room_segmentation"]["source_form"]["doorway_partition_enabled"] is True
+    assert cfg["mapping"]["room_segmentation"]["source_form"]["merge_guard_enabled"] is True
     assert cfg["mapping"]["room_segmentation"]["use_structural_obstacle_mask"] is True
     assert cfg["mapping"]["room_segmentation"]["vertical_or_free"]["enabled"] is True
     assert cfg["mapping"]["room_segmentation"]["vertical_or_free"]["z_min_m"] == 0.20
@@ -58,7 +62,7 @@ def test_required_sgnav_defaults():
     assert cfg["object_memory"]["footprint_iou_track_match_threshold"] == 0.20
     assert cfg["object_memory"]["child_containment_threshold"] == 0.70
     assert cfg["object_memory"]["child_object_area_ratio_max"] == 0.35
-    assert cfg["sgnav"]["scene_graph"]["room_nodes"]["source"] == "rose2_source_form_vlm"
+    assert cfg["sgnav"]["scene_graph"]["room_nodes"]["source"] == "rose2_source_form_v2_vlm"
     assert cfg["visualization"]["show_gt_goal_cells"] is False
     assert cfg["visualization"]["show_room_proposals"] is True
     assert cfg["isaac"]["perception_every_steps"] == 1
