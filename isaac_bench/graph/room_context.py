@@ -57,7 +57,7 @@ class RoomContextResult:
     object_evidence_hash: str = ""
     room_mask_geometry_hash: str = ""
     room_object_evidence_hash: str = ""
-    source: str = "rose2_source_faithful_v1_vlm"
+    source: str = "upstream_rose2_vertical_or_free_vlm"
 
     def metadata(self, *, full_order: bool = True) -> dict:
         trace = list(SCORING_ROOM_CALL_ORDER_FULL if full_order else self.call_order_trace)
@@ -73,7 +73,7 @@ class RoomContextResult:
             "room_label_cache_hits": int(self.label_cache_hits),
             "room_call_order_trace": trace,
             "room_segmentation_called_for": "frontier_scoring_pre_hook",
-            "room_segmentation_algorithm": str(self.room_segmentation_debug.get("algorithm", "rose2_source_faithful_v1")),
+            "room_segmentation_algorithm": str(self.room_segmentation_debug.get("algorithm", "upstream_rose2_vertical_or_free")),
             "room_segmentation_step_index": self.room_segmentation_debug.get("step"),
             "room_vlm_called": bool(self.labeling_ran),
             "scenegraph_updated_after_room_context": True,
@@ -131,8 +131,10 @@ def prepare_room_context_for_frontier_scoring(
         unknown_arr = ~np.asarray(observed_arr, dtype=bool)
     else:
         unknown_arr = np.asarray(unknown_mask, dtype=bool)
+    static_structural_arr = _resolve_optional_mapper_array("roomseg_static_structural_occupied", mapper, obstacle_arr.shape)
+    roomseg_ray_evidence = _resolve_roomseg_ray_evidence(mapper, obstacle_arr.shape)
 
-    map_hash = _hash_arrays(free_arr, obstacle_arr, unknown_arr)
+    map_hash = _hash_arrays(free_arr, obstacle_arr, unknown_arr, static_structural_arr, *roomseg_ray_evidence.values())
     object_hash = _hash_object_memory(object_memory)
     if (
         cache.last_result is not None
@@ -182,6 +184,10 @@ def prepare_room_context_for_frontier_scoring(
                 build_params = {}
             if "vertical_profile" in build_params:
                 build_kwargs["vertical_profile"] = getattr(mapper, "vertical_profile", None)
+            if "roomseg_static_structural_occupied" in build_params:
+                build_kwargs["roomseg_static_structural_occupied"] = static_structural_arr
+            if "roomseg_ray_evidence" in build_params:
+                build_kwargs["roomseg_ray_evidence"] = roomseg_ray_evidence
             proposal_rooms, proposal_state = room_segmenter.build_proposals(
                 occupancy_arr,
                 free_arr,
@@ -219,6 +225,10 @@ def prepare_room_context_for_frontier_scoring(
                 update_kwargs["object_memory"] = getattr(object_memory, "nodes", [])
             if "vertical_profile" in update_params:
                 update_kwargs["vertical_profile"] = getattr(mapper, "vertical_profile", None)
+            if "roomseg_static_structural_occupied" in update_params:
+                update_kwargs["roomseg_static_structural_occupied"] = static_structural_arr
+            if "roomseg_ray_evidence" in update_params:
+                update_kwargs["roomseg_ray_evidence"] = roomseg_ray_evidence
             room_masks = room_segmenter.update(
                 occupancy_arr,
                 free_arr,
@@ -236,6 +246,10 @@ def prepare_room_context_for_frontier_scoring(
             update_kwargs["object_memory"] = getattr(object_memory, "nodes", [])
         if "vertical_profile" in update_params:
             update_kwargs["vertical_profile"] = getattr(mapper, "vertical_profile", None)
+        if "roomseg_static_structural_occupied" in update_params:
+            update_kwargs["roomseg_static_structural_occupied"] = static_structural_arr
+        if "roomseg_ray_evidence" in update_params:
+            update_kwargs["roomseg_ray_evidence"] = roomseg_ray_evidence
         room_masks = room_segmenter.update(
             occupancy_arr,
             free_arr,
@@ -330,6 +344,48 @@ def _resolve_array(name: str, explicit: Optional[np.ndarray], mapper: object | N
         value = getattr(mapper, name)
         return np.asarray(value() if callable(value) else value)
     raise ValueError("room context could not resolve %s from mapper" % name)
+
+
+def _resolve_optional_mapper_array(name: str, mapper: object | None, shape: tuple[int, ...]) -> np.ndarray:
+    if mapper is None or not hasattr(mapper, name):
+        return np.zeros(shape, dtype=bool)
+    value = getattr(mapper, name)
+    arr = np.asarray(value() if callable(value) else value, dtype=bool)
+    if arr.shape != tuple(shape):
+        return np.zeros(shape, dtype=bool)
+    return arr
+
+
+def _resolve_roomseg_ray_evidence(mapper: object | None, shape: tuple[int, ...]) -> dict[str, np.ndarray]:
+    out = {
+        "ray_covered_count": np.zeros(shape, dtype=np.uint16),
+        "terminal_wall_count": np.zeros(shape, dtype=np.uint16),
+        "terminal_wall_height_min": np.full(shape, np.inf, dtype=np.float32),
+        "terminal_wall_height_max": np.full(shape, -np.inf, dtype=np.float32),
+        "terminal_wall_depth_min": np.full(shape, np.inf, dtype=np.float32),
+        "terminal_wall_splat": np.zeros(shape, dtype=np.uint8),
+    }
+    if mapper is None:
+        return out
+    source = getattr(mapper, "roomseg_ray_evidence", None)
+    raw = source() if callable(source) else None
+    if not isinstance(raw, Mapping):
+        raw = {
+            "ray_covered_count": getattr(mapper, "roomseg_ray_covered_count", None),
+            "terminal_wall_count": getattr(mapper, "roomseg_terminal_wall_count", None),
+            "terminal_wall_height_min": getattr(mapper, "roomseg_terminal_wall_height_min", None),
+            "terminal_wall_height_max": getattr(mapper, "roomseg_terminal_wall_height_max", None),
+            "terminal_wall_depth_min": getattr(mapper, "roomseg_terminal_wall_depth_min", None),
+            "terminal_wall_splat": getattr(mapper, "roomseg_terminal_wall_splat", None),
+        }
+    for key, default in list(out.items()):
+        value = raw.get(key) if isinstance(raw, Mapping) else None
+        if value is None:
+            continue
+        arr = np.asarray(value, dtype=default.dtype)
+        if arr.shape == tuple(shape):
+            out[key] = arr
+    return out
 
 
 def _hash_arrays(*arrays: np.ndarray) -> str:

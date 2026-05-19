@@ -18,6 +18,7 @@ from isaac_bench.config import repo_root
 from isaac_bench.dataset.category_normalizer import normalize_category
 from isaac_bench.perception.detection_types import Detection2D
 from isaac_bench.perception.detector_base import DetectorBase
+from isaac_bench.perception.grounding_dino_detector import grounding_dino_vocabulary
 
 
 def detection_to_payload(det: Detection2D) -> Dict[str, Any]:
@@ -141,7 +142,10 @@ class SubprocessDetector(DetectorBase):
         return sys.executable
 
     def set_vocabulary(self, categories: List[str]) -> None:
-        self.vocab = [normalize_category(cat) for cat in categories]
+        if self.detector_name == "grounding_dino":
+            self.vocab = grounding_dino_vocabulary(categories)
+        else:
+            self.vocab = [normalize_category(cat) for cat in categories]
         self._ensure_started()
         self._send({"type": "set_vocabulary", "categories": self.vocab})
         self._read_response("ok", timeout_s=self.response_timeout_s)

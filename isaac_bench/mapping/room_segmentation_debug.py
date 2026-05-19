@@ -25,6 +25,7 @@ def save_rose2_roomseg_debug(
         "rose2_source_form",
         "rose2_source_form_v2",
         "rose2_source_faithful_v1",
+        "rose2_source_external_runner",
         "upstream_rose2_pure_python",
         "upstream_rose2_vertical_or_free",
     }:
@@ -134,16 +135,9 @@ def rose2_layers_payload(room_masks: Sequence[object], debug: Mapping[str, objec
     source_mode = str(
         debug.get(
             "source_mode",
-            "source_form_no_ros"
-            if algorithm
-            in {
-                "rose2_source_form",
-                "rose2_source_form_v2",
-                "rose2_source_faithful_v1",
-                "upstream_rose2_pure_python",
-                "upstream_rose2_vertical_or_free",
-            }
-            else "local_rose2_lite",
+            "declutter_reconstruct_external"
+            if algorithm in {"rose2_source_external_runner", "upstream_rose2_pure_python", "upstream_rose2_vertical_or_free"}
+            else ("source_form_no_ros" if algorithm in {"rose2_source_form", "rose2_source_form_v2", "rose2_source_faithful_v1"} else "local_rose2_lite"),
         )
     )
     return {
@@ -225,6 +219,19 @@ def rose2_layers_payload(room_masks: Sequence[object], debug: Mapping[str, objec
             {"name": "room_labels", "enabled": True, "primitive_count": len(room_labels)},
             {"name": "repaired_window_gaps", "enabled": True, "primitive_count": len(list(debug.get("repaired_window_gaps") or []))},
             {"name": "verified_doorway_gaps", "enabled": True, "primitive_count": len(list(debug.get("verified_doorway_gaps") or []))},
+            {
+                "name": "rose2_source_external",
+                "enabled": bool(debug.get("actual_backend") == "rose2_source_external_runner" or debug.get("source_backend") == "rose2_source_external_runner"),
+                "primitive_count": int(debug.get("source_room_count", debug.get("num_physical_rooms", 0)) or 0),
+                "backend": str(debug.get("actual_backend", debug.get("source_backend", ""))),
+                "work_dir": str((debug.get("external_runner_summary") or {}).get("work_dir", "")) if isinstance(debug.get("external_runner_summary"), dict) else "",
+                "metric_map_png": str(debug.get("metric_map_path", "")),
+                "source_output_png": str(debug.get("source_output_png", debug.get("source_output_path", ""))),
+                "parsed_labels_png": str(debug.get("parsed_labels_png", "")),
+                "summary_json": str(debug.get("summary_json", "")),
+                "room_count": int(debug.get("source_room_count", debug.get("num_physical_rooms", 0)) or 0),
+                "source_form_used_for_final": bool(debug.get("source_form_used_for_final", False)),
+            },
         ],
     }
 

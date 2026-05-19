@@ -1,8 +1,8 @@
 # External Assets
 
 This repository does not vendor Isaac Sim, InteriorAgent scenes, GroundingDINO-B/Swin-B
-weights, SAM2 checkpoints, the upstream ROSE2/declutter-reconstruct source
-checkout, or LLM model/server assets.
+weights, SAM2 checkpoints, optional upstream ROSE2/declutter-reconstruct source
+checkout for debug/ablation, or LLM model/server assets.
 
 ## Default Asset Paths
 
@@ -17,7 +17,8 @@ The default config uses:
   a package/Hydra config reference; it does not need to exist as a repo-local
   file when the installed SAM2 package can resolve it)
 - OpenAI-compatible LLM endpoint: `http://127.0.0.1:8000/v1`
-- Upstream no-ROS ROSE2 source root: `${ROSE2_SOURCE_ROOT}` pointing at a
+- Optional upstream no-ROS ROSE2 source root for debug/ablation:
+  `${ROSE2_SOURCE_ROOT}` pointing at a
   `goldleaf3i/declutter-reconstruct` checkout that contains
   `code/FFT_MQ.py`, `code/minibatch.py`, and `code/parameters.py`
 
@@ -47,13 +48,14 @@ Run:
 python -m isaac_bench.scripts.check_assets \
   --require-grounding-dino \
   --require-sam2 \
-  --require-rose2-source \
   --require-interioragent \
   --require-isaac
 ```
 
-The command exits with status `0` when all requested assets are present and
-prints a clear missing-path report with nonzero status otherwise.
+The command exits with status `0` when all requested strict-default assets are
+present and prints a clear missing-path report with nonzero status otherwise.
+Add `--require-rose2-source` only when intentionally running an upstream ROSE2
+debug/ablation backend.
 
 ## Benchmark Rule
 

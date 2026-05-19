@@ -34,8 +34,11 @@ def _args(**overrides):
         "allow_gt_goal_fallback": False,
         "static_nearfield_map": False,
         "frontier_allow_near_fallback": False,
-        "room_map_mode": "upstream_rose2_vertical_or_free",
-        "room_segmentation_config": {"require_upstream_source_for_strict": False},
+        "room_map_mode": "vertical_free_gap_closure_v1_vlm",
+        "room_segmentation_config": {
+            "backend": "vertical_free_gap_closure_v1",
+            "require_upstream_source_for_strict": False,
+        },
         "yolo_world_model": "data/models/yolov8l-worldv2.pt",
         "grounding_dino_checkpoint": "data/models/groundingdino_swinb_cogcoor.pth",
         "grounding_dino_config": "data/models/GroundingDINO_SwinB.cfg.py",
@@ -195,23 +198,30 @@ def test_config_defaults_match_benchmark_contract():
     assert cfg["nearfield_static_map"]["enabled"] is False
     assert cfg["mapping"]["frontier_allow_near_fallback"] is False
     assert cfg["mapping"]["frontier_min_distance_m"] == 1.0
-    assert cfg["mapping"]["room_map_mode"] == "rose2_source_faithful_v1_vlm"
+    assert cfg["mapping"]["room_map_mode"] == "vertical_free_gap_closure_v1_vlm"
     assert cfg["mapping"]["strict_no_oracle_rooms"] is True
-    assert cfg["mapping"]["room_segmentation"]["algorithm"] == "rose2_source_faithful_v1"
-    assert cfg["mapping"]["room_segmentation"]["backend"] == "rose2_source_faithful_v1"
-    assert cfg["mapping"]["room_segmentation"]["source_mode"] == "source_form_no_ros"
+    assert cfg["mapping"]["room_segmentation"]["algorithm"] == "vertical_free_gap_closure_v1"
+    assert cfg["mapping"]["room_segmentation"]["backend"] == "vertical_free_gap_closure_v1"
+    assert cfg["mapping"]["room_segmentation"]["source_mode"] == "declutter_reconstruct_external"
     assert cfg["mapping"]["room_segmentation"]["legacy_watershed_allowed"] == "debug_only"
     assert cfg["mapping"]["room_segmentation"]["local_rose2_lite_allowed"] == "debug_only"
-    assert cfg["mapping"]["room_segmentation"]["require_upstream_source_for_strict"] is True
+    assert cfg["mapping"]["room_segmentation"]["require_upstream_source_for_strict"] is False
+    assert cfg["mapping"]["room_segmentation"]["allow_source_form_in_metric"] is False
+    assert cfg["mapping"]["room_segmentation"]["allow_silent_fallback"] is False
     assert cfg["mapping"]["room_segmentation"]["upstream_repo_env"] == "ROSE2_SOURCE_ROOT"
     assert cfg["mapping"]["room_segmentation"]["run_only_before_frontier_scoring"] is True
-    assert cfg["mapping"]["room_segmentation"]["finalization_mode"] == "no_merge_until_source_backend_verified"
+    assert cfg["mapping"]["room_segmentation"]["finalization_mode"] == "no_merge_until_geometry_verified"
     assert cfg["mapping"]["room_segmentation"]["strict_disallow_legacy_fallback"] is True
     assert cfg["mapping"]["room_segmentation"]["source_form"]["min_cell_area_m2"] == 0.35
     assert cfg["mapping"]["room_segmentation"]["open_boundary_merge"] is True
     assert cfg["mapping"]["room_segmentation"]["vertical_or_free"]["enabled"] is True
     assert cfg["mapping"]["room_segmentation"]["vertical_or_free"]["z_min_m"] == 0.20
     assert cfg["mapping"]["room_segmentation"]["vertical_or_free"]["z_max_m"] == 2.00
+    assert cfg["mapping"]["room_segmentation"]["vertical_free_roomseg"]["enabled"] is True
+    assert cfg["mapping"]["room_segmentation"]["vertical_free_roomseg"]["doorway_width_max_m"] == 1.60
+    assert cfg["mapping"]["room_segmentation"]["vertical_free_gap_closure"]["enabled"] is True
+    assert cfg["mapping"]["room_segmentation"]["vertical_free_gap_closure"]["close_max_gap_m"] == 1.50
+    assert cfg["mapping"]["room_segmentation"]["vertical_free_gap_closure"]["topology_verify_enabled"] is True
     assert cfg["mapping"]["room_segmentation"]["wall_confidence_threshold"] == 0.55
     assert cfg["mapping"]["room_segmentation"]["vertical_free_suppression_weight"] == 0.35
     assert cfg["mapping"]["room_segmentation"]["furniture_suppression_radius_m"] == 0.90
@@ -298,15 +308,14 @@ def test_check_assets_reports_required_missing_paths(tmp_path, capsys, monkeypat
     assert "MISSING grounding_dino_checkpoint" in captured.out
 
 
-def test_check_assets_reports_missing_rose2_source(tmp_path, capsys, monkeypatch):
+def test_check_assets_does_not_require_rose2_source_for_gap_closure_default(tmp_path, capsys, monkeypatch):
     monkeypatch.setenv("ROSE2_SOURCE_ROOT", str(tmp_path / "missing-rose2"))
 
     status = check_assets_main(["--require-rose2-source"])
     captured = capsys.readouterr()
 
-    assert status == 2
-    assert "MISSING rose2_source_root" in captured.out
-    assert "declutter-reconstruct" in captured.out
+    assert status == 0
+    assert "OPTIONAL_MISSING rose2_source_root" in captured.out
 
 
 def test_asset_path_lookup_accepts_legacy_isaac_root_env(monkeypatch):

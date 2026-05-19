@@ -16,6 +16,10 @@ def _fake_source_root(tmp_path: Path) -> Path:
     code.mkdir(parents=True)
     for name in ("FFT_MQ.py", "minibatch.py", "parameters.py"):
         (code / name).write_text("# MIT upstream placeholder for vertical profile tests\n", encoding="utf-8")
+    util = code / "util"
+    util.mkdir()
+    for name in ("layout.py", "postprocessing.py"):
+        (util / name).write_text("# MIT upstream placeholder for vertical profile tests\n", encoding="utf-8")
     return root
 
 
@@ -33,6 +37,8 @@ def _segmenter(
     return UpstreamROSE2PurePythonSegmenter(
         UpstreamROSE2Config(
             source_root=str(_fake_source_root(tmp_path)),
+            backend="rose2_source_faithful_v1",
+            allow_source_form_in_metric=True,
             resolution_m=0.10,
             min_room_area_m2=0.5,
             hough_min_line_length_m=0.5,

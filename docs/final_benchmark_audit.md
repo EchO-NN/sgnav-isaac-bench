@@ -18,10 +18,10 @@ enabled and reachable.
     `pytest` is not installed in the base shell.
   - Repository environment result: `./run_isaac_bench.sh -m pytest -q`
     passed with `127 passed`.
-- `./run_isaac_bench.sh -m isaac_bench.scripts.check_assets --require-grounding-dino --require-sam2 --require-rose2-source --require-interioragent --require-isaac`
-  must pass before a strict metric run. It reports `MISSING rose2_source_root`
-  when `ROSE2_SOURCE_ROOT` is not set to a `goldleaf3i/declutter-reconstruct`
-  checkout containing the required source files.
+- `./run_isaac_bench.sh -m isaac_bench.scripts.check_assets --require-grounding-dino --require-sam2 --require-interioragent --require-isaac`
+  must pass before a strict metric run. `ROSE2_SOURCE_ROOT` is optional for the
+  strict default `vertical_free_gap_closure_v1` room segmenter and should be
+  required only for upstream ROSE2 debug/ablation runs.
 - `./scripts/run_sgnav_isaac_env.sh -m isaac_bench.scripts.preprocess_interioragent --dataset-root ${INTERIORAGENT_ROOT:-/home/echo/InteriorAgent} --out data/interioragent_preprocessed --resolution 0.05 --scene-id kujiale_0031`
   passed and wrote one preprocessed scene.
 - `./scripts/run_sgnav_isaac_env.sh -m isaac_bench.scripts.generate_episodes --preprocessed-dir data/interioragent_preprocessed --scene-id kujiale_0031 --episodes-per-scene 10 --out data/interioragent_episodes/debug.jsonl`

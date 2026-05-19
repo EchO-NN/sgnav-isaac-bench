@@ -12,6 +12,14 @@ from isaac_bench.mapping.upstream_rose2_pure_python_adapter import (
     REQUIRED_SOURCE_FILES,
     validate_upstream_rose2_source_root,
 )
+from isaac_bench.mapping.vertical_free_roomseg import (
+    VERTICAL_FREE_ROOMSEG_ALGORITHM,
+    VERTICAL_FREE_ROOMSEG_BACKEND,
+)
+from isaac_bench.mapping.vertical_free_gap_closure_roomseg import (
+    VERTICAL_FREE_GAP_CLOSURE_ALGORITHM,
+    VERTICAL_FREE_GAP_CLOSURE_BACKEND,
+)
 
 
 def _path_from_env_or_config(env_names: Union[str, Sequence[str]], cfg: dict, config_key: str, default: str) -> str:
@@ -72,6 +80,23 @@ def main(argv: Optional[List[str]] = None) -> int:
     args = parser.parse_args(argv)
 
     cfg = load_config(args.config)
+    roomseg_backend = str(get_nested(cfg, "mapping.room_segmentation.backend", "") or "").strip().lower()
+    uses_rose2_source = (
+        roomseg_backend
+        not in {
+            VERTICAL_FREE_ROOMSEG_BACKEND,
+            VERTICAL_FREE_ROOMSEG_ALGORITHM,
+            VERTICAL_FREE_GAP_CLOSURE_BACKEND,
+            VERTICAL_FREE_GAP_CLOSURE_ALGORITHM,
+        }
+        and (
+            "rose2" in roomseg_backend
+            or "source_form" in roomseg_backend
+            or "source_faithful" in roomseg_backend
+            or "external_runner" in roomseg_backend
+        )
+    )
+    rose2_source_required = bool(args.require_rose2_source and uses_rose2_source)
     checks = [
         _check_path(
             "isaac_sim_root",
@@ -132,7 +157,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 "",
             ),
             str(get_nested(cfg, "mapping.room_segmentation.upstream_repo_env", DEFAULT_SOURCE_ENV) or DEFAULT_SOURCE_ENV),
-            args.require_rose2_source,
+            rose2_source_required,
         ),
     ]
     missing_required = [item for item in checks if item["required"] and not item["exists"]]

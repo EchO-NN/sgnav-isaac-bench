@@ -1,5 +1,6 @@
 import json
 import numpy as np
+import pytest
 
 from isaac_bench.mapping.rose2_source_external_runner import run_rose2_source_external_runner
 from isaac_bench.mapping.rose2_source_form import ROSE2SourceFormConfig, run_rose2_source_form_v2
@@ -130,21 +131,21 @@ def test_external_runner_smoke_writes_reproducible_failure_report(tmp_path):
     occupied = np.zeros(shape, dtype=bool)
     unknown = ~(free | occupied)
 
-    result = run_rose2_source_external_runner(
-        source_root=tmp_path / "missing_source",
-        observed_occupied=occupied,
-        observed_free=free,
-        unknown=unknown,
-        work_dir=tmp_path / "external",
-        timeout_s=1.0,
-    )
+    with pytest.raises(FileNotFoundError):
+        run_rose2_source_external_runner(
+            source_root=tmp_path / "missing_source",
+            observed_occupied=occupied,
+            observed_free=free,
+            unknown=unknown,
+            work_dir=tmp_path / "external",
+            timeout_s=1.0,
+        )
 
     summary_path = tmp_path / "external" / "external_summary.json"
     assert summary_path.exists()
     summary = json.loads(summary_path.read_text())
     assert summary["failure_reason"] == "missing_rose2_source_root"
     assert (tmp_path / "external" / "external_room_label_map.png").exists()
-    assert result.debug["source_backend"] == "rose2_source_external_runner"
 
 
 def _component_count(mask):

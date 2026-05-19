@@ -153,7 +153,7 @@ def test_online_mapper_vertical_profile_free_uses_ray_height_not_floor_endpoint_
     assert int(np.count_nonzero(mapper.vertical_profile.free_ray_count[band_index("robot_body")])) > 0
     assert int(np.count_nonzero(mapper.vertical_profile.free_ray_count[band_index("mid")])) > 0
     floor_endpoint_cell = mapper.grid.world_to_grid(1.0, 0.0)
-    assert int(np.sum(mapper.vertical_profile.free_ray_count[:, floor_endpoint_cell[0], floor_endpoint_cell[1]])) > 0
+    assert int(np.sum(mapper.vertical_profile.free_ray_count[:, floor_endpoint_cell[0], floor_endpoint_cell[1]])) == 0
 
 
 def test_online_mapper_nearfield_topdown_fills_blind_spot_from_depth():

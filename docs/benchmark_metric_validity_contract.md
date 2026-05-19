@@ -69,11 +69,20 @@ Every episode result row must include:
 - `room_map_mode=observed_rooms_json`, `rooms_json`, or `observed` implies
   oracle room maps and is not valid for the strict SG-Nav metric path unless
   the run is explicitly named `oracle_room_ablation`.
-- `room_map_mode=upstream_rose2_vertical_or_free` is the strict default room
-  segmenter. It requires a no-ROS pure-Python ROSE2 source checkout from
-  `goldleaf3i/declutter-reconstruct`; by default `ROSE2_SOURCE_ROOT` must
-  contain `code/FFT_MQ.py`, `code/minibatch.py`, and `code/parameters.py`.
-  Missing source in strict mode is a clear failure, not a fallback.
+- `room_map_mode=vertical_free_gap_closure_v1_vlm` is the strict default room
+  segmenter. It requires
+  `room_segmentation.backend=vertical_free_gap_closure_v1` and directly
+  segments the 0.2--2.0 m vertical-free roomseg map by closing only verified
+  short wall gaps as virtual room boundaries. It must not require
+  `ROSE2_SOURCE_ROOT`, call upstream ROSE2, use watershed geometry, or silently
+  fallback to ROSE2/source-form/watershed output.
+- `room_map_mode=upstream_rose2_vertical_or_free` with
+  `room_segmentation.backend=rose2_source_external_runner` is now a named
+  ROSE2 debug/ablation path. If selected, missing source or source parse failure
+  is a clear failure, not a fallback.
+- `rose2_source_form`, `rose2_source_form_v2`, `rose2_source_faithful_v1`,
+  and `legacy_rose2_style_debug` are debug/ablation-only room backends and may
+  not contaminate metric rows unless a named ablation is explicitly declared.
 - `room_map_mode=online_rose2_structure`, `rose2_structure`, or
   `online_rose2_structure_vlm` is the local ROSE2-lite debug/ablation path and
   is not valid for the strict SG-Nav metric path unless the run is explicitly

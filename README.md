@@ -25,13 +25,14 @@ External assets are not vendored. By default the project expects:
 - InteriorAgent: `/home/echo/InteriorAgent`
 - GroundingDINO-B/Swin-B: `data/models/groundingdino_swinb_cogcoor.pth`
 - SAM2: `data/models/sam2.1_hiera_small.pt`
-- No-ROS ROSE2 source: `ROSE2_SOURCE_ROOT` pointing at
-  `goldleaf3i/declutter-reconstruct`
+- Optional ROSE2 source for debug/ablation only: `ROSE2_SOURCE_ROOT` pointing
+  at `goldleaf3i/declutter-reconstruct`
 - Optional OpenAI-compatible LLM endpoint: `http://127.0.0.1:8000/v1`
 
 Override paths with `ISAAC_SIM_ROOT`, `INTERIORAGENT_ROOT`,
 `GROUNDING_DINO_CHECKPOINT`, `GROUNDING_DINO_CONFIG`, `GROUNDING_DINO_ROOT`,
-`SAM2_CHECKPOINT`, `SAM2_MODEL_CFG`, `ROSE2_SOURCE_ROOT`, and `LLM_BASE_URL`.
+`SAM2_CHECKPOINT`, `SAM2_MODEL_CFG`, optional `ROSE2_SOURCE_ROOT`, and
+`LLM_BASE_URL`.
 `ISAAC_ROOT` remains a legacy alias for `ISAAC_SIM_ROOT`.
 
 ```bash
@@ -47,10 +48,13 @@ Check required assets:
 python -m isaac_bench.scripts.check_assets \
   --require-grounding-dino \
   --require-sam2 \
-  --require-rose2-source \
   --require-interioragent \
   --require-isaac
 ```
+
+Add `--require-rose2-source` only for upstream ROSE2 debug/ablation runs; the
+strict default `vertical_free_gap_closure_v1` room segmentation does not need
+that source checkout.
 
 ## Preprocess And Episodes
 
@@ -95,33 +99,26 @@ Strict SG-Nav requires GroundingDINO-B/Swin-B and SAM2. A row is metric-valid on
 debug fallback is used. Local deterministic LLM scoring is non-metric unless a
 named ablation is explicitly declared; configure a real OpenAI-compatible LLM
 for metric SG-Nav scoring. The default config uses `llm.enabled: true`,
-`mapping.room_map_mode: upstream_rose2_vertical_or_free`,
-`mapping.room_segmentation.algorithm: upstream_rose2_vertical_or_free`,
-`mapping.room_segmentation.source_mode: declutter_reconstruct_mit`,
-`mapping.room_segmentation.require_upstream_source_for_strict: true`,
-`sgnav.scene_graph.room_nodes.source: upstream_rose2_vertical_or_free_vlm`,
+`mapping.room_map_mode: vertical_free_gap_closure_v1_vlm`,
+`mapping.room_segmentation.algorithm: vertical_free_gap_closure_v1`,
+`mapping.room_segmentation.backend: vertical_free_gap_closure_v1`,
+`mapping.room_segmentation.require_upstream_source_for_strict: false`,
+`sgnav.scene_graph.room_nodes.source: vertical_free_gap_closure_v1_vlm`,
 `mapping.frontier_min_distance_m: 1.0`, and
 `sgnav.frontier_distance_weight: 0.2`.
 
-Room nodes in strict SG-Nav come from the no-ROS upstream ROSE2 pure-Python
-adapter over the online occupancy/free-space map, followed by VLM labels over
-objects inside those masks. Set `ROSE2_SOURCE_ROOT` to a
-`goldleaf3i/declutter-reconstruct` checkout containing `code/FFT_MQ.py`,
-`code/minibatch.py`, and `code/parameters.py`. Missing source in strict mode
-fails clearly; it does not fall back to local ROSE2-lite, watershed, or
-`rooms.json`. `unknown` is the correct room label when the evidence is
-insufficient. `rooms.json` labels are rejected in strict metric mode except for
-a named `oracle_room_ablation`. Local ROSE2-lite and old watershed room
-segmentation are kept only for debug or explicit ablations.
-
-Room segmentation is two-stage. Upstream ROSE2 first separates structural wall evidence
-from clutter with DFT dominant directions, directional filtering, Hough wall
-segments, wall clustering, representative walls, and grid-face room masks.
-Before ROSE2 extraction, the online mapper's vertical profile builds
-`vertical_carved_map` and `wall_confidence_map`: vertical free evidence can
-suppress furniture, but only floor-level traversability plus wall-line support
-can create a verified doorway. Window, curtain, glass, and exterior/perimeter
-gaps are closed as walls for room segmentation.
+Room nodes in strict SG-Nav come from pure Python vertical-free gap closure over
+the online 0.2--2.0 m vertical-free roomseg map: short wall gaps are closed only
+as virtual room boundaries after endpoint, side-support, and topology checks,
+then rooms are connected components of `vertical_free & ~virtual_boundary`.
+VLM labels are applied over objects inside those masks. This path does not require
+`ROSE2_SOURCE_ROOT`, does not call upstream ROSE2, and does not fall back to
+local ROSE2-lite, watershed, or `rooms.json`. Virtual room boundaries are not
+written into the planner obstacle map. `unknown` is the correct room
+label when the evidence is insufficient. `rooms.json` labels are rejected in
+strict metric mode except for a named `oracle_room_ablation`. Upstream ROSE2,
+local ROSE2-lite, and old watershed room segmentation are kept only for debug
+or explicit ablations.
 Premerge proposal labels are used only to decide weak/open-plan functional
 splits. Verified structural walls preserve splits regardless of room labels.
 Open-plan proposal boundaries preserve a functional split only when both
@@ -159,7 +156,7 @@ or non-diagnostic evidence is labeled `unknown`.
   --strict-benchmark true \
   --llm-enabled true \
   --llm-base-url ${LLM_BASE_URL:-http://127.0.0.1:8000/v1} \
-  --room-map-mode upstream_rose2_vertical_or_free \
+  --room-map-mode vertical_free_gap_closure_v1_vlm \
   --output data/isaac_bench_runs/final_strict_smoke/results.jsonl \
   --debug-map debug/final_strict_smoke.png
 ```
@@ -181,7 +178,7 @@ For a headed Isaac window with saved SG-Nav visualization panels:
   --strict-benchmark true \
   --llm-enabled true \
   --llm-base-url ${LLM_BASE_URL:-http://127.0.0.1:8000/v1} \
-  --room-map-mode upstream_rose2_vertical_or_free \
+  --room-map-mode vertical_free_gap_closure_v1_vlm \
   --sgnav-viz \
   --sgnav-viz-save-dir debug/full_llm_episode_viz \
   --debug-graph-dump \
@@ -204,7 +201,7 @@ For a short integration check on machines with Isaac/model assets:
   --sim-backend isaac \
   --headless true \
   --strict-benchmark true \
-  --room-map-mode upstream_rose2_vertical_or_free \
+  --room-map-mode vertical_free_gap_closure_v1_vlm \
   --max-control-steps 1 \
   --panorama-steps 0 \
   --output data/isaac_bench_runs/short_isaac_smoke/results.jsonl

@@ -29,6 +29,10 @@ def _fake_source_root(tmp_path: Path) -> Path:
     code.mkdir(parents=True)
     for name in ("FFT_MQ.py", "minibatch.py", "parameters.py"):
         (code / name).write_text("# MIT upstream placeholder for adapter tests\n", encoding="utf-8")
+    util = code / "util"
+    util.mkdir()
+    for name in ("layout.py", "postprocessing.py"):
+        (util / name).write_text("# MIT upstream placeholder for adapter tests\n", encoding="utf-8")
     return root
 
 
@@ -58,7 +62,7 @@ def test_upstream_rose2_missing_source_strict_fails(tmp_path):
         llm_enabled=True,
         room_map_mode="upstream_rose2_vertical_or_free",
         room_segmentation_config={
-            "backend": "rose2_source_external",
+            "backend": "rose2_source_external_runner",
             "source_root": str(tmp_path / "missing"),
             "upstream_repo_env": "ROSE2_SOURCE_ROOT",
             "require_upstream_source_for_strict": True,
@@ -83,8 +87,11 @@ def test_upstream_rose2_synthetic_two_rooms(tmp_path):
     segmenter = UpstreamROSE2PurePythonSegmenter(
         UpstreamROSE2Config(
             source_root=str(_fake_source_root(tmp_path)),
+            source_mode="source_form_no_ros",
             resolution_m=0.10,
             min_room_area_m2=0.5,
+            backend="rose2_source_faithful_v1",
+            allow_source_form_in_metric=True,
             hough_min_line_length_m=0.5,
             hough_line_gap_m=0.15,
             wall_min_support_ratio=0.10,
@@ -96,7 +103,8 @@ def test_upstream_rose2_synthetic_two_rooms(tmp_path):
     rooms = segmenter.update(occupied, free, occupied, unknown, step=1)
 
     assert len([room for room in rooms if not room.stale]) == 2
-    assert segmenter.last_debug["algorithm"] == "rose2_source_faithful_v1"
+    assert segmenter.last_debug["algorithm"] == "upstream_rose2_vertical_or_free"
+    assert segmenter.last_debug["source_backend"] == "rose2_source_faithful_v1"
     assert segmenter.last_debug["source_mode"] == "source_form_no_ros"
     assert segmenter.last_debug["strict_fallback_used"] is False
 
@@ -113,8 +121,11 @@ def test_upstream_rose2_open_living_not_oversplit(tmp_path):
     segmenter = UpstreamROSE2PurePythonSegmenter(
         UpstreamROSE2Config(
             source_root=str(_fake_source_root(tmp_path)),
+            source_mode="source_form_no_ros",
             resolution_m=0.10,
             min_room_area_m2=0.5,
+            backend="rose2_source_faithful_v1",
+            allow_source_form_in_metric=True,
             hough_min_line_length_m=0.5,
             debug_dump=False,
         ),
@@ -141,8 +152,11 @@ def test_final_room_masks_absorb_rose_free_cells_left_unlabeled_by_boundaries(tm
     segmenter = UpstreamROSE2PurePythonSegmenter(
         UpstreamROSE2Config(
             source_root=str(_fake_source_root(tmp_path)),
+            source_mode="source_form_no_ros",
             resolution_m=0.10,
             min_room_area_m2=0.5,
+            backend="rose2_source_faithful_v1",
+            allow_source_form_in_metric=True,
             finalization_mode="no_merge",
             debug_dump=False,
         ),
@@ -182,8 +196,11 @@ def test_upstream_rose2_debug_artifact_contract(tmp_path):
     segmenter = UpstreamROSE2PurePythonSegmenter(
         UpstreamROSE2Config(
             source_root=str(_fake_source_root(tmp_path)),
+            source_mode="source_form_no_ros",
             resolution_m=0.10,
             min_room_area_m2=0.5,
+            backend="rose2_source_faithful_v1",
+            allow_source_form_in_metric=True,
             hough_min_line_length_m=0.5,
             wall_min_support_ratio=0.10,
             debug_dump=True,
@@ -198,7 +215,7 @@ def test_upstream_rose2_debug_artifact_contract(tmp_path):
     payload = json.loads(layers.read_text(encoding="utf-8"))
 
     assert png.exists()
-    assert payload["algorithm"] == "rose2_source_faithful_v1"
+    assert payload["algorithm"] == "upstream_rose2_vertical_or_free"
     assert payload["source_mode"] == "source_form_no_ros"
     assert "num_rooms" in payload
     assert "num_wall_lines" in payload

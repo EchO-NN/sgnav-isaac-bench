@@ -146,12 +146,13 @@ def test_source_form_open_plan_does_not_turn_clutter_into_rooms():
     assert result.debug["source_cell_count"] == 1
 
 
-def test_adapter_strict_default_uses_source_form_without_external_source_root(tmp_path):
+def test_source_form_ablation_can_run_without_external_source_root(tmp_path):
     occupied, free, unknown = _two_rooms_with_door()
     segmenter = UpstreamROSE2PurePythonSegmenter(
         UpstreamROSE2Config(
             source_root=str(tmp_path / "missing-source"),
             backend=SOURCE_FORM_BACKEND,
+            allow_source_form_in_metric=True,
             resolution_m=0.10,
             min_room_area_m2=0.5,
             hough_min_line_length_m=0.5,
@@ -188,7 +189,7 @@ def test_legacy_style_backend_is_rejected_when_strict_disallow_is_set(tmp_path):
         segmenter.update(occupied, free, occupied, unknown, step=3)
 
 
-def test_strict_asset_contract_requires_external_source_only_for_external_backend(tmp_path):
+def test_strict_asset_contract_rejects_source_form_and_requires_external_source(tmp_path):
     base = dict(
         strict_benchmark=True,
         allow_debug_fallbacks=False,
@@ -200,15 +201,16 @@ def test_strict_asset_contract_requires_external_source_only_for_external_backen
         room_map_mode="upstream_rose2_vertical_or_free",
         ablation_name=None,
     )
-    validate_strict_benchmark_assets(
-        Namespace(**base, room_segmentation_config={"backend": SOURCE_FORM_BACKEND, "source_root": str(tmp_path / "missing")})
-    )
+    with pytest.raises(BenchmarkAssetError, match="debug/ablation-only"):
+        validate_strict_benchmark_assets(
+            Namespace(**base, room_segmentation_config={"backend": SOURCE_FORM_BACKEND, "source_root": str(tmp_path / "missing")})
+        )
     with pytest.raises(BenchmarkAssetError, match="Missing upstream ROSE2"):
         validate_strict_benchmark_assets(
             Namespace(
                 **base,
                 room_segmentation_config={
-                    "backend": SOURCE_EXTERNAL_BACKEND,
+                    "backend": "rose2_source_external_runner",
                     "source_root": str(tmp_path / "missing"),
                     "require_upstream_source_for_strict": True,
                 },

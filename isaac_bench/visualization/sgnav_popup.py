@@ -644,6 +644,27 @@ class SGNavPopupVisualizer:
         obs = np.asarray(observed, dtype=bool)
         roomseg_free = self._room_debug_array("initial_roomseg_free", shape, bool)
         roomseg_occupied = self._room_debug_array("initial_roomseg_occupied", shape, bool)
+        initial_unknown_after_fusion = self._room_debug_array("initial_roomseg_unknown_after_fusion", shape, bool)
+        vertical_free_room_domain = self._room_debug_array("vertical_free_room_domain", shape, bool)
+        vertical_occupied_0p2_2p0 = self._room_debug_array("vertical_occupied_0p2_2p0", shape, bool)
+        vertical_observed = self._room_debug_array("vertical_observed_map", shape, bool)
+        vertical_observed_0p2_2p0 = self._room_debug_array("vertical_observed_0p2_2p0", shape, bool)
+        vertical_unknown_before_overlay = self._room_debug_array("vertical_unknown_before_overlay", shape, bool)
+        roomseg_ray_covered_count = self._room_debug_array("roomseg_ray_covered_count", shape, np.uint16)
+        roomseg_terminal_wall_count = self._room_debug_array("roomseg_terminal_wall_count", shape, np.uint16)
+        roomseg_terminal_wall_splat = self._room_debug_array("roomseg_terminal_wall_splat", shape, bool)
+        ray_valid_wall = self._room_debug_array("ray_valid_wall_inference", shape, bool)
+        unknown_removed_by_ray_wall = self._room_debug_array("unknown_removed_by_ray_wall", shape, bool)
+        nav_raw_obstacle = self._room_debug_array("nav_raw_obstacle", shape, bool)
+        static_structural = self._room_debug_array("roomseg_static_structural_occupied", shape, bool)
+        nav_obstacle_overlay_accepted = self._room_debug_array("nav_obstacle_overlay_accepted", shape, bool)
+        walls_rescued_from_unknown = self._room_debug_array("walls_rescued_from_unknown", shape, bool)
+        vertical_free_over_nav_obstacle = self._room_debug_array("vertical_free_over_nav_obstacle", shape, bool)
+        repaired_free = self._room_debug_array("repaired_roomseg_free", shape, bool)
+        repaired_occupied = self._room_debug_array("repaired_roomseg_occupied", shape, bool)
+        boundary_map = self._room_debug_array("boundary_map", shape, bool)
+        virtual_boundary = self._room_debug_array("virtual_boundary_map", shape, bool)
+        accepted_closure = self._room_debug_array("accepted_closure_map", shape, bool)
         vertical_or_free = self._room_debug_array("vertical_or_free_map", shape, bool)
         vertical_carved = self._room_debug_array("vertical_carved_map", shape, bool)
         structural = self._room_debug_array("structural_wall_mask", shape, bool)
@@ -658,10 +679,24 @@ class SGNavPopupVisualizer:
         context_absorbed = (context_labels > 0) & (final_labels <= 0)
         threshold = float(self._room_segmentation_debug.get("wall_confidence_threshold", 0.55) or 0.55)
         wall_conf_hot = wall_conf >= threshold if wall_conf.shape == shape else np.zeros(shape, dtype=bool)
+        debug_only = bool(self._room_segmentation_debug.get("roomseg_debug_only", False))
+        vertical_debug_free = (
+            vertical_free_room_domain
+            if np.any(vertical_free_room_domain)
+            else (repaired_free if np.any(repaired_free) else roomseg_free)
+        )
 
         has_rose_input = bool(
-            np.any(roomseg_free)
+            np.any(vertical_debug_free)
+            or np.any(roomseg_free)
             or np.any(roomseg_occupied)
+            or np.any(vertical_observed)
+            or np.any(vertical_observed_0p2_2p0)
+            or np.any(ray_valid_wall)
+            or np.any(roomseg_terminal_wall_splat)
+            or np.any(nav_raw_obstacle)
+            or np.any(static_structural)
+            or np.any(nav_obstacle_overlay_accepted)
             or np.any(vertical_or_free)
             or np.any(vertical_carved)
             or np.any(structural)
@@ -669,24 +704,63 @@ class SGNavPopupVisualizer:
             or np.any(suppressed_clutter)
             or np.any(wall_conf > 0.0)
         )
-        rose_occupied = roomseg_occupied if np.any(roomseg_occupied) else (structural if np.any(structural) else (clean_structure | wall_conf_hot))
+        rose_occupied = (
+            repaired_occupied
+            if debug_only and np.any(repaired_occupied)
+            else (roomseg_occupied if np.any(roomseg_occupied) else (structural if np.any(structural) else (clean_structure | wall_conf_hot)))
+        )
         vertical_free_overridden_occupied = occ & vertical_or_free & ~roomseg_occupied
         canvas = np.zeros((shape[0], shape[1], 3), dtype=np.uint8)
-        canvas[:, :] = (36, 40, 48)
-        canvas[nav] = (86, 92, 96)
-        canvas[obs & nav] = (118, 126, 130)
-        canvas[obs & ~nav] = (54, 56, 60)
-        if not has_rose_input:
-            canvas[occ] = (8, 8, 8)
-        canvas[roomseg_free] = (150, 156, 160)
-        canvas[suppressed_clutter] = (58, 82, 132)
-        canvas[vertical_or_free] = (116, 96, 74)
-        canvas[vertical_carved] = (126, 104, 75)
-        canvas[vertical_free_overridden_occupied] = (225, 132, 45)
-        canvas[wall_conf_hot] = (255, 105, 75)
-        canvas[rose_occupied] = (0, 0, 0)
-        canvas[clean_structure] = (255, 190, 70)
-        canvas[context_absorbed] = (120, 210, 255)
+        if debug_only:
+            canvas[:, :] = (12, 14, 18)
+            canvas[obs] = (28, 31, 36)
+            canvas[initial_unknown_after_fusion] = (8, 10, 14)
+            canvas[vertical_debug_free] = (166, 170, 174)
+            canvas[rose_occupied | boundary_map] = (0, 0, 0)
+            label_palette = [
+                (125, 104, 235),
+                (100, 185, 245),
+                (95, 210, 155),
+                (235, 185, 80),
+                (235, 120, 145),
+                (180, 140, 240),
+            ]
+            for label in np.unique(final_labels):
+                if int(label) <= 0:
+                    continue
+                mask = final_labels == int(label)
+                color = np.asarray(label_palette[(int(label) - 1) % len(label_palette)], dtype=np.float32)
+                base = canvas[mask].astype(np.float32)
+                canvas[mask] = np.clip(base * 0.45 + color * 0.55, 0, 255).astype(np.uint8)
+            canvas[accepted_closure] = (255, 205, 45)
+            canvas[virtual_boundary] = (255, 65, 90)
+            canvas[ray_valid_wall] = (255, 80, 40)
+            canvas[roomseg_terminal_wall_splat] = (255, 135, 25)
+            canvas[nav_obstacle_overlay_accepted] = (230, 40, 230)
+            canvas[walls_rescued_from_unknown] = (255, 35, 35)
+            canvas[vertical_free_over_nav_obstacle] = (45, 135, 255)
+        else:
+            canvas[:, :] = (36, 40, 48)
+            canvas[nav] = (86, 92, 96)
+            canvas[obs & nav] = (118, 126, 130)
+            canvas[obs & ~nav] = (54, 56, 60)
+            if not has_rose_input:
+                canvas[occ] = (8, 8, 8)
+            canvas[roomseg_free] = (150, 156, 160)
+            canvas[suppressed_clutter] = (58, 82, 132)
+            canvas[vertical_or_free] = (116, 96, 74)
+            canvas[vertical_carved] = (126, 104, 75)
+            canvas[vertical_free_overridden_occupied] = (225, 132, 45)
+            canvas[ray_valid_wall] = (255, 80, 40)
+            canvas[roomseg_terminal_wall_splat] = (255, 135, 25)
+            canvas[unknown_removed_by_ray_wall] = (255, 35, 35)
+            canvas[wall_conf_hot] = (255, 105, 75)
+            canvas[rose_occupied] = (0, 0, 0)
+            canvas[clean_structure] = (255, 190, 70)
+            canvas[context_absorbed] = (120, 210, 255)
+            canvas[nav_obstacle_overlay_accepted] = (230, 40, 230)
+            canvas[walls_rescued_from_unknown] = (255, 35, 35)
+            canvas[vertical_free_over_nav_obstacle] = (45, 135, 255)
 
         r0, r1, c0, c1 = crop_bounds
         crop = canvas[r0:r1, c0:c1]
@@ -720,14 +794,14 @@ class SGNavPopupVisualizer:
             crop_bounds,
             (80, 255, 130),
         )
-        title = "ROSE roomseg input after vertical-free operation"
+        title = "vertical-free roomseg debug" if debug_only else "ROSE roomseg input after vertical-free operation"
         if has_rose_input:
-            title += " | occupied=%d free=%d overridden_occ=%d conf>%.2f=%d win=%d door=%d" % (
+            title += " | occupied=%d vfree=%d ray_wall=%d room_pixels=%d closures=%d win=%d door=%d" % (
                 int(np.count_nonzero(rose_occupied)),
-                int(np.count_nonzero(roomseg_free)),
-                int(np.count_nonzero(vertical_free_overridden_occupied)),
-                threshold,
-                int(np.count_nonzero(wall_conf_hot)),
+                int(np.count_nonzero(vertical_debug_free)),
+                int(np.count_nonzero(ray_valid_wall)),
+                int(np.count_nonzero(final_labels > 0)),
+                int(np.count_nonzero(accepted_closure | virtual_boundary)),
                 int(window_gap_count),
                 int(doorway_gap_count),
             )
@@ -750,11 +824,64 @@ class SGNavPopupVisualizer:
                 vertical_free_overridden_occupied_cells=int(np.count_nonzero(vertical_free_overridden_occupied)),
             ),
             self._overlay_record(
-                "rose_roomseg_free_map",
+                "roomseg_ray_valid_wall_inference",
+                True,
+                (255, 80, 40),
+                int(np.count_nonzero(ray_valid_wall)),
+                "roomseg occupied cells inferred only from vertical occupied evidence or valid depth-ray terminal wall evidence",
+                terminal_wall_cells=int(np.count_nonzero(roomseg_terminal_wall_count)),
+                terminal_wall_splat_cells=int(np.count_nonzero(roomseg_terminal_wall_splat)),
+                ray_covered_cells=int(np.count_nonzero(roomseg_ray_covered_count)),
+                unknown_removed_by_ray_wall_cells=int(np.count_nonzero(unknown_removed_by_ray_wall)),
+            ),
+            self._overlay_record(
+                "roomseg_nav_obstacle_overlay_accepted",
+                True,
+                (230, 40, 230),
+                int(np.count_nonzero(nav_obstacle_overlay_accepted)),
+                "debug-only audit; strict ray-valid roomseg must keep this at zero",
+                nav_raw_obstacle_cells=int(np.count_nonzero(nav_raw_obstacle)),
+                roomseg_static_structural_occupied_cells=int(np.count_nonzero(static_structural)),
+            ),
+            self._overlay_record(
+                "roomseg_walls_rescued_from_unknown",
+                True,
+                (255, 35, 35),
+                int(np.count_nonzero(walls_rescued_from_unknown)),
+                "wall cells rescued from roomseg unknown before ROSE2 receives the structural map",
+            ),
+            self._overlay_record(
+                "roomseg_vertical_free_over_nav_obstacle",
+                True,
+                (45, 135, 255),
+                int(np.count_nonzero(vertical_free_over_nav_obstacle)),
+                "vertical-free cells that override raw/static navigation obstacle evidence",
+            ),
+            self._overlay_record(
+                "vertical_free_roomseg_input",
                 True,
                 (150, 156, 160),
-                int(np.count_nonzero(roomseg_free)),
-                "free cells in the ROSE room segmentation input after applying vertical-free evidence",
+                int(np.count_nonzero(vertical_debug_free)),
+                "vertical-free room segmentation input used by the current latest room segmenter",
+                vertical_observed_cells=int(np.count_nonzero(vertical_observed)),
+                vertical_observed_0p2_2p0_cells=int(np.count_nonzero(vertical_observed_0p2_2p0)),
+                vertical_occupied_0p2_2p0_cells=int(np.count_nonzero(vertical_occupied_0p2_2p0)),
+                vertical_unknown_before_overlay_cells=int(np.count_nonzero(vertical_unknown_before_overlay)),
+                initial_roomseg_unknown_after_fusion_cells=int(np.count_nonzero(initial_unknown_after_fusion)),
+            ),
+            self._overlay_record(
+                "vertical_free_room_labels",
+                bool(np.any(final_labels > 0)),
+                (125, 104, 235),
+                int(np.count_nonzero(final_labels > 0)),
+                "final room labels overlaid on the vertical-free roomseg input",
+            ),
+            self._overlay_record(
+                "vertical_free_gap_closure_boundaries",
+                bool(np.any(accepted_closure | virtual_boundary)),
+                (255, 65, 90),
+                int(np.count_nonzero(accepted_closure | virtual_boundary)),
+                "accepted or virtual gap-closure boundaries from the latest room segmentation method",
             ),
             self._overlay_record(
                 "rose_vertical_free_overrides",
@@ -872,6 +999,9 @@ class SGNavPopupVisualizer:
             ((0, 0, 0), "ROSE roomseg occupied"),
             ((150, 156, 160), "ROSE roomseg free"),
             ((225, 132, 45), "occupied -> free"),
+            ((230, 40, 230), "nav obstacle overlay"),
+            ((255, 35, 35), "rescued wall"),
+            ((45, 135, 255), "vfree wins warning"),
             ((58, 82, 132), "rejected clutter"),
             ((126, 104, 75), "vertical-carved"),
             ((255, 190, 70), "ROSE line"),

@@ -17,6 +17,14 @@ from isaac_bench.mapping.room_segmentation import (
     RoomSegmentationConfig,
     merge_open_plan_proposals,
 )
+from isaac_bench.mapping.roomseg_evidence_fusion import (
+    EVIDENCE_FUSION_MODE,
+    fuse_vertical_profile_with_navigation_obstacles,
+)
+from isaac_bench.mapping.roomseg_ray_valid_wall import (
+    RAY_VALID_WALL_INFERENCE_MODE,
+    build_ray_valid_wall_inference,
+)
 from isaac_bench.mapping.room_context_overlay import build_navigation_free_room_context_overlay
 from isaac_bench.mapping.structure_extraction import (
     StructureExtractionConfig,
@@ -44,11 +52,29 @@ from isaac_bench.mapping.rose2_source_form import (
 )
 from isaac_bench.mapping.rose2_source_external_runner import run_rose2_source_external_runner
 from isaac_bench.mapping.vertical_profile import VerticalProfileMap, band_index, ensure_vertical_profile
+from isaac_bench.mapping.vertical_free_roomseg import (
+    VERTICAL_FREE_ROOMSEG_ALGORITHM,
+    VERTICAL_FREE_ROOMSEG_BACKEND,
+    VERTICAL_FREE_ROOMSEG_CONTEXT,
+    VerticalFreeRoomSegConfig,
+    run_vertical_free_roomseg,
+    save_vertical_free_roomseg_debug,
+    vertical_free_result_to_source_result,
+)
+from isaac_bench.mapping.vertical_free_gap_closure_roomseg import (
+    VERTICAL_FREE_GAP_CLOSURE_ALGORITHM,
+    VERTICAL_FREE_GAP_CLOSURE_BACKEND,
+    VERTICAL_FREE_GAP_CLOSURE_CONTEXT,
+    VFGCConfig,
+    run_vertical_free_gap_closure_roomseg,
+    save_vertical_free_gap_closure_debug,
+    vfgc_result_to_source_result,
+)
 
 
-UPSTREAM_SOURCE_MODE = "source_form_no_ros"
-UPSTREAM_ALGORITHM = SOURCE_FAITHFUL_BACKEND
-UPSTREAM_CONTEXT_SOURCE = "%s_vlm" % SOURCE_FAITHFUL_BACKEND
+UPSTREAM_SOURCE_MODE = "declutter_reconstruct_external"
+UPSTREAM_ALGORITHM = "upstream_rose2_vertical_or_free"
+UPSTREAM_CONTEXT_SOURCE = "%s_vlm" % UPSTREAM_ALGORITHM
 UPSTREAM_ALGORITHM_ALIASES = {
     SOURCE_FAITHFUL_BACKEND,
     "%s_vlm" % SOURCE_FAITHFUL_BACKEND,
@@ -60,12 +86,20 @@ UPSTREAM_ALGORITHM_ALIASES = {
     "upstream_rose2_vertical_or_free_vlm",
     "upstream_rose2_pure_python",
     "upstream_rose2_pure_python_vlm",
+    VERTICAL_FREE_ROOMSEG_ALGORITHM,
+    VERTICAL_FREE_ROOMSEG_CONTEXT,
+    VERTICAL_FREE_ROOMSEG_BACKEND,
+    VERTICAL_FREE_GAP_CLOSURE_ALGORITHM,
+    VERTICAL_FREE_GAP_CLOSURE_CONTEXT,
+    VERTICAL_FREE_GAP_CLOSURE_BACKEND,
 }
 DEFAULT_SOURCE_ENV = "ROSE2_SOURCE_ROOT"
 REQUIRED_SOURCE_FILES = (
     "code/FFT_MQ.py",
     "code/minibatch.py",
     "code/parameters.py",
+    "code/util/layout.py",
+    "code/util/postprocessing.py",
 )
 
 
@@ -73,7 +107,7 @@ REQUIRED_SOURCE_FILES = (
 class UpstreamROSE2Config:
     source_root: str | None
     source_mode: str = UPSTREAM_SOURCE_MODE
-    backend: str = SOURCE_FAITHFUL_BACKEND
+    backend: str = SOURCE_EXTERNAL_RUNNER_BACKEND
     filter_value: float = 0.18
     spatial_clustering_line_segments_threshold: float = 5.0
     lines_th1: float = 0.1
@@ -114,6 +148,26 @@ class UpstreamROSE2Config:
     vertical_or_free_z_max_m: float = 2.00
     vertical_or_free_min_free_rays: int = 1
     vertical_or_free_min_observed_rays: int = 1
+    roomseg_evidence_fusion_enabled: bool = True
+    roomseg_evidence_fusion_mode: str = EVIDENCE_FUSION_MODE
+    roomseg_evidence_fusion_vertical_free_priority: bool = True
+    roomseg_use_navigation_obstacle_for_vertical_unknown: bool = False
+    roomseg_use_navigation_free_for_roomseg_free: bool = False
+    roomseg_use_inflated_obstacle: bool = False
+    roomseg_use_depth_valid_as_wall: bool = False
+    roomseg_use_static_structural_occupied: bool = False
+    ray_valid_wall_inference_enabled: bool = True
+    ray_valid_wall_inference_mode: str = RAY_VALID_WALL_INFERENCE_MODE
+    ray_valid_wall_depth_max_m: float = 3.0
+    ray_valid_wall_min_endpoint_height_m: float = 0.20
+    ray_valid_wall_max_endpoint_height_m: float = 2.00
+    ray_valid_wall_min_terminal_wall_count: int = 1
+    ray_valid_wall_terminal_wall_splat_radius_cells: int = 1
+    ray_valid_wall_require_no_vertical_free: bool = True
+    ray_valid_wall_mark_ray_covered_debug: bool = True
+    ray_valid_wall_decouple_roomseg_rays_from_nav_clear: bool = True
+    ray_valid_wall_strict_no_navigation_obstacle_overlay: bool = True
+    ray_valid_wall_strict_no_navigation_free_overlay: bool = True
     navigation_free_context_overlay_enabled: bool = False
     navigation_free_context_overlay_use_for_room_nodes: bool = True
     navigation_free_context_overlay_use_for_visualization: bool = True
@@ -134,6 +188,14 @@ class UpstreamROSE2Config:
     rose2_source_work_dir: str = "debug/rose2_source"
     rose2_compare_legacy: bool = False
     strict_disallow_legacy_fallback: bool = True
+    allow_source_form_in_metric: bool = False
+    allow_silent_fallback: bool = False
+    external_runner_timeout_s: float = 60.0
+    external_runner_python_executable: str | None = None
+    external_runner_encoding: str = "auto"
+    external_runner_keep_work_dir: bool = True
+    external_runner_cache_enabled: bool = True
+    external_runner_parameter_overrides: Mapping[str, object] | None = None
     source_form_min_cell_area_m2: float = 0.35
     source_form_min_cell_free_ratio: float = 0.12
     source_form_min_cut_spacing_m: float = 0.45
@@ -153,16 +215,57 @@ class UpstreamROSE2Config:
     source_form_doorway_width_max_m: float = 1.60
     source_form_doorway_min_wall_support_on_sides_m: float = 0.35
     source_form_merge_guard_enabled: bool = True
+    vertical_free_roomseg: Mapping[str, object] | None = None
+    vertical_free_gap_closure: Mapping[str, object] | None = None
 
     @classmethod
     def from_mapping(cls, data: Optional[Mapping[str, object]] = None, **overrides) -> "UpstreamROSE2Config":
         raw = dict(data or {})
+        debug_layers = dict(raw.get("debug_layers", {}) or {})
+        if "enabled" in debug_layers:
+            raw["debug_dump"] = bool(debug_layers.get("enabled"))
+        if "output_dir" in debug_layers:
+            raw["debug_dir"] = str(debug_layers.get("output_dir"))
         rose2 = dict(raw.get("rose2", {}) or {})
         for key, value in rose2.items():
             raw.setdefault(key, value)
         vertical_or_free = dict(raw.get("vertical_or_free", {}) or {})
         for key, value in vertical_or_free.items():
             raw.setdefault("vertical_or_free_%s" % key, value)
+        evidence_fusion = dict(raw.get("evidence_fusion", {}) or {})
+        if evidence_fusion:
+            raw.setdefault("roomseg_evidence_fusion", evidence_fusion)
+        evidence_key_map = {
+            "enabled": "roomseg_evidence_fusion_enabled",
+            "mode": "roomseg_evidence_fusion_mode",
+            "vertical_free_priority": "roomseg_evidence_fusion_vertical_free_priority",
+            "use_navigation_obstacle_for_vertical_unknown": "roomseg_use_navigation_obstacle_for_vertical_unknown",
+            "use_navigation_free_for_roomseg_free": "roomseg_use_navigation_free_for_roomseg_free",
+            "use_inflated_obstacle": "roomseg_use_inflated_obstacle",
+            "use_depth_valid_as_wall": "roomseg_use_depth_valid_as_wall",
+            "use_static_structural_occupied": "roomseg_use_static_structural_occupied",
+        }
+        for key, value in evidence_fusion.items():
+            if key in evidence_key_map:
+                raw.setdefault(evidence_key_map[key], value)
+        ray_valid_wall = dict(raw.get("ray_valid_wall_inference", {}) or {})
+        ray_key_map = {
+            "enabled": "ray_valid_wall_inference_enabled",
+            "mode": "ray_valid_wall_inference_mode",
+            "depth_max_m": "ray_valid_wall_depth_max_m",
+            "min_endpoint_height_m": "ray_valid_wall_min_endpoint_height_m",
+            "max_endpoint_height_m": "ray_valid_wall_max_endpoint_height_m",
+            "min_terminal_wall_count": "ray_valid_wall_min_terminal_wall_count",
+            "terminal_wall_splat_radius_cells": "ray_valid_wall_terminal_wall_splat_radius_cells",
+            "require_no_vertical_free": "ray_valid_wall_require_no_vertical_free",
+            "mark_ray_covered_debug": "ray_valid_wall_mark_ray_covered_debug",
+            "decouple_roomseg_rays_from_nav_clear": "ray_valid_wall_decouple_roomseg_rays_from_nav_clear",
+            "strict_no_navigation_obstacle_overlay": "ray_valid_wall_strict_no_navigation_obstacle_overlay",
+            "strict_no_navigation_free_overlay": "ray_valid_wall_strict_no_navigation_free_overlay",
+        }
+        for key, value in ray_valid_wall.items():
+            if key in ray_key_map:
+                raw.setdefault(ray_key_map[key], value)
         for section in ("navigation_free_context_overlay", "wall_gating_fix"):
             nested = dict(raw.get(section, {}) or {})
             for key, value in nested.items():
@@ -170,6 +273,14 @@ class UpstreamROSE2Config:
         source_form = dict(raw.get("source_form", {}) or {})
         for key, value in source_form.items():
             raw.setdefault("source_form_%s" % key, value)
+        external_runner = dict(raw.get("external_runner", {}) or {})
+        for key, value in external_runner.items():
+            if key == "parameter_overrides":
+                raw.setdefault("external_runner_parameter_overrides", value)
+            elif key == "work_dir":
+                raw.setdefault("rose2_source_work_dir", value)
+            else:
+                raw.setdefault("external_runner_%s" % key, value)
         if "source_root" not in raw:
             env_name = str(raw.get("upstream_repo_env", DEFAULT_SOURCE_ENV) or DEFAULT_SOURCE_ENV)
             raw["source_root"] = os.environ.get(env_name)
@@ -198,14 +309,31 @@ class UpstreamROSE2PurePythonSegmenter:
     def __init__(self, config: UpstreamROSE2Config, map_info: MapInfo):
         self.config = config
         self.map_info = map_info
-        backend = str(config.backend or SOURCE_FAITHFUL_BACKEND).strip().lower()
-        self.source_root = validate_upstream_rose2_source_root(
-            config.source_root,
-            env_name=config.upstream_repo_env,
-            fail=bool(config.fail_on_missing_source and backend in {SOURCE_EXTERNAL_BACKEND, SOURCE_EXTERNAL_RUNNER_BACKEND}),
-        )
+        backend = str(config.backend or SOURCE_EXTERNAL_RUNNER_BACKEND).strip().lower()
+        if backend in {VERTICAL_FREE_GAP_CLOSURE_BACKEND, VERTICAL_FREE_GAP_CLOSURE_ALGORITHM}:
+            self.source = VERTICAL_FREE_GAP_CLOSURE_ALGORITHM
+            self.context_source = VERTICAL_FREE_GAP_CLOSURE_CONTEXT
+        elif backend in {VERTICAL_FREE_ROOMSEG_BACKEND, VERTICAL_FREE_ROOMSEG_ALGORITHM}:
+            self.source = VERTICAL_FREE_ROOMSEG_ALGORITHM
+            self.context_source = VERTICAL_FREE_ROOMSEG_CONTEXT
+        else:
+            self.source = UPSTREAM_ALGORITHM
+            self.context_source = UPSTREAM_CONTEXT_SOURCE
+        if backend in {
+            VERTICAL_FREE_ROOMSEG_BACKEND,
+            VERTICAL_FREE_ROOMSEG_ALGORITHM,
+            VERTICAL_FREE_GAP_CLOSURE_BACKEND,
+            VERTICAL_FREE_GAP_CLOSURE_ALGORITHM,
+        }:
+            self.source_root = None
+        else:
+            self.source_root = validate_upstream_rose2_source_root(
+                config.source_root,
+                env_name=config.upstream_repo_env,
+                fail=bool(config.fail_on_missing_source and backend in {SOURCE_EXTERNAL_BACKEND, SOURCE_EXTERNAL_RUNNER_BACKEND}),
+            )
         self._room_config = RoomSegmentationConfig(
-            algorithm=UPSTREAM_ALGORITHM,
+            algorithm=self.source,
             source_grid="online_depth_observed",
             finalization_mode=str(config.finalization_mode),
             resolution_m=float(config.resolution_m),
@@ -305,6 +433,8 @@ class UpstreamROSE2PurePythonSegmenter:
         step: int,
         object_memory: Optional[Sequence[object]] = None,
         vertical_profile: VerticalProfileMap | None = None,
+        roomseg_static_structural_occupied: np.ndarray | None = None,
+        roomseg_ray_evidence: Mapping[str, np.ndarray] | None = None,
     ) -> List[RoomMask]:
         proposals, state = self.build_proposals(
             occupancy_map,
@@ -314,6 +444,8 @@ class UpstreamROSE2PurePythonSegmenter:
             step=step,
             object_memory=object_memory,
             vertical_profile=vertical_profile,
+            roomseg_static_structural_occupied=roomseg_static_structural_occupied,
+            roomseg_ray_evidence=roomseg_ray_evidence,
         )
         _ = proposals
         return self.finalize_proposals(state, proposal_semantic_labels=None)
@@ -327,6 +459,8 @@ class UpstreamROSE2PurePythonSegmenter:
         step: int,
         object_memory: Optional[Sequence[object]] = None,
         vertical_profile: VerticalProfileMap | None = None,
+        roomseg_static_structural_occupied: np.ndarray | None = None,
+        roomseg_ray_evidence: Mapping[str, np.ndarray] | None = None,
     ) -> tuple[List[RoomMask], RoomProposalState]:
         free = np.asarray(observed_free_mask, dtype=bool)
         occupied = np.asarray(obstacle_mask if obstacle_mask is not None else occupancy_map, dtype=bool)
@@ -339,6 +473,8 @@ class UpstreamROSE2PurePythonSegmenter:
             unknown=unknown,
             vertical_profile=ensure_vertical_profile(vertical_profile, occupied.shape),
             vertical_profile_provided=vertical_profile is not None,
+            roomseg_static_structural_occupied=roomseg_static_structural_occupied,
+            roomseg_ray_evidence=roomseg_ray_evidence,
             object_memory=object_memory or [],
             map_info=self.map_info,
             config=self.config,
@@ -346,7 +482,7 @@ class UpstreamROSE2PurePythonSegmenter:
         )
         if int(structural.get("navigation_free_added_to_strict_roomseg_cells", -1)) != 0:
             raise AssertionError("strict room segmentation must not add navigation-free cells to vertical-free input")
-        backend = str(self.config.backend or SOURCE_FAITHFUL_BACKEND).strip().lower()
+        backend = str(self.config.backend or SOURCE_EXTERNAL_RUNNER_BACKEND).strip().lower()
         source_result, legacy_structure = self._run_source_backend(
             backend=backend,
             structural=structural,
@@ -382,9 +518,14 @@ class UpstreamROSE2PurePythonSegmenter:
         occupied = np.asarray(structural["repaired_roomseg_occupied"], dtype=bool)
         free = np.asarray(structural["repaired_roomseg_free"], dtype=bool)
         unknown = np.asarray(structural["repaired_roomseg_unknown"], dtype=bool)
-        backend_name = str(backend or SOURCE_FAITHFUL_BACKEND).strip().lower()
+        backend_name = str(backend or SOURCE_EXTERNAL_RUNNER_BACKEND).strip().lower()
         legacy_structure: StructureExtractionResult | None = None
         if backend_name == SOURCE_FAITHFUL_BACKEND:
+            if bool(self.config.strict_disallow_legacy_fallback) and not bool(self.config.allow_source_form_in_metric):
+                raise ValueError(
+                    "%s is debug/ablation-only; strict room segmentation requires %s"
+                    % (SOURCE_FAITHFUL_BACKEND, SOURCE_EXTERNAL_RUNNER_BACKEND)
+                )
             source_result = run_rose2_source_faithful_v1(
                 observed_occupied=occupied,
                 observed_free=free,
@@ -397,6 +538,11 @@ class UpstreamROSE2PurePythonSegmenter:
                 object_memory=object_memory,
             )
         elif backend_name in {SOURCE_FORM_BACKEND, "rose2_source_form"}:
+            if bool(self.config.strict_disallow_legacy_fallback) and not bool(self.config.allow_source_form_in_metric):
+                raise ValueError(
+                    "%s is debug/ablation-only; strict room segmentation requires %s"
+                    % (backend_name, SOURCE_EXTERNAL_RUNNER_BACKEND)
+                )
             source_result = run_rose2_source_form_v2(
                 observed_occupied=occupied,
                 observed_free=free,
@@ -408,27 +554,85 @@ class UpstreamROSE2PurePythonSegmenter:
                 source_config=self._source_form_config,
                 object_memory=object_memory,
             )
-        elif backend_name == SOURCE_EXTERNAL_BACKEND:
-            source_result = run_rose2_source_external(
-                source_root=self.source_root,
-                observed_occupied=occupied,
-                observed_free=free,
-                unknown=unknown,
-                work_dir=str(self.config.rose2_source_work_dir),
-            )
-        elif backend_name == SOURCE_EXTERNAL_RUNNER_BACKEND:
+        elif backend_name in {SOURCE_EXTERNAL_BACKEND, SOURCE_EXTERNAL_RUNNER_BACKEND}:
+            step_dir = Path(str(self.config.rose2_source_work_dir)) / ("rose2_source_step_%06d" % int(step))
             source_result = run_rose2_source_external_runner(
                 source_root=self.source_root,
                 observed_occupied=occupied,
                 observed_free=free,
                 unknown=unknown,
-                work_dir=str(self.config.rose2_source_work_dir),
+                vertical_observed=np.asarray(structural.get("vertical_observed_map", structural.get("vertical_observed")), dtype=bool),
+                vertical_free=np.asarray(structural.get("vertical_free_room_domain", free), dtype=bool),
+                wall_confidence_map=np.asarray(structural.get("wall_confidence_map", np.zeros_like(occupied, dtype=np.float32)), dtype=np.float32),
+                resolution_m=float(self.config.resolution_m),
+                min_room_area_m2=float(self.config.min_room_area_m2),
+                work_dir=str(step_dir),
+                timeout_s=float(self.config.external_runner_timeout_s),
+                python_executable=self.config.external_runner_python_executable,
+                encoding=str(self.config.external_runner_encoding or "auto"),
+                keep_work_dir=bool(self.config.external_runner_keep_work_dir),
+                parameter_overrides=dict(self.config.external_runner_parameter_overrides or {}),
+                cache_enabled=bool(self.config.external_runner_cache_enabled),
             )
+        elif backend_name in {VERTICAL_FREE_ROOMSEG_BACKEND, VERTICAL_FREE_ROOMSEG_ALGORITHM}:
+            vf_cfg = VerticalFreeRoomSegConfig.from_mapping(
+                self.config.vertical_free_roomseg or {},
+                resolution_m=float(self.config.resolution_m),
+                min_room_area_m2=float(self.config.min_room_area_m2),
+                debug_dump=bool(
+                    self.config.debug_dump
+                    and bool(dict(self.config.vertical_free_roomseg or {}).get("debug_dump", self.config.debug_dump))
+                ),
+                debug_dir=str(dict(self.config.vertical_free_roomseg or {}).get("debug_dir", self.config.debug_dir)),
+            )
+            vf_result = run_vertical_free_roomseg(
+                observed_free=free,
+                observed_occupied=occupied,
+                unknown=unknown,
+                resolution_m=float(self.config.resolution_m),
+                config=vf_cfg,
+            )
+            if bool(vf_cfg.debug_dump):
+                dump = save_vertical_free_roomseg_debug(
+                    result=vf_result,
+                    out_dir=str(vf_cfg.debug_dir),
+                    step=int(step),
+                )
+                vf_result.debug["vertical_free_roomseg_layers"] = dict(dump.get("paths", {}))
+                vf_result.debug["vertical_free_roomseg_debug_summary"] = dict(dump.get("summary", {}))
+            source_result = vertical_free_result_to_source_result(vf_result)
+        elif backend_name in {VERTICAL_FREE_GAP_CLOSURE_BACKEND, VERTICAL_FREE_GAP_CLOSURE_ALGORITHM}:
+            vfgc_cfg = VFGCConfig.from_mapping(
+                self.config.vertical_free_gap_closure or {},
+                resolution_m=float(self.config.resolution_m),
+                min_room_area_m2=float(self.config.min_room_area_m2),
+                debug_dump=bool(
+                    self.config.debug_dump
+                    and bool(dict(self.config.vertical_free_gap_closure or {}).get("debug_dump", self.config.debug_dump))
+                ),
+                debug_dir=str(dict(self.config.vertical_free_gap_closure or {}).get("debug_dir", self.config.debug_dir)),
+            )
+            vfgc_result = run_vertical_free_gap_closure_roomseg(
+                free_mask=free,
+                wall_mask=occupied,
+                unknown_mask=unknown,
+                resolution_m=float(self.config.resolution_m),
+                config=vfgc_cfg,
+            )
+            if bool(vfgc_cfg.debug_dump):
+                dump = save_vertical_free_gap_closure_debug(
+                    result=vfgc_result,
+                    out_dir=str(vfgc_cfg.debug_dir),
+                    step=int(step),
+                )
+                vfgc_result.debug["vertical_free_gap_closure_layers"] = dict(dump.get("paths", {}))
+                vfgc_result.debug["vertical_free_gap_closure_debug_summary"] = dict(dump.get("summary", {}))
+            source_result = vfgc_result_to_source_result(vfgc_result)
         elif backend_name == LEGACY_STYLE_BACKEND:
             if bool(self.config.strict_disallow_legacy_fallback):
                 raise ValueError(
                     "%s is debug/ablation-only; strict room segmentation uses %s"
-                    % (LEGACY_STYLE_BACKEND, SOURCE_FAITHFUL_BACKEND)
+                    % (LEGACY_STYLE_BACKEND, SOURCE_EXTERNAL_RUNNER_BACKEND)
                 )
             legacy_structure = extract_rose2_structure(
                 observed_occupied=occupied,
@@ -440,9 +644,18 @@ class UpstreamROSE2PurePythonSegmenter:
             source_result = _source_result_from_legacy_structure(legacy_structure)
         else:
             raise ValueError(
-                "unsupported roomseg backend %s; expected %s, %s, %s, %s, or %s"
-                % (backend_name, SOURCE_FAITHFUL_BACKEND, SOURCE_FORM_BACKEND, SOURCE_EXTERNAL_BACKEND, SOURCE_EXTERNAL_RUNNER_BACKEND, LEGACY_STYLE_BACKEND)
-            )
+                "unsupported roomseg backend %s; expected %s, %s, %s, %s, %s, %s, or %s"
+                    % (
+                        backend_name,
+                        SOURCE_FAITHFUL_BACKEND,
+                        SOURCE_FORM_BACKEND,
+                        SOURCE_EXTERNAL_BACKEND,
+                        SOURCE_EXTERNAL_RUNNER_BACKEND,
+                        LEGACY_STYLE_BACKEND,
+                        VERTICAL_FREE_ROOMSEG_BACKEND,
+                        VERTICAL_FREE_GAP_CLOSURE_BACKEND,
+                    )
+                )
         if bool(self.config.rose2_compare_legacy) and backend_name != LEGACY_STYLE_BACKEND:
             legacy_structure = extract_rose2_structure(
                 observed_occupied=occupied,
@@ -551,7 +764,13 @@ class UpstreamROSE2PurePythonSegmenter:
             debug["finalization_mode"] = finalization_mode
             self.last_debug = debug
             return []
-        if finalization_mode in {"no_merge", "proposal_only", "premerge_proposals", "no_merge_until_source_backend_verified"}:
+        if finalization_mode in {
+            "no_merge",
+            "proposal_only",
+            "premerge_proposals",
+            "no_merge_until_source_backend_verified",
+            "no_merge_until_geometry_verified",
+        }:
             final_labels = labels.copy()
             doorway_edges: list[dict] = []
             finalization_debug = {
@@ -627,15 +846,18 @@ class UpstreamROSE2PurePythonSegmenter:
             for key, value in dict(proposal_state.debug or {}).items()
             if key not in {"_source_result", "_structure_result", "_input_occupancy_map"}
         }
+        debug_algorithm = str(debug.get("algorithm", getattr(self, "source", UPSTREAM_ALGORITHM)) or getattr(self, "source", UPSTREAM_ALGORITHM))
+        debug_source = str(debug.get("source", debug_algorithm) or debug_algorithm)
+        source_repository = None if debug_algorithm == VERTICAL_FREE_ROOMSEG_ALGORITHM else "https://github.com/goldleaf3i/declutter-reconstruct"
         debug.update(
             {
-                "algorithm": UPSTREAM_ALGORITHM,
-                "source": UPSTREAM_ALGORITHM,
+                "algorithm": debug_algorithm,
+                "source": debug_source,
                 "source_mode": str(self.config.source_mode),
-                "roomseg_backend": str(self.config.backend or SOURCE_FAITHFUL_BACKEND),
-                "source_backend": str(self.config.backend or SOURCE_FAITHFUL_BACKEND),
+                "roomseg_backend": str(self.config.backend or SOURCE_EXTERNAL_RUNNER_BACKEND),
+                "source_backend": str(self.config.backend or SOURCE_EXTERNAL_RUNNER_BACKEND),
                 "source_root": str(self.source_root) if self.source_root is not None else None,
-                "source_repository": "https://github.com/goldleaf3i/declutter-reconstruct",
+                "source_repository": source_repository,
                 "source_provenance": _source_provenance(self.source_root),
                 "strict_fallback_used": False,
                 "step": int(proposal_state.step),
@@ -685,8 +907,10 @@ class UpstreamROSE2PurePythonSegmenter:
         for label_id in sorted(int(v) for v in np.unique(labels) if int(v) > 0):
             mask = labels == label_id
             room = _room_from_mask("pending", mask, unknown, doorway_edges, self.map_info, int(step), int(label_id))
-            room.metadata["algorithm"] = UPSTREAM_ALGORITHM
-            room.metadata["segmentation_source"] = UPSTREAM_ALGORITHM
+            source_name = str(getattr(self, "source", UPSTREAM_ALGORITHM))
+            room.source = source_name
+            room.metadata["algorithm"] = source_name
+            room.metadata["segmentation_source"] = source_name
             room.metadata["source_mode"] = str(self.config.source_mode)
             room.metadata["label_id"] = int(label_id)
             room.metadata["proposal_labels"] = sorted(int(v) for v in np.unique(source_labels[mask]) if int(v) > 0)
@@ -721,8 +945,8 @@ class UpstreamROSE2PurePythonSegmenter:
             "algorithm": UPSTREAM_ALGORITHM,
             "source": UPSTREAM_ALGORITHM,
             "source_mode": str(self.config.source_mode),
-            "roomseg_backend": str(self.config.backend or SOURCE_FAITHFUL_BACKEND),
-            "source_backend": str(self.config.backend or SOURCE_FAITHFUL_BACKEND),
+            "roomseg_backend": str(self.config.backend or SOURCE_EXTERNAL_RUNNER_BACKEND),
+            "source_backend": str(self.config.backend or SOURCE_EXTERNAL_RUNNER_BACKEND),
             "source_root": str(self.source_root) if self.source_root is not None else None,
             "source_repository": "https://github.com/goldleaf3i/declutter-reconstruct",
             "source_provenance": _source_provenance(self.source_root),
@@ -1184,6 +1408,88 @@ WINDOW_LIKE_CATEGORIES = {
 }
 
 
+def _normalize_roomseg_ray_evidence(
+    evidence: Mapping[str, np.ndarray] | None,
+    shape: tuple[int, int],
+) -> dict[str, np.ndarray]:
+    raw = dict(evidence or {})
+
+    def pick(*names: str, dtype=np.uint16, fill=0):
+        for name in names:
+            if name not in raw:
+                continue
+            arr = np.asarray(raw[name], dtype=dtype)
+            if arr.shape == tuple(shape):
+                return arr
+        return np.full(tuple(shape), fill, dtype=dtype)
+
+    return {
+        "ray_covered_count": pick("ray_covered_count", "roomseg_ray_covered_count", dtype=np.uint16, fill=0),
+        "terminal_wall_count": pick("terminal_wall_count", "roomseg_terminal_wall_count", dtype=np.uint16, fill=0),
+        "terminal_wall_splat": pick("terminal_wall_splat", "roomseg_terminal_wall_splat", dtype=np.uint8, fill=0),
+        "terminal_wall_height_min": pick("terminal_wall_height_min", "roomseg_terminal_wall_height_min", dtype=np.float32, fill=np.inf),
+        "terminal_wall_height_max": pick("terminal_wall_height_max", "roomseg_terminal_wall_height_max", dtype=np.float32, fill=-np.inf),
+        "terminal_wall_depth_min": pick("terminal_wall_depth_min", "roomseg_terminal_wall_depth_min", dtype=np.float32, fill=np.inf),
+    }
+
+
+def _legacy_fusion_audit(
+    *,
+    vertical_free: np.ndarray,
+    vertical_observed: np.ndarray,
+    nav_raw_obstacle: np.ndarray,
+    static_structural_occupied: np.ndarray | None,
+    navigation_free: np.ndarray,
+    config: UpstreamROSE2Config,
+    initial_free: np.ndarray,
+    initial_occupied: np.ndarray,
+    initial_unknown: np.ndarray,
+) -> dict[str, object]:
+    strict_no_nav_obstacle = bool(config.ray_valid_wall_strict_no_navigation_obstacle_overlay)
+    strict_no_nav_free = bool(config.ray_valid_wall_strict_no_navigation_free_overlay)
+    audit_config = {
+        "enabled": bool(config.roomseg_evidence_fusion_enabled),
+        "mode": "ray_valid_wall_no_navigation_overlay",
+        "vertical_free_priority": True,
+        "use_navigation_obstacle_for_vertical_unknown": False if strict_no_nav_obstacle else bool(config.roomseg_use_navigation_obstacle_for_vertical_unknown),
+        "use_navigation_free_for_roomseg_free": False if strict_no_nav_free else bool(config.roomseg_use_navigation_free_for_roomseg_free),
+        "use_inflated_obstacle": False,
+        "use_depth_valid_as_wall": False,
+        "use_static_structural_occupied": False if strict_no_nav_obstacle else bool(config.roomseg_use_static_structural_occupied),
+    }
+    audit = fuse_vertical_profile_with_navigation_obstacles(
+        vertical_free=vertical_free,
+        vertical_observed=vertical_observed,
+        nav_raw_obstacle=nav_raw_obstacle,
+        static_structural_occupied=static_structural_occupied,
+        navigation_free=navigation_free,
+        inflated_obstacle=None,
+        config=audit_config,
+    )
+    audit["initial_roomseg_free"] = np.asarray(initial_free, dtype=bool)
+    audit["initial_roomseg_occupied"] = np.asarray(initial_occupied, dtype=bool)
+    audit["initial_roomseg_unknown"] = np.asarray(initial_unknown, dtype=bool)
+    audit["initial_roomseg_free_after_fusion"] = np.asarray(initial_free, dtype=bool)
+    audit["initial_roomseg_occupied_after_fusion"] = np.asarray(initial_occupied, dtype=bool)
+    audit["initial_roomseg_unknown_after_fusion"] = np.asarray(initial_unknown, dtype=bool)
+    debug = dict(audit.get("debug", {}) or {})
+    debug.update(
+        {
+            "evidence_fusion_mode": "ray_valid_wall_no_navigation_overlay",
+            "use_navigation_obstacle_for_vertical_unknown": bool(audit_config["use_navigation_obstacle_for_vertical_unknown"]),
+            "use_navigation_free_for_roomseg_free": bool(audit_config["use_navigation_free_for_roomseg_free"]),
+            "use_static_structural_occupied": bool(audit_config["use_static_structural_occupied"]),
+            "navigation_obstacle_overlay_for_roomseg_occupied": False,
+            "navigation_free_overlay_for_roomseg_free": False,
+            "initial_roomseg_free_cells": int(np.count_nonzero(initial_free)),
+            "initial_roomseg_occupied_cells": int(np.count_nonzero(initial_occupied)),
+            "initial_roomseg_unknown_cells": int(np.count_nonzero(initial_unknown)),
+        }
+    )
+    audit["debug"] = debug
+    return audit
+
+
 def _vertical_profile_structural_maps(
     *,
     occupied: np.ndarray,
@@ -1191,6 +1497,8 @@ def _vertical_profile_structural_maps(
     unknown: np.ndarray,
     vertical_profile: VerticalProfileMap,
     vertical_profile_provided: bool,
+    roomseg_static_structural_occupied: np.ndarray | None,
+    roomseg_ray_evidence: Mapping[str, np.ndarray] | None,
     object_memory: Sequence[object],
     map_info: MapInfo,
     config: UpstreamROSE2Config,
@@ -1230,19 +1538,54 @@ def _vertical_profile_structural_maps(
     )
     nav_free_room_domain = free_arr.copy()
     vertical_free_room_domain = vertical_or_free.copy()
-    # Room segmentation uses a dedicated ROSE2 input map from the vertical
-    # profile only. It deliberately does not overlay the 2D navigation
-    # occupancy map: for each observed xy column in the configured 0.2-2.0 m
-    # range, any free evidence makes the column free; otherwise the observed
-    # column is structural occupied/wall-like for room segmentation.
-    initial_roomseg_free = vertical_free_room_domain.copy()
-    initial_roomseg_occupied = vertical_observed & ~initial_roomseg_free
+    synthetic_nav_free_bootstrap = False
     # Compatibility for tiny synthetic tests without ray evidence. Strict Isaac
     # runs feed this from OnlineMapper.vertical_profile; this branch keeps unit
     # fixtures readable without changing the planner/frontier maps.
     if not bool(vertical_profile_provided) and not np.any(vertical_observed) and (np.any(free_arr) or np.any(occ)):
-        initial_roomseg_free = free_arr.copy()
-        initial_roomseg_occupied = occ & ~initial_roomseg_free
+        vertical_observed = free_arr | occ
+        vertical_free_room_domain = free_arr.copy()
+        synthetic_nav_free_bootstrap = True
+
+    if vertical_band_indices:
+        vertical_occupied_count = np.sum(np.asarray(vp.occupied_count[vertical_band_indices], dtype=np.uint32), axis=0)
+    else:
+        vertical_occupied_count = np.zeros_like(occ, dtype=np.uint32)
+    vertical_occupied_map = vertical_occupied_count >= 1
+    if synthetic_nav_free_bootstrap:
+        vertical_occupied_map |= occ & ~vertical_free_room_domain
+    ray_evidence = _normalize_roomseg_ray_evidence(roomseg_ray_evidence, occ.shape)
+    ray_wall = build_ray_valid_wall_inference(
+        vertical_free=vertical_free_room_domain,
+        vertical_occupied=vertical_occupied_map,
+        vertical_observed=vertical_observed,
+        terminal_wall_count=ray_evidence.get("terminal_wall_count"),
+        terminal_wall_splat=ray_evidence.get("terminal_wall_splat"),
+        ray_covered_count=ray_evidence.get("ray_covered_count"),
+        terminal_wall_height_min=ray_evidence.get("terminal_wall_height_min"),
+        terminal_wall_height_max=ray_evidence.get("terminal_wall_height_max"),
+        terminal_wall_depth_min=ray_evidence.get("terminal_wall_depth_min"),
+        config=config,
+    )
+    initial_roomseg_free = np.asarray(ray_wall["initial_roomseg_free"], dtype=bool)
+    initial_roomseg_occupied = np.asarray(ray_wall["initial_roomseg_occupied"], dtype=bool)
+    initial_roomseg_unknown = np.asarray(ray_wall["initial_roomseg_unknown"], dtype=bool)
+    vertical_observed = np.asarray(ray_wall["vertical_observed_map"], dtype=bool)
+    fusion = _legacy_fusion_audit(
+        vertical_free=vertical_free_room_domain,
+        vertical_observed=np.asarray(ray_wall["vertical_observed_map"], dtype=bool),
+        nav_raw_obstacle=occ,
+        static_structural_occupied=roomseg_static_structural_occupied,
+        navigation_free=free_arr,
+        config=config,
+        initial_free=initial_roomseg_free,
+        initial_occupied=initial_roomseg_occupied,
+        initial_unknown=initial_roomseg_unknown,
+    )
+    fusion_debug = dict(fusion.get("debug", {}) or {})
+    ray_wall_debug = dict(ray_wall.get("debug", {}) or {})
+    fusion_debug.update(ray_wall_debug)
+    fusion_debug["compat_synthetic_nav_free_bootstrap"] = bool(synthetic_nav_free_bootstrap)
 
     occupied_bands = (occ_counts > 0) & initial_roomseg_occupied[None, :, :]
     continuity = np.count_nonzero(occupied_bands, axis=0).astype(np.float32) / float(max(1, occ_counts.shape[0]))
@@ -1307,7 +1650,7 @@ def _vertical_profile_structural_maps(
         }
     closed_gap_mask = np.zeros_like(occ, dtype=bool)
     repaired_free = np.asarray(initial_roomseg_free, dtype=bool).copy()
-    repaired_unknown = unknown_arr & ~(repaired_occupied | repaired_free)
+    repaired_unknown = initial_roomseg_unknown & ~(repaired_occupied | repaired_free)
     vertical_carved = repaired_occupied.copy()
     return {
         "vertical_profile_bands": vp.to_debug_dict(),
@@ -1322,9 +1665,51 @@ def _vertical_profile_structural_maps(
         "vertical_free_source": "vertical_profile_0p2_2p0",
         "vertical_free_overrides_occupied": True,
         "vertical_free_overridden_occupied_cells": int(np.count_nonzero(occ & vertical_or_free)),
-        "roomseg_input_source": "vertical_profile_only",
+        "roomseg_input_source": "vertical_profile_plus_ray_valid_terminal_wall",
+        "ray_valid_wall_inference": np.asarray(ray_wall["ray_valid_wall_inference"], dtype=bool),
+        "ray_valid_wall_inference_enabled": bool(ray_wall_debug.get("ray_valid_wall_inference_enabled", True)),
+        "ray_valid_wall_inference_mode": str(ray_wall_debug.get("ray_valid_wall_inference_mode", RAY_VALID_WALL_INFERENCE_MODE)),
+        "ray_valid_wall_inference_debug": ray_wall_debug,
+        "vertical_occupied_0p2_2p0": np.asarray(ray_wall["vertical_occupied_0p2_2p0"], dtype=bool),
+        "vertical_occupied_0p2_2p0_cells": int(np.count_nonzero(ray_wall["vertical_occupied_0p2_2p0"])),
+        "vertical_observed_0p2_2p0": np.asarray(ray_wall["vertical_observed_0p2_2p0"], dtype=bool),
+        "vertical_observed_0p2_2p0_cells": int(np.count_nonzero(ray_wall["vertical_observed_0p2_2p0"])),
+        "roomseg_ray_covered_count": np.asarray(ray_wall["roomseg_ray_covered_count"], dtype=np.uint16),
+        "roomseg_terminal_wall_count": np.asarray(ray_wall["roomseg_terminal_wall_count"], dtype=np.uint16),
+        "roomseg_terminal_wall_height_min": np.asarray(ray_wall["roomseg_terminal_wall_height_min"], dtype=np.float32),
+        "roomseg_terminal_wall_height_max": np.asarray(ray_wall["roomseg_terminal_wall_height_max"], dtype=np.float32),
+        "roomseg_terminal_wall_depth_min": np.asarray(ray_wall["roomseg_terminal_wall_depth_min"], dtype=np.float32),
+        "roomseg_terminal_wall_splat": np.asarray(ray_wall["roomseg_terminal_wall_splat"], dtype=bool),
+        "roomseg_ray_covered_cells": int(ray_wall_debug.get("roomseg_ray_covered_cells", 0)),
+        "terminal_wall_cells": int(ray_wall_debug.get("terminal_wall_cells", 0)),
+        "terminal_wall_splat_cells": int(ray_wall_debug.get("terminal_wall_splat_cells", 0)),
+        "unknown_before_ray_wall": np.asarray(ray_wall["unknown_before_ray_wall"], dtype=bool),
+        "unknown_after_ray_wall": np.asarray(ray_wall["unknown_after_ray_wall"], dtype=bool),
+        "unknown_removed_by_ray_wall": np.asarray(ray_wall["unknown_removed_by_ray_wall"], dtype=bool),
+        "unknown_before_ray_wall_cells": int(ray_wall_debug.get("unknown_before_cells", 0)),
+        "unknown_after_ray_wall_cells": int(ray_wall_debug.get("unknown_after_cells", 0)),
+        "unknown_removed_by_ray_wall_cells": int(ray_wall_debug.get("unknown_removed_by_ray_wall_cells", 0)),
+        "vertical_free_overridden_by_wall_cells": int(ray_wall_debug.get("vertical_free_overridden_by_wall_cells", 0)),
+        "evidence_fusion": fusion_debug,
+        "occupied_source_audit": dict(fusion_debug.get("occupied_source_audit", {})),
         "vertical_observed_map": vertical_observed,
         "vertical_observed_cells": int(np.count_nonzero(vertical_observed)),
+        "vertical_unknown_before_overlay": np.asarray(fusion["vertical_unknown_before_overlay"], dtype=bool),
+        "vertical_unknown_before_overlay_cells": int(fusion_debug.get("vertical_unknown_before_overlay_cells", 0)),
+        "nav_raw_obstacle": np.asarray(fusion["nav_raw_obstacle"], dtype=bool),
+        "nav_raw_obstacle_cells": int(fusion_debug.get("nav_raw_obstacle_cells", 0)),
+        "roomseg_static_structural_occupied": np.asarray(fusion["roomseg_static_structural_occupied"], dtype=bool),
+        "roomseg_static_structural_occupied_cells": int(fusion_debug.get("static_structural_occupied_cells", 0)),
+        "nav_obstacle_overlay_candidate": np.asarray(fusion["nav_obstacle_overlay_candidate"], dtype=bool),
+        "nav_obstacle_overlay_candidate_cells": int(fusion_debug.get("nav_obstacle_overlay_candidate_cells", 0)),
+        "nav_obstacle_overlay_accepted": np.asarray(fusion["nav_obstacle_overlay_accepted"], dtype=bool),
+        "nav_obstacle_overlay_accepted_cells": int(fusion_debug.get("nav_obstacle_overlay_accepted_cells", 0)),
+        "walls_rescued_from_unknown": np.asarray(fusion["walls_rescued_from_unknown"], dtype=bool),
+        "walls_rescued_from_unknown_cells": int(fusion_debug.get("walls_rescued_from_unknown_cells", 0)),
+        "vertical_free_over_nav_obstacle": np.asarray(fusion["vertical_free_over_nav_obstacle"], dtype=bool),
+        "vertical_free_over_nav_obstacle_cells": int(fusion_debug.get("vertical_free_over_nav_obstacle_cells", 0)),
+        "nav_obstacle_still_unknown_after_fusion": np.asarray(fusion["nav_obstacle_still_unknown_after_fusion"], dtype=bool),
+        "nav_obstacle_still_unknown_after_fusion_cells": int(fusion_debug.get("nav_obstacle_still_unknown_after_fusion_cells", 0)),
         "observed_not_vertical_free": vertical_observed & ~vertical_free_room_domain,
         "observed_not_vertical_free_cells": int(np.count_nonzero(vertical_observed & ~vertical_free_room_domain)),
         "vertical_or_free_map": vertical_or_free,
@@ -1340,6 +1725,16 @@ def _vertical_profile_structural_maps(
         "navigation_free_not_added_to_roomseg_cells": int(np.count_nonzero(nav_free_room_domain & ~vertical_free_room_domain)),
         "initial_roomseg_free": initial_roomseg_free,
         "initial_roomseg_occupied": initial_roomseg_occupied,
+        "initial_roomseg_unknown": initial_roomseg_unknown,
+        "initial_roomseg_free_after_ray_wall": np.asarray(ray_wall["initial_roomseg_free_after_ray_wall"], dtype=bool),
+        "initial_roomseg_occupied_after_ray_wall": np.asarray(ray_wall["initial_roomseg_occupied_after_ray_wall"], dtype=bool),
+        "initial_roomseg_unknown_after_ray_wall": np.asarray(ray_wall["initial_roomseg_unknown_after_ray_wall"], dtype=bool),
+        "initial_roomseg_free_after_fusion": np.asarray(fusion["initial_roomseg_free_after_fusion"], dtype=bool),
+        "initial_roomseg_occupied_after_fusion": np.asarray(fusion["initial_roomseg_occupied_after_fusion"], dtype=bool),
+        "initial_roomseg_unknown_after_fusion": np.asarray(fusion["initial_roomseg_unknown_after_fusion"], dtype=bool),
+        "initial_roomseg_free_cells": int(fusion_debug.get("initial_roomseg_free_cells", np.count_nonzero(initial_roomseg_free))),
+        "initial_roomseg_occupied_cells": int(fusion_debug.get("initial_roomseg_occupied_cells", np.count_nonzero(initial_roomseg_occupied))),
+        "initial_roomseg_unknown_cells": int(fusion_debug.get("initial_roomseg_unknown_cells", np.count_nonzero(initial_roomseg_unknown))),
         "repaired_roomseg_free": repaired_free,
         "repaired_roomseg_occupied": repaired_occupied,
         "repaired_roomseg_unknown": repaired_unknown,

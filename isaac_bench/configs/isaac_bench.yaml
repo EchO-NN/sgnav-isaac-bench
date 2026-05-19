@@ -164,21 +164,41 @@ mapping:
   frontier_allow_near_fallback: false
   frontier_debug_dump: false
   frontier_debug_dir: data/debug_frontier
-  room_map_mode: rose2_source_faithful_v1_vlm
+  room_map_mode: vertical_free_gap_closure_v1_vlm
   strict_no_oracle_rooms: true
   room_segmentation:
     enabled: true
-    algorithm: rose2_source_faithful_v1
-    backend: rose2_source_faithful_v1
-    source_mode: source_form_no_ros
+    algorithm: vertical_free_gap_closure_v1
+    backend: vertical_free_gap_closure_v1
+    source_mode: declutter_reconstruct_external
     legacy_watershed_allowed: debug_only
     local_rose2_lite_allowed: debug_only
-    require_upstream_source_for_strict: true
+    require_upstream_source_for_strict: false
+    allow_source_form_in_metric: false
+    allow_silent_fallback: false
     upstream_repo_env: ROSE2_SOURCE_ROOT
+    external_runner:
+      enabled: true
+      timeout_s: 60
+      work_dir: debug/rose2_external_runner
+      python_executable: null
+      encoding: auto
+      keep_work_dir: true
+      cache_enabled: true
+      parse_strategy: auto
+      fail_on_parse_error: true
+      parameter_overrides:
+        thresholdHough: 25
+        minLineLength: 10
+        maxLineGap: 5
+        filter_level: 0.18
+        th_post: 750
+        th1: 0.1
+        distance_extended_segment: 20
     run_only_before_frontier_scoring: true
     source_grid: online_depth_observed
-    proposal_mode: distance_watershed
-    finalization_mode: no_merge_until_source_backend_verified
+    proposal_mode: vertical_free_gap_closure
+    finalization_mode: no_merge_until_geometry_verified
     use_structural_obstacle_mask: true
     suppress_furniture_obstacles: true
     debug_rose2_source: false
@@ -221,6 +241,158 @@ mapping:
       upper_band_m: [1.30, 2.00]
       min_free_rays: 1
       min_observed_rays: 1
+    evidence_fusion:
+      enabled: true
+      mode: ray_valid_wall_no_navigation_overlay
+      vertical_free_priority: true
+      use_navigation_obstacle_for_vertical_unknown: false
+      use_navigation_free_for_roomseg_free: false
+      use_inflated_obstacle: false
+      use_depth_valid_as_wall: false
+      use_static_structural_occupied: false
+      exclude_openings: true
+      debug_dump: true
+    ray_valid_wall_inference:
+      enabled: true
+      depth_max_m: 3.0
+      min_endpoint_height_m: 0.20
+      max_endpoint_height_m: 2.00
+      min_terminal_wall_count: 1
+      terminal_wall_splat_radius_cells: 1
+      require_no_vertical_free: true
+      mark_ray_covered_debug: true
+      decouple_roomseg_rays_from_nav_clear: true
+      strict_no_navigation_obstacle_overlay: true
+      strict_no_navigation_free_overlay: true
+    vertical_free_roomseg:
+      enabled: true
+      debug_dump: false
+      debug_dir: debug/vertical_free_roomseg
+      free_close_radius_m: 0.05
+      free_open_radius_m: 0.00
+      wall_close_radius_m: 0.05
+      min_free_component_area_m2: 0.25
+      fill_tiny_unknown_holes_m2: 0.15
+      distance_smooth_sigma_cells: 1.0
+      seed_min_clearance_m: 0.45
+      seed_h_max_m: 0.12
+      seed_min_distance_m: 0.80
+      seed_min_area_m2: 0.20
+      force_one_seed_per_free_component: true
+      connectivity: 8
+      conflict_boundary_enabled: true
+      conflict_boundary_max_clearance_m: 0.85
+      conflict_min_neighbor_labels: 2
+      keep_boundary_unlabeled: false
+      doorway_partition_enabled: true
+      doorway_width_min_m: 0.45
+      doorway_width_max_m: 1.60
+      bottleneck_max_clearance_m: 0.80
+      bottleneck_min_side_area_m2: 1.00
+      bottleneck_band_radius_m: 0.30
+      open_region_merge_enabled: true
+      open_merge_min_boundary_width_m: 1.80
+      open_merge_min_contact_length_m: 0.60
+      open_merge_max_boundary_fraction: 0.35
+      merge_small_area_m2: 1.20
+      merge_thin_sliver_area_m2: 0.50
+    vertical_free_gap_closure:
+      enabled: true
+      close_max_gap_m: 1.50
+      close_min_gap_m: 0.15
+      virtual_boundary_radius_m: 0.06
+      virtual_boundary_connect_to_wall_radius_m: 0.08
+      wall_min_component_cells: 3
+      free_min_component_cells: 8
+      wall_micro_close_radius_cells: 1
+      use_skeleton_endpoints: true
+      use_curvature_endpoints: true
+      endpoint_min_wall_support_m: 0.25
+      endpoint_tangent_window_m: 0.35
+      max_endpoints_per_component: 128
+      tangent_parallel_cos_min: 0.70
+      tangent_line_cos_min: 0.65
+      throat_tangent_parallel_cos_min: 0.45
+      corner_guard_min_tangent_parallel_cos: 0.35
+      same_component_min_wall_path_m: 0.50
+      line_free_ratio_min: 0.70
+      line_unknown_ratio_max: 0.10
+      line_mid_wall_ratio_max: 0.20
+      side_support_band_m: 0.35
+      side_support_min_free_cells: 15
+      side_support_min_ratio: 0.15
+      side_support_balance_min: 0.25
+      max_candidates: 2048
+      nms_line_distance_m: 0.25
+      nms_endpoint_distance_m: 0.20
+      candidate_score_min: 0.45
+      topology_verify_enabled: true
+      small_component_area_m2: 0.60
+      keep_closure_if_between_two_meaningful_rooms: true
+      debug_dump: false
+      debug_dir: debug/vertical_free_gap_closure
+      min_room_area_m2: 1.20
+      min_room_free_cells: 50
+      corridor_keep_enabled: true
+      corridor_as_room_min_area_m2: 1.00
+      corridor_as_room_aspect_ratio: 4.0
+    online_roomseg:
+      enabled: true
+      backend: online_rose_style_v1
+      depth:
+        roomseg_depth_stride_px: 4
+        roomseg_depth_stride_debug_px: 2
+      free_clean:
+        enabled: true
+        hole_fill_max_area_cells: 16
+        hole_fill_max_radius_cells: 3
+        island_remove_max_area_cells: 8
+        do_not_fill_if_occupied_ratio_gt: 0.15
+      wall_candidate:
+        enabled: true
+        min_component_area_cells: 6
+        min_component_length_m: 0.25
+        max_component_thickness_m: 0.25
+        min_component_elongation: 2.5
+      line_walls:
+        enabled: true
+        hough_enabled: true
+        pca_enabled: true
+        min_line_length_m: 0.45
+        min_support_ratio: 0.35
+        max_angle_to_dominant_deg: 15
+      physical_wall_completion:
+        enabled: true
+        max_gap_m: 0.45
+        max_lateral_offset_m: 0.15
+        max_angle_deg: 10
+        min_endpoint_support: 0.5
+      doorway_virtual_cut:
+        enabled: true
+        min_width_m: 0.45
+        max_width_m: 1.60
+        max_angle_deg: 12
+        min_wall_endpoint_support: 0.4
+        require_free_gap: true
+      corridor:
+        enabled: true
+        min_length_m: 1.5
+        max_width_m: 1.8
+        min_aspect_ratio: 2.5
+        skeleton_prune_length_m: 0.4
+      corridor_room_neck_cut:
+        enabled: true
+        max_neck_width_m: 1.8
+        min_room_side_area_m2: 1.5
+        reject_if_splits_corridor_axis: true
+      topology_test:
+        enabled: true
+        min_split_area_m2: 1.0
+        max_tiny_fragment_count: 3
+        reject_corridor_split: true
+      debug:
+        save_layers: false
+        save_candidate_json: false
     debug_layers:
       enabled: false
       output_dir: debug/roomseg_layers
@@ -424,7 +596,7 @@ sgnav:
     long_edge_geometric_pruning: true
     group_nodes: true
     room_nodes:
-      source: rose2_source_faithful_v1_vlm
+      source: vertical_free_gap_closure_v1_vlm
       use_dataset_room_labels_in_metric: false
       strict_no_oracle_rooms: true
       room_label_backend: vlm

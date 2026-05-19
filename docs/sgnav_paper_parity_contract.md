@@ -36,15 +36,15 @@ Metric-path SG-Nav runs must use the following pipeline:
    HCoT/subgraph frontier interpolation. Mapper-only updates, perception-only
    updates, committed-frontier local replans, and candidate re-perception/STOP
    confirmation must use cached context and must not trigger room VLM calls.
-11. Strict room masks come from `upstream_rose2_vertical_or_free`: a no-ROS
-   pure-Python adapter for the MIT `goldleaf3i/declutter-reconstruct` ROSE2
-   paper code. It operates on the online 2D occupancy grid, estimates DFT/FFT
-   dominant wall directions, filters robust structure, extracts Hough/clustered
-   wall lines, creates room masks/polygons, preserves stable IDs, and runs
-   two-stage room recognition immediately before frontier scoring. Strict runs
-   must fail clearly if `ROSE2_SOURCE_ROOT` does not point to a checkout
-   containing `code/FFT_MQ.py`, `code/minibatch.py`, and `code/parameters.py`.
-   Local ROSE2-lite and the old watershed segmenter are debug/ablation only.
+11. Strict room masks come from `vertical_free_gap_closure_v1_vlm` with
+   `room_segmentation.backend=vertical_free_gap_closure_v1`: the online
+   0.2--2.0 m vertical-free roomseg map is segmented in-repository with
+   pure Python/Numpy/Scipy geometry. Short wall gaps are closed only as
+   virtual room boundaries after endpoint, side-support, line-free, unknown,
+   and topology checks; virtual boundaries affect only room labels and are not
+   written back into navigation obstacles. Upstream ROSE2, source-form/faithful
+   local rewrites, local ROSE2-lite, the old watershed segmenter, and the prior
+   geodesic watershed vertical-free backend are debug/ablation only.
    Premerge room labels can preserve weak/open-plan functional splits only
    when both sides are reliable, non-unknown, and different; final room masks
    are labeled again for SG-Nav room nodes. `unknown` is a valid first-class

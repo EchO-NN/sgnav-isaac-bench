@@ -18,6 +18,7 @@ DEFAULT_GROUNDING_DINO_CONFIG_CANDIDATES = (
     "GroundingDINO/groundingdino/config/GroundingDINO_SwinB.py",
     "groundingdino/config/GroundingDINO_SwinB.py",
 )
+GROUNDING_DINO_FIXED_VOCABULARY = ("door", "doorframe")
 
 
 class GroundingDINODetector(DetectorBase):
@@ -62,15 +63,7 @@ class GroundingDINODetector(DetectorBase):
         self.model = _load_model(self.config_path, self.checkpoint_path, device=self.device).to(self.device)
 
     def set_vocabulary(self, categories: List[str]) -> None:
-        seen: set[str] = set()
-        vocab: list[str] = []
-        for category in categories:
-            normalized = normalize_category(category)
-            if normalized in seen or normalized == "unknown":
-                continue
-            seen.add(normalized)
-            vocab.append(normalized)
-        self.vocab = vocab
+        self.vocab = grounding_dino_vocabulary(categories)
 
     def detect(self, rgb: Any) -> List[Detection2D]:
         if not self.vocab:
@@ -137,8 +130,29 @@ def grounding_dino_caption(categories: Sequence[str]) -> str:
         if not normalized or normalized == "unknown" or normalized in seen:
             continue
         seen.add(normalized)
-        tokens.append(normalized.replace("_", " "))
+        tokens.append(_caption_token_for_category(normalized))
     return ". ".join(tokens) + "."
+
+
+def grounding_dino_vocabulary(categories: Sequence[str]) -> list[str]:
+    """Normalize a GroundingDINO vocabulary and always include structural door cues."""
+
+    seen: set[str] = set()
+    vocab: list[str] = []
+    for category in list(categories or []) + list(GROUNDING_DINO_FIXED_VOCABULARY):
+        normalized = normalize_category(category)
+        if normalized in seen or normalized == "unknown":
+            continue
+        seen.add(normalized)
+        vocab.append(normalized)
+    return vocab
+
+
+def _caption_token_for_category(category: str) -> str:
+    normalized = normalize_category(category)
+    if normalized == "doorframe":
+        return "door frame"
+    return normalized.replace("_", " ")
 
 
 def resolve_grounding_dino_config(config_path: str | None = None) -> Path:
@@ -210,7 +224,13 @@ def _match_phrase_to_vocab(phrase: str, vocab: Sequence[str]) -> tuple[int | Non
     normalized_words = {normalize_category(part) for part in str(phrase).replace(".", " ").split()}
     for idx, category in enumerate(vocab):
         normalized_category = normalize_category(category)
-        if normalized_phrase == normalized_category or normalized_category in normalized_words:
+        compact_phrase = normalized_phrase.replace("_", "")
+        compact_category = normalized_category.replace("_", "")
+        if normalized_phrase == normalized_category or compact_phrase == compact_category:
+            return int(idx), normalized_category
+    for idx, category in enumerate(vocab):
+        normalized_category = normalize_category(category)
+        if normalized_category in normalized_words:
             return int(idx), normalized_category
         if normalized_category in normalized_phrase or normalized_phrase in normalized_category:
             return int(idx), normalized_category

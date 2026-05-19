@@ -15,18 +15,22 @@ def test_required_sgnav_defaults():
     assert cfg["perception"]["grounding_dino"]["checkpoint"].endswith("groundingdino_swinb_cogcoor.pth")
     assert cfg["perception"]["grounding_dino"]["config"].endswith("GroundingDINO_SwinB.cfg.py")
     assert cfg["sgnav"]["candidate_start_min_confidence"] == 0.45
-    assert cfg["mapping"]["room_map_mode"] == "rose2_source_faithful_v1_vlm"
+    assert cfg["mapping"]["room_map_mode"] == "vertical_free_gap_closure_v1_vlm"
     assert cfg["mapping"]["strict_no_oracle_rooms"] is True
-    assert cfg["mapping"]["room_segmentation"]["algorithm"] == "rose2_source_faithful_v1"
-    assert cfg["mapping"]["room_segmentation"]["backend"] == "rose2_source_faithful_v1"
-    assert cfg["mapping"]["room_segmentation"]["source_mode"] == "source_form_no_ros"
+    assert cfg["mapping"]["room_segmentation"]["algorithm"] == "vertical_free_gap_closure_v1"
+    assert cfg["mapping"]["room_segmentation"]["backend"] == "vertical_free_gap_closure_v1"
+    assert cfg["mapping"]["room_segmentation"]["source_mode"] == "declutter_reconstruct_external"
     assert cfg["mapping"]["room_segmentation"]["legacy_watershed_allowed"] == "debug_only"
     assert cfg["mapping"]["room_segmentation"]["local_rose2_lite_allowed"] == "debug_only"
-    assert cfg["mapping"]["room_segmentation"]["require_upstream_source_for_strict"] is True
+    assert cfg["mapping"]["room_segmentation"]["require_upstream_source_for_strict"] is False
+    assert cfg["mapping"]["room_segmentation"]["allow_source_form_in_metric"] is False
+    assert cfg["mapping"]["room_segmentation"]["allow_silent_fallback"] is False
     assert cfg["mapping"]["room_segmentation"]["upstream_repo_env"] == "ROSE2_SOURCE_ROOT"
+    assert cfg["mapping"]["room_segmentation"]["external_runner"]["enabled"] is True
+    assert cfg["mapping"]["room_segmentation"]["external_runner"]["encoding"] == "auto"
     assert cfg["mapping"]["room_segmentation"]["run_only_before_frontier_scoring"] is True
-    assert cfg["mapping"]["room_segmentation"]["proposal_mode"] == "distance_watershed"
-    assert cfg["mapping"]["room_segmentation"]["finalization_mode"] == "no_merge_until_source_backend_verified"
+    assert cfg["mapping"]["room_segmentation"]["proposal_mode"] == "vertical_free_gap_closure"
+    assert cfg["mapping"]["room_segmentation"]["finalization_mode"] == "no_merge_until_geometry_verified"
     assert cfg["mapping"]["room_segmentation"]["strict_disallow_legacy_fallback"] is True
     assert cfg["mapping"]["room_segmentation"]["source_form"]["min_cell_area_m2"] == 0.35
     assert cfg["mapping"]["room_segmentation"]["source_form"]["thin_wall_separator_enabled"] is True
@@ -39,6 +43,12 @@ def test_required_sgnav_defaults():
     assert cfg["mapping"]["room_segmentation"]["vertical_or_free"]["z_max_m"] == 2.00
     assert cfg["mapping"]["room_segmentation"]["vertical_or_free"]["min_free_rays"] == 1
     assert cfg["mapping"]["room_segmentation"]["vertical_or_free"]["min_observed_rays"] == 1
+    assert cfg["mapping"]["room_segmentation"]["vertical_free_roomseg"]["enabled"] is True
+    assert cfg["mapping"]["room_segmentation"]["vertical_free_roomseg"]["doorway_width_max_m"] == 1.60
+    assert cfg["mapping"]["room_segmentation"]["vertical_free_roomseg"]["open_region_merge_enabled"] is True
+    assert cfg["mapping"]["room_segmentation"]["vertical_free_gap_closure"]["enabled"] is True
+    assert cfg["mapping"]["room_segmentation"]["vertical_free_gap_closure"]["close_max_gap_m"] == 1.50
+    assert cfg["mapping"]["room_segmentation"]["vertical_free_gap_closure"]["topology_verify_enabled"] is True
     assert cfg["mapping"]["room_segmentation"]["max_clutter_component_area_m2"] == 4.0
     assert cfg["mapping"]["room_segmentation"]["open_boundary_merge"] is True
     assert cfg["mapping"]["room_segmentation"]["use_premerge_labels_for_open_plan_merge"] is True
@@ -62,7 +72,7 @@ def test_required_sgnav_defaults():
     assert cfg["object_memory"]["footprint_iou_track_match_threshold"] == 0.20
     assert cfg["object_memory"]["child_containment_threshold"] == 0.70
     assert cfg["object_memory"]["child_object_area_ratio_max"] == 0.35
-    assert cfg["sgnav"]["scene_graph"]["room_nodes"]["source"] == "rose2_source_faithful_v1_vlm"
+    assert cfg["sgnav"]["scene_graph"]["room_nodes"]["source"] == "vertical_free_gap_closure_v1_vlm"
     assert cfg["visualization"]["show_gt_goal_cells"] is False
     assert cfg["visualization"]["show_room_proposals"] is True
     assert cfg["isaac"]["perception_every_steps"] == 1

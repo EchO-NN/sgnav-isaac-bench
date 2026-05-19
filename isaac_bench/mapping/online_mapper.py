@@ -63,8 +63,10 @@ class OnlineMapper:
         self.last_static_nearfield_debug_stats: dict = {"reason": "not_updated"}
         self.last_timing_stats: dict = {"reason": "not_updated"}
         self.static_nearfield_mask = np.zeros_like(self.grid.free, dtype=np.uint8)
+        self.roomseg_static_structural_occupied = np.zeros_like(self.grid.free, dtype=np.uint8)
         self.depth_free_mask = np.zeros_like(self.grid.free, dtype=np.uint8)
         self.vertical_profile = VerticalProfileMap.zeros(self.grid.free.shape)
+        self._reset_roomseg_ray_evidence()
 
     def reset(self, start_xy: Tuple[float, float]) -> None:
         self.grid = OnlineGridMap.centered(start_xy[0], start_xy[1], self.size_m, self.resolution_m)
@@ -73,8 +75,10 @@ class OnlineMapper:
         self.last_static_nearfield_debug_stats = {"reason": "reset"}
         self.last_timing_stats = {"reason": "reset"}
         self.static_nearfield_mask = np.zeros_like(self.grid.free, dtype=np.uint8)
+        self.roomseg_static_structural_occupied = np.zeros_like(self.grid.free, dtype=np.uint8)
         self.depth_free_mask = np.zeros_like(self.grid.free, dtype=np.uint8)
         self.vertical_profile = VerticalProfileMap.zeros(self.grid.free.shape)
+        self._reset_roomseg_ray_evidence()
 
     def update_simple_radius(self, base_pose_world: Tuple[float, float, float, float], radius_m: float = 1.5) -> OnlineGridMap:
         # Conservative fallback mapping for smoke tests: mark a local disk free.
@@ -191,14 +195,16 @@ class OnlineMapper:
         free_flat_values: list[int] = []
         occupied_flat_values: list[int] = []
         free_flat_by_band: list[list[int]] = [[] for _ in self.vertical_profile.band_names]
+        roomseg_ray_covered_flat_values: list[int] = []
         ray_count = 0
         skipped_height_rays = 0
         vertical_profile_ray_count = 0
         vertical_profile_skipped_height_rays = 0
         stage_started_at = time.perf_counter()
-        for endpoint, endpoint_rel_z, endpoint_is_obstacle, ray_can_clear in zip(
+        for endpoint, endpoint_rel_z, endpoint_depth_m, endpoint_is_obstacle, ray_can_clear in zip(
             rows_cols,
             rel_z,
+            in_bounds_depth,
             obstacle_mask,
             ray_clear_mask,
         ):
@@ -215,27 +221,42 @@ class OnlineMapper:
                 for row, col in free_line:
                     flat_idx = int(row) * map_width + int(col)
                     free_flat_values.append(flat_idx)
-            include_free_endpoint_column = bool(
-                nav_can_clear and not bool(endpoint_is_obstacle) and float(endpoint_rel_z) <= self.free_max_height_m
+            roomseg_ray_valid = bool(
+                np.isfinite(float(endpoint_depth_m))
+                and self.depth_min_m < float(endpoint_depth_m) < self.depth_max_m
+                and is_inside_grid(int(end_cell[0]), int(end_cell[1]), self.grid.map_info)
             )
-            profile_free_line = line if include_free_endpoint_column else line[:-1]
-            added_profile_cells = _append_vertical_profile_free_ray_cells(
-                free_flat_by_band,
-                profile_free_line,
-                map_width=map_width,
-                origin_rel_z_m=camera_rel_z,
-                endpoint_rel_z_m=float(endpoint_rel_z),
-                z_min_m=self.vertical_profile_free_min_height_m,
-                z_max_m=self.vertical_profile_free_max_height_m,
-                vertical_profile=self.vertical_profile,
-            )
-            if added_profile_cells > 0:
-                vertical_profile_ray_count += 1
+            if roomseg_ray_valid:
+                profile_free_line = line[:-1]
+                added_profile_cells = _append_vertical_profile_free_ray_cells(
+                    free_flat_by_band,
+                    profile_free_line,
+                    map_width=map_width,
+                    origin_rel_z_m=camera_rel_z,
+                    endpoint_rel_z_m=float(endpoint_rel_z),
+                    z_min_m=self.vertical_profile_free_min_height_m,
+                    z_max_m=self.vertical_profile_free_max_height_m,
+                    vertical_profile=self.vertical_profile,
+                )
+                if added_profile_cells > 0:
+                    vertical_profile_ray_count += 1
+                    for row, col in profile_free_line:
+                        roomseg_ray_covered_flat_values.append(int(row) * map_width + int(col))
+                else:
+                    vertical_profile_skipped_height_rays += 1
+                self._mark_roomseg_terminal_wall_cell(
+                    int(end_cell[0]),
+                    int(end_cell[1]),
+                    endpoint_depth_m=float(endpoint_depth_m),
+                    endpoint_rel_z_m=float(endpoint_rel_z),
+                )
             else:
                 vertical_profile_skipped_height_rays += 1
             if bool(endpoint_is_obstacle):
                 occupied_flat_values.append(int(end_cell[0]) * map_width + int(end_cell[1]))
         self._mark_vertical_profile_free_flat(free_flat_by_band)
+        self._mark_roomseg_ray_covered_flat(roomseg_ray_covered_flat_values)
+        self._refresh_roomseg_terminal_wall_splat(radius_cells=1)
         timings["ray_cast_ms"] = _elapsed_ms(stage_started_at)
 
         stage_started_at = time.perf_counter()
@@ -475,6 +496,7 @@ class OnlineMapper:
         free_cells = 0
         occupied_cells = 0
         blocked_clearance_cells = 0
+        roomseg_static_structural_occupied_cells = 0
         skipped_outside_dynamic = 0
         skipped_outside_static = 0
         sampled_cells = 0
@@ -496,6 +518,7 @@ class OnlineMapper:
                 self.grid.free[row, col] = 1
                 self.grid.occupied[row, col] = 0
                 self.grid.observed[row, col] = 1
+                self.roomseg_static_structural_occupied[row, col] = 0
                 free_cells += 1
                 if is_opening:
                     opening_cells += 1
@@ -504,8 +527,11 @@ class OnlineMapper:
                 self.grid.occupied[row, col] = 0
                 if bool(occupancy[static_row, static_col]):
                     occupied_cells += 1
+                    self.roomseg_static_structural_occupied[row, col] = 1
+                    roomseg_static_structural_occupied_cells += 1
                 else:
                     blocked_clearance_cells += 1
+                    self.roomseg_static_structural_occupied[row, col] = 0
                 self.grid.observed[row, col] = 1
 
         stats = {
@@ -518,6 +544,7 @@ class OnlineMapper:
             "occupied_cells": int(occupied_cells),
             "blocked_clearance_cells": int(blocked_clearance_cells),
             "opening_cells": int(opening_cells),
+            "roomseg_static_structural_occupied_cells": int(roomseg_static_structural_occupied_cells),
             "skipped_outside_dynamic": int(skipped_outside_dynamic),
             "skipped_outside_static": int(skipped_outside_static),
             "base_pose_world": [float(v) for v in base_pose_world],
@@ -574,6 +601,79 @@ class OnlineMapper:
         out["update_total_ms"] = _elapsed_ms(total_started_at)
         out["reason"] = str(reason)
         self.last_timing_stats = out
+
+    def _reset_roomseg_ray_evidence(self) -> None:
+        shape = self.grid.free.shape
+        self.roomseg_ray_covered_count = np.zeros(shape, dtype=np.uint16)
+        self.roomseg_terminal_wall_count = np.zeros(shape, dtype=np.uint16)
+        self.roomseg_terminal_wall_height_min = np.full(shape, np.inf, dtype=np.float32)
+        self.roomseg_terminal_wall_height_max = np.full(shape, -np.inf, dtype=np.float32)
+        self.roomseg_terminal_wall_depth_min = np.full(shape, np.inf, dtype=np.float32)
+        self.roomseg_terminal_wall_splat = np.zeros(shape, dtype=np.uint8)
+
+    def roomseg_ray_evidence(self) -> dict[str, np.ndarray]:
+        return {
+            "ray_covered_count": np.asarray(self.roomseg_ray_covered_count, dtype=np.uint16),
+            "terminal_wall_count": np.asarray(self.roomseg_terminal_wall_count, dtype=np.uint16),
+            "terminal_wall_height_min": np.asarray(self.roomseg_terminal_wall_height_min, dtype=np.float32),
+            "terminal_wall_height_max": np.asarray(self.roomseg_terminal_wall_height_max, dtype=np.float32),
+            "terminal_wall_depth_min": np.asarray(self.roomseg_terminal_wall_depth_min, dtype=np.float32),
+            "terminal_wall_splat": np.asarray(self.roomseg_terminal_wall_splat, dtype=np.uint8),
+        }
+
+    def _mark_roomseg_ray_covered_flat(self, flat_values: List[int]) -> None:
+        h, w = self.grid.occupied.shape
+        total_cells = int(h * w)
+        flat = _valid_flat_array(flat_values, total_cells)
+        if flat.size == 0:
+            return
+        uint16_max = int(np.iinfo(np.uint16).max)
+        counts = np.bincount(flat, minlength=total_cells).reshape(h, w).astype(np.uint32)
+        updated = np.asarray(self.roomseg_ray_covered_count, dtype=np.uint32) + counts
+        self.roomseg_ray_covered_count[:, :] = np.minimum(updated, uint16_max).astype(np.uint16)
+
+    def _mark_roomseg_terminal_wall_cell(
+        self,
+        row: int,
+        col: int,
+        *,
+        endpoint_depth_m: float,
+        endpoint_rel_z_m: float,
+    ) -> None:
+        rr, cc = int(row), int(col)
+        if not is_inside_grid(rr, cc, self.grid.map_info):
+            return
+        depth = float(endpoint_depth_m)
+        rel_z = float(endpoint_rel_z_m)
+        if not (np.isfinite(depth) and self.depth_min_m < depth < self.depth_max_m):
+            return
+        if not (
+            float(self.vertical_profile_free_min_height_m)
+            <= rel_z
+            <= float(self.vertical_profile_free_max_height_m)
+        ):
+            return
+        uint16_max = int(np.iinfo(np.uint16).max)
+        self.roomseg_terminal_wall_count[rr, cc] = min(
+            uint16_max,
+            int(self.roomseg_terminal_wall_count[rr, cc]) + 1,
+        )
+        self.roomseg_terminal_wall_height_min[rr, cc] = min(
+            float(self.roomseg_terminal_wall_height_min[rr, cc]),
+            rel_z,
+        )
+        self.roomseg_terminal_wall_height_max[rr, cc] = max(
+            float(self.roomseg_terminal_wall_height_max[rr, cc]),
+            rel_z,
+        )
+        self.roomseg_terminal_wall_depth_min[rr, cc] = min(
+            float(self.roomseg_terminal_wall_depth_min[rr, cc]),
+            depth,
+        )
+
+    def _refresh_roomseg_terminal_wall_splat(self, radius_cells: int = 1, min_count: int = 1) -> None:
+        terminal = np.asarray(self.roomseg_terminal_wall_count, dtype=np.uint32) >= max(1, int(min_count))
+        self.roomseg_terminal_wall_splat[:, :] = _dilate_binary(terminal, int(radius_cells)).astype(np.uint8)
 
     def _mark_vertical_profile_free_flat(self, flat_indices_by_band: List[List[int]]) -> None:
         h, w = self.grid.occupied.shape
@@ -689,6 +789,22 @@ class OnlineMapper:
                 "vertical_profile_free_max": float(self.vertical_profile_free_max_height_m),
             },
             "vertical_profile": self.vertical_profile.to_debug_dict(),
+            "roomseg_ray_evidence": {
+                "ray_covered_cells": int(np.count_nonzero(self.roomseg_ray_covered_count)),
+                "ray_covered_count_sum": int(np.sum(self.roomseg_ray_covered_count, dtype=np.uint64)),
+                "terminal_wall_cells": int(np.count_nonzero(self.roomseg_terminal_wall_count)),
+                "terminal_wall_count_sum": int(np.sum(self.roomseg_terminal_wall_count, dtype=np.uint64)),
+                "terminal_wall_splat_cells": int(np.count_nonzero(self.roomseg_terminal_wall_splat)),
+                "terminal_wall_depth_min_m_percentiles": _percentiles(
+                    self.roomseg_terminal_wall_depth_min[np.isfinite(self.roomseg_terminal_wall_depth_min)]
+                ),
+                "terminal_wall_height_min_m_percentiles": _percentiles(
+                    self.roomseg_terminal_wall_height_min[np.isfinite(self.roomseg_terminal_wall_height_min)]
+                ),
+                "terminal_wall_height_max_m_percentiles": _percentiles(
+                    self.roomseg_terminal_wall_height_max[np.isfinite(self.roomseg_terminal_wall_height_max)]
+                ),
+            },
             "splat_thresholds": {
                 "free": int(self.free_splat_point_threshold),
                 "obstacle": int(self.splat_point_threshold),

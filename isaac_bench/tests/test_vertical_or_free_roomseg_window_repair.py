@@ -69,7 +69,7 @@ def test_vertical_or_free_any_band_free_overrides_roomseg_occupied(tmp_path):
     assert not segmenter.last_debug["structural_wall_mask"][10, 10]
 
 
-def test_rose_roomseg_input_does_not_overlay_2d_occupied_without_vertical_observation(tmp_path):
+def test_rose_roomseg_input_does_not_overlay_raw_obstacle_for_vertical_unknown_wall(tmp_path):
     shape = (24, 24)
     occupied = np.zeros(shape, dtype=bool)
     occupied[12, 12] = True
@@ -80,10 +80,15 @@ def test_rose_roomseg_input_does_not_overlay_2d_occupied_without_vertical_observ
     segmenter = _segmenter(tmp_path, shape)
     segmenter.update(occupied, free, occupied, unknown, step=1, vertical_profile=profile)
 
-    assert segmenter.last_debug["roomseg_input_source"] == "vertical_profile_only"
+    assert segmenter.last_debug["roomseg_input_source"] == "vertical_profile_plus_ray_valid_terminal_wall"
     assert not segmenter.last_debug["vertical_observed_map"][12, 12]
+    assert segmenter.last_debug["vertical_unknown_before_overlay"][12, 12]
+    assert segmenter.last_debug["nav_raw_obstacle"][12, 12]
+    assert not segmenter.last_debug["nav_obstacle_overlay_accepted"][12, 12]
+    assert not segmenter.last_debug["walls_rescued_from_unknown"][12, 12]
     assert not segmenter.last_debug["initial_roomseg_occupied"][12, 12]
     assert not segmenter.last_debug["initial_roomseg_free"][12, 12]
+    assert segmenter.last_debug["initial_roomseg_unknown_after_fusion"][12, 12]
 
 
 def test_rose_roomseg_input_marks_observed_column_without_free_as_wall(tmp_path):
@@ -158,7 +163,7 @@ def test_navigation_free_path_cells_are_not_added_to_vertical_only_roomseg_input
     room_union = np.zeros(shape, dtype=bool)
     for room in rooms:
         room_union |= np.asarray(room.mask, dtype=bool)
-    assert segmenter.last_debug["roomseg_input_source"] == "vertical_profile_only"
+    assert segmenter.last_debug["roomseg_input_source"] == "vertical_profile_plus_ray_valid_terminal_wall"
     assert segmenter.last_debug["navigation_free_added_to_roomseg_cells"] == 0
     assert segmenter.last_debug["navigation_free_not_added_to_roomseg_cells"] > 0
     assert not np.any(segmenter.last_debug["repaired_roomseg_free"][path_only_nav_free])
@@ -267,7 +272,7 @@ def test_strict_mode_does_not_use_watershed_fallback(tmp_path):
     segmenter = _segmenter(tmp_path, occupied.shape)
     segmenter.update(occupied, free, occupied, unknown, step=1, vertical_profile=profile)
 
-    assert segmenter.last_debug["algorithm"] == "rose2_source_faithful_v1"
+    assert segmenter.last_debug["algorithm"] == "upstream_rose2_vertical_or_free"
     assert segmenter.last_debug["strict_fallback_used"] is False
 
 

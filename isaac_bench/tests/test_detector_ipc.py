@@ -31,6 +31,18 @@ def test_rgb_png_roundtrip():
     assert np.array_equal(out, rgb)
 
 
+def test_subprocess_grounding_dino_vocab_includes_fixed_door_categories(monkeypatch):
+    detector = SubprocessDetector("grounding_dino", "unused")
+    monkeypatch.setattr(detector, "_ensure_started", lambda: None)
+    monkeypatch.setattr(detector, "_send", lambda payload: setattr(detector, "_last_payload", payload))
+    monkeypatch.setattr(detector, "_read_response", lambda expected_type, timeout_s: {"type": expected_type})
+
+    detector.set_vocabulary(["sofa"])
+
+    assert detector.vocab == ["sofa", "door", "doorframe"]
+    assert detector._last_payload["categories"] == ["sofa", "door", "doorframe"]
+
+
 def test_subprocess_detector_dry_run():
     detector = SubprocessDetector(
         "dry_run",

@@ -36,12 +36,28 @@ from isaac_bench.mapping.room_map_from_rooms_json import build_room_index_map, l
 from isaac_bench.mapping.room_segmentation import (
     OnlineRoomSegmenter,
     RoomSegmentationConfig,
+    room_segmentation_debug,
 )
 from isaac_bench.mapping.rose2_room_segmentation import OnlineROSE2RoomSegmenter
+from isaac_bench.mapping.online_roomseg import (
+    ONLINE_ROSE_STYLE_BACKEND,
+    ONLINE_ROSE_STYLE_CONTEXT,
+    OnlineRoseStyleConfig,
+    OnlineRoseStyleRoomSegmenter,
+)
 from isaac_bench.mapping.upstream_rose2_pure_python_adapter import (
-    UPSTREAM_ALGORITHM,
     UpstreamROSE2Config,
     UpstreamROSE2PurePythonSegmenter,
+)
+from isaac_bench.mapping.vertical_free_roomseg import (
+    VERTICAL_FREE_ROOMSEG_ALGORITHM,
+    VERTICAL_FREE_ROOMSEG_BACKEND,
+    VERTICAL_FREE_ROOMSEG_CONTEXT,
+)
+from isaac_bench.mapping.vertical_free_gap_closure_roomseg import (
+    VERTICAL_FREE_GAP_CLOSURE_ALGORITHM,
+    VERTICAL_FREE_GAP_CLOSURE_BACKEND,
+    VERTICAL_FREE_GAP_CLOSURE_CONTEXT,
 )
 from isaac_bench.graph.room_semantics import (
     DEFAULT_ROOM_CATEGORIES,
@@ -1069,7 +1085,12 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
     room_context_cache = RoomContextCache()
     last_room_context_result: Optional[RoomContextResult] = None
     last_room_context_metadata = room_context_not_invoked_metadata()
-    last_room_segmentation_debug = {"source": UPSTREAM_ALGORITHM, "algorithm": UPSTREAM_ALGORITHM, "room_count": 0, "rooms": []}
+    last_room_segmentation_debug = {
+        "source": VERTICAL_FREE_GAP_CLOSURE_ALGORITHM,
+        "algorithm": VERTICAL_FREE_GAP_CLOSURE_ALGORITHM,
+        "room_count": 0,
+        "rooms": [],
+    }
     last_room_semantics_debug = {
         "backend": "unavailable",
         "allowed_categories": list(getattr(args, "room_label_allowed_categories", DEFAULT_ROOM_CATEGORIES)),
@@ -1078,7 +1099,7 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
     if room_map_mode in {"observed_rooms_json", "rooms_json", "observed"}:
         if bool(getattr(args, "strict_benchmark", False)):
             raise BenchmarkAssetError(
-                "strict SG-Nav metric path requires rose2_source_faithful_v1 room masks; rooms.json/oracle room maps are not allowed"
+                "strict SG-Nav metric path requires rose2_source_external_runner room masks; rooms.json/oracle room maps are not allowed"
             )
         full_room_map = build_sgnav_room_map(scene_dir, dynamic_map_info)
         scenegraph.update(object_memory, room_map=full_room_map)
@@ -1093,14 +1114,34 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
         "upstream_rose2_vertical_or_free_vlm",
         "upstream_rose2_pure_python",
         "upstream_rose2_pure_python_vlm",
+        VERTICAL_FREE_ROOMSEG_ALGORITHM,
+        VERTICAL_FREE_ROOMSEG_CONTEXT,
+        VERTICAL_FREE_ROOMSEG_BACKEND,
+        VERTICAL_FREE_GAP_CLOSURE_ALGORITHM,
+        VERTICAL_FREE_GAP_CLOSURE_CONTEXT,
+        VERTICAL_FREE_GAP_CLOSURE_BACKEND,
     }:
-        roomseg_backend = str(getattr(args, "room_segmentation_config", {}).get("backend", "rose2_source_faithful_v1") or "rose2_source_faithful_v1").strip().lower()
+        roomseg_backend = str(getattr(args, "room_segmentation_config", {}).get("backend", "rose2_source_external_runner") or "rose2_source_external_runner").strip().lower()
+        strict_roomseg_backends = {
+            "rose2_source_external_runner",
+            VERTICAL_FREE_GAP_CLOSURE_BACKEND,
+            VERTICAL_FREE_GAP_CLOSURE_ALGORITHM,
+        }
+        legacy_vertical_free_ablation = (
+            roomseg_backend in {VERTICAL_FREE_ROOMSEG_BACKEND, VERTICAL_FREE_ROOMSEG_ALGORITHM}
+            and str(getattr(args, "ablation_name", "") or "") == "vertical_free_geodesic_room_ablation"
+        )
+        if bool(getattr(args, "strict_benchmark", False)) and roomseg_backend not in strict_roomseg_backends and not legacy_vertical_free_ablation:
+            raise BenchmarkAssetError(
+                "strict SG-Nav metric path requires room_segmentation.backend=vertical_free_gap_closure_v1 or rose2_source_external_runner; %s is debug/ablation-only"
+                % roomseg_backend
+            )
         upstream_cfg = UpstreamROSE2Config.from_mapping(
             getattr(args, "room_segmentation_config", {}),
             resolution_m=float(dynamic_map_info.resolution_m),
             fail_on_missing_source=bool(getattr(args, "strict_benchmark", False))
             and not bool(getattr(args, "allow_debug_fallbacks", False))
-            and roomseg_backend in {"rose2_source_external", "rose2_source_external_runner"}
+            and roomseg_backend == "rose2_source_external_runner"
             and bool(getattr(args, "room_segmentation_config", {}).get("require_upstream_source_for_strict", True)),
         )
         room_segmenter = UpstreamROSE2PurePythonSegmenter(upstream_cfg, dynamic_map_info)
@@ -1124,7 +1165,7 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
     elif room_map_mode in {"online_rose2_structure", "rose2_structure", "online_rose2_structure_vlm"}:
         if bool(getattr(args, "strict_benchmark", False)) and str(getattr(args, "ablation_name", "") or "") != "local_rose2_lite_room_ablation":
             raise BenchmarkAssetError(
-                "strict SG-Nav metric path requires rose2_source_form room masks; local ROSE2-lite is debug/ablation-only"
+                "strict SG-Nav metric path requires rose2_source_external_runner room masks; local ROSE2-lite is debug/ablation-only"
             )
         room_cfg = RoomSegmentationConfig.from_mapping(
             getattr(args, "room_segmentation_config", {}),
@@ -1150,6 +1191,38 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
         )
         last_room_semantics_debug["backend"] = room_labeler.backend
     elif room_map_mode in {
+        ONLINE_ROSE_STYLE_BACKEND,
+        ONLINE_ROSE_STYLE_CONTEXT,
+        "online_rose_style",
+        "online_rose_style_vlm",
+    }:
+        roomseg_backend = str(getattr(args, "room_segmentation_config", {}).get("backend", ONLINE_ROSE_STYLE_BACKEND) or ONLINE_ROSE_STYLE_BACKEND).strip().lower()
+        if roomseg_backend != ONLINE_ROSE_STYLE_BACKEND:
+            raise ValueError("online_rose_style room_map_mode requires --roomseg-backend %s" % ONLINE_ROSE_STYLE_BACKEND)
+        online_cfg = OnlineRoseStyleConfig.from_mapping(
+            getattr(args, "room_segmentation_config", {}),
+            resolution_m=float(dynamic_map_info.resolution_m),
+            map_info=dynamic_map_info,
+        )
+        room_segmenter = OnlineRoseStyleRoomSegmenter(online_cfg, map_info=dynamic_map_info)
+        room_label_client = (
+            getattr(scenegraph, "paper_llm_client", None)
+            if str(getattr(args, "room_label_backend", "vlm")).strip().lower() == "vlm"
+            else None
+        )
+        room_labeler = VLMRoomLabeler(
+            client=room_label_client,
+            allowed_categories=getattr(args, "room_label_allowed_categories", DEFAULT_ROOM_CATEGORIES),
+            min_confidence=float(getattr(args, "room_label_min_confidence", 0.60)),
+            ambiguity_margin=float(getattr(args, "room_label_ambiguity_margin", 0.15)),
+            min_reliable_objects=int(getattr(args, "room_label_min_reliable_objects", 2)),
+            unknown_category=str(getattr(args, "room_label_unknown_category", "unknown")),
+            require_backend=bool(getattr(args, "strict_benchmark", False))
+            and str(getattr(args, "room_label_backend", "vlm")).strip().lower() == "vlm",
+            max_room_objects_in_prompt=int(getattr(args, "max_room_objects_in_prompt", 25)),
+        )
+        last_room_semantics_debug["backend"] = room_labeler.backend
+    elif room_map_mode in {
         "online_geometry_watershed",
         "online_geometry_watershed_vlm",
         "online_geometry_watershed_vertical_free",
@@ -1157,7 +1230,7 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
     }:
         if bool(getattr(args, "strict_benchmark", False)) and str(getattr(args, "ablation_name", "") or "") != "legacy_watershed_room_ablation":
             raise BenchmarkAssetError(
-                "strict SG-Nav metric path requires rose2_source_faithful_v1 room masks; watershed is debug/ablation-only"
+                "strict SG-Nav metric path requires rose2_source_external_runner room masks; watershed is debug/ablation-only"
             )
         room_cfg = RoomSegmentationConfig.from_mapping(
             getattr(args, "room_segmentation_config", {}),
@@ -1249,6 +1322,7 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
         print("[sgnav-loop] static-map detection localization disabled; using depth projection", flush=True)
         detection_localization = "depth"
     args.read_depth = True
+    roomseg_debug_only = bool(getattr(args, "roomseg_debug_only", False))
     viz = None
     viz_requested = bool(sgnav_viz_enabled or sgnav_viz_save_dir)
     viz_every = max(1, int(getattr(args, "sgnav_viz_every_steps", 1)))
@@ -1715,6 +1789,159 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
                 viz.set_room_context(last_room_masks, room_semantic_labels, last_room_segmentation_debug)
             return result
 
+        def update_roomseg_debug_only(step_idx: int, map_state: dict) -> None:
+            nonlocal last_room_masks, room_semantic_labels, last_room_segmentation_debug
+            nonlocal last_room_semantics_debug, last_room_context_metadata, last_room_context_result
+            if room_segmenter is None:
+                last_room_masks = []
+                room_semantic_labels = {}
+                last_room_context_result = None
+                last_room_context_metadata = {
+                    **room_context_not_invoked_metadata(),
+                    "roomseg_debug_only": True,
+                    "room_context_source": "roomseg_debug_only",
+                    "room_update_invoked_for_frontier_scoring": False,
+                    "room_segmentation_ran": False,
+                    "room_labeling_ran": False,
+                    "room_segmentation_called_for": "debug_only",
+                    "room_vlm_called": False,
+                    "scenegraph_updated_after_room_context": False,
+                    "frontier_scoring_after_room_context": False,
+                    "room_mask_count": 0,
+                }
+                last_room_segmentation_debug = {
+                    "roomseg_debug_only": True,
+                    "enabled": False,
+                    "source": str(room_map_mode),
+                    "algorithm": str(getattr(args, "room_segmentation_config", {}).get("algorithm", room_map_mode)),
+                    "room_count": 0,
+                    "rooms": [],
+                    "reason": "room_segmenter_not_configured",
+                }
+                if viz is not None:
+                    viz.set_room_context(last_room_masks, room_semantic_labels, last_room_segmentation_debug)
+                return
+
+            started_at = time.perf_counter()
+            update_kwargs = {
+                "step": int(step_idx),
+                "object_memory": [],
+            }
+            vertical_profile = getattr(mapper, "vertical_profile", None)
+            if vertical_profile is not None:
+                update_kwargs["vertical_profile"] = vertical_profile
+            roomseg_static_structural = getattr(mapper, "roomseg_static_structural_occupied", None)
+            if roomseg_static_structural is not None:
+                update_kwargs["roomseg_static_structural_occupied"] = roomseg_static_structural
+            roomseg_ray_evidence = getattr(mapper, "roomseg_ray_evidence", None)
+            if callable(roomseg_ray_evidence):
+                update_kwargs["roomseg_ray_evidence"] = roomseg_ray_evidence()
+            try:
+                masks = room_segmenter.update(
+                    map_state["occupancy"],
+                    map_state["free"],
+                    map_state["occupancy"],
+                    ~np.asarray(map_state["observed"], dtype=bool),
+                    **update_kwargs,
+                )
+            except TypeError:
+                update_kwargs.pop("vertical_profile", None)
+                update_kwargs.pop("roomseg_static_structural_occupied", None)
+                update_kwargs.pop("roomseg_ray_evidence", None)
+                masks = room_segmenter.update(
+                    map_state["occupancy"],
+                    map_state["free"],
+                    map_state["occupancy"],
+                    ~np.asarray(map_state["observed"], dtype=bool),
+                    **update_kwargs,
+                )
+            last_room_masks = list(masks)
+            room_semantic_labels = {}
+            debug = dict(getattr(room_segmenter, "last_debug", {}) or {})
+            if not debug:
+                debug = room_segmentation_debug(
+                    last_room_masks,
+                    map_state["free"],
+                    map_state["occupancy"],
+                    ~np.asarray(map_state["observed"], dtype=bool),
+                    step=int(step_idx),
+                    config=None,
+                    source=str(room_map_mode),
+                )
+            debug = {
+                **debug,
+                "roomseg_debug_only": True,
+                "roomseg_debug_view": "vertical_free_room_domain",
+                "source": str(debug.get("source") or room_map_mode),
+                "algorithm": str(debug.get("algorithm") or getattr(args, "room_segmentation_config", {}).get("algorithm", room_map_mode)),
+                "room_count": int(len(last_room_masks)),
+                "room_vlm_called": False,
+                "scenegraph_updated_after_room_context": False,
+                "frontier_scoring_after_room_context": False,
+                "room_segmentation_called_for": "debug_only",
+                "room_segmentation_step_index": int(step_idx),
+                "room_segmentation_runtime_ms": max(0.0, (time.perf_counter() - started_at) * 1000.0),
+            }
+            last_room_segmentation_debug = debug
+            last_room_semantics_debug = {
+                "backend": "disabled_roomseg_debug_only",
+                "labels": [],
+                "request_count": 0,
+                "failure_count": 0,
+            }
+            last_room_context_result = None
+            last_room_context_metadata = {
+                **room_context_not_invoked_metadata(),
+                "roomseg_debug_only": True,
+                "room_context_source": "roomseg_debug_only",
+                "room_update_invoked_for_frontier_scoring": False,
+                "room_segmentation_ran": True,
+                "room_labeling_ran": False,
+                "room_context_cache_hit": False,
+                "room_label_count": 0,
+                "room_label_requests": 0,
+                "room_label_cache_hits": 0,
+                "room_call_order_trace": ["mapping", "room_segmentation_debug_only", "visualization"],
+                "room_segmentation_called_for": "debug_only",
+                "room_segmentation_algorithm": str(last_room_segmentation_debug.get("algorithm", "")),
+                "room_segmentation_step_index": int(step_idx),
+                "room_vlm_called": False,
+                "scenegraph_updated_after_room_context": False,
+                "frontier_scoring_after_room_context": False,
+                "room_mask_count": int(len(last_room_masks)),
+            }
+            if bool(getattr(args, "debug_roomseg_layers", False)):
+                dump = save_roomseg_layer_dump(
+                    out_dir=str(getattr(args, "debug_roomseg_dir", "debug/roomseg_layers")),
+                    step=int(step_idx),
+                    room_debug=last_room_segmentation_debug,
+                    occupancy_map=map_state["occupancy"],
+                    observed_free_mask=map_state["free"],
+                    obstacle_mask=map_state["occupancy"],
+                    unknown_mask=~np.asarray(map_state["observed"], dtype=bool),
+                    frontier_map=np.zeros_like(map_state["occupancy"], dtype=bool),
+                    selected_frontier_members=None,
+                    selected_frontier_center_rc=None,
+                    agent_rc=map_state["current_grid"],
+                    max_saves=int(getattr(args, "debug_roomseg_max_saves", 50)),
+                    save_npz=bool(dict(getattr(args, "room_segmentation_config", {}).get("debug_layers", {}) or {}).get("save_npz", True)),
+                    save_png=bool(dict(getattr(args, "room_segmentation_config", {}).get("debug_layers", {}) or {}).get("save_png", True)),
+                    save_summary_json=bool(dict(getattr(args, "room_segmentation_config", {}).get("debug_layers", {}) or {}).get("save_summary_json", True)),
+                    include_selected_frontier_sector=False,
+                )
+                last_room_segmentation_debug = {
+                    **dict(last_room_segmentation_debug),
+                    "roomseg_debug_layers": dict(dump.get("paths", {})),
+                    "roomseg_debug_summary": dict(dump.get("summary", {})),
+                }
+                last_room_context_metadata = {
+                    **dict(last_room_context_metadata),
+                    "roomseg_debug_layers": dict(dump.get("paths", {})),
+                    "roomseg_debug_likely_cause": dict(dump.get("summary", {})).get("likely_cause"),
+                }
+            if viz is not None:
+                viz.set_room_context(last_room_masks, room_semantic_labels, last_room_segmentation_debug)
+
         panorama_steps = max(0, int(getattr(args, "panorama_steps", 0)))
         if panorama_steps > 0:
             print("[sgnav-loop] opening panorama: %d RGB-D views" % panorama_steps, flush=True)
@@ -1723,10 +1950,50 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
             if map_state is None or map_state["current_grid"] is None:
                 failure_reason = "panorama_agent_off_navigable_map"
                 break
+            pano_step = -panorama_steps + pano_idx
+            if roomseg_debug_only:
+                update_roomseg_debug_only(pano_step, map_state)
+                panorama_frames += 1
+                if viz is not None:
+                    viz.update(
+                        step=pano_step,
+                        rgb=viz_rgb(obs),
+                        detections_2d=[],
+                        occupancy=map_state["occupancy"],
+                        navigable=map_state["navigable"],
+                        observed=map_state["observed"],
+                        goal_cells=goal_cells,
+                        current_grid=map_state["current_grid"],
+                        pose=map_state["pose"],
+                        frontiers=[],
+                        nav_decision=None,
+                        current_path=[],
+                        full_path=[],
+                        object_memory=object_memory,
+                        goal_category=episode["goal_category"],
+                        distance_to_goal=evaluator.final_distance_to_goal,
+                        path_length=float(evaluator.path_accum.total_m),
+                        scenegraph_backend="roomseg_debug_only",
+                        score_debug={},
+                        failure_reason=failure_reason,
+                    )
+                if pano_idx + 1 < panorama_steps:
+                    yaw_delta = (2.0 * math.pi) / float(panorama_steps)
+                    pano_wz = max(1e-3, abs(float(args.panorama_wz_radps)))
+                    obs = server.step_kinematic_velocity(
+                        0.0,
+                        0.0,
+                        pano_wz,
+                        dt=yaw_delta / pano_wz,
+                        render_updates=int(args.panorama_render_updates_per_step),
+                        read_rgb=viz_requested,
+                        read_depth=True,
+                        rgb_device="cpu",
+                    )
+                continue
             obs = run_detector_update(obs, -panorama_steps + pano_idx, map_state["map_info"], map_state["occupancy"], map_state["navigable"])
             update_scenegraph_frame(obs, -panorama_steps + pano_idx, map_state)
             panorama_frames += 1
-            pano_step = -panorama_steps + pano_idx
             has_goal_detection = any(row["step"] == int(pano_step) for row in goal_detection_history)
             if viz is not None and (has_goal_detection or pano_idx + 1 == panorama_steps):
                 viz.update(
@@ -1785,6 +2052,44 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
                 failure_reason = "agent_off_static_metric_map"
                 break
             evaluator.update_pose(pose, metric_grid, collided=bool(obs.get("collided", False)))
+            if roomseg_debug_only:
+                update_roomseg_debug_only(step, map_state)
+                if viz is not None and step % viz_every == 0:
+                    viz.update(
+                        step=step,
+                        rgb=viz_rgb(obs),
+                        detections_2d=[],
+                        occupancy=occupancy,
+                        navigable=navigable,
+                        observed=observed,
+                        goal_cells=goal_cells,
+                        current_grid=current_grid,
+                        pose=pose,
+                        frontiers=[],
+                        nav_decision=None,
+                        current_path=[],
+                        full_path=[],
+                        object_memory=object_memory,
+                        goal_category=episode["goal_category"],
+                        distance_to_goal=evaluator.final_distance_to_goal,
+                        path_length=float(evaluator.path_accum.total_m),
+                        scenegraph_backend="roomseg_debug_only",
+                        score_debug={},
+                        failure_reason=failure_reason,
+                    )
+                if step + 1 < max_steps:
+                    obs = server.step_kinematic_velocity(
+                        0.0,
+                        0.0,
+                        float(args.panorama_wz_radps),
+                        dt=float(args.control_dt),
+                        render_updates=int(args.render_updates_per_step),
+                        read_rgb=viz_requested and (step + 1) % viz_every == 0,
+                        read_depth=True,
+                        rgb_device="cpu",
+                    )
+                    continue
+                break
             if evaluator.final_distance_to_goal <= success_distance:
                 gt_success_region_reached = True
             if success_region_can_finish(
@@ -2672,6 +2977,7 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
         row["active_frontier_distance_m"] = last_frontier_commitment_metadata.get("active_frontier_distance_m")
         row["frontier_scenegraph_score_norm"] = str(args.frontier_scenegraph_score_norm)
         row["room_map_mode"] = str(room_map_mode)
+        row["roomseg_debug_only"] = bool(roomseg_debug_only)
         room_context_row = dict(last_room_context_metadata)
         row["room_context"] = room_context_row
         for key in (
@@ -2733,6 +3039,14 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
             start = world_xy_to_grid(float(start_pose[0]), float(start_pose[1]), dynamic_map_info)
             save_map_png(debug_map, last_dynamic_occupancy, last_dynamic_navigable, start=start, goals=goal_cells, path_cells=full_path)
         row = complete_result_row(row, args)
+        if roomseg_debug_only:
+            row["metric_valid"] = False
+            row["detector_backend"] = "none"
+            row["segmenter_backend"] = "none"
+            row["llm_backend"] = "disabled_roomseg_debug_only"
+            row["policy_name"] = "roomseg_debug_only"
+            row["sgnav_decision_mode"] = "roomseg_debug_only"
+            row["sgnav_decision_reason"] = "roomseg_debug_only_no_frontier_or_policy_decision"
         row = make_jsonable(row)
         summary_row = final_log_row(row)
         JsonlEpisodeLogger(args.output).log(row)
@@ -2952,17 +3266,51 @@ def main(argv: Optional[List[str]] = None) -> int:
         help="Deprecated compatibility option; online traversal inflation is footprint-only.",
     )
     parser.add_argument("--room-map-mode", default=None)
+    parser.add_argument(
+        "--roomseg-debug-only",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Run only online mapping plus the current room segmentation backend; skip detector, scene graph, frontier scoring, and local planning.",
+    )
     parser.add_argument("--debug-roomseg-layers", action="store_true", default=None)
+    parser.add_argument("--roomseg-debug-layers", dest="debug_roomseg_layers", action="store_true", default=None)
     parser.add_argument("--debug-roomseg-dir", default=None)
+    parser.add_argument("--roomseg-debug-dir", dest="debug_roomseg_dir", default=None)
     parser.add_argument("--debug-roomseg-max-saves", type=int, default=None)
-    parser.add_argument("--roomseg-backend", default=None, choices=["rose2_source_form", "rose2_source_form_v2", "rose2_source_faithful_v1", "rose2_source_external", "rose2_source_external_runner", "legacy_rose2_style_debug"])
+    parser.add_argument("--roomseg-roomseg-depth-stride-px", type=int, default=None)
+    parser.add_argument("--roomseg-disable-corridor-cuts", action="store_true", default=False)
+    parser.add_argument("--roomseg-disable-doorway-cuts", action="store_true", default=False)
+    parser.add_argument("--roomseg-disable-wall-completion", action="store_true", default=False)
+    parser.add_argument(
+        "--roomseg-backend",
+        default=None,
+        choices=[
+            "rose2_source_form",
+            "rose2_source_form_v2",
+            "rose2_source_faithful_v1",
+            "rose2_source_external",
+            "rose2_source_external_runner",
+            "legacy_rose2_style_debug",
+            ONLINE_ROSE_STYLE_BACKEND,
+            VERTICAL_FREE_ROOMSEG_BACKEND,
+            VERTICAL_FREE_ROOMSEG_ALGORITHM,
+            VERTICAL_FREE_GAP_CLOSURE_BACKEND,
+        ],
+    )
     parser.add_argument("--debug-rose2-source", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--rose2-source-work-dir", default=None)
     parser.add_argument("--rose2-compare-legacy", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument(
         "--roomseg-finalization-mode",
         default=None,
-        choices=["no_merge", "proposal_only", "premerge_proposals", "doorway_constrained_merge", "no_merge_until_source_backend_verified"],
+        choices=[
+            "no_merge",
+            "proposal_only",
+            "premerge_proposals",
+            "doorway_constrained_merge",
+            "no_merge_until_source_backend_verified",
+            "no_merge_until_geometry_verified",
+        ],
     )
     parser.add_argument("--enable-roomseg-nav-free-overlay", dest="roomseg_nav_free_overlay", action="store_true", default=None)
     parser.add_argument("--disable-roomseg-nav-free-overlay", dest="roomseg_nav_free_overlay", action="store_false")
@@ -3390,12 +3738,13 @@ def main(argv: Optional[List[str]] = None) -> int:
         default_robot_radius_m = 0.5 * float(get_nested(cfg, "robot.footprint_width_m", 0.28))
     args.robot_radius_m = float(args.robot_radius_m if args.robot_radius_m is not None else default_robot_radius_m)
     args.online_inflation_radius_m = float(args.online_inflation_radius_m if args.online_inflation_radius_m is not None else get_nested(cfg, "mapping.inflation_radius_m", 0.0))
-    args.room_map_mode = str(args.room_map_mode or get_nested(cfg, "mapping.room_map_mode", "rose2_source_faithful_v1_vlm"))
+    args.room_map_mode = str(args.room_map_mode or get_nested(cfg, "mapping.room_map_mode", VERTICAL_FREE_GAP_CLOSURE_CONTEXT))
     args.room_segmentation_config = dict(get_nested(cfg, "mapping.room_segmentation", {}) or {})
     roomseg_debug_layers_cfg = dict(args.room_segmentation_config.get("debug_layers", {}) or {})
     roomseg_overlay_cfg = dict(args.room_segmentation_config.get("navigation_free_context_overlay", {}) or {})
     roomseg_frontier_context_cfg = dict(args.room_segmentation_config.get("frontier_room_context", {}) or {})
     roomseg_wall_gating_fix_cfg = dict(args.room_segmentation_config.get("wall_gating_fix", {}) or {})
+    roomseg_online_cfg = dict(args.room_segmentation_config.get("online_roomseg", {}) or {})
     if args.roomseg_backend is not None:
         args.room_segmentation_config["backend"] = str(args.roomseg_backend)
     if args.debug_rose2_source is not None:
@@ -3419,14 +3768,42 @@ def main(argv: Optional[List[str]] = None) -> int:
         roomseg_frontier_context_cfg["enabled"] = bool(args.frontier_room_known_free_side)
     if args.roomseg_wall_gating_fix is not None:
         roomseg_wall_gating_fix_cfg["enabled"] = bool(args.roomseg_wall_gating_fix)
+    if args.roomseg_roomseg_depth_stride_px is not None:
+        depth_cfg = dict(roomseg_online_cfg.get("depth", {}) or {})
+        depth_cfg["roomseg_depth_stride_px"] = int(args.roomseg_roomseg_depth_stride_px)
+        roomseg_online_cfg["depth"] = depth_cfg
+    if args.roomseg_disable_corridor_cuts:
+        neck_cfg = dict(roomseg_online_cfg.get("corridor_room_neck_cut", {}) or {})
+        neck_cfg["enabled"] = False
+        roomseg_online_cfg["corridor_room_neck_cut"] = neck_cfg
+    if args.roomseg_disable_doorway_cuts:
+        doorway_cfg = dict(roomseg_online_cfg.get("doorway_virtual_cut", {}) or {})
+        doorway_cfg["enabled"] = False
+        roomseg_online_cfg["doorway_virtual_cut"] = doorway_cfg
+    if args.roomseg_disable_wall_completion:
+        physical_cfg = dict(roomseg_online_cfg.get("physical_wall_completion", {}) or {})
+        physical_cfg["enabled"] = False
+        roomseg_online_cfg["physical_wall_completion"] = physical_cfg
     args.room_segmentation_config["debug_layers"] = roomseg_debug_layers_cfg
     args.room_segmentation_config["navigation_free_context_overlay"] = roomseg_overlay_cfg
     args.room_segmentation_config["frontier_room_context"] = roomseg_frontier_context_cfg
     args.room_segmentation_config["wall_gating_fix"] = roomseg_wall_gating_fix_cfg
+    args.room_segmentation_config["online_roomseg"] = roomseg_online_cfg
     args.debug_roomseg_layers = bool(roomseg_debug_layers_cfg.get("enabled", False))
     args.debug_roomseg_dir = str(roomseg_debug_layers_cfg.get("output_dir", "debug/roomseg_layers"))
     args.debug_roomseg_max_saves = int(roomseg_debug_layers_cfg.get("max_saves", 50))
-    args.roomseg_backend = str(args.room_segmentation_config.get("backend", "rose2_source_faithful_v1"))
+    if args.debug_roomseg_layers:
+        for nested_key in ("vertical_free_roomseg", "vertical_free_gap_closure", "online_roomseg"):
+            nested_cfg = dict(args.room_segmentation_config.get(nested_key, {}) or {})
+            nested_cfg["debug_dump"] = True
+            nested_cfg.setdefault("debug_dir", args.debug_roomseg_dir)
+            if nested_key == "online_roomseg":
+                debug_cfg = dict(nested_cfg.get("debug", {}) or {})
+                debug_cfg["save_layers"] = True
+                debug_cfg["save_candidate_json"] = True
+                nested_cfg["debug"] = debug_cfg
+            args.room_segmentation_config[nested_key] = nested_cfg
+    args.roomseg_backend = str(args.room_segmentation_config.get("backend", "rose2_source_external_runner"))
     args.debug_rose2_source = bool(args.room_segmentation_config.get("debug_rose2_source", False))
     args.rose2_source_work_dir = str(args.room_segmentation_config.get("rose2_source_work_dir", "debug/rose2_source"))
     args.rose2_compare_legacy = bool(args.room_segmentation_config.get("rose2_compare_legacy", False))
@@ -3587,6 +3964,41 @@ def main(argv: Optional[List[str]] = None) -> int:
         if args.success_distance_m is not None
         else (float(configured_success_distance) if configured_success_distance is not None else None)
     )
+    args.roomseg_debug_only = bool(
+        args.roomseg_debug_only
+        if args.roomseg_debug_only is not None
+        else get_nested(cfg, "debug.roomseg_debug_only", False)
+    )
+    if args.roomseg_debug_only:
+        args.strict_benchmark = False
+        args.allow_debug_fallbacks = True
+        args.detector = "none"
+        args.segmenter = "none"
+        args.llm_enabled = False
+        args.vllm_frontier_scoring = False
+        args.vllm_image_scoring = False
+        args.score_frontiers_before_candidate = False
+        args.seed_gt_object_memory = False
+        args.allow_gt_goal_fallback = False
+        args.require_sgnav_stop = False
+        args.room_label_backend = "unavailable"
+        args.sgnav_viz_every_steps = 1
+        args.debug_roomseg_layers = True
+        debug_layers_cfg = dict(getattr(args, "room_segmentation_config", {}).get("debug_layers", {}) or {})
+        debug_layers_cfg["enabled"] = True
+        debug_layers_cfg.setdefault("output_dir", str(getattr(args, "debug_roomseg_dir", "debug/roomseg_layers")))
+        args.room_segmentation_config["debug_layers"] = debug_layers_cfg
+        args.debug_roomseg_dir = str(debug_layers_cfg.get("output_dir", getattr(args, "debug_roomseg_dir", "debug/roomseg_layers")))
+        for nested_key in ("vertical_free_roomseg", "vertical_free_gap_closure", "online_roomseg"):
+            nested_cfg = dict(args.room_segmentation_config.get(nested_key, {}) or {})
+            nested_cfg["debug_dump"] = True
+            nested_cfg.setdefault("debug_dir", args.debug_roomseg_dir)
+            if nested_key == "online_roomseg":
+                debug_cfg = dict(nested_cfg.get("debug", {}) or {})
+                debug_cfg["save_layers"] = True
+                debug_cfg["save_candidate_json"] = True
+                nested_cfg["debug"] = debug_cfg
+            args.room_segmentation_config[nested_key] = nested_cfg
 
     if args.planner == "nav2":
         from isaac_bench.navigation.nav2_client import Nav2NavigateToPoseClient
