@@ -96,7 +96,7 @@ def test_upstream_rose2_synthetic_two_rooms(tmp_path):
     rooms = segmenter.update(occupied, free, occupied, unknown, step=1)
 
     assert len([room for room in rooms if not room.stale]) == 2
-    assert segmenter.last_debug["algorithm"] == "rose2_source_form_v2"
+    assert segmenter.last_debug["algorithm"] == "rose2_source_faithful_v1"
     assert segmenter.last_debug["source_mode"] == "source_form_no_ros"
     assert segmenter.last_debug["strict_fallback_used"] is False
 
@@ -198,7 +198,7 @@ def test_upstream_rose2_debug_artifact_contract(tmp_path):
     payload = json.loads(layers.read_text(encoding="utf-8"))
 
     assert png.exists()
-    assert payload["algorithm"] == "rose2_source_form_v2"
+    assert payload["algorithm"] == "rose2_source_faithful_v1"
     assert payload["source_mode"] == "source_form_no_ros"
     assert "num_rooms" in payload
     assert "num_wall_lines" in payload

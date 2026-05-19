@@ -58,6 +58,9 @@ python -m pip install \
   iopath \
   fvcore \
   hydra-core \
+  descartes \
+  shapely \
+  skan \
   ultralytics-thop \
   ftfy \
   regex \

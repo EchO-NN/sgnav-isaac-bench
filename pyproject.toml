@@ -9,8 +9,11 @@ description = "SG-Nav Isaac/InteriorAgent benchmark wrapper"
 requires-python = ">=3.9"
 dependencies = [
   "numpy",
+  "descartes",
   "pyyaml",
   "pillow",
+  "shapely",
+  "skan",
 ]
 
 [tool.setuptools.packages.find]

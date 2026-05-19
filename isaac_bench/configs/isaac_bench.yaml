@@ -164,12 +164,12 @@ mapping:
   frontier_allow_near_fallback: false
   frontier_debug_dump: false
   frontier_debug_dir: data/debug_frontier
-  room_map_mode: rose2_source_form_v2_vlm
+  room_map_mode: rose2_source_faithful_v1_vlm
   strict_no_oracle_rooms: true
   room_segmentation:
     enabled: true
-    algorithm: rose2_source_form_v2
-    backend: rose2_source_form_v2
+    algorithm: rose2_source_faithful_v1
+    backend: rose2_source_faithful_v1
     source_mode: source_form_no_ros
     legacy_watershed_allowed: debug_only
     local_rose2_lite_allowed: debug_only
@@ -192,19 +192,25 @@ mapping:
       axis_snap_angle_rad: 0.488692191
       max_cuts_per_axis: 96
       thin_wall_separator_enabled: true
-      thin_wall_min_length_m: 0.45
-      thin_wall_max_width_m: 0.25
+      thin_wall_min_length_m: 0.35
+      thin_wall_max_width_m: 0.30
       thin_wall_min_aspect_ratio: 3.0
       thin_wall_free_support_band_m: 0.30
-      thin_wall_min_free_support_ratio: 0.25
+      thin_wall_min_free_support_ratio: 0.20
+      thin_wall_max_unknown_overlap_ratio: 0.25
       topology_effective_separator_enabled: true
       topology_effective_min_largest_component_drop: 0.08
-      topology_effective_max_candidates: 128
+      topology_effective_min_component_area_m2: 1.0
+      topology_effective_max_candidates: 256
       doorway_partition_enabled: true
       doorway_width_min_m: 0.45
       doorway_width_max_m: 1.60
       doorway_min_wall_support_on_sides_m: 0.35
+      doorway_max_unknown_ratio: 0.20
       merge_guard_enabled: true
+      block_merge_across_thin_wall: true
+      block_merge_across_doorway_partition: true
+      block_merge_across_topology_separator: true
     vertical_or_free:
       enabled: true
       z_min_m: 0.20
@@ -418,7 +424,7 @@ sgnav:
     long_edge_geometric_pruning: true
     group_nodes: true
     room_nodes:
-      source: rose2_source_form_v2_vlm
+      source: rose2_source_faithful_v1_vlm
       use_dataset_room_labels_in_metric: false
       strict_no_oracle_rooms: true
       room_label_backend: vlm

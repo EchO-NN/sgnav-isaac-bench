@@ -15,10 +15,10 @@ def test_required_sgnav_defaults():
     assert cfg["perception"]["grounding_dino"]["checkpoint"].endswith("groundingdino_swinb_cogcoor.pth")
     assert cfg["perception"]["grounding_dino"]["config"].endswith("GroundingDINO_SwinB.cfg.py")
     assert cfg["sgnav"]["candidate_start_min_confidence"] == 0.45
-    assert cfg["mapping"]["room_map_mode"] == "rose2_source_form_v2_vlm"
+    assert cfg["mapping"]["room_map_mode"] == "rose2_source_faithful_v1_vlm"
     assert cfg["mapping"]["strict_no_oracle_rooms"] is True
-    assert cfg["mapping"]["room_segmentation"]["algorithm"] == "rose2_source_form_v2"
-    assert cfg["mapping"]["room_segmentation"]["backend"] == "rose2_source_form_v2"
+    assert cfg["mapping"]["room_segmentation"]["algorithm"] == "rose2_source_faithful_v1"
+    assert cfg["mapping"]["room_segmentation"]["backend"] == "rose2_source_faithful_v1"
     assert cfg["mapping"]["room_segmentation"]["source_mode"] == "source_form_no_ros"
     assert cfg["mapping"]["room_segmentation"]["legacy_watershed_allowed"] == "debug_only"
     assert cfg["mapping"]["room_segmentation"]["local_rose2_lite_allowed"] == "debug_only"
@@ -62,7 +62,7 @@ def test_required_sgnav_defaults():
     assert cfg["object_memory"]["footprint_iou_track_match_threshold"] == 0.20
     assert cfg["object_memory"]["child_containment_threshold"] == 0.70
     assert cfg["object_memory"]["child_object_area_ratio_max"] == 0.35
-    assert cfg["sgnav"]["scene_graph"]["room_nodes"]["source"] == "rose2_source_form_v2_vlm"
+    assert cfg["sgnav"]["scene_graph"]["room_nodes"]["source"] == "rose2_source_faithful_v1_vlm"
     assert cfg["visualization"]["show_gt_goal_cells"] is False
     assert cfg["visualization"]["show_room_proposals"] is True
     assert cfg["isaac"]["perception_every_steps"] == 1

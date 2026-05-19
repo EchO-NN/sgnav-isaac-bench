@@ -1,6 +1,8 @@
 numpy
+descartes
 pyyaml
 pillow
 pytest
+shapely
+skan
 ultralytics
-

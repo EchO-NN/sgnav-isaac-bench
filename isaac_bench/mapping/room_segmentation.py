@@ -9,6 +9,7 @@ from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 import numpy as np
 
 from isaac_bench.mapping.coordinate_transform import MapInfo, grid_to_world_xy, is_inside_grid, world_xy_to_grid
+from isaac_bench.mapping.vertical_profile import VerticalProfileMap, ensure_vertical_profile
 
 
 GridCell = Tuple[int, int]
@@ -56,6 +57,10 @@ class RoomSegmentationConfig:
     stale_ttl_steps: int = 2
     debug_dump: bool = False
     debug_dir: str = "debug/roomseg_rose2"
+    vertical_free_z_min_m: float = 0.20
+    vertical_free_z_max_m: float = 2.00
+    vertical_free_min_free_rays: int = 1
+    vertical_free_min_observed_rays: int = 1
     rose2: Dict[str, object] = field(default_factory=dict)
     resolution_m: float = 0.05
     map_info: Optional[MapInfo] = None
@@ -63,6 +68,12 @@ class RoomSegmentationConfig:
     @classmethod
     def from_mapping(cls, data: Optional[Mapping[str, object]] = None, **overrides) -> "RoomSegmentationConfig":
         raw = dict(data or {})
+        vertical_or_free = dict(raw.get("vertical_or_free", {}) or {})
+        if vertical_or_free:
+            raw.setdefault("vertical_free_z_min_m", vertical_or_free.get("z_min_m", 0.20))
+            raw.setdefault("vertical_free_z_max_m", vertical_or_free.get("z_max_m", 2.00))
+            raw.setdefault("vertical_free_min_free_rays", vertical_or_free.get("min_free_rays", 1))
+            raw.setdefault("vertical_free_min_observed_rays", vertical_or_free.get("min_observed_rays", 1))
         raw.update({key: value for key, value in overrides.items() if value is not None})
         fields = {name for name in cls.__dataclass_fields__}
         return cls(**{key: raw[key] for key in raw if key in fields})
@@ -178,6 +189,7 @@ class OnlineRoomSegmenter:
         unknown_mask: np.ndarray,
         step: int,
         object_memory: Optional[Iterable[object]] = None,
+        vertical_profile: Optional[VerticalProfileMap] = None,
     ) -> List[RoomMask]:
         if not self.config.enabled:
             self.last_debug = {"enabled": False, "room_count": 0}
@@ -195,6 +207,7 @@ class OnlineRoomSegmenter:
             unknown_mask,
             step=step,
             object_memory=object_memory,
+            vertical_profile=vertical_profile,
         )
         _ = proposal_rooms
         return self.finalize_proposals(proposal_state, proposal_semantic_labels=None)
@@ -207,12 +220,26 @@ class OnlineRoomSegmenter:
         unknown_mask: np.ndarray,
         step: int,
         object_memory: Optional[Iterable[object]] = None,
+        vertical_profile: Optional[VerticalProfileMap] = None,
     ) -> Tuple[List[RoomMask], RoomProposalState]:
         free = np.asarray(observed_free_mask, dtype=bool)
         occ = np.asarray(obstacle_mask if obstacle_mask is not None else occupancy_map, dtype=bool)
         unknown = np.asarray(unknown_mask, dtype=bool)
         if free.shape != occ.shape or free.shape != unknown.shape:
             raise ValueError("room proposal masks must have the same HxW shape")
+        vertical_debug: dict = {}
+        vertical_source_active = False
+        if _uses_vertical_free_source(self.config):
+            vertical_free, vertical_observed, vertical_debug = _vertical_free_watershed_masks(
+                vertical_profile=vertical_profile,
+                shape=free.shape,
+                config=self.config,
+            )
+            if np.any(vertical_observed):
+                vertical_source_active = True
+                free = vertical_free
+                occ = vertical_observed & ~vertical_free
+                unknown = ~vertical_observed
         structural_obstacles, obstacle_debug = _build_structural_obstacle_mask_with_debug(
             occ,
             free,
@@ -226,7 +253,12 @@ class OnlineRoomSegmenter:
             obstacle_for_rooms = structural_obstacles
         else:
             obstacle_for_rooms = occ
-        structural = build_structural_free_mask(free_for_rooms, obstacle_for_rooms, unknown, self.config)
+        if vertical_source_active:
+            structural = free & ~unknown
+            obstacle_for_rooms = occ
+            structural_obstacles = occ
+        else:
+            structural = build_structural_free_mask(free_for_rooms, obstacle_for_rooms, unknown, self.config)
         proposal_rooms, proposal_state = build_room_proposals(
             structural,
             unknown,
@@ -235,6 +267,8 @@ class OnlineRoomSegmenter:
             structural_obstacle_mask=structural_obstacles,
         )
         proposal_state.debug["structural_obstacle_mask"] = obstacle_debug
+        if vertical_debug:
+            proposal_state.debug.update(vertical_debug)
         return proposal_rooms, proposal_state
 
     def finalize_proposals(
@@ -463,6 +497,79 @@ def build_structural_free_mask(
         free = _binary_open(free, open_radius)
     free &= ~unknown
     return free.astype(bool)
+
+
+def _uses_vertical_free_source(config: RoomSegmentationConfig) -> bool:
+    source = str(getattr(config, "source_grid", "") or "").strip().lower()
+    algorithm = str(getattr(config, "algorithm", "") or "").strip().lower()
+    return source in {
+        "vertical_profile_free_0p2_2p0",
+        "vertical_free_0p2_2p0",
+        "watershed_vertical_free",
+    } or "vertical_free" in algorithm
+
+
+def _vertical_free_watershed_masks(
+    *,
+    vertical_profile: Optional[VerticalProfileMap],
+    shape: tuple[int, int],
+    config: RoomSegmentationConfig,
+) -> tuple[np.ndarray, np.ndarray, dict]:
+    vp = ensure_vertical_profile(vertical_profile, shape)
+    indices = _vertical_band_indices(
+        vp,
+        z_min_m=float(config.vertical_free_z_min_m),
+        z_max_m=float(config.vertical_free_z_max_m),
+    )
+    if not indices:
+        free = np.zeros(shape, dtype=bool)
+        observed = np.zeros(shape, dtype=bool)
+    else:
+        band_names = tuple(str(vp.band_names[idx]) for idx in indices)
+        free = vp.reliable_free_mask(
+            min_free_rays=int(config.vertical_free_min_free_rays),
+            min_observed_rays=int(config.vertical_free_min_observed_rays),
+            band_names=band_names,
+        )
+        observed_count = np.sum(np.asarray(vp.observed_count[indices], dtype=np.uint32), axis=0)
+        observed = observed_count >= int(config.vertical_free_min_observed_rays)
+    debug = {
+        "roomseg_input_source": "vertical_profile_free_0p2_2p0_watershed",
+        "vertical_free_source": "vertical_profile_0p2_2p0",
+        "vertical_or_free_z_min_m": float(config.vertical_free_z_min_m),
+        "vertical_or_free_z_max_m": float(config.vertical_free_z_max_m),
+        "vertical_or_free_map": free.astype(bool),
+        "vertical_or_free_cells": int(np.count_nonzero(free)),
+        "vertical_free_room_domain": free.astype(bool),
+        "vertical_free_added_to_roomseg_cells": int(np.count_nonzero(free)),
+        "vertical_observed_map": observed.astype(bool),
+        "vertical_observed_cells": int(np.count_nonzero(observed)),
+        "observed_not_vertical_free": observed & ~free,
+        "observed_not_vertical_free_cells": int(np.count_nonzero(observed & ~free)),
+        "initial_roomseg_free": free.astype(bool),
+        "initial_roomseg_occupied": (observed & ~free).astype(bool),
+        "repaired_roomseg_free": free.astype(bool),
+        "repaired_roomseg_occupied": (observed & ~free).astype(bool),
+        "repaired_roomseg_unknown": (~observed).astype(bool),
+        "navigation_free_added_to_roomseg_cells": 0,
+        "navigation_free_added_to_strict_roomseg_cells": 0,
+    }
+    return free.astype(bool), observed.astype(bool), debug
+
+
+def _vertical_band_indices(
+    vertical_profile: VerticalProfileMap,
+    *,
+    z_min_m: float,
+    z_max_m: float,
+) -> list[int]:
+    lo = float(z_min_m)
+    hi = float(z_max_m)
+    return [
+        int(idx)
+        for idx, (_name, (band_lo, band_hi)) in enumerate(zip(vertical_profile.band_names, vertical_profile.band_ranges_m))
+        if float(band_hi) > lo and float(band_lo) < hi
+    ]
 
 
 def build_room_proposals(

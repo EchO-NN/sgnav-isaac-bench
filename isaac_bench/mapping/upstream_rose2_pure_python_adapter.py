@@ -33,8 +33,10 @@ from isaac_bench.mapping.rose2_source_form import (
     ROSE2SourceResult,
     SOURCE_EXTERNAL_BACKEND,
     SOURCE_EXTERNAL_RUNNER_BACKEND,
+    SOURCE_FAITHFUL_BACKEND,
     SOURCE_FORM_BACKEND,
     run_rose2_source_external,
+    run_rose2_source_faithful_v1,
     run_rose2_source_form,
     run_rose2_source_form_v2,
     save_rose2_source_debug,
@@ -45,10 +47,13 @@ from isaac_bench.mapping.vertical_profile import VerticalProfileMap, band_index,
 
 
 UPSTREAM_SOURCE_MODE = "source_form_no_ros"
-UPSTREAM_ALGORITHM = SOURCE_FORM_BACKEND
-UPSTREAM_CONTEXT_SOURCE = "%s_vlm" % SOURCE_FORM_BACKEND
+UPSTREAM_ALGORITHM = SOURCE_FAITHFUL_BACKEND
+UPSTREAM_CONTEXT_SOURCE = "%s_vlm" % SOURCE_FAITHFUL_BACKEND
 UPSTREAM_ALGORITHM_ALIASES = {
+    SOURCE_FAITHFUL_BACKEND,
+    "%s_vlm" % SOURCE_FAITHFUL_BACKEND,
     SOURCE_FORM_BACKEND,
+    "%s_vlm" % SOURCE_FORM_BACKEND,
     UPSTREAM_CONTEXT_SOURCE,
     SOURCE_EXTERNAL_RUNNER_BACKEND,
     "upstream_rose2_vertical_or_free",
@@ -68,7 +73,7 @@ REQUIRED_SOURCE_FILES = (
 class UpstreamROSE2Config:
     source_root: str | None
     source_mode: str = UPSTREAM_SOURCE_MODE
-    backend: str = SOURCE_FORM_BACKEND
+    backend: str = SOURCE_FAITHFUL_BACKEND
     filter_value: float = 0.18
     spatial_clustering_line_segments_threshold: float = 5.0
     lines_th1: float = 0.1
@@ -193,7 +198,7 @@ class UpstreamROSE2PurePythonSegmenter:
     def __init__(self, config: UpstreamROSE2Config, map_info: MapInfo):
         self.config = config
         self.map_info = map_info
-        backend = str(config.backend or SOURCE_FORM_BACKEND).strip().lower()
+        backend = str(config.backend or SOURCE_FAITHFUL_BACKEND).strip().lower()
         self.source_root = validate_upstream_rose2_source_root(
             config.source_root,
             env_name=config.upstream_repo_env,
@@ -341,7 +346,7 @@ class UpstreamROSE2PurePythonSegmenter:
         )
         if int(structural.get("navigation_free_added_to_strict_roomseg_cells", -1)) != 0:
             raise AssertionError("strict room segmentation must not add navigation-free cells to vertical-free input")
-        backend = str(self.config.backend or SOURCE_FORM_BACKEND).strip().lower()
+        backend = str(self.config.backend or SOURCE_FAITHFUL_BACKEND).strip().lower()
         source_result, legacy_structure = self._run_source_backend(
             backend=backend,
             structural=structural,
@@ -377,9 +382,21 @@ class UpstreamROSE2PurePythonSegmenter:
         occupied = np.asarray(structural["repaired_roomseg_occupied"], dtype=bool)
         free = np.asarray(structural["repaired_roomseg_free"], dtype=bool)
         unknown = np.asarray(structural["repaired_roomseg_unknown"], dtype=bool)
-        backend_name = str(backend or SOURCE_FORM_BACKEND).strip().lower()
+        backend_name = str(backend or SOURCE_FAITHFUL_BACKEND).strip().lower()
         legacy_structure: StructureExtractionResult | None = None
-        if backend_name in {SOURCE_FORM_BACKEND, "rose2_source_form"}:
+        if backend_name == SOURCE_FAITHFUL_BACKEND:
+            source_result = run_rose2_source_faithful_v1(
+                observed_occupied=occupied,
+                observed_free=free,
+                unknown=unknown,
+                vertical_observed=np.asarray(structural.get("vertical_observed_map", structural.get("vertical_observed")), dtype=bool),
+                vertical_free=np.asarray(structural.get("vertical_free_room_domain", free), dtype=bool),
+                wall_confidence_map=np.asarray(structural.get("wall_confidence_map", np.zeros_like(occupied, dtype=np.float32)), dtype=np.float32),
+                structure_config=self._structure_config,
+                source_config=self._source_form_config,
+                object_memory=object_memory,
+            )
+        elif backend_name in {SOURCE_FORM_BACKEND, "rose2_source_form"}:
             source_result = run_rose2_source_form_v2(
                 observed_occupied=occupied,
                 observed_free=free,
@@ -411,7 +428,7 @@ class UpstreamROSE2PurePythonSegmenter:
             if bool(self.config.strict_disallow_legacy_fallback):
                 raise ValueError(
                     "%s is debug/ablation-only; strict room segmentation uses %s"
-                    % (LEGACY_STYLE_BACKEND, SOURCE_FORM_BACKEND)
+                    % (LEGACY_STYLE_BACKEND, SOURCE_FAITHFUL_BACKEND)
                 )
             legacy_structure = extract_rose2_structure(
                 observed_occupied=occupied,
@@ -423,8 +440,8 @@ class UpstreamROSE2PurePythonSegmenter:
             source_result = _source_result_from_legacy_structure(legacy_structure)
         else:
             raise ValueError(
-                "unsupported roomseg backend %s; expected %s, %s, %s, or %s"
-                % (backend_name, SOURCE_FORM_BACKEND, SOURCE_EXTERNAL_BACKEND, SOURCE_EXTERNAL_RUNNER_BACKEND, LEGACY_STYLE_BACKEND)
+                "unsupported roomseg backend %s; expected %s, %s, %s, %s, or %s"
+                % (backend_name, SOURCE_FAITHFUL_BACKEND, SOURCE_FORM_BACKEND, SOURCE_EXTERNAL_BACKEND, SOURCE_EXTERNAL_RUNNER_BACKEND, LEGACY_STYLE_BACKEND)
             )
         if bool(self.config.rose2_compare_legacy) and backend_name != LEGACY_STYLE_BACKEND:
             legacy_structure = extract_rose2_structure(
@@ -615,8 +632,8 @@ class UpstreamROSE2PurePythonSegmenter:
                 "algorithm": UPSTREAM_ALGORITHM,
                 "source": UPSTREAM_ALGORITHM,
                 "source_mode": str(self.config.source_mode),
-                "roomseg_backend": str(self.config.backend or SOURCE_FORM_BACKEND),
-                "source_backend": str(self.config.backend or SOURCE_FORM_BACKEND),
+                "roomseg_backend": str(self.config.backend or SOURCE_FAITHFUL_BACKEND),
+                "source_backend": str(self.config.backend or SOURCE_FAITHFUL_BACKEND),
                 "source_root": str(self.source_root) if self.source_root is not None else None,
                 "source_repository": "https://github.com/goldleaf3i/declutter-reconstruct",
                 "source_provenance": _source_provenance(self.source_root),
@@ -704,8 +721,8 @@ class UpstreamROSE2PurePythonSegmenter:
             "algorithm": UPSTREAM_ALGORITHM,
             "source": UPSTREAM_ALGORITHM,
             "source_mode": str(self.config.source_mode),
-            "roomseg_backend": str(self.config.backend or SOURCE_FORM_BACKEND),
-            "source_backend": str(self.config.backend or SOURCE_FORM_BACKEND),
+            "roomseg_backend": str(self.config.backend or SOURCE_FAITHFUL_BACKEND),
+            "source_backend": str(self.config.backend or SOURCE_FAITHFUL_BACKEND),
             "source_root": str(self.source_root) if self.source_root is not None else None,
             "source_repository": "https://github.com/goldleaf3i/declutter-reconstruct",
             "source_provenance": _source_provenance(self.source_root),

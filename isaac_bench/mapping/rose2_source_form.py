@@ -36,6 +36,7 @@ from isaac_bench.mapping.rose2_separator_detection import detect_thin_wall_separ
 
 SOURCE_FORM_V1_BACKEND = "rose2_source_form"
 SOURCE_FORM_BACKEND = "rose2_source_form_v2"
+SOURCE_FAITHFUL_BACKEND = "rose2_source_faithful_v1"
 SOURCE_EXTERNAL_BACKEND = "rose2_source_external"
 SOURCE_EXTERNAL_RUNNER_BACKEND = "rose2_source_external_runner"
 LEGACY_STYLE_BACKEND = "legacy_rose2_style_debug"
@@ -508,6 +509,58 @@ def run_rose2_source_form_v2(
         timing_ms=timing,
         debug=debug,
     )
+
+
+def run_rose2_source_faithful_v1(
+    *,
+    observed_occupied: np.ndarray,
+    observed_free: np.ndarray,
+    unknown: np.ndarray,
+    vertical_observed: np.ndarray | None,
+    vertical_free: np.ndarray | None,
+    wall_confidence_map: np.ndarray | None,
+    structure_config: StructureExtractionConfig,
+    source_config: ROSE2SourceFormConfig | None = None,
+    object_memory: Optional[Sequence[object]] = None,
+) -> ROSE2SourceResult:
+    """Run the strict source-faithful no-ROS ROSE2 backend.
+
+    This backend preserves the 0.2--2.0 m vertical-free input contract and uses
+    the v2 source-form machinery: ordinary ROSE2 wall lines, promoted
+    non-free-observed thin-wall separators, topology-effective separator
+    selection, doorway partition cuts, and merge-guard evidence.  The separate
+    backend name lets strict configs distinguish the source-faithful path from
+    earlier source-form compatibility modes.
+    """
+
+    result = run_rose2_source_form_v2(
+        observed_occupied=observed_occupied,
+        observed_free=observed_free,
+        unknown=unknown,
+        vertical_observed=vertical_observed,
+        vertical_free=vertical_free,
+        wall_confidence_map=wall_confidence_map,
+        structure_config=structure_config,
+        source_config=source_config,
+        object_memory=object_memory,
+    )
+    result.backend = SOURCE_FAITHFUL_BACKEND
+    result.debug["source_backend"] = SOURCE_FAITHFUL_BACKEND
+    result.debug["roomseg_backend"] = SOURCE_FAITHFUL_BACKEND
+    result.debug["source_faithful_v1_used"] = True
+    result.debug["source_form_v2_compatibility_core"] = True
+    result.debug["source_form_pipeline"] = [
+        "vertical_profile_0p2_2p0_input",
+        "rose2_dft_hough_wall_lines",
+        "thin_wall_separator_promotion_from_nonfree_observed",
+        "line_extension_without_navigation_free_overlay",
+        "topology_effective_separator_selection",
+        "doorway_partition_cut_detection",
+        "partition_boundary_room_labels",
+        "boundary_pixel_absorption_without_merging",
+        "merge_guard_strong_structural_splits",
+    ]
+    return result
 
 
 def save_rose2_source_debug(

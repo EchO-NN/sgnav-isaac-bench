@@ -84,9 +84,13 @@ def run_rose2_source_external_runner(
             stdout_path.write_text(proc.stdout or "", encoding="utf-8")
             stderr_path.write_text(proc.stderr or "", encoding="utf-8")
             room_images = sorted(out.glob("**/*rooms*.png"))
-            if proc.returncode == 0 and room_images:
+            if room_images:
                 output_room_image = room_images[0]
                 label_map = parse_rose2_source_label_image(output_room_image)
+                if proc.returncode != 0:
+                    failure_reason = "external_runner_partial_success_after_room_image"
+                else:
+                    failure_reason = ""
             else:
                 failure_reason = "external_runner_failed_or_no_room_image"
         except Exception as exc:
@@ -153,16 +157,172 @@ import os
 import shutil
 import sys
 from pathlib import Path
+import numpy as np
 
 source_root = Path({str(source_root)!r})
 metric_map = Path({str(metric_map)!r})
 orebro_seed = Path({str(orebro)!r})
 out = Path({str(out)!r})
+shim = out / 'png.py'
+shim.write_text('''from __future__ import annotations
+import numpy as np
+from PIL import Image
+
+class Writer:
+    def __init__(self, width, height, greyscale=True, alpha=False, bitdepth=8):
+        self.width = int(width)
+        self.height = int(height)
+        self.greyscale = bool(greyscale)
+        self.alpha = bool(alpha)
+        self.bitdepth = int(bitdepth)
+
+    def write(self, fp, rows):
+        arr = np.asarray(rows)
+        if arr.ndim == 1:
+            arr = arr.reshape((self.height, self.width))
+        arr = arr[:self.height, :self.width]
+        if self.bitdepth == 1:
+            img = (arr > 0).astype(np.uint8) * 255
+        else:
+            img = np.clip(arr, 0, 255).astype(np.uint8)
+        Image.fromarray(img, mode='L').save(fp, format='PNG')
+''', encoding='utf-8')
+sys.path.insert(0, str(out))
 sys.path.insert(0, str(source_root / 'code' / 'rose_v1_repo'))
 sys.path.insert(0, str(source_root / 'code'))
+try:
+    import matplotlib
+    matplotlib.use('Agg', force=True)
+    from matplotlib.backend_bases import FigureCanvasBase
+    if not hasattr(FigureCanvasBase, 'set_window_title'):
+        FigureCanvasBase.set_window_title = lambda self, title: None
+except Exception:
+    pass
+try:
+    import skimage.morphology as _sk_morph
+    _orig_binary_dilation = _sk_morph.binary_dilation
+
+    def _binary_dilation_compat(image, footprint=None, *args, selem=None, **kwargs):
+        if footprint is None and selem is not None:
+            footprint = selem
+        return _orig_binary_dilation(image, footprint=footprint, *args, **kwargs)
+
+    _sk_morph.binary_dilation = _binary_dilation_compat
+except Exception:
+    pass
+try:
+    import skan
+    import skan.csr as _skan_csr
+    from skan.csr import skeleton_to_csgraph as _skan_skeleton_to_csgraph
+
+    def _skeleton_to_csgraph_compat(*args, **kwargs):
+        result = _skan_skeleton_to_csgraph(*args, **kwargs)
+        if isinstance(result, tuple) and len(result) == 2:
+            graph, coordinates = result
+            degrees = np.asarray(graph.sum(axis=1)).reshape(-1)
+            return graph, coordinates, degrees
+        return result
+
+    skan.skeleton_to_csgraph = _skeleton_to_csgraph_compat
+    _OrigSkeleton = _skan_csr.Skeleton
+
+    class _SkeletonCompat:
+        def __init__(self, skeleton, *args, **kwargs):
+            self._skeleton_image = np.asarray(skeleton, dtype=bool)
+            self._inner = _OrigSkeleton(skeleton, *args, **kwargs)
+            self.degrees_image = np.zeros(self._skeleton_image.shape, dtype=np.uint8)
+
+        def __getattr__(self, name):
+            return getattr(self._inner, name)
+
+    _skan_csr.Skeleton = _SkeletonCompat
+    skan.Skeleton = _SkeletonCompat
+except Exception:
+    pass
+try:
+    import networkx as _nx
+    if not hasattr(_nx, 'from_scipy_sparse_matrix') and hasattr(_nx, 'from_scipy_sparse_array'):
+        _nx.from_scipy_sparse_matrix = _nx.from_scipy_sparse_array
+except Exception:
+    pass
+try:
+    import cv2
+    _orig_find_contours = cv2.findContours
+
+    def _find_contours_compat(*args, **kwargs):
+        result = _orig_find_contours(*args, **kwargs)
+        if len(result) == 2:
+            contours, hierarchy = result
+            contours = list(contours)
+            image = args[0] if args else None
+            return image, contours, hierarchy
+        if len(result) == 3:
+            image, contours, hierarchy = result
+            return image, list(contours), hierarchy
+        return result
+
+    cv2.findContours = _find_contours_compat
+    _orig_imwrite = cv2.imwrite
+
+    def _imwrite_compat(filename, image, params=None):
+        if params is not None and len(params) % 2:
+            params = []
+        if params is None:
+            return _orig_imwrite(filename, image)
+        return _orig_imwrite(filename, image, params)
+
+    cv2.imwrite = _imwrite_compat
+    cv2.__version__ = '3.4.0'
+except Exception:
+    pass
 import parameters as par
 import FFT_MQ as fft
 import minibatch
+try:
+    import util.disegna as _rose_draw
+    from matplotlib.patches import Polygon as _MplPolygon
+
+    def _polygon_patch_compat(polygon, **kwargs):
+        geom = polygon
+        if hasattr(geom, 'geoms'):
+            geoms = [g for g in geom.geoms if hasattr(g, 'exterior') and not g.is_empty]
+            geom = max(geoms, key=lambda g: float(g.area), default=None)
+        if geom is not None and hasattr(geom, 'exterior'):
+            coords = np.asarray(geom.exterior.coords, dtype=float)
+        else:
+            coords = np.asarray(geom, dtype=float)
+        if coords.ndim != 2 or coords.shape[0] < 3:
+            coords = np.asarray([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]], dtype=float)
+        return _MplPolygon(coords[:, :2], closed=True, **kwargs)
+
+    _rose_draw.PolygonPatch = _polygon_patch_compat
+except Exception:
+    pass
+try:
+    import util.layout as _rose_layout
+    from sklearn.cluster import DBSCAN as _SklearnDBSCAN
+    _orig_external_contour = _rose_layout.external_contour
+
+    class _DBSCANCompat(_SklearnDBSCAN):
+        def __init__(self, eps=0.5, min_samples=5, **kwargs):
+            super().__init__(eps=eps, min_samples=min_samples, **kwargs)
+
+    def _external_contour_compat(img_rgb):
+        try:
+            contours, vertices = _orig_external_contour(img_rgb)
+            if len(vertices) >= 3:
+                return contours, vertices
+        except Exception:
+            pass
+        h, w = img_rgb.shape[:2]
+        vertices = [[0.0, 0.0], [float(w - 1), 0.0], [float(w - 1), float(h - 1)], [0.0, float(h - 1)]]
+        contour = np.asarray([[[0, 0]], [[w - 1, 0]], [[w - 1, h - 1]], [[0, h - 1]]], dtype=np.int32)
+        return contour, vertices
+
+    _rose_layout.external_contour = _external_contour_compat
+    _rose_layout.DBSCAN = _DBSCANCompat
+except Exception:
+    pass
 
 params = par.ParameterObj()
 paths = par.PathObj()

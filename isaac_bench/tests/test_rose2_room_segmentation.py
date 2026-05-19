@@ -6,9 +6,10 @@ import pytest
 
 from isaac_bench.graph.room_context import RoomContextCache, prepare_room_context_for_frontier_scoring
 from isaac_bench.mapping.coordinate_transform import MapInfo
-from isaac_bench.mapping.room_segmentation import RoomMask, RoomProposalState, RoomSegmentationConfig
+from isaac_bench.mapping.room_segmentation import OnlineRoomSegmenter, RoomMask, RoomProposalState, RoomSegmentationConfig
 from isaac_bench.mapping.room_segmentation_debug import save_rose2_roomseg_debug
 from isaac_bench.mapping.rose2_room_segmentation import OnlineROSE2RoomSegmenter
+from isaac_bench.mapping.vertical_profile import VerticalProfileMap, band_index
 from isaac_bench.metrics.result_schema import BenchmarkAssetError, validate_strict_benchmark_assets
 from isaac_bench.perception.object_memory import ObjectMemory
 
@@ -127,6 +128,52 @@ def test_rose2_visualization_outputs_layer_json(tmp_path):
     assert payload["num_final_rooms"] == len(rooms)
 
 
+def test_watershed_vertical_free_uses_0p2_2p0_profile_not_navigation_free():
+    shape = (30, 40)
+    nav_free = np.zeros(shape, dtype=bool)
+    nav_free[4:26, 4:36] = True
+    nav_occ = np.zeros(shape, dtype=bool)
+    unknown = ~nav_free
+    profile = VerticalProfileMap.zeros(shape)
+    robot_band = band_index("robot_body")
+    mid_band = band_index("mid")
+    profile.observed_count[robot_band, 4:26, 4:36] = 1
+    profile.observed_count[mid_band, 4:26, 4:36] = 1
+    profile.free_ray_count[robot_band, 4:26, 4:18] = 1
+    profile.free_ray_count[robot_band, 4:26, 22:36] = 1
+    profile.free_ray_count[mid_band, 4:26, 4:18] = 1
+    profile.free_ray_count[mid_band, 4:26, 22:36] = 1
+    profile.occupied_count[robot_band, 4:26, 18:22] = 1
+    profile.occupied_count[mid_band, 4:26, 18:22] = 1
+    profile.unknown_count[:, :, :] = (profile.observed_count == 0).astype(np.uint16)
+    cfg = RoomSegmentationConfig(
+        algorithm="legacy_watershed_vertical_free_ablation",
+        source_grid="vertical_profile_free_0p2_2p0",
+        resolution_m=0.10,
+        min_room_area_m2=0.25,
+        min_observed_free_cells=5,
+        use_structural_obstacle_mask=False,
+        morphology_close_radius_m=0.0,
+        morphology_open_radius_m=0.0,
+    )
+    segmenter = OnlineRoomSegmenter(cfg)
+
+    proposals, state = segmenter.build_proposals(
+        nav_occ,
+        nav_free,
+        nav_occ,
+        unknown,
+        step=1,
+        object_memory=[],
+        vertical_profile=profile,
+    )
+
+    assert state.debug["roomseg_input_source"] == "vertical_profile_free_0p2_2p0_watershed"
+    assert state.debug["vertical_or_free_cells"] == int(np.count_nonzero(state.structural_free_mask))
+    assert len(proposals) == 2
+    assert np.all(~state.structural_free_mask[4:26, 18:22])
+
+
 def test_room_segmentation_called_only_before_frontier_scoring():
     occ, free, unknown = _split_map()
     map_info = MapInfo(resolution_m=0.10, min_x=0.0, max_x=4.0, min_y=0.0, max_y=4.0, width=40, height=40)
@@ -163,5 +210,5 @@ def test_rose2_no_oracle_rooms_in_strict_mode():
         llm_enabled = False
         sim_backend = "map"
 
-    with pytest.raises(BenchmarkAssetError, match="rose2_source_form"):
+    with pytest.raises(BenchmarkAssetError, match="rose2_source_faithful_v1"):
         validate_strict_benchmark_assets(Args())

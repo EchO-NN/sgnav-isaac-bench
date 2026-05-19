@@ -15,7 +15,9 @@ from isaac_bench.mapping.structure_extraction import (
 
 STRONG_BOUNDARY_SOURCES = {
     "thin_wall_from_vertical_free_nonfree",
+    "thin_wall_from_nonfree_observed",
     "verified_doorway_partition_cut",
+    "doorway_partition_cut",
     "topology_effective_separator",
     "rose2_representative_wall",
 }
@@ -65,7 +67,7 @@ def select_topology_effective_separators(
         large_after = [comp for comp in comps_after if len(comp) >= min_cells]
         if len(comps_after) <= len(comps_before):
             large_before = [comp for comp in comps_before if len(comp) >= min_cells]
-            if str(line.get("source", "")) in {"thin_wall_from_vertical_free_nonfree", "rose2_representative_wall", "axis_support_from_structural_occupancy"} and (
+            if str(line.get("source", "")) in {"thin_wall_from_vertical_free_nonfree", "thin_wall_from_nonfree_observed", "rose2_representative_wall", "axis_support_from_structural_occupancy"} and (
                 len(large_before) >= 2 or len(comps_before) >= 2
             ):
                 row = dict(line)
@@ -204,7 +206,7 @@ def generate_doorway_partition_cuts(
     # Candidate lines with merged gaps already encode virtual cuts. Keep these
     # explicit records mainly for debug/merge guard evidence.
     for line in candidate_lines:
-        if str(line.get("source", "")) == "thin_wall_from_vertical_free_nonfree" and int(line.get("thin_wall_gap_count", 0) or 0) > 0:
+        if str(line.get("source", "")) in {"thin_wall_from_vertical_free_nonfree", "thin_wall_from_nonfree_observed"} and int(line.get("thin_wall_gap_count", 0) or 0) > 0:
             row = dict(line)
             row["source"] = "verified_doorway_partition_cut"
             row["line_id"] = int(len(cuts))
@@ -228,19 +230,30 @@ def labels_from_partition_boundary_v2(
     resolution_m: float,
     min_room_area_m2: float,
 ) -> tuple[np.ndarray, list[dict]]:
-    traversible = np.asarray(free, dtype=bool) & ~np.asarray(partition_boundary, dtype=bool) & ~np.asarray(unknown, dtype=bool)
+    free_arr = np.asarray(free, dtype=bool)
+    boundary_arr = np.asarray(partition_boundary, dtype=bool)
+    unknown_arr = np.asarray(unknown, dtype=bool)
+    unknown_bridge = _narrow_unknown_connectivity_bridge(
+        free=free_arr,
+        unknown=unknown_arr,
+        partition_boundary=boundary_arr,
+    )
+    traversible = (free_arr | unknown_bridge) & ~boundary_arr
     labels = np.zeros_like(traversible, dtype=np.int32)
     min_cells = max(1, int(round(float(min_room_area_m2) / max(float(resolution_m) ** 2, 1e-9))))
     next_label = 1
     small: list[tuple[int, int]] = []
     for comp in connected_components(traversible):
-        if len(comp) < min_cells and np.any(labels > 0):
+        free_comp = [(int(r), int(c)) for r, c in comp if bool(free_arr[int(r), int(c)])]
+        if len(free_comp) < min_cells and np.any(labels > 0):
             small.extend(comp)
             continue
-        for r, c in comp:
+        for r, c in free_comp:
             labels[int(r), int(c)] = int(next_label)
         next_label += 1
     for r, c in small:
+        if not bool(free_arr[int(r), int(c)]):
+            continue
         near = _nearest_label(labels, int(r), int(c), radius=8)
         if near:
             labels[int(r), int(c)] = int(near)
@@ -324,9 +337,9 @@ def _run_support(vec: np.ndarray, idx: int, *, direction: int) -> int:
 
 def _line_priority(line: Mapping[str, object]) -> float:
     source = str(line.get("source", ""))
-    if source == "thin_wall_from_vertical_free_nonfree":
+    if source in {"thin_wall_from_vertical_free_nonfree", "thin_wall_from_nonfree_observed"}:
         return 100.0
-    if source == "verified_doorway_partition_cut":
+    if source in {"verified_doorway_partition_cut", "doorway_partition_cut"}:
         return 90.0
     if source in {"rose2_representative_wall", "vertical_profile_window_door_repair"}:
         return 70.0
@@ -337,7 +350,7 @@ def _line_priority(line: Mapping[str, object]) -> float:
 
 def _strong_source_name(line: Mapping[str, object]) -> str:
     source = str(line.get("source", ""))
-    if source in {"thin_wall_from_vertical_free_nonfree", "verified_doorway_partition_cut"}:
+    if source in {"thin_wall_from_vertical_free_nonfree", "thin_wall_from_nonfree_observed", "verified_doorway_partition_cut", "doorway_partition_cut"}:
         return source
     if bool(line.get("topology_effective", False)):
         return "topology_effective_separator"
@@ -383,6 +396,75 @@ def _line_has_free_on_both_sides(line_mask: np.ndarray, free: np.ndarray) -> boo
     top = free[np.clip(rr - 1, 0, h - 1), np.clip(cc, 0, w - 1)]
     bottom = free[np.clip(rr + 1, 0, h - 1), np.clip(cc, 0, w - 1)]
     return bool(np.count_nonzero(top) > 0 and np.count_nonzero(bottom) > 0)
+
+
+def _narrow_unknown_connectivity_bridge(
+    *,
+    free: np.ndarray,
+    unknown: np.ndarray,
+    partition_boundary: np.ndarray,
+    max_width_cells: int = 2,
+    support_band_cells: int = 2,
+) -> np.ndarray:
+    """Let narrow unobserved slits preserve room connectivity without labels.
+
+    A black line in the vertical-free debug image is not necessarily a wall.
+    When it is only unknown/unobserved and has free evidence on both sides, it
+    should not split a room.  The returned mask is used only for connected
+    component topology; those unknown pixels remain unlabeled in the final room
+    mask and cannot override an accepted structural/doorway partition boundary.
+    """
+
+    free_arr = np.asarray(free, dtype=bool)
+    unknown_arr = np.asarray(unknown, dtype=bool) & ~np.asarray(partition_boundary, dtype=bool)
+    out = np.zeros_like(free_arr, dtype=bool)
+    for comp in connected_components(unknown_arr):
+        rr = np.asarray([int(r) for r, _c in comp], dtype=np.int32)
+        cc = np.asarray([int(c) for _r, c in comp], dtype=np.int32)
+        if rr.size == 0:
+            continue
+        r0, r1 = int(rr.min()), int(rr.max())
+        c0, c1 = int(cc.min()), int(cc.max())
+        height = r1 - r0 + 1
+        width = c1 - c0 + 1
+        if min(height, width) > int(max_width_cells):
+            continue
+        axis = "vertical" if height >= width else "horizontal"
+        support = _free_support_for_bridge(
+            free_arr,
+            axis=axis,
+            r0=r0,
+            r1=r1,
+            c0=c0,
+            c1=c1,
+            band=int(support_band_cells),
+        )
+        if support["side_a"] <= 0.0 or support["side_b"] <= 0.0:
+            continue
+        out[rr, cc] = True
+    return out
+
+
+def _free_support_for_bridge(
+    free: np.ndarray,
+    *,
+    axis: str,
+    r0: int,
+    r1: int,
+    c0: int,
+    c1: int,
+    band: int,
+) -> dict:
+    h, w = free.shape
+    if axis == "vertical":
+        rows = slice(max(0, r0), min(h, r1 + 1))
+        left = free[rows, max(0, c0 - band) : max(0, c0)]
+        right = free[rows, min(w, c1 + 1) : min(w, c1 + 1 + band)]
+        return {"side_a": float(np.count_nonzero(left)), "side_b": float(np.count_nonzero(right))}
+    cols = slice(max(0, c0), min(w, c1 + 1))
+    top = free[max(0, r0 - band) : max(0, r0), cols]
+    bottom = free[min(h, r1 + 1) : min(h, r1 + 1 + band), cols]
+    return {"side_a": float(np.count_nonzero(top)), "side_b": float(np.count_nonzero(bottom))}
 
 
 def _nearest_label(labels: np.ndarray, r: int, c: int, *, radius: int) -> int:
