@@ -164,12 +164,13 @@ mapping:
   frontier_allow_near_fallback: false
   frontier_debug_dump: false
   frontier_debug_dir: data/debug_frontier
-  room_map_mode: upstream_rose2_vertical_or_free
+  room_map_mode: rose2_source_form_vlm
   strict_no_oracle_rooms: true
   room_segmentation:
     enabled: true
-    algorithm: upstream_rose2_vertical_or_free
-    source_mode: declutter_reconstruct_mit
+    algorithm: rose2_source_form
+    backend: rose2_source_form
+    source_mode: source_form_no_ros
     legacy_watershed_allowed: debug_only
     local_rose2_lite_allowed: debug_only
     require_upstream_source_for_strict: true
@@ -177,9 +178,19 @@ mapping:
     run_only_before_frontier_scoring: true
     source_grid: online_depth_observed
     proposal_mode: distance_watershed
-    finalization_mode: doorway_constrained_merge
+    finalization_mode: no_merge_until_source_backend_verified
     use_structural_obstacle_mask: true
     suppress_furniture_obstacles: true
+    debug_rose2_source: false
+    rose2_source_work_dir: debug/rose2_source
+    rose2_compare_legacy: false
+    strict_disallow_legacy_fallback: true
+    source_form:
+      min_cell_area_m2: 0.35
+      min_cell_free_ratio: 0.12
+      min_cut_spacing_m: 0.45
+      axis_snap_angle_rad: 0.488692191
+      max_cuts_per_axis: 96
     vertical_or_free:
       enabled: true
       z_min_m: 0.20
@@ -393,7 +404,7 @@ sgnav:
     long_edge_geometric_pruning: true
     group_nodes: true
     room_nodes:
-      source: upstream_rose2_vertical_or_free_vlm
+      source: rose2_source_form_vlm
       use_dataset_room_labels_in_metric: false
       strict_no_oracle_rooms: true
       room_label_backend: vlm

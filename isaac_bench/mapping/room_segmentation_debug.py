@@ -21,7 +21,7 @@ def save_rose2_roomseg_debug(
 ) -> tuple[Path, Path]:
     out = Path(out_dir)
     algorithm = str(debug.get("algorithm", "rose2_structure"))
-    if algorithm in {"upstream_rose2_pure_python", "upstream_rose2_vertical_or_free"}:
+    if algorithm in {"rose2_source_form", "upstream_rose2_pure_python", "upstream_rose2_vertical_or_free"}:
         out = out / str(episode_id)
         out.mkdir(parents=True, exist_ok=True)
         stem = "%06d_rose2" % int(step)
@@ -125,7 +125,14 @@ def rose2_layers_payload(room_masks: Sequence[object], debug: Mapping[str, objec
             }
         )
     algorithm = str(debug.get("algorithm", "rose2_structure"))
-    source_mode = str(debug.get("source_mode", "declutter_reconstruct_mit" if algorithm in {"upstream_rose2_pure_python", "upstream_rose2_vertical_or_free"} else "local_rose2_lite"))
+    source_mode = str(
+        debug.get(
+            "source_mode",
+            "source_form_no_ros"
+            if algorithm in {"rose2_source_form", "upstream_rose2_pure_python", "upstream_rose2_vertical_or_free"}
+            else "local_rose2_lite",
+        )
+    )
     return {
         "algorithm": algorithm,
         "source_mode": source_mode,

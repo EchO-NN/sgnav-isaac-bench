@@ -58,6 +58,7 @@ def test_upstream_rose2_missing_source_strict_fails(tmp_path):
         llm_enabled=True,
         room_map_mode="upstream_rose2_vertical_or_free",
         room_segmentation_config={
+            "backend": "rose2_source_external",
             "source_root": str(tmp_path / "missing"),
             "upstream_repo_env": "ROSE2_SOURCE_ROOT",
             "require_upstream_source_for_strict": True,
@@ -95,8 +96,8 @@ def test_upstream_rose2_synthetic_two_rooms(tmp_path):
     rooms = segmenter.update(occupied, free, occupied, unknown, step=1)
 
     assert len([room for room in rooms if not room.stale]) == 2
-    assert segmenter.last_debug["algorithm"] == "upstream_rose2_vertical_or_free"
-    assert segmenter.last_debug["source_mode"] == "declutter_reconstruct_mit"
+    assert segmenter.last_debug["algorithm"] == "rose2_source_form"
+    assert segmenter.last_debug["source_mode"] == "source_form_no_ros"
     assert segmenter.last_debug["strict_fallback_used"] is False
 
 
@@ -197,8 +198,8 @@ def test_upstream_rose2_debug_artifact_contract(tmp_path):
     payload = json.loads(layers.read_text(encoding="utf-8"))
 
     assert png.exists()
-    assert payload["algorithm"] == "upstream_rose2_vertical_or_free"
-    assert payload["source_mode"] == "declutter_reconstruct_mit"
+    assert payload["algorithm"] == "rose2_source_form"
+    assert payload["source_mode"] == "source_form_no_ros"
     assert "num_rooms" in payload
     assert "num_wall_lines" in payload
     assert "main_directions" in payload

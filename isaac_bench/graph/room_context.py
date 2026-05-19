@@ -57,7 +57,7 @@ class RoomContextResult:
     object_evidence_hash: str = ""
     room_mask_geometry_hash: str = ""
     room_object_evidence_hash: str = ""
-    source: str = "upstream_rose2_pure_python_vlm"
+    source: str = "rose2_source_form_vlm"
 
     def metadata(self, *, full_order: bool = True) -> dict:
         trace = list(SCORING_ROOM_CALL_ORDER_FULL if full_order else self.call_order_trace)
@@ -73,7 +73,7 @@ class RoomContextResult:
             "room_label_cache_hits": int(self.label_cache_hits),
             "room_call_order_trace": trace,
             "room_segmentation_called_for": "frontier_scoring_pre_hook",
-            "room_segmentation_algorithm": str(self.room_segmentation_debug.get("algorithm", "upstream_rose2_pure_python")),
+            "room_segmentation_algorithm": str(self.room_segmentation_debug.get("algorithm", "rose2_source_form")),
             "room_segmentation_step_index": self.room_segmentation_debug.get("step"),
             "room_vlm_called": bool(self.labeling_ran),
             "scenegraph_updated_after_room_context": True,

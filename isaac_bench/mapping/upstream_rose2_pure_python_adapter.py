@@ -27,12 +27,31 @@ from isaac_bench.mapping.structure_extraction import (
     faces_from_boundary_map,
     extract_rose2_structure,
 )
+from isaac_bench.mapping.rose2_source_form import (
+    LEGACY_STYLE_BACKEND,
+    ROSE2SourceFormConfig,
+    ROSE2SourceResult,
+    SOURCE_EXTERNAL_BACKEND,
+    SOURCE_FORM_BACKEND,
+    run_rose2_source_external,
+    run_rose2_source_form,
+    save_rose2_source_debug,
+    source_result_summary,
+)
 from isaac_bench.mapping.vertical_profile import VerticalProfileMap, band_index, ensure_vertical_profile
 
 
-UPSTREAM_SOURCE_MODE = "declutter_reconstruct_mit"
-UPSTREAM_ALGORITHM = "upstream_rose2_vertical_or_free"
-UPSTREAM_ALGORITHM_ALIASES = {"upstream_rose2_vertical_or_free", "upstream_rose2_pure_python"}
+UPSTREAM_SOURCE_MODE = "source_form_no_ros"
+UPSTREAM_ALGORITHM = SOURCE_FORM_BACKEND
+UPSTREAM_CONTEXT_SOURCE = "%s_vlm" % SOURCE_FORM_BACKEND
+UPSTREAM_ALGORITHM_ALIASES = {
+    SOURCE_FORM_BACKEND,
+    UPSTREAM_CONTEXT_SOURCE,
+    "upstream_rose2_vertical_or_free",
+    "upstream_rose2_vertical_or_free_vlm",
+    "upstream_rose2_pure_python",
+    "upstream_rose2_pure_python_vlm",
+}
 DEFAULT_SOURCE_ENV = "ROSE2_SOURCE_ROOT"
 REQUIRED_SOURCE_FILES = (
     "code/FFT_MQ.py",
@@ -45,6 +64,7 @@ REQUIRED_SOURCE_FILES = (
 class UpstreamROSE2Config:
     source_root: str | None
     source_mode: str = UPSTREAM_SOURCE_MODE
+    backend: str = SOURCE_FORM_BACKEND
     filter_value: float = 0.18
     spatial_clustering_line_segments_threshold: float = 5.0
     lines_th1: float = 0.1
@@ -53,7 +73,7 @@ class UpstreamROSE2Config:
     rooms_voronoi: bool = False
     fail_on_missing_source: bool = True
     debug_dump: bool = True
-    finalization_mode: str = "doorway_constrained_merge"
+    finalization_mode: str = "no_merge_until_source_backend_verified"
     upstream_repo_env: str = DEFAULT_SOURCE_ENV
     resolution_m: float = 0.05
     min_room_area_m2: float = 1.5
@@ -101,6 +121,15 @@ class UpstreamROSE2Config:
     wall_gating_fix_keep_high_confidence_walls: bool = True
     wall_gating_fix_keep_line_supported_walls: bool = True
     wall_gating_fix_min_component_area_cells: int = 4
+    debug_rose2_source: bool = False
+    rose2_source_work_dir: str = "debug/rose2_source"
+    rose2_compare_legacy: bool = False
+    strict_disallow_legacy_fallback: bool = True
+    source_form_min_cell_area_m2: float = 0.35
+    source_form_min_cell_free_ratio: float = 0.12
+    source_form_min_cut_spacing_m: float = 0.45
+    source_form_axis_snap_angle_rad: float = 0.488692191
+    source_form_max_cuts_per_axis: int = 96
 
     @classmethod
     def from_mapping(cls, data: Optional[Mapping[str, object]] = None, **overrides) -> "UpstreamROSE2Config":
@@ -115,6 +144,9 @@ class UpstreamROSE2Config:
             nested = dict(raw.get(section, {}) or {})
             for key, value in nested.items():
                 raw.setdefault("%s_%s" % (section, key), value)
+        source_form = dict(raw.get("source_form", {}) or {})
+        for key, value in source_form.items():
+            raw.setdefault("source_form_%s" % key, value)
         if "source_root" not in raw:
             env_name = str(raw.get("upstream_repo_env", DEFAULT_SOURCE_ENV) or DEFAULT_SOURCE_ENV)
             raw["source_root"] = os.environ.get(env_name)
@@ -138,15 +170,16 @@ class UpstreamROSE2Result:
 
 class UpstreamROSE2PurePythonSegmenter:
     source = UPSTREAM_ALGORITHM
-    context_source = "upstream_rose2_vertical_or_free_vlm"
+    context_source = UPSTREAM_CONTEXT_SOURCE
 
     def __init__(self, config: UpstreamROSE2Config, map_info: MapInfo):
         self.config = config
         self.map_info = map_info
+        backend = str(config.backend or SOURCE_FORM_BACKEND).strip().lower()
         self.source_root = validate_upstream_rose2_source_root(
             config.source_root,
             env_name=config.upstream_repo_env,
-            fail=bool(config.fail_on_missing_source),
+            fail=bool(config.fail_on_missing_source and backend == SOURCE_EXTERNAL_BACKEND),
         )
         self._room_config = RoomSegmentationConfig(
             algorithm=UPSTREAM_ALGORITHM,
@@ -173,6 +206,19 @@ class UpstreamROSE2PurePythonSegmenter:
             wall_extension_margin_m=float(config.wall_extension_margin_m),
             clutter_component_max_area_m2=float(config.clutter_component_max_area_m2),
         )
+        self._source_form_config = ROSE2SourceFormConfig(
+            resolution_m=float(config.resolution_m),
+            min_room_area_m2=float(config.min_room_area_m2),
+            min_cell_area_m2=float(config.source_form_min_cell_area_m2),
+            min_cell_free_ratio=float(config.source_form_min_cell_free_ratio),
+            min_cut_spacing_m=float(config.source_form_min_cut_spacing_m),
+            min_wall_line_length_m=float(config.hough_min_line_length_m),
+            axis_snap_angle_rad=float(config.source_form_axis_snap_angle_rad),
+            max_cuts_per_axis=int(config.source_form_max_cuts_per_axis),
+            wall_raster_radius_cells=int(self._structure_config.wall_raster_radius_cells),
+            debug_dump=bool(config.debug_rose2_source),
+            debug_dir=str(config.rose2_source_work_dir),
+        )
         self.last_debug: dict = {}
         self.last_result: UpstreamROSE2Result | None = None
         self._previous: dict[str, RoomMask] = {}
@@ -184,13 +230,13 @@ class UpstreamROSE2PurePythonSegmenter:
         proposals, state = self.build_proposals(occupied, free, occupied, unknown, step=0, object_memory=None)
         _ = proposals
         room_masks = self.finalize_proposals(state, proposal_semantic_labels=None)
-        structure = state.debug.get("_structure_result")
-        if isinstance(structure, StructureExtractionResult):
-            clean = structure.clean_structure_map
-            main_directions = [float(v) for v in structure.dominant_directions_rad]
-            wall_lines = list(structure.hough_segments)
-            extended_lines = list(structure.representative_lines)
-            edges = list(structure.face_adjacency_edges)
+        source_result = state.debug.get("_source_result")
+        if isinstance(source_result, ROSE2SourceResult):
+            clean = source_result.clean_structure_map
+            main_directions = [float(v) for v in source_result.dominant_directions_rad]
+            wall_lines = list(source_result.hough_segments)
+            extended_lines = list(source_result.extended_lines)
+            edges = list(source_result.face_adjacency_edges)
         else:
             clean = np.zeros_like(occupied, dtype=bool)
             main_directions = []
@@ -261,29 +307,106 @@ class UpstreamROSE2PurePythonSegmenter:
             config=self.config,
             room_config=self._room_config,
         )
-        structure = extract_rose2_structure(
-            observed_occupied=np.asarray(structural["repaired_roomseg_occupied"], dtype=bool),
-            observed_free=np.asarray(structural["repaired_roomseg_free"], dtype=bool),
-            unknown=np.asarray(structural["repaired_roomseg_unknown"], dtype=bool),
-            config=self._structure_config,
+        backend = str(self.config.backend or SOURCE_FORM_BACKEND).strip().lower()
+        source_result, legacy_structure = self._run_source_backend(
+            backend=backend,
+            structural=structural,
             object_memory=object_memory,
+            step=int(step),
         )
-        proposal_labels = np.asarray(structure.face_labels, dtype=np.int32)
+        proposal_labels = np.asarray(source_result.room_label_map, dtype=np.int32)
         proposal_rooms = self._rooms_from_labels(proposal_labels, unknown, [], int(step), source_labels=proposal_labels)
-        debug = self._debug_from_structure(structure, proposal_labels, int(step))
+        debug = self._debug_from_source_result(source_result, proposal_labels, int(step), legacy_structure=legacy_structure)
         debug.update(structural)
-        debug["_structure_result"] = structure
+        debug["_source_result"] = source_result
+        debug["_structure_result"] = legacy_structure
         debug["_input_occupancy_map"] = occupied.copy()
         state = RoomProposalState(
             proposal_labels=proposal_labels,
             structural_free_mask=np.asarray(structural["repaired_roomseg_free"], dtype=bool),
-            structural_obstacle_mask=np.asarray(structure.boundary_map, dtype=bool),
+            structural_obstacle_mask=np.asarray(source_result.boundary_map, dtype=bool),
             unknown_mask=np.asarray(structural["repaired_roomseg_unknown"], dtype=bool),
-            distance_m=np.asarray(structure.structural_score, dtype=np.float32),
+            distance_m=np.asarray(source_result.structural_score, dtype=np.float32),
             step=int(step),
             debug=debug,
         )
         return proposal_rooms, state
+
+    def _run_source_backend(
+        self,
+        *,
+        backend: str,
+        structural: Mapping[str, object],
+        object_memory: Optional[Sequence[object]],
+        step: int,
+    ) -> tuple[ROSE2SourceResult, StructureExtractionResult | None]:
+        occupied = np.asarray(structural["repaired_roomseg_occupied"], dtype=bool)
+        free = np.asarray(structural["repaired_roomseg_free"], dtype=bool)
+        unknown = np.asarray(structural["repaired_roomseg_unknown"], dtype=bool)
+        backend_name = str(backend or SOURCE_FORM_BACKEND).strip().lower()
+        legacy_structure: StructureExtractionResult | None = None
+        if backend_name == SOURCE_FORM_BACKEND:
+            source_result = run_rose2_source_form(
+                observed_occupied=occupied,
+                observed_free=free,
+                unknown=unknown,
+                structure_config=self._structure_config,
+                source_config=self._source_form_config,
+                object_memory=object_memory,
+            )
+        elif backend_name == SOURCE_EXTERNAL_BACKEND:
+            source_result = run_rose2_source_external(
+                source_root=self.source_root,
+                observed_occupied=occupied,
+                observed_free=free,
+                unknown=unknown,
+                work_dir=str(self.config.rose2_source_work_dir),
+            )
+        elif backend_name == LEGACY_STYLE_BACKEND:
+            if bool(self.config.strict_disallow_legacy_fallback):
+                raise ValueError(
+                    "%s is debug/ablation-only; strict room segmentation uses %s"
+                    % (LEGACY_STYLE_BACKEND, SOURCE_FORM_BACKEND)
+                )
+            legacy_structure = extract_rose2_structure(
+                observed_occupied=occupied,
+                observed_free=free,
+                unknown=unknown,
+                config=self._structure_config,
+                object_memory=object_memory,
+            )
+            source_result = _source_result_from_legacy_structure(legacy_structure)
+        else:
+            raise ValueError(
+                "unsupported roomseg backend %s; expected %s, %s, or %s"
+                % (backend_name, SOURCE_FORM_BACKEND, SOURCE_EXTERNAL_BACKEND, LEGACY_STYLE_BACKEND)
+            )
+        if bool(self.config.rose2_compare_legacy) and backend_name != LEGACY_STYLE_BACKEND:
+            legacy_structure = extract_rose2_structure(
+                observed_occupied=occupied,
+                observed_free=free,
+                unknown=unknown,
+                config=self._structure_config,
+                object_memory=object_memory,
+            )
+            source_result.debug["legacy_compare"] = {
+                "enabled": True,
+                "legacy_room_count": _label_count(legacy_structure.face_labels),
+                "legacy_wall_line_count": int(len(legacy_structure.representative_lines)),
+                "legacy_connected_component_rooms_used": False,
+            }
+        if bool(self.config.debug_rose2_source):
+            dump = save_rose2_source_debug(
+                out_dir=str(self.config.rose2_source_work_dir),
+                step=int(step),
+                result=source_result,
+                observed_occupied=occupied,
+                observed_free=free,
+                unknown=unknown,
+            )
+            source_result.debug["rose2_source_debug_paths"] = dict(dump.get("paths", {}))
+            source_result.debug["rose2_source_debug_summary"] = dict(dump.get("summary", {}))
+        return source_result, legacy_structure
 
     def _apply_window_door_gap_repair(
         self,
@@ -348,13 +471,13 @@ class UpstreamROSE2PurePythonSegmenter:
             debug = {
                 key: value
                 for key, value in dict(proposal_state.debug or {}).items()
-                if key not in {"_structure_result", "_input_occupancy_map"}
+                if key not in {"_source_result", "_structure_result", "_input_occupancy_map"}
             }
             debug.update(self._empty_debug(int(proposal_state.step)))
             debug["finalization_mode"] = finalization_mode
             self.last_debug = debug
             return []
-        if finalization_mode in {"no_merge", "proposal_only", "premerge_proposals"}:
+        if finalization_mode in {"no_merge", "proposal_only", "premerge_proposals", "no_merge_until_source_backend_verified"}:
             final_labels = labels.copy()
             doorway_edges: list[dict] = []
             finalization_debug = {
@@ -426,13 +549,15 @@ class UpstreamROSE2PurePythonSegmenter:
         debug = {
             key: value
             for key, value in dict(proposal_state.debug or {}).items()
-            if key not in {"_structure_result", "_input_occupancy_map"}
+            if key not in {"_source_result", "_structure_result", "_input_occupancy_map"}
         }
         debug.update(
             {
                 "algorithm": UPSTREAM_ALGORITHM,
                 "source": UPSTREAM_ALGORITHM,
                 "source_mode": str(self.config.source_mode),
+                "roomseg_backend": str(self.config.backend or SOURCE_FORM_BACKEND),
+                "source_backend": str(self.config.backend or SOURCE_FORM_BACKEND),
                 "source_root": str(self.source_root) if self.source_root is not None else None,
                 "source_repository": "https://github.com/goldleaf3i/declutter-reconstruct",
                 "source_provenance": _source_provenance(self.source_root),
@@ -518,6 +643,8 @@ class UpstreamROSE2PurePythonSegmenter:
             "algorithm": UPSTREAM_ALGORITHM,
             "source": UPSTREAM_ALGORITHM,
             "source_mode": str(self.config.source_mode),
+            "roomseg_backend": str(self.config.backend or SOURCE_FORM_BACKEND),
+            "source_backend": str(self.config.backend or SOURCE_FORM_BACKEND),
             "source_root": str(self.source_root) if self.source_root is not None else None,
             "source_repository": "https://github.com/goldleaf3i/declutter-reconstruct",
             "source_provenance": _source_provenance(self.source_root),
@@ -545,6 +672,66 @@ class UpstreamROSE2PurePythonSegmenter:
             "proposal_room_masks": _proposal_masks_debug(proposal_labels),
             "room_proposal_labels_before_merge": np.asarray(proposal_labels, dtype=np.int32),
         }
+
+    def _debug_from_source_result(
+        self,
+        source_result: ROSE2SourceResult,
+        proposal_labels: np.ndarray,
+        step: int,
+        *,
+        legacy_structure: StructureExtractionResult | None = None,
+    ) -> dict:
+        debug = {
+            "algorithm": UPSTREAM_ALGORITHM,
+            "source": UPSTREAM_ALGORITHM,
+            "source_mode": str(self.config.source_mode),
+            "roomseg_backend": str(source_result.backend),
+            "source_backend": str(source_result.backend),
+            "source_root": str(self.source_root) if self.source_root is not None else None,
+            "source_repository": "https://github.com/goldleaf3i/declutter-reconstruct",
+            "source_provenance": _source_provenance(self.source_root),
+            "strict_fallback_used": False,
+            "step": int(step),
+            "dominant_directions_rad": [float(v) for v in source_result.dominant_directions_rad],
+            "main_directions": [float(v) for v in source_result.dominant_directions_rad],
+            "clean_structure_map": np.asarray(source_result.clean_structure_map, dtype=bool),
+            "boundary_map": np.asarray(source_result.boundary_map, dtype=bool),
+            "hough_segments": list(source_result.hough_segments),
+            "wall_lines": list(source_result.hough_segments),
+            "wall_clusters": list(source_result.wall_clusters),
+            "representative_lines": list(source_result.extended_lines or source_result.representative_lines),
+            "extended_lines": list(source_result.extended_lines or source_result.representative_lines),
+            "edges": list(source_result.face_adjacency_edges),
+            "cell_edges": list(source_result.cell_edges),
+            "faces": list(source_result.faces),
+            "source_cell_polygons": list(source_result.cell_polygons),
+            "room_polygons": [
+                _room_polygon_from_mask(proposal_labels == label_id, self.map_info)
+                for label_id in sorted(int(v) for v in np.unique(proposal_labels) if int(v) > 0)
+            ],
+            "timing_ms": dict(source_result.timing_ms),
+            "num_hough_segments": int(len(source_result.hough_segments)),
+            "num_wall_lines": int(len(source_result.hough_segments)),
+            "num_wall_clusters": int(len(source_result.wall_clusters)),
+            "num_representative_lines": int(len(source_result.extended_lines or source_result.representative_lines)),
+            "num_source_cells": int(len(source_result.cell_polygons)),
+            "num_source_cell_edges": int(len(source_result.cell_edges)),
+            "num_physical_rooms": int(len([v for v in np.unique(proposal_labels) if int(v) > 0])),
+            "proposal_room_count": int(len([v for v in np.unique(proposal_labels) if int(v) > 0])),
+            "proposal_room_masks": _proposal_masks_debug(proposal_labels),
+            "room_proposal_labels_before_merge": np.asarray(proposal_labels, dtype=np.int32),
+            "source_room_label_map": np.asarray(source_result.source_room_label_map, dtype=np.int32),
+            "source_result_summary": source_result_summary(source_result),
+        }
+        debug.update(dict(source_result.debug or {}))
+        if legacy_structure is not None and "legacy_compare" not in debug:
+            debug["legacy_compare"] = {
+                "enabled": bool(source_result.backend == LEGACY_STYLE_BACKEND),
+                "legacy_room_count": _label_count(legacy_structure.face_labels),
+                "legacy_wall_line_count": int(len(legacy_structure.representative_lines)),
+                "legacy_connected_component_rooms_used": bool(source_result.backend == LEGACY_STYLE_BACKEND),
+            }
+        return debug
 
     def _empty_debug(self, step: int) -> dict:
         return {
@@ -591,6 +778,38 @@ def occupancy_to_rose_image(occupancy_grid: np.ndarray, observed_free: np.ndarra
     image[occupied] = 255
     image[unknown] = 127
     return image
+
+
+def _source_result_from_legacy_structure(structure: StructureExtractionResult) -> ROSE2SourceResult:
+    debug = {
+        "source_backend": LEGACY_STYLE_BACKEND,
+        "source_form_used": False,
+        "source_exact_used": False,
+        "legacy_style_used": True,
+        "legacy_connected_component_rooms_used": True,
+        "source_room_count": _label_count(structure.face_labels),
+        "proposal_room_count": _label_count(structure.face_labels),
+        "failure_mode": "",
+    }
+    return ROSE2SourceResult(
+        backend=LEGACY_STYLE_BACKEND,
+        room_label_map=np.asarray(structure.face_labels, dtype=np.int32),
+        source_room_label_map=np.asarray(structure.face_labels, dtype=np.int32),
+        clean_structure_map=np.asarray(structure.clean_structure_map, dtype=bool),
+        structural_score=np.asarray(structure.structural_score, dtype=np.float32),
+        boundary_map=np.asarray(structure.boundary_map, dtype=bool),
+        dominant_directions_rad=[float(v) for v in structure.dominant_directions_rad],
+        hough_segments=[dict(item) for item in structure.hough_segments],
+        wall_clusters=[dict(item) for item in structure.wall_clusters],
+        representative_lines=[dict(item) for item in structure.representative_lines],
+        extended_lines=[dict(item) for item in structure.representative_lines],
+        faces=[dict(item) for item in structure.faces],
+        face_adjacency_edges=[dict(item) for item in structure.face_adjacency_edges],
+        cell_edges=[],
+        cell_polygons=[],
+        timing_ms=dict(structure.timing_ms),
+        debug=debug,
+    )
 
 
 def rose_polygons_to_room_masks(polygons: list[np.ndarray], shape: tuple[int, int], map_info: MapInfo) -> list[RoomMask]:

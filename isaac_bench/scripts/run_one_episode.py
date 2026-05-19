@@ -1078,16 +1078,25 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
     if room_map_mode in {"observed_rooms_json", "rooms_json", "observed"}:
         if bool(getattr(args, "strict_benchmark", False)):
             raise BenchmarkAssetError(
-                "strict SG-Nav metric path requires upstream_rose2_vertical_or_free room masks; rooms.json/oracle room maps are not allowed"
+                "strict SG-Nav metric path requires rose2_source_form room masks; rooms.json/oracle room maps are not allowed"
             )
         full_room_map = build_sgnav_room_map(scene_dir, dynamic_map_info)
         scenegraph.update(object_memory, room_map=full_room_map)
-    elif room_map_mode in {"upstream_rose2_vertical_or_free", "upstream_rose2_vertical_or_free_vlm", "upstream_rose2_pure_python", "upstream_rose2_pure_python_vlm"}:
+    elif room_map_mode in {
+        "rose2_source_form",
+        "rose2_source_form_vlm",
+        "upstream_rose2_vertical_or_free",
+        "upstream_rose2_vertical_or_free_vlm",
+        "upstream_rose2_pure_python",
+        "upstream_rose2_pure_python_vlm",
+    }:
+        roomseg_backend = str(getattr(args, "room_segmentation_config", {}).get("backend", "rose2_source_form") or "rose2_source_form").strip().lower()
         upstream_cfg = UpstreamROSE2Config.from_mapping(
             getattr(args, "room_segmentation_config", {}),
             resolution_m=float(dynamic_map_info.resolution_m),
             fail_on_missing_source=bool(getattr(args, "strict_benchmark", False))
             and not bool(getattr(args, "allow_debug_fallbacks", False))
+            and roomseg_backend == "rose2_source_external"
             and bool(getattr(args, "room_segmentation_config", {}).get("require_upstream_source_for_strict", True)),
         )
         room_segmenter = UpstreamROSE2PurePythonSegmenter(upstream_cfg, dynamic_map_info)
@@ -1111,7 +1120,7 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
     elif room_map_mode in {"online_rose2_structure", "rose2_structure", "online_rose2_structure_vlm"}:
         if bool(getattr(args, "strict_benchmark", False)) and str(getattr(args, "ablation_name", "") or "") != "local_rose2_lite_room_ablation":
             raise BenchmarkAssetError(
-                "strict SG-Nav metric path requires upstream_rose2_vertical_or_free room masks; local ROSE2-lite is debug/ablation-only"
+                "strict SG-Nav metric path requires rose2_source_form room masks; local ROSE2-lite is debug/ablation-only"
             )
         room_cfg = RoomSegmentationConfig.from_mapping(
             getattr(args, "room_segmentation_config", {}),
@@ -1139,7 +1148,7 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
     elif room_map_mode in {"online_geometry_watershed", "online_geometry_watershed_vlm"}:
         if bool(getattr(args, "strict_benchmark", False)) and str(getattr(args, "ablation_name", "") or "") != "legacy_watershed_room_ablation":
             raise BenchmarkAssetError(
-                "strict SG-Nav metric path requires upstream_rose2_vertical_or_free room masks; watershed is debug/ablation-only"
+                "strict SG-Nav metric path requires rose2_source_form room masks; watershed is debug/ablation-only"
             )
         room_cfg = RoomSegmentationConfig.from_mapping(
             getattr(args, "room_segmentation_config", {}),
@@ -2933,6 +2942,15 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--debug-roomseg-layers", action="store_true", default=None)
     parser.add_argument("--debug-roomseg-dir", default=None)
     parser.add_argument("--debug-roomseg-max-saves", type=int, default=None)
+    parser.add_argument("--roomseg-backend", default=None, choices=["rose2_source_form", "rose2_source_external", "legacy_rose2_style_debug"])
+    parser.add_argument("--debug-rose2-source", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--rose2-source-work-dir", default=None)
+    parser.add_argument("--rose2-compare-legacy", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument(
+        "--roomseg-finalization-mode",
+        default=None,
+        choices=["no_merge", "proposal_only", "premerge_proposals", "doorway_constrained_merge", "no_merge_until_source_backend_verified"],
+    )
     parser.add_argument("--enable-roomseg-nav-free-overlay", dest="roomseg_nav_free_overlay", action="store_true", default=None)
     parser.add_argument("--disable-roomseg-nav-free-overlay", dest="roomseg_nav_free_overlay", action="store_false")
     parser.add_argument("--enable-frontier-room-known-free-side", dest="frontier_room_known_free_side", action="store_true", default=None)
@@ -3359,12 +3377,22 @@ def main(argv: Optional[List[str]] = None) -> int:
         default_robot_radius_m = 0.5 * float(get_nested(cfg, "robot.footprint_width_m", 0.28))
     args.robot_radius_m = float(args.robot_radius_m if args.robot_radius_m is not None else default_robot_radius_m)
     args.online_inflation_radius_m = float(args.online_inflation_radius_m if args.online_inflation_radius_m is not None else get_nested(cfg, "mapping.inflation_radius_m", 0.0))
-    args.room_map_mode = str(args.room_map_mode or get_nested(cfg, "mapping.room_map_mode", "upstream_rose2_vertical_or_free"))
+    args.room_map_mode = str(args.room_map_mode or get_nested(cfg, "mapping.room_map_mode", "rose2_source_form_vlm"))
     args.room_segmentation_config = dict(get_nested(cfg, "mapping.room_segmentation", {}) or {})
     roomseg_debug_layers_cfg = dict(args.room_segmentation_config.get("debug_layers", {}) or {})
     roomseg_overlay_cfg = dict(args.room_segmentation_config.get("navigation_free_context_overlay", {}) or {})
     roomseg_frontier_context_cfg = dict(args.room_segmentation_config.get("frontier_room_context", {}) or {})
     roomseg_wall_gating_fix_cfg = dict(args.room_segmentation_config.get("wall_gating_fix", {}) or {})
+    if args.roomseg_backend is not None:
+        args.room_segmentation_config["backend"] = str(args.roomseg_backend)
+    if args.debug_rose2_source is not None:
+        args.room_segmentation_config["debug_rose2_source"] = bool(args.debug_rose2_source)
+    if args.rose2_source_work_dir is not None:
+        args.room_segmentation_config["rose2_source_work_dir"] = str(args.rose2_source_work_dir)
+    if args.rose2_compare_legacy is not None:
+        args.room_segmentation_config["rose2_compare_legacy"] = bool(args.rose2_compare_legacy)
+    if args.roomseg_finalization_mode is not None:
+        args.room_segmentation_config["finalization_mode"] = str(args.roomseg_finalization_mode)
     if args.debug_roomseg_layers is not None:
         roomseg_debug_layers_cfg["enabled"] = bool(args.debug_roomseg_layers)
     if args.debug_roomseg_dir is not None:
@@ -3385,6 +3413,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     args.debug_roomseg_layers = bool(roomseg_debug_layers_cfg.get("enabled", False))
     args.debug_roomseg_dir = str(roomseg_debug_layers_cfg.get("output_dir", "debug/roomseg_layers"))
     args.debug_roomseg_max_saves = int(roomseg_debug_layers_cfg.get("max_saves", 50))
+    args.roomseg_backend = str(args.room_segmentation_config.get("backend", "rose2_source_form"))
+    args.debug_rose2_source = bool(args.room_segmentation_config.get("debug_rose2_source", False))
+    args.rose2_source_work_dir = str(args.room_segmentation_config.get("rose2_source_work_dir", "debug/rose2_source"))
+    args.rose2_compare_legacy = bool(args.room_segmentation_config.get("rose2_compare_legacy", False))
+    args.roomseg_finalization_mode = str(args.room_segmentation_config.get("finalization_mode", "no_merge_until_source_backend_verified"))
     args.roomseg_nav_free_overlay = bool(roomseg_overlay_cfg.get("enabled", False))
     args.frontier_room_known_free_side = bool(roomseg_frontier_context_cfg.get("enabled", True) and roomseg_frontier_context_cfg.get("use_known_free_side", True))
     room_semantics_cfg = dict(get_nested(cfg, "room_semantics", {}) or {})

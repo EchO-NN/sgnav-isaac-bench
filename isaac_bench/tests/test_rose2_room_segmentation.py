@@ -163,5 +163,5 @@ def test_rose2_no_oracle_rooms_in_strict_mode():
         llm_enabled = False
         sim_backend = "map"
 
-    with pytest.raises(BenchmarkAssetError, match="upstream_rose2_vertical_or_free"):
+    with pytest.raises(BenchmarkAssetError, match="rose2_source_form"):
         validate_strict_benchmark_assets(Args())
