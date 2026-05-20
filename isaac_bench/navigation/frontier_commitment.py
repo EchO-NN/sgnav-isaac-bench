@@ -48,12 +48,13 @@ class FrontierCommitmentManager:
         match_radius_m: float = 0.75,
         reached_radius_m: float = 0.60,
         min_commit_steps: int = 12,
-        max_commit_steps: int = 120,
+        max_commit_steps: int = 0,
         switch_margin: float = 0.25,
         switch_ratio: float = 1.15,
         no_progress_steps: int = 25,
         progress_min_delta_m: float = 0.10,
         blacklist_ttl_steps: int = 100,
+        allow_score_switch: bool = False,
     ):
         self.resolution_m = float(resolution_m)
         self.match_radius_cells = max(1, int(round(float(match_radius_m) / max(self.resolution_m, 1e-6))))
@@ -65,6 +66,7 @@ class FrontierCommitmentManager:
         self.no_progress_steps = int(no_progress_steps)
         self.progress_min_delta_m = float(progress_min_delta_m)
         self.blacklist_ttl_steps = int(blacklist_ttl_steps)
+        self.allow_score_switch = bool(allow_score_switch)
         self.active: Optional[ActiveFrontierTarget] = None
         self.next_id = 1
         self.blacklist: List[Tuple[GridCell, int, str]] = []
@@ -220,7 +222,9 @@ class FrontierCommitmentManager:
         if self.active is None:
             return
         if matched_active is None:
-            self.active.invalid_reason = "frontier_unmatched"
+            self._update_progress(current_grid, step)
+            if self.active.no_progress_steps >= self.no_progress_steps:
+                self.active.invalid_reason = "frontier_no_progress"
             return
         cells = list(self.active.target_cells) + list(matched_active.members)
         if self._distance_to_cells_m(current_grid, cells) <= self.reached_radius_m:
@@ -256,7 +260,7 @@ class FrontierCommitmentManager:
             return "frontier_reached"
         if active.invalid_reason:
             return active.invalid_reason
-        if active_age > self.max_commit_steps:
+        if self.max_commit_steps > 0 and active_age > self.max_commit_steps:
             return "frontier_max_commit_steps"
         if proposed is None:
             return ""
@@ -266,7 +270,7 @@ class FrontierCommitmentManager:
         enough_age = active_age >= self.min_commit_steps
         better_margin = float(proposed_score) > float(active_score) + self.switch_margin
         better_ratio = float(proposed_score) > float(active_score) * self.switch_ratio
-        if enough_age and better_margin and better_ratio:
+        if self.allow_score_switch and enough_age and better_margin and better_ratio:
             return "frontier_score_hysteresis_switch"
         return ""
 

@@ -752,6 +752,8 @@ class OnlineMapper:
             "reason": "ok",
             "mapping_mode": "depth_ray_cast",
             "depth_shape": [int(v) for v in depth_arr.shape],
+            "depth_stride_px": int(self.depth_stride_px),
+            "vertical_profile_depth_stride_px": int(self.depth_stride_px),
             "base_pose_world": [float(v) for v in base_pose_world],
             "camera_pose_world": [float(v) for v in camera_pose_world],
             "ray_origin_cell": [int(ray_origin_cell[0]), int(ray_origin_cell[1])],

@@ -45,6 +45,12 @@ from isaac_bench.mapping.online_roomseg import (
     OnlineRoseStyleConfig,
     OnlineRoseStyleRoomSegmenter,
 )
+from isaac_bench.mapping.online_watershed_roomseg import (
+    ONLINE_WATERSHED_ROOMSEG_BACKEND,
+    ONLINE_WATERSHED_ROOMSEG_CONTEXT,
+    OnlineWatershedRoomSegConfig,
+    OnlineWatershedRoomSegmenter,
+)
 from isaac_bench.mapping.upstream_rose2_pure_python_adapter import (
     UpstreamROSE2Config,
     UpstreamROSE2PurePythonSegmenter,
@@ -110,6 +116,81 @@ def load_passable_opening_mask(scene_dir: Path, map_info: MapInfo) -> np.ndarray
         if mask.shape == (int(map_info.height), int(map_info.width)):
             return mask
     return np.zeros((int(map_info.height), int(map_info.width)), dtype=bool)
+
+
+def _positive_int_or_none(value: object) -> int | None:
+    try:
+        parsed = int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
+
+
+def _resolve_roomseg_depth_stride_px(room_segmentation_config: Mapping[str, object] | None, default_stride_px: int) -> int:
+    """Return the depth stride used to build vertical-profile roomseg evidence.
+
+    The vertical-free room-segmentation map is generated during OnlineMapper's
+    depth ray pass. If roomseg asks for denser sampling, that request has to
+    feed the mapper pass instead of only the later segmentation stage.
+    """
+
+    default_stride = max(1, int(default_stride_px))
+    strides = [default_stride]
+    cfg = dict(room_segmentation_config or {})
+    candidate_blocks: list[Mapping[str, object]] = []
+    top_level_depth = cfg.get("depth")
+    if isinstance(top_level_depth, Mapping):
+        candidate_blocks.append(top_level_depth)
+    for section in (
+        "online_roomseg",
+        "online_watershed_roomseg",
+        "vertical_free_roomseg",
+        "vertical_free_gap_closure",
+    ):
+        section_cfg = cfg.get(section)
+        if not isinstance(section_cfg, Mapping):
+            continue
+        depth_cfg = section_cfg.get("depth")
+        if isinstance(depth_cfg, Mapping):
+            candidate_blocks.append(depth_cfg)
+    for block in candidate_blocks:
+        parsed = _positive_int_or_none(block.get("roomseg_depth_stride_px"))
+        if parsed is not None:
+            strides.append(parsed)
+    return min(strides)
+
+
+def _roomseg_debug_for_layer_dump(room_debug: Mapping[str, object], room_segmenter: object | None) -> dict:
+    debug = dict(room_debug or {})
+    result = getattr(room_segmenter, "last_result", None)
+    layers = getattr(result, "layers", None)
+    if isinstance(layers, Mapping):
+        aliases = {
+            "vertical_free_room_domain": "vertical_free_raw",
+            "vertical_occupied_0p2_2p0": "vertical_occupied_raw",
+            "vertical_observed_map": "vertical_observed_raw",
+            "vertical_observed_0p2_2p0": "vertical_observed_raw",
+            "vertical_unknown_before_overlay": "vertical_unknown_raw",
+            "navigation_free_room_domain": "free_clean",
+            "initial_roomseg_free": "free_clean",
+            "initial_roomseg_occupied": "wall_candidate_clean",
+            "initial_roomseg_unknown": "unknown_clean",
+            "repaired_roomseg_free": "free_clean",
+            "repaired_roomseg_occupied": "wall_candidate_clean",
+            "repaired_roomseg_unknown": "unknown_clean",
+            "structural_free_mask": "free_clean",
+            "wall_boundary_map": "wall_candidate_clean",
+            "candidate_wall": "wall_candidate_clean",
+            "final_room_label_map": "room_labels_after_corridor_merge",
+            "room_labels_after_merge": "room_labels_after_corridor_merge",
+            "room_proposal_labels_before_merge": "room_labels_before_separators",
+        }
+        for out_key, layer_key in aliases.items():
+            if out_key not in debug and layer_key in layers:
+                debug[out_key] = np.asarray(layers[layer_key])
+    if "final_room_label_map" not in debug and result is not None and hasattr(result, "room_label_map"):
+        debug["final_room_label_map"] = np.asarray(getattr(result, "room_label_map"))
+    return debug
 
 
 def apply_episode_planning_clearance(
@@ -1032,6 +1113,8 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
         found_goal_stop_distance_m=float(args.found_goal_stop_distance_m),
         score_frontiers_before_candidate=bool(args.score_frontiers_before_candidate),
         frontier_scenegraph_score_norm=str(args.frontier_scenegraph_score_norm),
+        frontier_selection_mode=str(args.frontier_selection_mode),
+        frontier_random_seed=int(args.frontier_random_seed),
     )
     follower = HolonomicWaypointFollower(
         max_vx=float(args.max_vx_mps),
@@ -1040,12 +1123,22 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
         lookahead_m=float(args.lookahead_m),
     )
     vertical_or_free_cfg = dict(getattr(args, "room_segmentation_config", {}).get("vertical_or_free", {}) or {})
+    roomseg_depth_stride_px = _resolve_roomseg_depth_stride_px(
+        getattr(args, "room_segmentation_config", {}),
+        int(args.depth_stride_px),
+    )
+    if int(roomseg_depth_stride_px) != int(args.depth_stride_px):
+        print(
+            "[sgnav-roomseg] vertical-free depth stride: mapping=%d roomseg_effective=%d"
+            % (int(args.depth_stride_px), int(roomseg_depth_stride_px)),
+            flush=True,
+        )
     mapper = OnlineMapper(
         size_m=float(args.online_map_size_m),
         resolution_m=float(args.online_resolution_m),
         depth_max_m=float(args.depth_max_m),
         depth_min_m=float(args.depth_min_m),
-        depth_stride_px=int(args.depth_stride_px),
+        depth_stride_px=int(roomseg_depth_stride_px),
         obstacle_min_height_m=float(args.obstacle_min_height_m),
         obstacle_max_height_m=float(args.obstacle_max_height_m),
         free_min_height_m=float(args.free_min_height_m),
@@ -1205,6 +1298,41 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
             map_info=dynamic_map_info,
         )
         room_segmenter = OnlineRoseStyleRoomSegmenter(online_cfg, map_info=dynamic_map_info)
+        room_label_client = (
+            getattr(scenegraph, "paper_llm_client", None)
+            if str(getattr(args, "room_label_backend", "vlm")).strip().lower() == "vlm"
+            else None
+        )
+        room_labeler = VLMRoomLabeler(
+            client=room_label_client,
+            allowed_categories=getattr(args, "room_label_allowed_categories", DEFAULT_ROOM_CATEGORIES),
+            min_confidence=float(getattr(args, "room_label_min_confidence", 0.60)),
+            ambiguity_margin=float(getattr(args, "room_label_ambiguity_margin", 0.15)),
+            min_reliable_objects=int(getattr(args, "room_label_min_reliable_objects", 2)),
+            unknown_category=str(getattr(args, "room_label_unknown_category", "unknown")),
+            require_backend=bool(getattr(args, "strict_benchmark", False))
+            and str(getattr(args, "room_label_backend", "vlm")).strip().lower() == "vlm",
+            max_room_objects_in_prompt=int(getattr(args, "max_room_objects_in_prompt", 25)),
+        )
+        last_room_semantics_debug["backend"] = room_labeler.backend
+    elif room_map_mode in {
+        ONLINE_WATERSHED_ROOMSEG_BACKEND,
+        ONLINE_WATERSHED_ROOMSEG_CONTEXT,
+        "online_watershed_roomseg",
+        "online_watershed_roomseg_vlm",
+    }:
+        roomseg_backend = str(
+            getattr(args, "room_segmentation_config", {}).get("backend", ONLINE_WATERSHED_ROOMSEG_BACKEND)
+            or ONLINE_WATERSHED_ROOMSEG_BACKEND
+        ).strip().lower()
+        if roomseg_backend != ONLINE_WATERSHED_ROOMSEG_BACKEND:
+            raise ValueError("online_watershed_roomseg room_map_mode requires --roomseg-backend %s" % ONLINE_WATERSHED_ROOMSEG_BACKEND)
+        watershed_cfg = OnlineWatershedRoomSegConfig.from_mapping(
+            getattr(args, "room_segmentation_config", {}),
+            resolution_m=float(dynamic_map_info.resolution_m),
+            map_info=dynamic_map_info,
+        )
+        room_segmenter = OnlineWatershedRoomSegmenter(watershed_cfg, map_info=dynamic_map_info)
         room_label_client = (
             getattr(scenegraph, "paper_llm_client", None)
             if str(getattr(args, "room_label_backend", "vlm")).strip().lower() == "vlm"
@@ -1914,7 +2042,7 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
                 dump = save_roomseg_layer_dump(
                     out_dir=str(getattr(args, "debug_roomseg_dir", "debug/roomseg_layers")),
                     step=int(step_idx),
-                    room_debug=last_room_segmentation_debug,
+                    room_debug=_roomseg_debug_for_layer_dump(last_room_segmentation_debug, room_segmenter),
                     occupancy_map=map_state["occupancy"],
                     observed_free_mask=map_state["free"],
                     obstacle_mask=map_state["occupancy"],
@@ -2271,7 +2399,7 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
                             dump = save_roomseg_layer_dump(
                                 out_dir=str(getattr(args, "debug_roomseg_dir", "debug/roomseg_layers")),
                                 step=int(step),
-                                room_debug=last_room_segmentation_debug,
+                                room_debug=_roomseg_debug_for_layer_dump(last_room_segmentation_debug, room_segmenter),
                                 occupancy_map=occupancy,
                                 observed_free_mask=free,
                                 obstacle_mask=occupancy,
@@ -3292,6 +3420,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             "rose2_source_external_runner",
             "legacy_rose2_style_debug",
             ONLINE_ROSE_STYLE_BACKEND,
+            ONLINE_WATERSHED_ROOMSEG_BACKEND,
             VERTICAL_FREE_ROOMSEG_BACKEND,
             VERTICAL_FREE_ROOMSEG_ALGORITHM,
             VERTICAL_FREE_GAP_CLOSURE_BACKEND,
@@ -3343,6 +3472,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--child-area-ratio-threshold", type=float, default=None)
     parser.add_argument("--frontier-distance-weight", type=float, default=None)
     parser.add_argument("--frontier-scenegraph-score-norm", "--frontier_scenegraph_score_norm", default=None, choices=["none", "minmax", "zscore"])
+    parser.add_argument("--frontier-selection-mode", "--frontier_selection_mode", default=None, choices=["sgnav", "nearest", "random"])
+    parser.add_argument("--frontier-random-seed", "--frontier_random_seed", type=int, default=None)
     parser.add_argument("--semantic-priors-path", "--semantic_priors_path", default=None)
     parser.add_argument("--debug-graph-dump", "--debug_graph_dump", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--debug-graph-dump-dir", "--debug_graph_dump_dir", default=None)
@@ -3745,6 +3876,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     roomseg_frontier_context_cfg = dict(args.room_segmentation_config.get("frontier_room_context", {}) or {})
     roomseg_wall_gating_fix_cfg = dict(args.room_segmentation_config.get("wall_gating_fix", {}) or {})
     roomseg_online_cfg = dict(args.room_segmentation_config.get("online_roomseg", {}) or {})
+    roomseg_watershed_cfg = dict(args.room_segmentation_config.get("online_watershed_roomseg", {}) or {})
     if args.roomseg_backend is not None:
         args.room_segmentation_config["backend"] = str(args.roomseg_backend)
     if args.debug_rose2_source is not None:
@@ -3769,9 +3901,15 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.roomseg_wall_gating_fix is not None:
         roomseg_wall_gating_fix_cfg["enabled"] = bool(args.roomseg_wall_gating_fix)
     if args.roomseg_roomseg_depth_stride_px is not None:
+        top_depth_cfg = dict(args.room_segmentation_config.get("depth", {}) or {})
+        top_depth_cfg["roomseg_depth_stride_px"] = int(args.roomseg_roomseg_depth_stride_px)
+        args.room_segmentation_config["depth"] = top_depth_cfg
         depth_cfg = dict(roomseg_online_cfg.get("depth", {}) or {})
         depth_cfg["roomseg_depth_stride_px"] = int(args.roomseg_roomseg_depth_stride_px)
         roomseg_online_cfg["depth"] = depth_cfg
+        watershed_depth_cfg = dict(roomseg_watershed_cfg.get("depth", {}) or {})
+        watershed_depth_cfg["roomseg_depth_stride_px"] = int(args.roomseg_roomseg_depth_stride_px)
+        roomseg_watershed_cfg["depth"] = watershed_depth_cfg
     if args.roomseg_disable_corridor_cuts:
         neck_cfg = dict(roomseg_online_cfg.get("corridor_room_neck_cut", {}) or {})
         neck_cfg["enabled"] = False
@@ -3789,11 +3927,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     args.room_segmentation_config["frontier_room_context"] = roomseg_frontier_context_cfg
     args.room_segmentation_config["wall_gating_fix"] = roomseg_wall_gating_fix_cfg
     args.room_segmentation_config["online_roomseg"] = roomseg_online_cfg
+    args.room_segmentation_config["online_watershed_roomseg"] = roomseg_watershed_cfg
     args.debug_roomseg_layers = bool(roomseg_debug_layers_cfg.get("enabled", False))
     args.debug_roomseg_dir = str(roomseg_debug_layers_cfg.get("output_dir", "debug/roomseg_layers"))
     args.debug_roomseg_max_saves = int(roomseg_debug_layers_cfg.get("max_saves", 50))
     if args.debug_roomseg_layers:
-        for nested_key in ("vertical_free_roomseg", "vertical_free_gap_closure", "online_roomseg"):
+        for nested_key in ("vertical_free_roomseg", "vertical_free_gap_closure", "online_roomseg", "online_watershed_roomseg"):
             nested_cfg = dict(args.room_segmentation_config.get(nested_key, {}) or {})
             nested_cfg["debug_dump"] = True
             nested_cfg.setdefault("debug_dir", args.debug_roomseg_dir)
@@ -3801,6 +3940,11 @@ def main(argv: Optional[List[str]] = None) -> int:
                 debug_cfg = dict(nested_cfg.get("debug", {}) or {})
                 debug_cfg["save_layers"] = True
                 debug_cfg["save_candidate_json"] = True
+                nested_cfg["debug"] = debug_cfg
+            if nested_key == "online_watershed_roomseg":
+                debug_cfg = dict(nested_cfg.get("debug", {}) or {})
+                debug_cfg["save_layers"] = True
+                debug_cfg["save_json"] = True
                 nested_cfg["debug"] = debug_cfg
             args.room_segmentation_config[nested_key] = nested_cfg
     args.roomseg_backend = str(args.room_segmentation_config.get("backend", "rose2_source_external_runner"))
@@ -3868,6 +4012,16 @@ def main(argv: Optional[List[str]] = None) -> int:
         args.frontier_scenegraph_score_norm
         if args.frontier_scenegraph_score_norm is not None
         else get_nested(cfg, "sgnav.frontier_scenegraph_score_norm", "minmax")
+    )
+    args.frontier_selection_mode = str(
+        args.frontier_selection_mode
+        if args.frontier_selection_mode is not None
+        else get_nested(cfg, "sgnav.frontier_selection_mode", "sgnav")
+    )
+    args.frontier_random_seed = int(
+        args.frontier_random_seed
+        if args.frontier_random_seed is not None
+        else get_nested(cfg, "sgnav.frontier_random_seed", 0)
     )
     args.semantic_priors_path = str(args.semantic_priors_path or get_nested(cfg, "sgnav.semantic_priors_path", "isaac_bench/configs/sgnav_semantic_priors.yaml"))
     args.debug_graph_dump = bool(
@@ -3989,7 +4143,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         debug_layers_cfg.setdefault("output_dir", str(getattr(args, "debug_roomseg_dir", "debug/roomseg_layers")))
         args.room_segmentation_config["debug_layers"] = debug_layers_cfg
         args.debug_roomseg_dir = str(debug_layers_cfg.get("output_dir", getattr(args, "debug_roomseg_dir", "debug/roomseg_layers")))
-        for nested_key in ("vertical_free_roomseg", "vertical_free_gap_closure", "online_roomseg"):
+        for nested_key in ("vertical_free_roomseg", "vertical_free_gap_closure", "online_roomseg", "online_watershed_roomseg"):
             nested_cfg = dict(args.room_segmentation_config.get(nested_key, {}) or {})
             nested_cfg["debug_dump"] = True
             nested_cfg.setdefault("debug_dir", args.debug_roomseg_dir)
@@ -3997,6 +4151,11 @@ def main(argv: Optional[List[str]] = None) -> int:
                 debug_cfg = dict(nested_cfg.get("debug", {}) or {})
                 debug_cfg["save_layers"] = True
                 debug_cfg["save_candidate_json"] = True
+                nested_cfg["debug"] = debug_cfg
+            if nested_key == "online_watershed_roomseg":
+                debug_cfg = dict(nested_cfg.get("debug", {}) or {})
+                debug_cfg["save_layers"] = True
+                debug_cfg["save_json"] = True
                 nested_cfg["debug"] = debug_cfg
             args.room_segmentation_config[nested_key] = nested_cfg
 

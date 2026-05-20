@@ -33,6 +33,7 @@ def test_online_mapper_ray_casts_depth_obstacle_and_floor_free_cells():
     assert grid.free[free_cell] == 1
     assert not mapper.traversible(unknown_is_obstacle=True)[obstacle_cell]
     assert mapper.last_debug_stats["mapping_mode"] == "depth_ray_cast"
+    assert mapper.last_debug_stats["vertical_profile_depth_stride_px"] == 1
     assert mapper.last_debug_stats["ray_count"] == 2
     assert mapper.last_debug_stats["free_ray_cells"] >= 1
     assert mapper.last_debug_stats["occupied_endpoint_cells"] >= 1

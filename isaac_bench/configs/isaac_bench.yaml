@@ -198,6 +198,8 @@ mapping:
     run_only_before_frontier_scoring: true
     source_grid: online_depth_observed
     proposal_mode: vertical_free_gap_closure
+    depth:
+      roomseg_depth_stride_px: 4
     finalization_mode: no_merge_until_geometry_verified
     use_structural_obstacle_mask: true
     suppress_furniture_obstacles: true
@@ -339,9 +341,187 @@ mapping:
     online_roomseg:
       enabled: true
       backend: online_rose_style_v1
+      algorithm: online_line_extend_roomseg_v1
       depth:
         roomseg_depth_stride_px: 4
         roomseg_depth_stride_debug_px: 2
+      free_clean:
+        enabled: true
+        hole_fill_max_area_cells: 16
+        hole_fill_max_radius_cells: 3
+        island_remove_max_area_cells: 8
+        do_not_fill_if_occupied_ratio_gt: 0.15
+      wall_candidate:
+        enabled: true
+        mode: jitter_permissive
+        jitter_tolerance_cells: 1
+        isolated_remove_max_area_cells: 1
+        shape_gate_enabled: false
+        min_component_area_cells: 6
+        min_component_length_m: 0.25
+        max_component_thickness_m: 0.25
+        min_component_elongation: 2.5
+      line_walls:
+        enabled: true
+        hough_enabled: true
+        pca_enabled: true
+        min_line_length_m: 0.45
+        min_support_ratio: 0.35
+        max_angle_to_dominant_deg: 15
+        axis_snap_lateral_tolerance_cells: 2
+        axis_snap_min_projected_support_ratio: 0.35
+      line_filtering:
+        enabled: true
+        dominant_angle_bin_deg: 5
+        max_snap_angle_deg: 12
+        merge_collinear_gap_m: 0.35
+        merge_lateral_offset_m: 0.12
+        min_filtered_line_length_m: 0.60
+        min_filtered_support_ratio: 0.45
+        endpoint_refine_window_m: 0.25
+        endpoint_min_wall_support_m: 0.20
+        max_wall_thickness_m: 0.30
+        min_confidence: 0.45
+      line_extension:
+        enabled: true
+        passes: 2
+        min_extension_m: 0.40
+        max_extension_m: 1.60
+        max_probe_m: 1.80
+        sample_step_m: 0.05
+        hit_radius_m: 0.10
+        free_ratio_min: 0.65
+        unknown_ratio_max: 0.10
+        wall_mid_ratio_max: 0.15
+        require_free_between_start_and_hit: true
+        min_free_cells_between_start_and_hit: 3
+        allow_hit_virtual_door_on_pass2: true
+        virtual_target_dilation_m: 0.08
+      door_neck:
+        enabled: true
+        min_width_m: 0.40
+        max_width_m: 1.60
+        min_confidence: 0.50
+        require_topology_gain: true
+        reject_unknown_only_support: true
+      wall_run_snap:
+        enabled: true
+        max_angle_to_axis_deg: 25.0
+        support_band_cells: 2
+        min_run_length_m: 0.35
+        min_support_ratio: 0.25
+        close_holes_m: 0.20
+      wall_run_merge:
+        enabled: true
+        max_lateral_offset_cells: 3
+        max_merge_gap_m: 0.30
+        min_overlap_m: 0.05
+      physical_wall_completion:
+        enabled: true
+        max_gap_m: 0.45
+        max_lateral_offset_m: 0.20
+        max_angle_deg: 10
+        min_endpoint_support: 0.35
+      missed_scan_gap_closure:
+        enabled: true
+        max_gap_m: 0.45
+        max_unknown_ratio: 0.70
+        max_free_ratio: 0.65
+      short_unknown_gap_closure:
+        enabled: true
+        max_gap_m: 0.60
+        min_unknown_ratio: 0.45
+      noise_wall_gap_fill:
+        enabled: true
+        max_gap_m: 0.40
+        max_lateral_offset_m: 0.20
+        min_endpoint_support: 0.25
+        thickness_cells: 0
+      doorway_virtual_cut:
+        enabled: true
+        min_width_m: 0.45
+        max_width_m: 1.60
+        max_angle_deg: 12
+        min_wall_endpoint_support: 0.30
+        require_free_gap: true
+      single_sided_wall_extension:
+        enabled: true
+        max_extension_m: 1.20
+        max_open_free_ratio: 0.70
+        require_anchor: true
+      separator:
+        thickness_cells: 1
+        doorway_thickness_cells: 1
+        wall_completion_thickness_cells: 1
+        corridor_neck_thickness_cells: 1
+        max_anchor_extension_m: 0.35
+        require_two_anchors: true
+      corridor:
+        enabled: true
+        min_length_m: 1.5
+        max_width_m: 1.8
+        max_median_width_m: 1.80
+        max_p90_width_m: 2.25
+        min_aspect_ratio: 2.5
+        max_width_std_m: 0.45
+        min_parallel_wall_support: 0.45
+        min_skeleton_density_inv_m: 0.45
+        skeleton_prune_length_m: 0.4
+      corridor_room_neck_cut:
+        enabled: true
+        max_neck_width_m: 1.8
+        min_room_side_area_m2: 1.5
+        reject_if_splits_corridor_axis: true
+      corridor_merge:
+        enabled: true
+        parallel_door_angle_deg: 12
+        parallel_door_pair_max_distance_m: 2.20
+        parallel_door_min_overlap_m: 0.25
+        parallel_edge_length_tolerance_ratio: 0.05
+        parallel_edge_coverage_min_ratio: 0.95
+        isolated_chunk_max_length_m: 2.20
+        isolated_chunk_max_area_m2: 4.00
+        width_similarity_tol_m: 0.35
+        axis_angle_similarity_deg: 15
+        merge_three_if_both_neighbors_similar: true
+        reject_both_doors_if_middle_corridor_like: true
+        min_region_area_m2: 0.40
+        post_corridor_small_region_merge_enabled: true
+        post_corridor_small_region_max_area_m2: 2.00
+        post_corridor_small_region_max_unknown_ratio: 0.20
+      topology_test:
+        enabled: true
+        min_split_area_m2: 1.0
+        per_kind_min_split_area_m2:
+          physical_wall_completion: 0.50
+          missed_scan_gap_closure: 0.35
+          short_unknown_gap_closure: 0.35
+          doorway_virtual_cut: 0.30
+          line_extension_door_neck: 0.30
+          single_sided_wall_extension: 0.50
+          corridor_room_neck_cut: 0.30
+        min_new_component_width_m: 0.15
+        min_new_component_area_cells: 4
+        allow_partial_room_split: true
+        max_tiny_fragment_count: 3
+        reject_corridor_split: true
+        open_room_width_min_m: 1.80
+        open_room_min_side_area_m2: 2.00
+        narrow_neck_width_max_m: 1.60
+        reject_open_living_room_internal_split: true
+      debug:
+        save_layers: false
+        save_candidate_json: false
+    online_watershed_roomseg:
+      enabled: true
+      backend: online_watershed_roomseg_v1
+      z_min_m: 0.20
+      z_max_m: 2.00
+      min_free_rays: 1
+      min_observed_rays: 1
+      min_observed_free_cells: 20
+      min_room_area_m2: 0.40
+      alpha_narrow: 0.35
       free_clean:
         enabled: true
         hole_fill_max_area_cells: 16
@@ -354,45 +534,31 @@ mapping:
         min_component_length_m: 0.25
         max_component_thickness_m: 0.25
         min_component_elongation: 2.5
-      line_walls:
-        enabled: true
-        hough_enabled: true
-        pca_enabled: true
-        min_line_length_m: 0.45
-        min_support_ratio: 0.35
-        max_angle_to_dominant_deg: 15
-      physical_wall_completion:
-        enabled: true
-        max_gap_m: 0.45
-        max_lateral_offset_m: 0.15
-        max_angle_deg: 10
-        min_endpoint_support: 0.5
-      doorway_virtual_cut:
-        enabled: true
-        min_width_m: 0.45
-        max_width_m: 1.60
-        max_angle_deg: 12
-        min_wall_endpoint_support: 0.4
-        require_free_gap: true
       corridor:
         enabled: true
-        min_length_m: 1.5
-        max_width_m: 1.8
-        min_aspect_ratio: 2.5
-        skeleton_prune_length_m: 0.4
-      corridor_room_neck_cut:
-        enabled: true
-        max_neck_width_m: 1.8
-        min_room_side_area_m2: 1.5
-        reject_if_splits_corridor_axis: true
-      topology_test:
-        enabled: true
-        min_split_area_m2: 1.0
-        max_tiny_fragment_count: 3
-        reject_corridor_split: true
+        max_width_m: 1.40
+        min_length_m: 1.50
+        min_aspect_ratio: 2.8
+        seed_dilate_radius_m: 0.12
+        min_component_cells: 8
+      seeds:
+        confirmed_min_clearance_m: 0.55
+        confirmed_min_distance_m: 1.20
+        confirmed_min_component_area_m2: 1.00
+        confirmed_seed_radius_m: 0.06
+        provisional_enabled: true
+        provisional_search_radius_m: 0.80
+        provisional_min_clearance_m: 0.25
+        provisional_min_distance_from_confirmed_m: 0.70
+        provisional_seed_radius_m: 0.06
+      regions:
+        min_region_area_m2: 0.40
+        merge_small_regions: true
+        corridor_overlap_min_ratio: 0.15
+      frontier_context_radius_m: 0.45
       debug:
         save_layers: false
-        save_candidate_json: false
+        save_json: false
     debug_layers:
       enabled: false
       output_dir: debug/roomseg_layers
@@ -550,7 +716,7 @@ sgnav:
   frontier_commit_match_radius_m: 0.75
   frontier_commit_reached_radius_m: 0.60
   frontier_commit_min_steps: 12
-  frontier_commit_max_steps: 120
+  frontier_commit_max_steps: 0
   frontier_commit_switch_margin: 0.25
   frontier_commit_switch_ratio: 1.15
   frontier_commit_no_progress_steps: 25

@@ -1254,12 +1254,14 @@ class SGNavPopupVisualizer:
 
     def _apply_room_mask_overlay(self, base: np.ndarray, room_masks: Sequence[object]) -> Tuple[np.ndarray, int, int]:
         out = np.asarray(base, dtype=np.uint8).copy()
+        owner = np.zeros(out.shape[:2], dtype=np.int32)
         total_mask_cells = 0
         total_boundary_cells = 0
         for idx, room in enumerate(room_masks[:64]):
             mask = np.asarray(getattr(room, "mask", None), dtype=bool)
             if mask.shape != out.shape[:2] or not np.any(mask):
                 continue
+            owner[(owner <= 0) & mask] = int(idx) + 1
             color = np.asarray(self._room_color(idx), dtype=np.float32)
             total_mask_cells += int(np.count_nonzero(mask))
             blended = out[mask].astype(np.float32) * 0.62 + color[None, :] * 0.38
@@ -1267,6 +1269,10 @@ class SGNavPopupVisualizer:
             boundary = self._mask_boundary(mask)
             total_boundary_cells += int(np.count_nonzero(boundary))
             out[boundary] = np.asarray(np.clip(color * 1.08, 0, 255), dtype=np.uint8)
+        adjacency_boundary = self._room_label_adjacency_boundary(owner)
+        if np.any(adjacency_boundary):
+            total_boundary_cells += int(np.count_nonzero(adjacency_boundary))
+            out[adjacency_boundary] = np.asarray((245, 250, 255), dtype=np.uint8)
         return out, total_mask_cells, total_boundary_cells
 
     @staticmethod
@@ -1280,6 +1286,19 @@ class SGNavPopupVisualizer:
             & padded[2:, 1:-1]
         )
         return arr & ~neighbors
+
+    @staticmethod
+    def _room_label_adjacency_boundary(owner: np.ndarray) -> np.ndarray:
+        labels = np.asarray(owner, dtype=np.int32)
+        if labels.size == 0:
+            return np.zeros_like(labels, dtype=bool)
+        pos = labels > 0
+        boundary = np.zeros_like(pos, dtype=bool)
+        boundary[:, 1:] |= pos[:, 1:] & pos[:, :-1] & (labels[:, 1:] != labels[:, :-1])
+        boundary[:, :-1] |= pos[:, :-1] & pos[:, 1:] & (labels[:, :-1] != labels[:, 1:])
+        boundary[1:, :] |= pos[1:, :] & pos[:-1, :] & (labels[1:, :] != labels[:-1, :])
+        boundary[:-1, :] |= pos[:-1, :] & pos[1:, :] & (labels[:-1, :] != labels[1:, :])
+        return boundary
 
     def _draw_room_labels(
         self,

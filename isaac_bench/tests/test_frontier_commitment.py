@@ -13,7 +13,7 @@ def _frontier(center, score_dist=5.0):
 
 def test_frontier_commitment_keeps_sticky_frontier_until_hysteresis_passes():
     planner = GridAStarPlanner(np.ones((40, 40), dtype=bool), resolution_m=0.1)
-    manager = FrontierCommitmentManager(resolution_m=0.1, min_commit_steps=12, no_progress_steps=999)
+    manager = FrontierCommitmentManager(resolution_m=0.1, min_commit_steps=12, no_progress_steps=999, allow_score_switch=True)
     current = (0, 0)
     a = _frontier((10, 10))
     b = _frontier((25, 25))
@@ -66,3 +66,32 @@ def test_frontier_commitment_no_progress_blacklists_and_selects_new():
     assert not out.keep_existing
     assert out.frontier is b
     assert manager.blacklist
+
+
+def test_frontier_commitment_default_holds_until_reached_without_score_switch():
+    planner = GridAStarPlanner(np.ones((60, 60), dtype=bool), resolution_m=0.1)
+    manager = FrontierCommitmentManager(resolution_m=0.1, min_commit_steps=1, no_progress_steps=999)
+    a = _frontier((10, 10))
+    b = _frontier((40, 40))
+
+    manager.select([a, b], a, 1.0, (0, 0), 0, planner=planner, scores_by_index=[1.0, 0.1])
+    out = manager.select([a, b], b, 10.0, (1, 1), 10, planner=planner, scores_by_index=[1.0, 10.0])
+
+    assert out.keep_existing
+    assert out.frontier is a
+    assert out.reason == "continue_committed_frontier"
+
+
+def test_frontier_commitment_unmatched_frontier_keeps_saved_target_cells():
+    planner = GridAStarPlanner(np.ones((60, 60), dtype=bool), resolution_m=0.1)
+    manager = FrontierCommitmentManager(resolution_m=0.1, no_progress_steps=999)
+    a = _frontier((10, 10))
+    b = _frontier((40, 40))
+
+    first = manager.select([a, b], a, 1.0, (0, 0), 0, planner=planner, scores_by_index=[1.0, 0.5])
+    out = manager.select([b], b, 10.0, (1, 1), 1, planner=planner, scores_by_index=[10.0])
+
+    assert out.keep_existing
+    assert out.frontier is None
+    assert out.target_cells == first.target_cells
+    assert out.reason == "continue_committed_frontier"

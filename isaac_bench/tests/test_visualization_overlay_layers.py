@@ -122,6 +122,44 @@ def test_room_masks_are_actually_rendered_into_map_panel():
     assert np.count_nonzero(with_rooms != without_rooms) > 0
 
 
+def test_adjacent_room_masks_draw_explicit_boundary():
+    viz = SGNavPopupVisualizer(enabled=False, panel_size=(640, 360))
+    base = np.zeros((8, 10, 3), dtype=np.uint8)
+    left = np.zeros((8, 10), dtype=bool)
+    right = np.zeros((8, 10), dtype=bool)
+    left[2:6, 2:5] = True
+    right[2:6, 5:8] = True
+    rooms = [
+        RoomMask(
+            room_id="left",
+            mask=left,
+            centroid_xy=(0.0, 0.0),
+            area_m2=1.0,
+            boundary_unknown_fraction=0.0,
+            doorway_edges=[],
+            confidence=1.0,
+            observed_free_cells=int(np.count_nonzero(left)),
+            mask_confidence=1.0,
+        ),
+        RoomMask(
+            room_id="right",
+            mask=right,
+            centroid_xy=(0.0, 0.0),
+            area_m2=1.0,
+            boundary_unknown_fraction=0.0,
+            doorway_edges=[],
+            confidence=1.0,
+            observed_free_cells=int(np.count_nonzero(right)),
+            mask_confidence=1.0,
+        ),
+    ]
+
+    rendered, _mask_cells, boundary_cells = viz._apply_room_mask_overlay(base, rooms)
+
+    assert boundary_cells > 0
+    assert np.any(np.all(rendered[:, 4:6] == np.asarray((245, 250, 255), dtype=np.uint8), axis=-1))
+
+
 def test_disabling_frontier_member_cells_removes_raw_frontier_primitives():
     viz = SGNavPopupVisualizer(enabled=False, show_frontier_member_cells=False, panel_size=(640, 360))
     _update(viz)

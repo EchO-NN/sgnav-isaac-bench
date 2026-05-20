@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 from typing import Mapping
 
 import numpy as np
+from scipy import ndimage
 
 from isaac_bench.mapping.vertical_profile import VerticalProfileMap, ensure_vertical_profile
 
@@ -28,6 +29,10 @@ class FreeCleanConfig:
 @dataclass
 class WallCandidateConfig:
     enabled: bool = True
+    mode: str = "jitter_permissive"
+    jitter_tolerance_cells: int = 1
+    isolated_remove_max_area_cells: int = 1
+    shape_gate_enabled: bool = False
     min_component_area_cells: int = 6
     min_component_length_m: float = 0.25
     max_component_thickness_m: float = 0.25
@@ -61,6 +66,7 @@ def build_evidence_maps(
     unknown_mask: np.ndarray,
     resolution_m: float,
     vertical_profile: VerticalProfileMap | None = None,
+    roomseg_ray_evidence: Mapping[str, np.ndarray] | None = None,
     free_clean_config: FreeCleanConfig | Mapping[str, object] | None = None,
     wall_candidate_config: WallCandidateConfig | Mapping[str, object] | None = None,
     z_min_m: float = 0.20,
@@ -82,6 +88,12 @@ def build_evidence_maps(
         z_max_m=float(z_max_m),
         min_free_rays=int(min_free_rays),
         min_observed_rays=int(min_observed_rays),
+    )
+    vertical_occupied, vertical_observed, endpoint_debug = _merge_terminal_wall_endpoints(
+        vertical_free=vertical_free,
+        vertical_occupied=vertical_occupied,
+        vertical_observed=vertical_observed,
+        roomseg_ray_evidence=roomseg_ray_evidence,
     )
     vertical_unknown = ~vertical_observed
     free_clean, free_debug = clean_free_map(
@@ -106,6 +118,7 @@ def build_evidence_maps(
         "vertical_occupied_raw_cells": int(np.count_nonzero(vertical_occupied)),
         "vertical_observed_raw_cells": int(np.count_nonzero(vertical_observed)),
         "vertical_unknown_raw_cells": int(np.count_nonzero(vertical_unknown)),
+        **endpoint_debug,
         "free_clean_cells": int(np.count_nonzero(free_clean)),
         "wall_candidate_clean_cells": int(np.count_nonzero(wall_clean)),
         "unknown_clean_cells": int(np.count_nonzero(unknown_clean)),
@@ -123,6 +136,50 @@ def build_evidence_maps(
         resolution_m=float(resolution_m),
         debug=debug,
     )
+
+
+def _merge_terminal_wall_endpoints(
+    *,
+    vertical_free: np.ndarray,
+    vertical_occupied: np.ndarray,
+    vertical_observed: np.ndarray,
+    roomseg_ray_evidence: Mapping[str, np.ndarray] | None,
+) -> tuple[np.ndarray, np.ndarray, dict]:
+    free = np.asarray(vertical_free, dtype=bool)
+    occupied_before = np.asarray(vertical_occupied, dtype=bool)
+    observed_before = np.asarray(vertical_observed, dtype=bool)
+    occupied = occupied_before.copy()
+    observed = observed_before.copy()
+    evidence = dict(roomseg_ray_evidence or {})
+    terminal_count = _optional_like(evidence, free.shape, "terminal_wall_count", "roomseg_terminal_wall_count", dtype=np.uint16)
+    terminal_splat = _optional_like(evidence, free.shape, "terminal_wall_splat", "roomseg_terminal_wall_splat", dtype=np.uint8)
+    terminal = (np.asarray(terminal_count, dtype=np.uint16) > 0) | np.asarray(terminal_splat, dtype=bool)
+    terminal_no_free = terminal & ~free
+    occupied |= terminal_no_free
+    observed |= terminal_no_free
+    return occupied.astype(bool), observed.astype(bool), {
+        "terminal_wall_endpoint_cells": int(np.count_nonzero(np.asarray(terminal_count, dtype=np.uint16) > 0)),
+        "terminal_wall_splat_cells": int(np.count_nonzero(np.asarray(terminal_splat, dtype=bool))),
+        "terminal_wall_added_to_occupied_cells": int(np.count_nonzero(terminal_no_free & ~occupied_before)),
+        "terminal_wall_added_to_observed_cells": int(np.count_nonzero(terminal_no_free & ~observed_before)),
+        "terminal_wall_suppressed_by_vertical_free_cells": int(np.count_nonzero(terminal & free)),
+    }
+
+
+def _optional_like(
+    evidence: Mapping[str, np.ndarray],
+    shape: tuple[int, int],
+    *names: str,
+    dtype: type,
+) -> np.ndarray:
+    for name in names:
+        value = evidence.get(name)
+        if value is None:
+            continue
+        arr = np.asarray(value, dtype=dtype)
+        if arr.shape == shape:
+            return arr
+    return np.zeros(shape, dtype=dtype)
 
 
 def clean_free_map(
@@ -171,6 +228,8 @@ def clean_wall_candidate_map(
     raw = (np.asarray(vertical_occupied_raw, dtype=bool) | (np.asarray(vertical_observed_raw, dtype=bool) & ~np.asarray(vertical_free_raw, dtype=bool))) & ~np.asarray(free_clean, dtype=bool)
     if not bool(config.enabled):
         return raw.astype(bool), {"enabled": False, "input_cells": int(np.count_nonzero(raw)), "kept_cells": int(np.count_nonzero(raw)), "components": []}
+    if str(getattr(config, "mode", "jitter_permissive")) == "jitter_permissive":
+        return _clean_wall_candidate_map_jitter_permissive(raw, float(resolution_m), config)
     labels, count = label_components(raw, 8)
     out = np.zeros_like(raw, dtype=bool)
     components: list[dict] = []
@@ -188,8 +247,60 @@ def clean_wall_candidate_map(
         components.append({"component": int(idx), **metrics, "kept": bool(keep)})
     return out.astype(bool), {
         "enabled": True,
+        "mode": "shape_gate",
         "input_cells": int(np.count_nonzero(raw)),
         "kept_cells": int(np.count_nonzero(out)),
+        "components": components[:256],
+    }
+
+
+def _clean_wall_candidate_map_jitter_permissive(raw: np.ndarray, resolution_m: float, config: WallCandidateConfig) -> tuple[np.ndarray, dict]:
+    candidate = np.asarray(raw, dtype=bool).copy()
+    jitter = max(0, int(getattr(config, "jitter_tolerance_cells", 1)))
+    if jitter > 0 and np.any(candidate):
+        structure = np.ones((2 * jitter + 1, 2 * jitter + 1), dtype=bool)
+        candidate = (candidate | ndimage.binary_closing(candidate, structure=structure, border_value=0)).astype(bool)
+
+    labels, count = label_components(candidate, 8)
+    out = candidate.copy()
+    components: list[dict] = []
+    removed_isolated = 0
+    removed_shape_gate = 0
+    max_isolated = int(getattr(config, "isolated_remove_max_area_cells", 1))
+    shape_gate = bool(getattr(config, "shape_gate_enabled", False))
+    for idx in range(1, int(count) + 1):
+        comp = labels == idx
+        area = int(np.count_nonzero(comp))
+        metrics = component_metrics(comp, float(resolution_m))
+        keep = True
+        reason = "kept"
+        if max_isolated >= 0 and area <= max_isolated:
+            keep = False
+            reason = "isolated_single_cell_noise"
+            removed_isolated += 1
+        elif shape_gate:
+            keep = bool(
+                metrics["area_cells"] >= int(config.min_component_area_cells)
+                and metrics["length_m"] >= float(config.min_component_length_m)
+                and metrics["thickness_m"] <= float(config.max_component_thickness_m) + 1e-6
+                and metrics["elongation"] >= float(config.min_component_elongation)
+            )
+            if not keep:
+                reason = "shape_gate_rejected"
+                removed_shape_gate += 1
+        if not keep:
+            out[comp] = False
+        components.append({"component": int(idx), **metrics, "kept": bool(keep), "reject_reason": reason})
+    return out.astype(bool), {
+        "enabled": True,
+        "mode": "jitter_permissive",
+        "input_cells": int(np.count_nonzero(raw)),
+        "jitter_tolerance_cells": int(jitter),
+        "cells_after_jitter_closing": int(np.count_nonzero(candidate)),
+        "kept_cells": int(np.count_nonzero(out)),
+        "removed_isolated_component_count": int(removed_isolated),
+        "removed_shape_gate_component_count": int(removed_shape_gate),
+        "shape_gate_enabled": bool(shape_gate),
         "components": components[:256],
     }
 

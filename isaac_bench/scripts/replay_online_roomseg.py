@@ -7,13 +7,18 @@ from pathlib import Path
 import numpy as np
 
 from isaac_bench.mapping.online_roomseg import OnlineRoseStyleConfig, run_online_rose_style_roomseg
+from isaac_bench.mapping.online_watershed_roomseg import (
+    ONLINE_WATERSHED_ROOMSEG_BACKEND,
+    OnlineWatershedRoomSegConfig,
+    run_online_watershed_roomseg,
+)
 from isaac_bench.mapping.vertical_profile import VerticalProfileMap
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Replay one saved roomseg NPZ through online_rose_style_v1 without Isaac.")
+    parser = argparse.ArgumentParser(description="Replay one saved roomseg NPZ through online room segmentation without Isaac.")
     parser.add_argument("--input", required=True)
-    parser.add_argument("--backend", default="online_rose_style_v1", choices=["online_rose_style_v1"])
+    parser.add_argument("--backend", default="online_rose_style_v1", choices=["online_rose_style_v1", ONLINE_WATERSHED_ROOMSEG_BACKEND])
     parser.add_argument("--out-dir", required=True)
     parser.add_argument("--resolution-m", type=float, default=0.05)
     parser.add_argument("--save-layers", action="store_true")
@@ -28,24 +33,52 @@ def main(argv: list[str] | None = None) -> int:
     shape = free.shape
     vp = _vertical_profile_from_masks(free, occupied, observed)
     out_dir = Path(args.out_dir)
-    cfg = OnlineRoseStyleConfig.from_mapping(
-        {
-            "online_roomseg": {
-                "debug": {"save_layers": bool(args.save_layers), "save_candidate_json": True},
-                "debug_dir": str(out_dir),
-            }
-        },
-        resolution_m=float(args.resolution_m),
-    )
-    result = run_online_rose_style_roomseg(
-        occupancy_map=occupied.astype(bool),
-        observed_free_mask=free.astype(bool),
-        obstacle_mask=occupied.astype(bool),
-        unknown_mask=unknown.astype(bool),
-        vertical_profile=vp,
-        config=cfg,
-        step=0,
-    )
+    if str(args.backend) == ONLINE_WATERSHED_ROOMSEG_BACKEND:
+        cfg = OnlineWatershedRoomSegConfig.from_mapping(
+            {
+                "online_watershed_roomseg": {
+                    "debug": {"save_layers": bool(args.save_layers), "save_json": True},
+                    "debug_dir": str(out_dir),
+                }
+            },
+            resolution_m=float(args.resolution_m),
+        )
+        result = run_online_watershed_roomseg(
+            occupancy_map=occupied.astype(bool),
+            observed_free_mask=free.astype(bool),
+            obstacle_mask=occupied.astype(bool),
+            unknown_mask=unknown.astype(bool),
+            vertical_profile=vp,
+            config=cfg,
+            step=0,
+        )
+        report = dict(result.debug.get("watershed_region_report", {}))
+        accepted_count = 0
+        rejected_count = 0
+        report_name = "watershed_region_report.json"
+    else:
+        cfg = OnlineRoseStyleConfig.from_mapping(
+            {
+                "online_roomseg": {
+                    "debug": {"save_layers": bool(args.save_layers), "save_candidate_json": True},
+                    "debug_dir": str(out_dir),
+                }
+            },
+            resolution_m=float(args.resolution_m),
+        )
+        result = run_online_rose_style_roomseg(
+            occupancy_map=occupied.astype(bool),
+            observed_free_mask=free.astype(bool),
+            obstacle_mask=occupied.astype(bool),
+            unknown_mask=unknown.astype(bool),
+            vertical_profile=vp,
+            config=cfg,
+            step=0,
+        )
+        report = dict(result.debug.get("separator_report", {}))
+        accepted_count = int(report.get("accepted_count", 0))
+        rejected_count = int(report.get("rejected_count", 0))
+        report_name = "separator_report.json"
     out_dir.mkdir(parents=True, exist_ok=True)
     layer_payload = {key: value for key, value in result.layers.items() if isinstance(value, np.ndarray)}
     layer_payload.pop("final_room_labels", None)
@@ -54,16 +87,16 @@ def main(argv: list[str] | None = None) -> int:
         out_dir / "online_roomseg_result.npz",
         **layer_payload,
         final_room_labels=result.room_label_map.astype(np.int32),
-        accepted_separators=result.separator_map.astype(np.uint8),
+        accepted_separators=getattr(result, "separator_map", np.zeros(shape, dtype=bool)).astype(np.uint8),
     )
-    report = dict(result.debug.get("separator_report", {}))
-    (out_dir / "separator_report.json").write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
+    (out_dir / report_name).write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
     summary = {
         "input": str(src),
         "backend": str(args.backend),
         "room_count": int(result.debug.get("room_count", 0)),
-        "accepted_count": int(report.get("accepted_count", 0)),
-        "rejected_count": int(report.get("rejected_count", 0)),
+        "accepted_count": int(accepted_count),
+        "rejected_count": int(rejected_count),
+        "region_type_counts": dict(report.get("region_type_counts", {})),
         "out_dir": str(out_dir),
     }
     (out_dir / "summary.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")

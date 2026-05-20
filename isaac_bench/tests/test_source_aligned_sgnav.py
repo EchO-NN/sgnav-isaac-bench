@@ -153,6 +153,43 @@ def test_paper_mode_disables_direct_frontier_vllm_scorer():
     assert scenegraph.vllm_scorer.enabled is False
 
 
+def test_random_frontier_mode_skips_scenegraph_scores_deterministically():
+    scenegraph = SGNavSceneGraphAdapter(use_original=False)
+    decision_a = SGNavDecision(scenegraph, frontier_selection_mode="random", frontier_random_seed=13)
+    decision_b = SGNavDecision(scenegraph, frontier_selection_mode="random", frontier_random_seed=13)
+    frontiers = [
+        FrontierCluster((1, 1), (1.0, 1.0), [(1, 1)], 1, 1.5),
+        FrontierCluster((2, 2), (2.0, 2.0), [(2, 2)], 1, 2.5),
+        FrontierCluster((3, 3), (3.0, 3.0), [(3, 3)], 1, 3.5),
+    ]
+
+    first = decision_a.choose_frontier(frontiers)
+    second = decision_b.choose_frontier(frontiers)
+
+    assert first.reason == "selected_random_frontier"
+    assert first.selected_index == second.selected_index
+    assert first.metadata["frontier_selection_mode"] == "random"
+    assert first.metadata["scenegraph_scoring_skipped"] is True
+    assert sum(1 for score in first.total_scores if score == 1.0) == 1
+
+
+def test_nearest_frontier_mode_selects_closest_eligible_frontier():
+    scenegraph = SGNavSceneGraphAdapter(use_original=False)
+    decision = SGNavDecision(scenegraph, frontier_selection_mode="nearest", frontier_min_select_distance_m=1.0)
+    frontiers = [
+        FrontierCluster((1, 1), (1.0, 1.0), [(1, 1)], 1, 4.0),
+        FrontierCluster((2, 2), (2.0, 2.0), [(2, 2)], 1, 1.5),
+        FrontierCluster((3, 3), (3.0, 3.0), [(3, 3)], 1, 2.0),
+    ]
+
+    result = decision.choose_frontier(frontiers)
+
+    assert result.reason == "selected_nearest_frontier"
+    assert result.selected_index == 1
+    assert result.metadata["frontier_selection_mode"] == "nearest"
+    assert result.metadata["scenegraph_scoring_skipped"] is True
+
+
 def test_paper_llm_uses_separate_llm_config():
     scenegraph = SGNavSceneGraphAdapter(
         use_original=False,

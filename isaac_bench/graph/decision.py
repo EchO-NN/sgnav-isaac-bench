@@ -101,6 +101,8 @@ class SGNavDecision:
         found_goal_stop_distance_m: float = 0.35,
         score_frontiers_before_candidate: bool = False,
         frontier_scenegraph_score_norm: str = "minmax",
+        frontier_selection_mode: str = "sgnav",
+        frontier_random_seed: int = 0,
     ):
         self.scenegraph = scenegraph
         self.frontier_distance_weight = float(frontier_distance_weight)
@@ -129,6 +131,11 @@ class SGNavDecision:
         self.found_goal_stop_distance_m = max(0.05, float(found_goal_stop_distance_m))
         self.score_frontiers_before_candidate = bool(score_frontiers_before_candidate)
         self.frontier_scenegraph_score_norm = str(frontier_scenegraph_score_norm or "minmax").strip().lower()
+        self.frontier_selection_mode = str(frontier_selection_mode or "sgnav").strip().lower()
+        if self.frontier_selection_mode not in {"sgnav", "nearest", "random"}:
+            raise ValueError("unsupported frontier_selection_mode: %s" % frontier_selection_mode)
+        self.frontier_random_seed = int(frontier_random_seed)
+        self.frontier_rng = np.random.default_rng(self.frontier_random_seed)
         self.state = "frontier"
         self.reperception_candidate_id: Optional[int] = None
         self.reperception_steps = 0
@@ -142,6 +149,8 @@ class SGNavDecision:
     def choose_frontier(self, frontier_clusters: List[FrontierCluster]) -> DecisionResult:
         if not frontier_clusters:
             return DecisionResult(None, None, [], [], [], "no_frontiers")
+        if self.frontier_selection_mode in {"nearest", "random"}:
+            return self._choose_frontier_without_scenegraph(frontier_clusters)
         locs = np.asarray([f.center_grid for f in frontier_clusters], dtype=np.int32)
         raw_sg_scores = np.asarray(self.scenegraph.score(locs, len(frontier_clusters)), dtype=np.float32)
         sg_scores = normalize_scores(raw_sg_scores, self.frontier_scenegraph_score_norm)
@@ -211,6 +220,69 @@ class SGNavDecision:
                 "filtered_near_frontiers": filtered_near,
                 "eligible_frontier_indices": [int(item) for item in eligible],
                 "used_near_frontier_fallback": bool(used_near_fallback),
+            },
+        )
+
+    def _choose_frontier_without_scenegraph(self, frontier_clusters: List[FrontierCluster]) -> DecisionResult:
+        dists = np.asarray([float(f.path_distance_from_agent) for f in frontier_clusters], dtype=np.float32)
+        dist_scores = np.asarray([getattr(f, "distance_inverse", 0.0) for f in frontier_clusters], dtype=np.float32)
+        if len(dist_scores) != len(frontier_clusters) or not np.all(np.isfinite(dist_scores)):
+            clipped = np.clip(dists, self.frontier_min_select_distance_m, self.frontier_min_select_distance_m + self.frontier_distance_score_span_m)
+            dist_scores = 1.0 - (clipped - self.frontier_min_select_distance_m) / self.frontier_distance_score_span_m
+        sg_scores = np.zeros((len(frontier_clusters),), dtype=np.float32)
+        eligible = [
+            idx
+            for idx, dist in enumerate(dists)
+            if np.isfinite(float(dist)) and float(dist) >= self.frontier_min_select_distance_m
+        ]
+        filtered_near = int(len(frontier_clusters) - len(eligible))
+        used_near_fallback = False
+        if not eligible:
+            if not self.frontier_allow_near_fallback:
+                return DecisionResult(
+                    None,
+                    None,
+                    [float(x) for x in sg_scores],
+                    [float(x) for x in dist_scores],
+                    [float(x) for x in dist_scores],
+                    "all_frontiers_within_min_distance",
+                    metadata={
+                        "frontier_selection_mode": self.frontier_selection_mode,
+                        "frontier_random_seed": int(self.frontier_random_seed),
+                        "frontier_min_select_distance_m": float(self.frontier_min_select_distance_m),
+                        "filtered_near_frontiers": filtered_near,
+                        "eligible_frontier_indices": [],
+                        "used_near_frontier_fallback": False,
+                        "scenegraph_scoring_skipped": True,
+                    },
+                )
+            eligible = list(range(len(frontier_clusters)))
+            used_near_fallback = True
+        if self.frontier_selection_mode == "nearest":
+            idx = min(eligible, key=lambda item: float(dists[int(item)]))
+            reason = "selected_nearest_frontier"
+        else:
+            idx = int(self.frontier_rng.choice(np.asarray(eligible, dtype=np.int32)))
+            reason = "selected_random_frontier"
+        total = np.zeros((len(frontier_clusters),), dtype=np.float32)
+        total[idx] = 1.0
+        return DecisionResult(
+            int(idx),
+            frontier_clusters[int(idx)],
+            [float(x) for x in sg_scores],
+            [float(x) for x in dist_scores],
+            [float(x) for x in total],
+            reason,
+            metadata={
+                "frontier_selection_mode": self.frontier_selection_mode,
+                "frontier_random_seed": int(self.frontier_random_seed),
+                "distance_scores": [float(x) for x in dist_scores],
+                "total_scores": [float(x) for x in total],
+                "frontier_min_select_distance_m": float(self.frontier_min_select_distance_m),
+                "filtered_near_frontiers": filtered_near,
+                "eligible_frontier_indices": [int(item) for item in eligible],
+                "used_near_frontier_fallback": bool(used_near_fallback),
+                "scenegraph_scoring_skipped": True,
             },
         )
 
