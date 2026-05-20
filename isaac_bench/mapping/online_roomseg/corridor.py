@@ -190,9 +190,11 @@ def merge_false_parallel_door_corridor_regions(
     for edge in edges:
         left = int(edge["label_a"])
         right = int(edge["label_b"])
-        other_left = _best_other_parallel_edge(edge, left, edges, cfg)
-        other_right = _best_other_parallel_edge(edge, right, edges, cfg)
+        other_left = _best_other_parallel_edge(edge, left, forbidden_label=right, edges=edges, config=cfg, resolution_m=float(resolution_m))
+        other_right = _best_other_parallel_edge(edge, right, forbidden_label=left, edges=edges, config=cfg, resolution_m=float(resolution_m))
         if other_left is None or other_right is None:
+            continue
+        if int(other_left["candidate_id"]) == int(other_right["candidate_id"]):
             continue
         if not _lengths_close(float(other_left["length_m"]), float(other_right["length_m"]), cfg):
             continue
@@ -412,18 +414,25 @@ def _candidate_label_pair_coverage(
 def _best_other_parallel_edge(
     shared_edge: Mapping[str, object],
     label: int,
+    *,
+    forbidden_label: int,
     edges: Sequence[Mapping[str, object]],
     config: CorridorMergeConfig,
+    resolution_m: float,
 ) -> Mapping[str, object] | None:
     shared_id = int(shared_edge.get("candidate_id", -1))
     label_i = int(label)
+    forbidden_i = int(forbidden_label)
     options: list[Mapping[str, object]] = []
     for edge in edges:
         if int(edge.get("candidate_id", -2)) == shared_id:
             continue
-        if label_i not in {int(edge.get("label_a", 0)), int(edge.get("label_b", 0))}:
+        edge_labels = {int(edge.get("label_a", 0)), int(edge.get("label_b", 0))}
+        if label_i not in edge_labels:
             continue
-        if not _edges_parallel(shared_edge, edge, config):
+        if forbidden_i in edge_labels:
+            continue
+        if not _edge_pair_geometry_ok(shared_edge, edge, config, float(resolution_m)):
             continue
         options.append(edge)
     if not options:
@@ -434,6 +443,26 @@ def _best_other_parallel_edge(
 
 def _edges_parallel(a: Mapping[str, object], b: Mapping[str, object], config: CorridorMergeConfig) -> bool:
     return bool(_angle_diff(float(a.get("theta", 0.0)), float(b.get("theta", 0.0))) <= np.deg2rad(float(config.parallel_door_angle_deg)))
+
+
+def _edge_pair_geometry_ok(
+    a: Mapping[str, object],
+    b: Mapping[str, object],
+    config: CorridorMergeConfig,
+    resolution_m: float,
+) -> bool:
+    if not _edges_parallel(a, b, config):
+        return False
+    ca = a.get("candidate")
+    cb = b.get("candidate")
+    if not isinstance(ca, SeparatorCandidate) or not isinstance(cb, SeparatorCandidate):
+        return False
+    center_distance_m = float(np.linalg.norm(_candidate_center(cb) - _candidate_center(ca)) * float(resolution_m))
+    tangent_overlap_m = _candidate_tangent_overlap_m(ca, cb, float(resolution_m))
+    return bool(
+        center_distance_m <= float(config.parallel_door_pair_max_distance_m)
+        and tangent_overlap_m >= float(config.parallel_door_min_overlap_m)
+    )
 
 
 def _lengths_close(a_m: float, b_m: float, config: CorridorMergeConfig) -> bool:

@@ -115,6 +115,62 @@ def test_strict_parallel_edge_merge_requires_complete_door_neck_edge_coverage():
     assert len([v for v in np.unique(merged) if int(v) > 0]) == 4
 
 
+def test_strict_parallel_edge_merge_rejects_second_edge_between_same_two_regions():
+    labels = np.zeros((25, 70), dtype=np.int32)
+    labels[8:14, 3:30] = 1
+    labels[8:14, 31:62] = 2
+    free = labels > 0
+    candidates = [_door(1, 30), _door(2, 45)]
+
+    merged, debug = merge_false_parallel_door_corridor_regions(
+        labels,
+        accepted_candidates=candidates,
+        free_clean=free,
+        wall_candidate_clean=np.zeros_like(free),
+        filtered_lines=[],
+        resolution_m=0.1,
+        config=CorridorMergeConfig(
+            parallel_door_pair_max_distance_m=2.0,
+            parallel_door_min_overlap_m=0.2,
+            parallel_edge_length_tolerance_ratio=0.05,
+            parallel_edge_coverage_min_ratio=0.95,
+            post_corridor_small_region_merge_enabled=False,
+        ),
+    )
+
+    assert len(debug["merge_events"]) == 0
+    assert len([v for v in np.unique(merged) if int(v) > 0]) == 2
+
+
+def test_strict_parallel_edge_merge_rejects_far_parallel_other_edges():
+    labels = np.zeros((25, 120), dtype=np.int32)
+    labels[8:14, 3:15] = 1
+    labels[8:14, 16:30] = 2
+    labels[8:14, 31:45] = 3
+    labels[8:14, 90:110] = 4
+    free = labels > 0
+    candidates = [_door(1, 15), _door(2, 30), _door(3, 90), _door(4, 110)]
+
+    merged, debug = merge_false_parallel_door_corridor_regions(
+        labels,
+        accepted_candidates=candidates,
+        free_clean=free,
+        wall_candidate_clean=np.zeros_like(free),
+        filtered_lines=[],
+        resolution_m=0.1,
+        config=CorridorMergeConfig(
+            parallel_door_pair_max_distance_m=2.0,
+            parallel_door_min_overlap_m=0.2,
+            parallel_edge_length_tolerance_ratio=0.05,
+            parallel_edge_coverage_min_ratio=0.95,
+            post_corridor_small_region_merge_enabled=False,
+        ),
+    )
+
+    assert len(debug["merge_events"]) == 0
+    assert len([v for v in np.unique(merged) if int(v) > 0]) == 4
+
+
 def test_parallel_door_pair_without_complete_edge_rule_merges_small_middle_to_one_large_neighbor():
     labels = np.zeros((70, 120), dtype=np.int32)
     labels[8:58, 5:45] = 1
