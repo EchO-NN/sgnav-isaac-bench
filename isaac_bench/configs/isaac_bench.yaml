@@ -199,7 +199,7 @@ mapping:
     source_grid: online_depth_observed
     proposal_mode: vertical_free_gap_closure
     depth:
-      roomseg_depth_stride_px: 4
+      roomseg_depth_stride_px: 2
     finalization_mode: no_merge_until_geometry_verified
     use_structural_obstacle_mask: true
     suppress_furniture_obstacles: true
@@ -343,7 +343,7 @@ mapping:
       backend: online_rose_style_v1
       algorithm: online_line_extend_roomseg_v1
       depth:
-        roomseg_depth_stride_px: 4
+        roomseg_depth_stride_px: 2
         roomseg_depth_stride_debug_px: 2
       free_clean:
         enabled: true
@@ -391,7 +391,7 @@ mapping:
         sample_step_m: 0.05
         hit_radius_m: 0.10
         free_ratio_min: 0.65
-        unknown_ratio_max: 0.10
+        unknown_ratio_max: 0.50
         wall_mid_ratio_max: 0.15
         require_free_between_start_and_hit: true
         min_free_cells_between_start_and_hit: 3
@@ -487,8 +487,10 @@ mapping:
         reject_both_doors_if_middle_corridor_like: true
         min_region_area_m2: 0.40
         post_corridor_small_region_merge_enabled: true
-        post_corridor_small_region_max_area_m2: 2.00
+        post_corridor_small_region_max_area_m2: 2.50
         post_corridor_small_region_max_unknown_ratio: 0.20
+        post_corridor_small_region_require_single_neighbor: true
+        post_corridor_small_region_single_neighbor_search_m: 0.50
       topology_test:
         enabled: true
         min_split_area_m2: 1.0
@@ -714,7 +716,7 @@ sgnav:
   frontier_scenegraph_score_norm: none
   frontier_commitment_enabled: true
   frontier_commit_match_radius_m: 0.75
-  frontier_commit_reached_radius_m: 0.60
+  frontier_commit_reached_radius_m: 0.20
   frontier_commit_min_steps: 12
   frontier_commit_max_steps: 0
   frontier_commit_switch_margin: 0.25
@@ -842,7 +844,7 @@ astar:
   goal_tolerance_m: 0.20
   waypoint_lookahead_m: 0.15
   replan_every_steps: 5
-  runtime_planning_clearance_m: 0.10
+  runtime_planning_clearance_m: 0.30
   stuck_timeout_steps: 30
 
 nav2:

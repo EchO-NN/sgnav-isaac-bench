@@ -48,6 +48,13 @@ def test_success_radius_does_not_finish_strict_run_without_sgnav_stop():
         require_sgnav_stop=False,
         policy_stop_confirmed=False,
     )
+    assert not success_region_can_finish(
+        0.0,
+        0.2,
+        require_sgnav_stop=False,
+        policy_stop_confirmed=False,
+        ignore_goal_success=True,
+    )
 
 
 def test_result_schema_removes_success_without_policy_stop_confirmation():

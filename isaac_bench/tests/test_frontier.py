@@ -132,6 +132,50 @@ def test_extract_frontiers_returns_sgnav_fbe_cells_without_projection():
     assert actual_cells <= expected_cells
 
 
+def test_extract_frontiers_can_keep_raw_frontiers_without_reachability_filter():
+    free = np.zeros((7, 7), dtype=bool)
+    observed = np.zeros_like(free)
+    occupancy = np.zeros_like(free)
+    free[2:5, 2:5] = True
+    observed[2:5, 2:5] = True
+    traversible = np.zeros_like(free)
+    traversible[3, 3] = True
+
+    info = MapInfo(resolution_m=0.1, min_x=0.0, max_x=0.7, min_y=0.0, max_y=0.7, width=7, height=7)
+    filtered = extract_frontiers(
+        free=free,
+        observed=observed,
+        traversible=traversible,
+        map_info=info,
+        agent_grid=(3, 3),
+        min_cluster_size=1,
+        min_distance_m=0.0,
+        max_count=0,
+        occupancy=occupancy,
+        obstacle_dilation_radius_cells=0,
+        unknown_dilation_radius_cells=1,
+    )
+    raw = extract_frontiers(
+        free=free,
+        observed=observed,
+        traversible=traversible,
+        map_info=info,
+        agent_grid=(3, 3),
+        min_cluster_size=1,
+        min_distance_m=0.0,
+        max_count=0,
+        occupancy=occupancy,
+        obstacle_dilation_radius_cells=0,
+        unknown_dilation_radius_cells=1,
+        require_reachable=False,
+    )
+
+    expected = frontier_cells(free, occupancy=occupancy, obstacle_dilation_radius_cells=0, unknown_dilation_radius_cells=1)
+    assert filtered == []
+    assert raw
+    assert sum(cluster.size for cluster in raw) == int(np.count_nonzero(expected))
+
+
 def test_extract_frontiers_filters_small_components():
     free = np.zeros((7, 7), dtype=bool)
     observed = np.zeros_like(free)

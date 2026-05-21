@@ -179,6 +179,97 @@ def test_disabling_object_nodes_removes_object_dot_primitives():
     assert layers["object_nodes"]["primitive_count"] == 0
 
 
+def test_corridor_merge_debug_draws_bright_red_dashed_markers():
+    debug = {
+        "corridor_merge_report": {
+            "merge_events": [
+                {
+                    "reason": "strict_parallel_door_neck_edge_merge",
+                    "shared_edge_p0_rc": [8, 10],
+                    "shared_edge_p1_rc": [8, 20],
+                }
+            ],
+            "sliver_merge_events": [
+                {
+                    "reason": "merge_post_corridor_small_region_to_larger_neighbor",
+                    "source_centroid_rc": [12, 16],
+                }
+            ],
+        }
+    }
+    viz = SGNavPopupVisualizer(enabled=False, panel_size=(640, 360))
+    panel = _update(viz, room_segmentation_debug=debug)
+    layers = {layer["name"]: layer for layer in viz.overlay_layer_metadata()["layers"]}
+
+    assert layers["corridor_merge_edges"]["primitive_count"] == 1
+    assert layers["corridor_merge_edges"]["color"] == [255, 24, 24]
+    assert layers["post_corridor_small_region_merges"]["primitive_count"] == 1
+    assert layers["post_corridor_small_region_merges"]["color"] == [255, 190, 24]
+    assert int(np.count_nonzero(np.all(panel == np.asarray([255, 24, 24], dtype=np.uint8), axis=-1))) > 0
+    assert int(np.count_nonzero(np.all(panel == np.asarray([255, 190, 24], dtype=np.uint8), axis=-1))) > 0
+
+
+def test_roomseg_wall_lines_and_extensions_draw_red_even_without_room_split():
+    debug = {
+        "filtered_wall_lines_report": {
+            "filtered_wall_lines": [
+                {
+                    "line_id": 1,
+                    "p0_rc": [6, 8],
+                    "p1_rc": [6, 20],
+                    "length_m": 1.2,
+                }
+            ]
+        },
+        "line_extension_report": {
+            "pass1": {
+                "extensions": [
+                    {
+                        "extension_id": 1,
+                        "p_start_rc": [6, 20],
+                        "p_hit_rc": [10, 24],
+                        "reject_reason": "reject_extension_no_wall_or_virtual_door_hit",
+                    }
+                ]
+            },
+            "pass2": {"extensions": []},
+        },
+    }
+    viz = SGNavPopupVisualizer(enabled=False, panel_size=(640, 360))
+    panel = _update(viz, room_segmentation_debug=debug)
+    layers = {layer["name"]: layer for layer in viz.overlay_layer_metadata()["layers"]}
+
+    assert layers["roomseg_wall_lines_red"]["primitive_count"] == 1
+    assert layers["roomseg_wall_lines_red"]["color"] == [255, 35, 35]
+    assert layers["roomseg_wall_extensions_red_dashed"]["primitive_count"] >= 2
+    assert layers["roomseg_wall_extensions_red_dashed"]["color"] == [255, 0, 0]
+    assert int(np.count_nonzero(np.all(panel == np.asarray([255, 0, 0], dtype=np.uint8), axis=-1))) > 0
+
+
+def test_roomseg_wall_endpoint_probe_draws_when_extension_report_is_missing():
+    debug = {
+        "resolution_m": 0.05,
+        "filtered_wall_lines_report": {
+            "filtered_wall_lines": [
+                {
+                    "line_id": 1,
+                    "p0_rc": [8, 8],
+                    "p1_rc": [8, 20],
+                    "length_m": 0.6,
+                }
+            ]
+        },
+        "line_extension_report": {"pass1": {"extensions": []}, "pass2": {"extensions": []}},
+    }
+    viz = SGNavPopupVisualizer(enabled=False, panel_size=(640, 360))
+    panel = _update(viz, room_segmentation_debug=debug)
+    layers = {layer["name"]: layer for layer in viz.overlay_layer_metadata()["layers"]}
+
+    assert layers["roomseg_wall_lines_red"]["primitive_count"] == 1
+    assert layers["roomseg_wall_extensions_red_dashed"]["primitive_count"] == 2
+    assert int(np.count_nonzero(np.all(panel == np.asarray([255, 0, 0], dtype=np.uint8), axis=-1))) > 0
+
+
 def test_rose_input_occupancy_map_is_rendered_below_runtime_map(tmp_path):
     occupancy, _, _, _, _, _, _ = _scene()
     structural = np.zeros_like(occupancy, dtype=bool)

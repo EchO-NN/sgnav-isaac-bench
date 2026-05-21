@@ -32,6 +32,7 @@ def test_online_mapper_ray_casts_depth_obstacle_and_floor_free_cells():
     assert grid.occupied[obstacle_cell] == 1
     assert grid.free[free_cell] == 1
     assert not mapper.traversible(unknown_is_obstacle=True)[obstacle_cell]
+    assert np.array_equal(mapper.last_inflated_occupied, mapper.inflated_occupied())
     assert mapper.last_debug_stats["mapping_mode"] == "depth_ray_cast"
     assert mapper.last_debug_stats["vertical_profile_depth_stride_px"] == 1
     assert mapper.last_debug_stats["ray_count"] == 2
@@ -286,6 +287,48 @@ def test_online_mapper_free_ray_clears_stale_obstacle_cells():
     assert mapper.grid.free[shared_cell] == 1
     assert mapper.grid.occupied[shared_cell] == 0
     assert mapper.traversible(unknown_is_obstacle=True)[shared_cell]
+
+
+def test_online_mapper_obstacle_endpoint_protects_navigation_occupied_from_later_free_ray():
+    mapper = OnlineMapper(
+        size_m=8.0,
+        resolution_m=0.1,
+        depth_max_m=2.0,
+        depth_stride_px=1,
+        obstacle_min_height_m=0.20,
+        obstacle_max_height_m=2.00,
+        free_min_height_m=-1.5,
+        free_max_height_m=0.1,
+        splat_point_threshold=1,
+        robot_radius_m=0.1,
+    )
+    mapper.reset((0.0, 0.0))
+    intr = CameraIntrinsics(width=5, height=5, fx=2.0, fy=2.0, cx=2.0, cy=2.0)
+    obstacle_depth = np.full((5, 5), np.inf, dtype=np.float32)
+    obstacle_depth[1, 2] = 1.0  # same xy cell as the floor ray below, but in obstacle height range
+
+    mapper.update(obstacle_depth, intr, (0.0, 0.0, 0.0, 0.0), (0.0, 0.0, 1.0, 0.0))
+    shared_cell = mapper.grid.world_to_grid(1.0, 0.0)
+
+    assert mapper.grid.occupied[shared_cell] == 1
+    assert mapper.depth_obstacle_endpoint_count[shared_cell] > 0
+
+    floor_depth = np.full((5, 5), np.inf, dtype=np.float32)
+    floor_depth[4, 2] = 1.0
+    mapper.update(floor_depth, intr, (0.0, 0.0, 0.0, 0.0), (0.0, 0.0, 1.0, 0.0))
+
+    assert mapper.grid.occupied[shared_cell] == 1
+    assert mapper.grid.free[shared_cell] == 0
+    assert not mapper.traversible(unknown_is_obstacle=True)[shared_cell]
+    assert mapper.last_debug_stats["free_ray_cells_protected_by_obstacle_endpoint"] >= 1
+    assert mapper.last_debug_stats["stale_obstacle_endpoint_cells_cleared_by_free_rays"] == 0
+
+    mapper.update(floor_depth, intr, (0.0, 0.0, 0.0, 0.0), (0.0, 0.0, 1.0, 0.0))
+
+    assert mapper.grid.occupied[shared_cell] == 0
+    assert mapper.grid.free[shared_cell] == 1
+    assert mapper.traversible(unknown_is_obstacle=True)[shared_cell]
+    assert mapper.last_debug_stats["stale_obstacle_endpoint_cells_cleared_by_free_rays"] >= 1
 
 
 def test_online_mapper_invalid_depth_only_marks_robot_footprint():

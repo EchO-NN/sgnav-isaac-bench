@@ -208,6 +208,7 @@ def extract_frontiers(
     unknown_source: str = "observed",
     cluster_distance_mode: str = "mean",
     allow_near_frontier_fallback: bool = False,
+    require_reachable: bool = True,
 ) -> List[FrontierCluster]:
     if cluster_distance_mode not in {"mean", "min", "center"}:
         raise ValueError(
@@ -226,19 +227,34 @@ def extract_frontiers(
     clusters: List[FrontierCluster] = []
     near_clusters: List[FrontierCluster] = []
     for members in _connected_components(cells):
-        finite_members = [(row, col) for row, col in members if np.isfinite(float(dist_map[row, col]))]
+        finite_members = (
+            [(row, col) for row, col in members if np.isfinite(float(dist_map[row, col]))]
+            if bool(require_reachable)
+            else [(int(row), int(col)) for row, col in members]
+        )
         if len(finite_members) < max(1, int(min_cluster_size)):
             continue
         member_arr = np.asarray(finite_members, dtype=np.float32)
-        member_dists = np.asarray([float(dist_map[row, col]) for row, col in finite_members], dtype=np.float32)
+        raw_member_dists = np.asarray([float(dist_map[row, col]) for row, col in finite_members], dtype=np.float32)
+        if bool(require_reachable):
+            member_dists = raw_member_dists
+        else:
+            agent_arr = np.asarray(agent_grid, dtype=np.float32)
+            geometric_dists = np.linalg.norm(member_arr - agent_arr[None, :], axis=1).astype(np.float32) * float(map_info.resolution_m)
+            member_dists = np.where(np.isfinite(raw_member_dists), raw_member_dists, geometric_dists).astype(np.float32)
         centroid = np.mean(member_arr, axis=0)
         center_idx = int(np.argmin(np.sum((member_arr - centroid) ** 2, axis=1)))
         center = tuple(int(v) for v in member_arr[center_idx])
         center_dist = float(dist_map[center])
-        if not np.isfinite(center_dist):
+        if not np.isfinite(center_dist) and bool(require_reachable):
             center_idx = int(np.argmin(member_dists))
             center = tuple(int(v) for v in member_arr[center_idx])
             center_dist = float(dist_map[center])
+        if not np.isfinite(center_dist):
+            center_dist = float(
+                np.linalg.norm(np.asarray(center, dtype=np.float32) - np.asarray(agent_grid, dtype=np.float32))
+                * float(map_info.resolution_m)
+            )
         min_dist = float(np.min(member_dists))
         mean_dist = float(np.mean(member_dists))
         max_dist = float(np.max(member_dists))

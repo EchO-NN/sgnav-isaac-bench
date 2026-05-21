@@ -61,11 +61,15 @@ def test_required_sgnav_defaults():
     assert cfg["mapping"]["room_segmentation"]["rose2"]["wall_extension_enabled"] is True
     assert cfg["mapping"]["room_segmentation"]["rose2"]["wall_extension_band_m"] == 0.45
     assert cfg["mapping"]["room_segmentation"]["rose2"]["wall_extension_margin_m"] == 0.15
+    assert cfg["mapping"]["room_segmentation"]["online_roomseg"]["line_extension"]["passes"] == 2
+    assert cfg["mapping"]["room_segmentation"]["online_roomseg"]["line_extension"]["unknown_ratio_max"] == 0.50
     assert cfg["mapping"]["room_segmentation"]["online_roomseg"]["corridor_merge"]["parallel_edge_length_tolerance_ratio"] == 0.05
     assert cfg["mapping"]["room_segmentation"]["online_roomseg"]["corridor_merge"]["parallel_edge_coverage_min_ratio"] == 0.95
     assert cfg["mapping"]["room_segmentation"]["online_roomseg"]["corridor_merge"]["post_corridor_small_region_merge_enabled"] is True
-    assert cfg["mapping"]["room_segmentation"]["online_roomseg"]["corridor_merge"]["post_corridor_small_region_max_area_m2"] == 2.00
+    assert cfg["mapping"]["room_segmentation"]["online_roomseg"]["corridor_merge"]["post_corridor_small_region_max_area_m2"] == 2.50
     assert cfg["mapping"]["room_segmentation"]["online_roomseg"]["corridor_merge"]["post_corridor_small_region_max_unknown_ratio"] == 0.20
+    assert cfg["mapping"]["room_segmentation"]["online_roomseg"]["corridor_merge"]["post_corridor_small_region_require_single_neighbor"] is True
+    assert cfg["mapping"]["room_segmentation"]["online_roomseg"]["corridor_merge"]["post_corridor_small_region_single_neighbor_search_m"] == 0.50
     assert cfg["room_semantics"]["min_label_reliability_for_functional_split"] == 0.65
     assert cfg["room_semantics"]["unknown_allows_functional_split"] is False
     assert cfg["perception"]["yolo_world"]["reject_edge_touching_bboxes"] is False

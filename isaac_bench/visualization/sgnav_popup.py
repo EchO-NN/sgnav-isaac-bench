@@ -529,6 +529,21 @@ class SGNavPopupVisualizer:
             crop_bounds=(r0, r1, c0, c1),
         ) if self.show_room_labels else 0
         record("room_labels", self.show_room_labels, (250, 250, 255), room_label_count, "VLM room category and reliability")
+        wall_line_count, wall_extension_count = self._draw_roomseg_wall_debug_lines(draw, xy, (r0, r1, c0, c1))
+        record(
+            "roomseg_wall_lines_red",
+            wall_line_count > 0,
+            (255, 35, 35),
+            wall_line_count,
+            "solid bright-red filtered wall lines used by the current room segmentation pass",
+        )
+        record(
+            "roomseg_wall_extensions_red_dashed",
+            wall_extension_count > 0,
+            (255, 0, 0),
+            wall_extension_count,
+            "pure-red dashed attempted wall-line extensions with dark outline; drawn whether or not the final split succeeds",
+        )
         merged_count, doorway_count, merge_reasons = self._draw_room_adjacency_debug_lines(draw, xy, (r0, r1, c0, c1))
         record(
             "room_merged_boundaries",
@@ -545,6 +560,21 @@ class SGNavPopupVisualizer:
             doorway_count,
             "bold verified doorway/gateway cuts preserved as room splits",
             adjacency_merge_reasons=[item for item in merge_reasons if item.get("verified_doorway")],
+        )
+        corridor_merge_count, small_region_merge_count = self._draw_corridor_merge_debug_lines(draw, xy, (r0, r1, c0, c1))
+        record(
+            "corridor_merge_edges",
+            corridor_merge_count > 0,
+            (255, 24, 24),
+            corridor_merge_count,
+            "bright red dashed shared edges that triggered strict corridor/door-neck region merge",
+        )
+        record(
+            "post_corridor_small_region_merges",
+            small_region_merge_count > 0,
+            (255, 190, 24),
+            small_region_merge_count,
+            "bright amber dashed circles mark small regions merged after strict corridor merge",
         )
 
         goal_color = (30, 220, 80)
@@ -644,6 +674,10 @@ class SGNavPopupVisualizer:
         obs = np.asarray(observed, dtype=bool)
         roomseg_free = self._room_debug_array("initial_roomseg_free", shape, bool)
         roomseg_occupied = self._room_debug_array("initial_roomseg_occupied", shape, bool)
+        pass2_extension_intersection_targets = self._room_debug_array("pass2_extension_intersection_targets", shape, bool)
+        pass2_line_extension_completion = self._room_debug_array("pass2_line_extension_completion", shape, bool)
+        wall_target_after_line_extension = self._room_debug_array("wall_target_after_line_extension", shape, bool)
+        completed_wall_after_line_extension = self._room_debug_array("completed_wall_after_line_extension", shape, bool)
         initial_unknown_after_fusion = self._room_debug_array("initial_roomseg_unknown_after_fusion", shape, bool)
         vertical_free_room_domain = self._room_debug_array("vertical_free_room_domain", shape, bool)
         vertical_occupied_0p2_2p0 = self._room_debug_array("vertical_occupied_0p2_2p0", shape, bool)
@@ -690,6 +724,10 @@ class SGNavPopupVisualizer:
             np.any(vertical_debug_free)
             or np.any(roomseg_free)
             or np.any(roomseg_occupied)
+            or np.any(pass2_extension_intersection_targets)
+            or np.any(pass2_line_extension_completion)
+            or np.any(wall_target_after_line_extension)
+            or np.any(completed_wall_after_line_extension)
             or np.any(vertical_observed)
             or np.any(vertical_observed_0p2_2p0)
             or np.any(ray_valid_wall)
@@ -707,7 +745,15 @@ class SGNavPopupVisualizer:
         rose_occupied = (
             repaired_occupied
             if debug_only and np.any(repaired_occupied)
-            else (roomseg_occupied if np.any(roomseg_occupied) else (structural if np.any(structural) else (clean_structure | wall_conf_hot)))
+            else (
+                completed_wall_after_line_extension
+                if np.any(completed_wall_after_line_extension)
+                else (
+                    wall_target_after_line_extension
+                    if np.any(wall_target_after_line_extension)
+                    else (roomseg_occupied if np.any(roomseg_occupied) else (structural if np.any(structural) else (clean_structure | wall_conf_hot)))
+                )
+            )
         )
         vertical_free_overridden_occupied = occ & vertical_or_free & ~roomseg_occupied
         canvas = np.zeros((shape[0], shape[1], 3), dtype=np.uint8)
@@ -736,6 +782,8 @@ class SGNavPopupVisualizer:
             canvas[virtual_boundary] = (255, 65, 90)
             canvas[ray_valid_wall] = (255, 80, 40)
             canvas[roomseg_terminal_wall_splat] = (255, 135, 25)
+            canvas[pass2_extension_intersection_targets] = (255, 240, 0)
+            canvas[pass2_line_extension_completion] = (255, 0, 0)
             canvas[nav_obstacle_overlay_accepted] = (230, 40, 230)
             canvas[walls_rescued_from_unknown] = (255, 35, 35)
             canvas[vertical_free_over_nav_obstacle] = (45, 135, 255)
@@ -753,6 +801,8 @@ class SGNavPopupVisualizer:
             canvas[vertical_free_overridden_occupied] = (225, 132, 45)
             canvas[ray_valid_wall] = (255, 80, 40)
             canvas[roomseg_terminal_wall_splat] = (255, 135, 25)
+            canvas[pass2_extension_intersection_targets] = (255, 240, 0)
+            canvas[pass2_line_extension_completion] = (255, 0, 0)
             canvas[unknown_removed_by_ray_wall] = (255, 35, 35)
             canvas[wall_conf_hot] = (255, 105, 75)
             canvas[rose_occupied] = (0, 0, 0)
@@ -794,6 +844,7 @@ class SGNavPopupVisualizer:
             crop_bounds,
             (80, 255, 130),
         )
+        wall_line_count, wall_extension_count = self._draw_roomseg_wall_debug_lines(draw, xy, crop_bounds)
         title = "vertical-free roomseg debug" if debug_only else "ROSE roomseg input after vertical-free operation"
         if has_rose_input:
             title += " | occupied=%d vfree=%d ray_wall=%d room_pixels=%d closures=%d win=%d door=%d" % (
@@ -882,6 +933,35 @@ class SGNavPopupVisualizer:
                 (255, 65, 90),
                 int(np.count_nonzero(accepted_closure | virtual_boundary)),
                 "accepted or virtual gap-closure boundaries from the latest room segmentation method",
+            ),
+            self._overlay_record(
+                "pass2_extension_intersection_targets",
+                bool(np.any(pass2_extension_intersection_targets)),
+                (255, 240, 0),
+                int(np.count_nonzero(pass2_extension_intersection_targets)),
+                "virtual neck targets generated from crossing pass2 line-extension probes",
+            ),
+            self._overlay_record(
+                "pass2_line_extension_completion",
+                bool(np.any(pass2_line_extension_completion)),
+                (255, 0, 0),
+                int(np.count_nonzero(pass2_line_extension_completion)),
+                "topology-accepted pass2 line extensions merged into the completed roomseg wall target",
+                completed_wall_after_line_extension_cells=int(np.count_nonzero(completed_wall_after_line_extension)),
+            ),
+            self._overlay_record(
+                "roomseg_wall_lines_red",
+                wall_line_count > 0,
+                (255, 35, 35),
+                int(wall_line_count),
+                "solid bright-red filtered wall lines used by the current room segmentation pass",
+            ),
+            self._overlay_record(
+                "roomseg_wall_extensions_red_dashed",
+                wall_extension_count > 0,
+                (255, 0, 0),
+                int(wall_extension_count),
+                "pure-red dashed attempted wall-line extensions with dark outline; drawn whether or not the final split succeeds",
             ),
             self._overlay_record(
                 "rose_vertical_free_overrides",
@@ -1005,6 +1085,7 @@ class SGNavPopupVisualizer:
             ((58, 82, 132), "rejected clutter"),
             ((126, 104, 75), "vertical-carved"),
             ((255, 190, 70), "ROSE line"),
+            ((255, 35, 35), "wall line / dashed extension"),
             ((255, 80, 130), "closed window"),
             ((80, 255, 130), "doorway portal"),
         ]
@@ -1326,6 +1407,77 @@ class SGNavPopupVisualizer:
             count += 1
         return count
 
+    def _draw_roomseg_wall_debug_lines(self, draw: ImageDraw.ImageDraw, xy_func, crop_bounds: Tuple[int, int, int, int]) -> Tuple[int, int]:
+        debug = self._room_segmentation_debug if isinstance(self._room_segmentation_debug, Mapping) else {}
+        wall_color = (255, 35, 35)
+        extension_color = (255, 0, 0)
+        extension_outline_color = (8, 8, 8)
+        wall_count = 0
+        extension_count = 0
+
+        filtered_report = debug.get("filtered_wall_lines_report") or {}
+        if isinstance(filtered_report, Mapping):
+            raw_lines = filtered_report.get("filtered_wall_lines") or []
+        else:
+            raw_lines = []
+        line_items: List[Mapping[str, object]] = []
+        for item in list(raw_lines)[:512]:
+            if not isinstance(item, Mapping):
+                continue
+            line_items.append(item)
+            p0 = self._debug_rc_point(item.get("p0_rc"))
+            p1 = self._debug_rc_point(item.get("p1_rc"))
+            if p0 is None or p1 is None or not self._line_overlaps_crop(p0, p1, crop_bounds):
+                continue
+            draw.line([xy_func(p0), xy_func(p1)], fill=wall_color, width=3)
+            wall_count += 1
+
+        visible_extension_starts: set[GridCell] = set()
+        extension_report = debug.get("line_extension_report") or {}
+        if isinstance(extension_report, Mapping):
+            pass_reports = [extension_report.get("pass1"), extension_report.get("pass2")]
+        else:
+            pass_reports = []
+        for report in pass_reports:
+            if not isinstance(report, Mapping):
+                continue
+            for item in list(report.get("extensions") or [])[:1024]:
+                if not isinstance(item, Mapping):
+                    continue
+                p0 = self._debug_rc_point(item.get("p_start_rc"))
+                p1 = self._debug_rc_point(item.get("p_hit_rc"))
+                if p0 is None or p1 is None or not self._line_overlaps_crop(p0, p1, crop_bounds):
+                    continue
+                if float(np.hypot(float(p1[0] - p0[0]), float(p1[1] - p0[1]))) >= 3.0:
+                    visible_extension_starts.add((int(p0[0]), int(p0[1])))
+                p0_xy = xy_func(p0)
+                p1_xy = xy_func(p1)
+                self._draw_dashed_line(draw, p0_xy, p1_xy, extension_outline_color, width=7, dash_px=10, gap_px=5)
+                self._draw_dashed_line(draw, p0_xy, p1_xy, extension_color, width=4, dash_px=10, gap_px=5)
+                for x, y in (p0_xy, p1_xy):
+                    draw.ellipse((x - 3, y - 3, x + 3, y + 3), fill=extension_color, outline=extension_outline_color)
+                extension_count += 1
+        resolution_m = max(1e-6, float(debug.get("resolution_m", 0.05) or 0.05))
+        probe_cells = max(6, int(round(1.80 / resolution_m)))
+        for item in line_items[:512]:
+            for endpoint in ("p0", "p1"):
+                probe = self._line_endpoint_probe(item, endpoint, probe_cells)
+                if probe is None:
+                    continue
+                p0, p1 = probe
+                if (int(p0[0]), int(p0[1])) in visible_extension_starts:
+                    continue
+                if not self._line_overlaps_crop(p0, p1, crop_bounds):
+                    continue
+                p0_xy = xy_func(p0)
+                p1_xy = xy_func(p1)
+                self._draw_dashed_line(draw, p0_xy, p1_xy, extension_outline_color, width=5, dash_px=7, gap_px=6)
+                self._draw_dashed_line(draw, p0_xy, p1_xy, extension_color, width=3, dash_px=7, gap_px=6)
+                x, y = p0_xy
+                draw.ellipse((x - 3, y - 3, x + 3, y + 3), fill=extension_color, outline=extension_outline_color)
+                extension_count += 1
+        return wall_count, extension_count
+
     def _draw_room_adjacency_debug_lines(self, draw: ImageDraw.ImageDraw, xy_func, crop_bounds: Tuple[int, int, int, int]) -> Tuple[int, int, List[dict]]:
         r0, r1, c0, c1 = crop_bounds
         merged_count = 0
@@ -1364,6 +1516,136 @@ class SGNavPopupVisualizer:
                         self._dot(draw, xy_func(cell), (150, 150, 155), radius=2)
                         merged_count += 1
         return merged_count, doorway_count, reasons
+
+    def _draw_corridor_merge_debug_lines(self, draw: ImageDraw.ImageDraw, xy_func, crop_bounds: Tuple[int, int, int, int]) -> Tuple[int, int]:
+        debug = self._room_segmentation_debug if isinstance(self._room_segmentation_debug, Mapping) else {}
+        report = debug.get("corridor_merge_report") or debug.get("corridor_merge") or {}
+        if not isinstance(report, Mapping):
+            return 0, 0
+        merge_count = 0
+        small_region_count = 0
+        corridor_color = (255, 24, 24)
+        small_region_color = (255, 190, 24)
+        for item in list(report.get("merge_events") or []):
+            if not isinstance(item, Mapping):
+                continue
+            p0 = self._debug_rc_point(item.get("shared_edge_total_p0_rc")) or self._debug_rc_point(item.get("shared_edge_p0_rc"))
+            p1 = self._debug_rc_point(item.get("shared_edge_total_p1_rc")) or self._debug_rc_point(item.get("shared_edge_p1_rc"))
+            if p0 is None or p1 is None:
+                continue
+            if not self._line_overlaps_crop(p0, p1, crop_bounds):
+                continue
+            self._draw_dashed_line(draw, xy_func(p0), xy_func(p1), corridor_color, width=4, dash_px=10, gap_px=6)
+            midpoint = ((p0[0] + p1[0]) // 2, (p0[1] + p1[1]) // 2)
+            if _cell_in_crop(midpoint, *crop_bounds):
+                mx, my = xy_func(midpoint)
+                self._label(draw, (mx + 5, my - 11), "CORRIDOR", corridor_color)
+            merge_count += 1
+        for item in list(report.get("sliver_merge_events") or []):
+            if not isinstance(item, Mapping):
+                continue
+            if str(item.get("reason", "")) != "merge_post_corridor_small_region_to_larger_neighbor":
+                continue
+            center = self._debug_rc_point(item.get("source_centroid_rc"))
+            if center is None or not _cell_in_crop(center, *crop_bounds):
+                continue
+            cx, cy = xy_func(center)
+            self._draw_dashed_circle(draw, (cx, cy), radius=11, color=small_region_color, width=3)
+            neighbors = item.get("neighbors") if isinstance(item.get("neighbors"), list) else []
+            label = "SMALL n=%d" % len(neighbors)
+            if item.get("target") is not None:
+                label += " ->%s" % str(item.get("target"))
+            self._label(draw, (cx + 6, cy + 5), label, small_region_color)
+            small_region_count += 1
+        return merge_count, small_region_count
+
+    @staticmethod
+    def _debug_rc_point(raw: object) -> Optional[GridCell]:
+        try:
+            row, col = raw[:2]  # type: ignore[index]
+            return int(round(float(row))), int(round(float(col)))
+        except Exception:
+            return None
+
+    @classmethod
+    def _line_endpoint_probe(cls, item: Mapping[str, object], endpoint: str, probe_cells: int) -> Optional[Tuple[GridCell, GridCell]]:
+        p0 = cls._debug_rc_point(item.get("p0_rc"))
+        p1 = cls._debug_rc_point(item.get("p1_rc"))
+        if p0 is None or p1 is None:
+            return None
+        if str(endpoint) == "p0":
+            start = p0
+            delta = (int(p0[0]) - int(p1[0]), int(p0[1]) - int(p1[1]))
+        else:
+            start = p1
+            delta = (int(p1[0]) - int(p0[0]), int(p1[1]) - int(p0[1]))
+        if abs(int(delta[0])) >= abs(int(delta[1])):
+            direction = (1 if int(delta[0]) >= 0 else -1, 0)
+        else:
+            direction = (0, 1 if int(delta[1]) >= 0 else -1)
+        end = (int(start[0]) + int(direction[0]) * int(probe_cells), int(start[1]) + int(direction[1]) * int(probe_cells))
+        return (int(start[0]), int(start[1])), end
+
+    @staticmethod
+    def _line_overlaps_crop(p0: GridCell, p1: GridCell, crop_bounds: Tuple[int, int, int, int]) -> bool:
+        r0, r1, c0, c1 = crop_bounds
+        min_r = min(int(p0[0]), int(p1[0]))
+        max_r = max(int(p0[0]), int(p1[0]))
+        min_c = min(int(p0[1]), int(p1[1]))
+        max_c = max(int(p0[1]), int(p1[1]))
+        return bool(max_r >= r0 and min_r < r1 and max_c >= c0 and min_c < c1)
+
+    @staticmethod
+    def _draw_dashed_line(
+        draw: ImageDraw.ImageDraw,
+        p0_xy: Tuple[int, int],
+        p1_xy: Tuple[int, int],
+        color: Tuple[int, int, int],
+        *,
+        width: int = 3,
+        dash_px: int = 8,
+        gap_px: int = 5,
+    ) -> None:
+        x0, y0 = float(p0_xy[0]), float(p0_xy[1])
+        x1, y1 = float(p1_xy[0]), float(p1_xy[1])
+        length = float(np.hypot(x1 - x0, y1 - y0))
+        if length <= 1e-6:
+            draw.point((int(round(x0)), int(round(y0))), fill=color)
+            return
+        ux = (x1 - x0) / length
+        uy = (y1 - y0) / length
+        pos = 0.0
+        dash = max(1.0, float(dash_px))
+        gap = max(0.0, float(gap_px))
+        while pos < length:
+            end = min(length, pos + dash)
+            draw.line(
+                [
+                    (int(round(x0 + ux * pos)), int(round(y0 + uy * pos))),
+                    (int(round(x0 + ux * end)), int(round(y0 + uy * end))),
+                ],
+                fill=color,
+                width=max(1, int(width)),
+            )
+            pos += dash + gap
+
+    @classmethod
+    def _draw_dashed_circle(
+        cls,
+        draw: ImageDraw.ImageDraw,
+        center_xy: Tuple[int, int],
+        *,
+        radius: int,
+        color: Tuple[int, int, int],
+        width: int = 2,
+    ) -> None:
+        cx, cy = float(center_xy[0]), float(center_xy[1])
+        points: list[Tuple[int, int]] = []
+        for idx in range(25):
+            theta = (2.0 * np.pi * float(idx)) / 24.0
+            points.append((int(round(cx + float(radius) * np.cos(theta))), int(round(cy + float(radius) * np.sin(theta)))))
+        for idx in range(0, 24, 2):
+            cls._draw_dashed_line(draw, points[idx], points[idx + 1], color, width=width, dash_px=4, gap_px=3)
 
     def _room_center_cell(self, room: object) -> Optional[GridCell]:
         metadata = getattr(room, "metadata", {}) or {}

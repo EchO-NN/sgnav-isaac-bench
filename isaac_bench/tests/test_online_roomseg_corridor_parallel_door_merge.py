@@ -57,6 +57,43 @@ def test_strict_parallel_door_neck_edges_merge_only_when_opposite_edges_match():
     assert candidates[1].debug.get("rejected_after_corridor_merge")
 
 
+def test_strict_parallel_edge_merge_uses_noise_filled_total_parallel_edge_length():
+    labels = np.zeros((25, 70), dtype=np.int32)
+    labels[8:14, 3:15] = 1
+    labels[8:14, 16:30] = 2
+    labels[8:14, 31:45] = 3
+    labels[8:14, 46:62] = 4
+    free = labels > 0
+    wall = np.zeros_like(free)
+    wall[4:8, 15] = True
+    wall[14:19, 15] = True
+    candidates = [_door(1, 15), _door(2, 30), _door(3, 45)]
+
+    merged, debug = merge_false_parallel_door_corridor_regions(
+        labels,
+        accepted_candidates=candidates,
+        free_clean=free,
+        wall_candidate_clean=wall,
+        filtered_lines=[],
+        resolution_m=0.1,
+        config=CorridorMergeConfig(
+            parallel_door_pair_max_distance_m=2.0,
+            parallel_door_min_overlap_m=0.2,
+            parallel_edge_length_tolerance_ratio=0.05,
+            parallel_edge_coverage_min_ratio=0.95,
+            post_corridor_small_region_merge_enabled=False,
+        ),
+    )
+
+    assert len(debug["merge_events"]) == 0
+    assert len([v for v in np.unique(merged) if int(v) > 0]) == 4
+    rejected = next(event for event in debug["rejected_merge_events"] if event["reason"] == "reject_parallel_total_edge_length_mismatch")
+    assert np.isclose(rejected["shared_edge_total_length_m"], 0.6)
+    assert np.isclose(rejected["left_other_edge_total_length_m"], 1.5)
+    assert rejected["left_other_edge_total_p0_rc"] == [4, 15]
+    assert rejected["left_other_edge_total_p1_rc"] == [18, 15]
+
+
 def test_strict_parallel_edge_merge_rejects_opposite_width_mismatch():
     labels = np.zeros((25, 70), dtype=np.int32)
     labels[8:14, 3:15] = 1
@@ -171,7 +208,7 @@ def test_strict_parallel_edge_merge_rejects_far_parallel_other_edges():
     assert len([v for v in np.unique(merged) if int(v) > 0]) == 4
 
 
-def test_parallel_door_pair_without_complete_edge_rule_merges_small_middle_to_one_large_neighbor():
+def test_parallel_door_pair_without_complete_edge_rule_does_not_merge_small_middle_touching_two_rooms():
     labels = np.zeros((70, 120), dtype=np.int32)
     labels[8:58, 5:45] = 1
     labels[8:14, 46:58] = 2
@@ -196,14 +233,15 @@ def test_parallel_door_pair_without_complete_edge_rule_merges_small_middle_to_on
     )
 
     assert len(debug["merge_events"]) == 0
-    assert len([v for v in np.unique(merged) if int(v) > 0]) == 2
-    assert merged[10, 50] in {merged[20, 20], merged[20, 80]}
+    assert len([v for v in np.unique(merged) if int(v) > 0]) == 3
+    assert merged[10, 50] != merged[20, 20]
+    assert merged[10, 50] != merged[20, 80]
     assert merged[20, 20] != merged[20, 80]
     assert sum(1 for c in candidates if c.debug.get("rejected_after_corridor_merge")) == 0
-    assert any(event["reason"] == "merge_post_corridor_small_region_to_larger_neighbor" for event in debug["sliver_merge_events"])
+    assert any(event["reason"] == "skip_not_single_adjacent_room" for event in debug["sliver_merge_events"])
 
 
-def test_post_corridor_small_region_merge_absorbs_tiny_sliver_into_one_larger_neighbor():
+def test_post_corridor_small_region_merge_requires_single_adjacent_room():
     labels = np.zeros((70, 120), dtype=np.int32)
     labels[8:58, 5:45] = 1
     labels[8:14, 45:58] = 2
@@ -225,10 +263,66 @@ def test_post_corridor_small_region_merge_absorbs_tiny_sliver_into_one_larger_ne
         ),
     )
 
-    assert len([v for v in np.unique(merged) if int(v) > 0]) == 2
-    assert merged[10, 50] in {merged[20, 20], merged[20, 80]}
+    assert len([v for v in np.unique(merged) if int(v) > 0]) == 3
+    assert merged[10, 50] != merged[20, 20]
+    assert merged[10, 50] != merged[20, 80]
     assert merged[20, 20] != merged[20, 80]
-    assert any(event["reason"] == "merge_post_corridor_small_region_to_larger_neighbor" for event in debug["sliver_merge_events"])
+    event = next(event for event in debug["sliver_merge_events"] if event["label"] == 2)
+    assert event["reason"] == "skip_not_single_adjacent_room"
+    assert event["neighbor_count"] == 2
+
+
+def test_post_corridor_small_region_counts_free_reachable_rooms_before_merge():
+    labels = np.zeros((45, 45), dtype=np.int32)
+    labels[18:22, 18:22] = 5
+    labels[10:18, 18:22] = 1
+    labels[26:34, 18:22] = 2
+    labels[18:22, 10:14] = 3
+    labels[18:22, 26:34] = 4
+    free = labels > 0
+    free[18:26, 18:22] = True
+    free[18:22, 14:26] = True
+
+    merged, debug = merge_false_parallel_door_corridor_regions(
+        labels,
+        accepted_candidates=[],
+        free_clean=free,
+        wall_candidate_clean=np.zeros_like(free),
+        filtered_lines=[],
+        resolution_m=0.1,
+        config=CorridorMergeConfig(),
+    )
+
+    assert len([v for v in np.unique(merged) if int(v) > 0]) == 5
+    event = next(event for event in debug["sliver_merge_events"] if event["label"] == 5)
+    assert event["reason"] == "skip_not_single_adjacent_room"
+    assert event["direct_neighbors"] == [1]
+    assert event["free_reachable_neighbors"] == [1, 2, 3, 4]
+    assert event["neighbor_count"] == 4
+
+
+def test_post_corridor_small_region_under_2p5m2_merges_when_touching_one_room_only():
+    labels = np.zeros((70, 80), dtype=np.int32)
+    labels[8:58, 5:45] = 1
+    labels[20:44, 45:55] = 2
+    free = labels > 0
+
+    merged, debug = merge_false_parallel_door_corridor_regions(
+        labels,
+        accepted_candidates=[],
+        free_clean=free,
+        wall_candidate_clean=np.zeros_like(free),
+        filtered_lines=[],
+        resolution_m=0.1,
+        config=CorridorMergeConfig(),
+    )
+
+    assert len([v for v in np.unique(merged) if int(v) > 0]) == 1
+    assert merged[25, 50] == merged[25, 20]
+    event = next(event for event in debug["sliver_merge_events"] if event["label"] == 2)
+    assert event["reason"] == "merge_post_corridor_small_region_to_larger_neighbor"
+    assert event["max_area_m2"] == 2.5
+    assert event["area_m2"] < 2.5
 
 
 def test_post_corridor_small_region_merge_requires_low_surrounding_unknown_ratio():

@@ -5,6 +5,7 @@ import numpy as np
 from isaac_bench.mapping.online_roomseg.separator_candidates import (
     DoorNeckConfig,
     LineExtensionConfig,
+    build_door_neck_candidates_from_extension_intersections,
     build_door_neck_candidates_from_extensions,
     extend_wall_lines_once,
 )
@@ -115,3 +116,83 @@ def test_extension_hit_snaps_from_dilated_halo_to_actual_wall_cell():
     assert accepted[0].hit_type == "real_wall"
     assert accepted[0].p_hit_rc.tolist() == [11.0, 20.0]
     assert accepted[0].debug["hit_cell_snap_target"] == "real_wall"
+
+
+def test_extension_stops_at_near_blocking_wall_before_min_free_cells():
+    free = np.zeros((30, 40), dtype=bool)
+    free[10, 11] = True
+    free[10, 13:20] = True
+    wall = np.zeros_like(free)
+    wall[10, 5:11] = True
+    wall[10, 12] = True
+    wall[10, 20:26] = True
+    unknown = ~(free | wall)
+
+    hits, debug = extend_wall_lines_once(
+        [_line(1, [10, 5], [10, 10])],
+        free_clean=free,
+        wall_target_mask=wall,
+        virtual_target_mask=None,
+        unknown_clean=unknown,
+        resolution_m=0.1,
+        pass_id=2,
+        config=LineExtensionConfig(
+            min_extension_m=0.4,
+            max_extension_m=1.6,
+            free_ratio_min=0.65,
+            unknown_ratio_max=0.5,
+            min_free_cells_between_start_and_hit=3,
+        ),
+    )
+    p1_hit = next(hit for hit in hits if hit.source_endpoint == "p1")
+
+    assert debug["accepted_extension_count"] == 0
+    assert p1_hit.reject_reason == "reject_extension_blocked_by_near_wall"
+    assert p1_hit.hit_type == "blocked_wall"
+    assert p1_hit.debug["blocked_cell"] == [10, 12]
+
+
+def test_crossing_extension_probes_create_virtual_neck_candidates():
+    free = np.zeros((35, 40), dtype=bool)
+    wall = np.zeros_like(free)
+    wall[15, 5:11] = True
+    wall[5:11, 20] = True
+    free[15, 11:23] = True
+    free[11:23, 20] = True
+    unknown = ~(free | wall)
+
+    cfg = LineExtensionConfig(
+        min_extension_m=0.4,
+        max_extension_m=1.6,
+        max_probe_m=1.2,
+        free_ratio_min=0.65,
+        unknown_ratio_max=0.5,
+    )
+    hits, _ = extend_wall_lines_once(
+        [
+            _line(1, [15, 5], [15, 10]),
+            _line(2, [5, 20], [10, 20]),
+        ],
+        free_clean=free,
+        wall_target_mask=wall,
+        virtual_target_mask=None,
+        unknown_clean=unknown,
+        resolution_m=0.1,
+        pass_id=2,
+        config=cfg,
+    )
+
+    candidates, virtual_targets, debug = build_door_neck_candidates_from_extension_intersections(
+        hits,
+        free_clean=free,
+        unknown_clean=unknown,
+        resolution_m=0.1,
+        line_config=cfg,
+        door_config=DoorNeckConfig(min_confidence=0.4),
+    )
+
+    assert debug["intersection_count"] == 1
+    assert debug["candidate_count"] >= 2
+    assert virtual_targets[15, 20]
+    assert {c.debug["candidate_source"] for c in candidates} == {"extension_intersection"}
+    assert all(c.debug["hit_types"] == ["virtual_neck"] for c in candidates)

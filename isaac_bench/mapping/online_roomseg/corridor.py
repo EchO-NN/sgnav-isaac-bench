@@ -63,8 +63,10 @@ class CorridorMergeConfig:
     reject_both_doors_if_middle_corridor_like: bool = True
     min_region_area_m2: float = 0.40
     post_corridor_small_region_merge_enabled: bool = True
-    post_corridor_small_region_max_area_m2: float = 2.00
+    post_corridor_small_region_max_area_m2: float = 2.50
     post_corridor_small_region_max_unknown_ratio: float = 0.20
+    post_corridor_small_region_require_single_neighbor: bool = True
+    post_corridor_small_region_single_neighbor_search_m: float = 0.50
 
     @classmethod
     def from_mapping(cls, data: Mapping[str, object] | None = None) -> "CorridorMergeConfig":
@@ -180,12 +182,16 @@ def merge_false_parallel_door_corridor_regions(
     infos = _label_region_infos(labels, free, distance, float(resolution_m), wall_candidate_clean, filtered_lines, cfg)
     parent = {int(label): int(label) for label in infos}
     merge_events: list[dict] = []
+    rejected_merge_events: list[dict] = []
     pairs = detect_parallel_door_pairs(
         accepted_candidates,
         resolution_m=float(resolution_m),
         config=cfg,
     )
     edges = _door_neck_region_edges(labels, accepted_candidates, free.shape, cfg)
+    wall_total_mask = np.asarray(wall_candidate_clean, dtype=bool)
+    if wall_total_mask.shape != free.shape:
+        wall_total_mask = np.zeros_like(free, dtype=bool)
     protected_raw_labels: set[int] = set()
     for edge in edges:
         left = int(edge["label_a"])
@@ -196,11 +202,37 @@ def merge_false_parallel_door_corridor_regions(
             continue
         if int(other_left["candidate_id"]) == int(other_right["candidate_id"]):
             continue
-        if not _lengths_close(float(other_left["length_m"]), float(other_right["length_m"]), cfg):
-            continue
-        if not _lengths_close(float(edge["length_m"]), float(other_left["length_m"]), cfg):
-            continue
-        if not _lengths_close(float(edge["length_m"]), float(other_right["length_m"]), cfg):
+        shared_total = _edge_total_length_after_noise_fill(edge, wall_total_mask, float(resolution_m))
+        left_total = _edge_total_length_after_noise_fill(other_left, wall_total_mask, float(resolution_m))
+        right_total = _edge_total_length_after_noise_fill(other_right, wall_total_mask, float(resolution_m))
+        if not (
+            _lengths_close(float(shared_total["length_m"]), float(left_total["length_m"]), cfg)
+            and _lengths_close(float(shared_total["length_m"]), float(right_total["length_m"]), cfg)
+            and _lengths_close(float(left_total["length_m"]), float(right_total["length_m"]), cfg)
+        ):
+            rejected_merge_events.append(
+                {
+                    "reason": "reject_parallel_total_edge_length_mismatch",
+                    "shared_edge_candidate": int(edge["candidate_id"]),
+                    "left_other_parallel_edge_candidate": int(other_left["candidate_id"]),
+                    "right_other_parallel_edge_candidate": int(other_right["candidate_id"]),
+                    "merged_regions": [left, right],
+                    "length_tolerance_ratio": float(cfg.parallel_edge_length_tolerance_ratio),
+                    "length_source": "noise_gap_filled_wall_target_plus_candidate",
+                    "shared_edge_candidate_length_m": float(edge["length_m"]),
+                    "left_other_candidate_length_m": float(other_left["length_m"]),
+                    "right_other_candidate_length_m": float(other_right["length_m"]),
+                    "shared_edge_total_length_m": float(shared_total["length_m"]),
+                    "left_other_edge_total_length_m": float(left_total["length_m"]),
+                    "right_other_edge_total_length_m": float(right_total["length_m"]),
+                    "shared_edge_total_p0_rc": shared_total.get("p0_rc"),
+                    "shared_edge_total_p1_rc": shared_total.get("p1_rc"),
+                    "left_other_edge_total_p0_rc": left_total.get("p0_rc"),
+                    "left_other_edge_total_p1_rc": left_total.get("p1_rc"),
+                    "right_other_edge_total_p0_rc": right_total.get("p0_rc"),
+                    "right_other_edge_total_p1_rc": right_total.get("p1_rc"),
+                }
+            )
             continue
         _union(parent, left, right)
         protected_raw_labels.update({int(left), int(right)})
@@ -219,6 +251,22 @@ def merge_false_parallel_door_corridor_regions(
                 "shared_edge_length_m": float(edge["length_m"]),
                 "left_other_edge_length_m": float(other_left["length_m"]),
                 "right_other_edge_length_m": float(other_right["length_m"]),
+                "length_source": "noise_gap_filled_wall_target_plus_candidate",
+                "shared_edge_total_length_m": float(shared_total["length_m"]),
+                "left_other_edge_total_length_m": float(left_total["length_m"]),
+                "right_other_edge_total_length_m": float(right_total["length_m"]),
+                "shared_edge_total_p0_rc": shared_total.get("p0_rc"),
+                "shared_edge_total_p1_rc": shared_total.get("p1_rc"),
+                "left_other_edge_total_p0_rc": left_total.get("p0_rc"),
+                "left_other_edge_total_p1_rc": left_total.get("p1_rc"),
+                "right_other_edge_total_p0_rc": right_total.get("p0_rc"),
+                "right_other_edge_total_p1_rc": right_total.get("p1_rc"),
+                "shared_edge_p0_rc": _edge_point(edge, "p0"),
+                "shared_edge_p1_rc": _edge_point(edge, "p1"),
+                "left_other_edge_p0_rc": _edge_point(other_left, "p0"),
+                "left_other_edge_p1_rc": _edge_point(other_left, "p1"),
+                "right_other_edge_p0_rc": _edge_point(other_right, "p0"),
+                "right_other_edge_p1_rc": _edge_point(other_right, "p1"),
                 "length_tolerance_ratio": float(cfg.parallel_edge_length_tolerance_ratio),
                 "shared_edge_coverage_ratio": float(edge["coverage_ratio"]),
                 "left_other_edge_coverage_ratio": float(other_left["coverage_ratio"]),
@@ -249,6 +297,7 @@ def merge_false_parallel_door_corridor_regions(
                     "label": int(label),
                     "reason": "skip_just_merged_corridor_region",
                     "neighbors": [int(n) for n in _neighbor_labels(strict_out, int(label), iterations=2)],
+                    "source_centroid_rc": _label_centroid_rc(strict_out, int(label)),
                     "area_m2": float(area_m2),
                     "length_m": float(length_m),
                     "corridor_like": bool(corridor_like),
@@ -264,6 +313,7 @@ def merge_false_parallel_door_corridor_regions(
                     "label": int(label),
                     "reason": "skip_surrounding_unknown_ratio_too_high",
                     "neighbors": [int(n) for n in _neighbor_labels(strict_out, int(label), iterations=2)],
+                    "source_centroid_rc": _label_centroid_rc(strict_out, int(label)),
                     "area_m2": float(area_m2),
                     "length_m": float(length_m),
                     "corridor_like": bool(corridor_like),
@@ -272,7 +322,32 @@ def merge_false_parallel_door_corridor_regions(
                 }
             )
             continue
-        neighbors = _neighbor_labels(strict_out, int(label), iterations=2)
+        direct_neighbors = _neighbor_labels(strict_out, int(label), iterations=2)
+        search_cells = max(2, int(round(float(cfg.post_corridor_small_region_single_neighbor_search_m) / max(float(resolution_m), 1e-9))))
+        reachable_neighbors = _free_reachable_neighbor_labels(strict_out, free, int(label), max_iterations=search_cells)
+        neighbors = reachable_neighbors if reachable_neighbors else direct_neighbors
+        if bool(cfg.post_corridor_small_region_require_single_neighbor) and len(neighbors) != 1:
+            sliver_merge_events.append(
+                {
+                    "label": int(label),
+                    "reason": "skip_not_single_adjacent_room",
+                    "neighbors": [int(n) for n in neighbors],
+                    "neighbor_count": int(len(neighbors)),
+                    "direct_neighbors": [int(n) for n in direct_neighbors],
+                    "direct_neighbor_count": int(len(direct_neighbors)),
+                    "free_reachable_neighbors": [int(n) for n in reachable_neighbors],
+                    "free_reachable_neighbor_count": int(len(reachable_neighbors)),
+                    "single_neighbor_search_m": float(cfg.post_corridor_small_region_single_neighbor_search_m),
+                    "source_centroid_rc": _label_centroid_rc(strict_out, int(label)),
+                    "area_m2": float(area_m2),
+                    "length_m": float(length_m),
+                    "corridor_like": bool(corridor_like),
+                    "surrounding_unknown_ratio": float(unknown_ratio),
+                    "max_unknown_ratio": float(cfg.post_corridor_small_region_max_unknown_ratio),
+                    "require_single_neighbor": True,
+                }
+            )
+            continue
         larger_neighbors = [
             int(n)
             for n in neighbors
@@ -284,6 +359,7 @@ def merge_false_parallel_door_corridor_regions(
                     "label": int(label),
                     "reason": "skip_no_adjacent_larger_region",
                     "neighbors": [int(n) for n in neighbors],
+                    "source_centroid_rc": _label_centroid_rc(strict_out, int(label)),
                     "area_m2": float(area_m2),
                     "length_m": float(length_m),
                     "corridor_like": bool(corridor_like),
@@ -300,6 +376,10 @@ def merge_false_parallel_door_corridor_regions(
                 "reason": "merge_post_corridor_small_region_to_larger_neighbor",
                 "target": int(target),
                 "neighbors": [int(n) for n in neighbors],
+                "direct_neighbors": [int(n) for n in direct_neighbors],
+                "free_reachable_neighbors": [int(n) for n in reachable_neighbors],
+                "single_neighbor_search_m": float(cfg.post_corridor_small_region_single_neighbor_search_m),
+                "source_centroid_rc": _label_centroid_rc(strict_out, int(label)),
                 "area_m2": float(area_m2),
                 "target_area_m2": float(strict_infos.get(int(target), {}).get("area_m2", 0.0)),
                 "length_m": float(length_m),
@@ -316,10 +396,13 @@ def merge_false_parallel_door_corridor_regions(
         "parallel_door_pairs": pairs,
         "strict_parallel_door_neck_edges": [_edge_debug(edge) for edge in edges],
         "merge_events": merge_events,
+        "rejected_merge_events": rejected_merge_events[:512],
         "sliver_merge_events": sliver_merge_events,
         "protected_post_corridor_labels": sorted(int(v) for v in protected_strict_labels),
         "post_corridor_small_region_merge_max_area_m2": float(cfg.post_corridor_small_region_max_area_m2),
         "post_corridor_small_region_merge_max_unknown_ratio": float(cfg.post_corridor_small_region_max_unknown_ratio),
+        "post_corridor_small_region_require_single_neighbor": bool(cfg.post_corridor_small_region_require_single_neighbor),
+        "post_corridor_small_region_single_neighbor_search_m": float(cfg.post_corridor_small_region_single_neighbor_search_m),
         "region_infos_before_merge": list(infos.values()),
         "region_infos_after_strict_corridor_merge": list(strict_infos.values()),
         "region_infos_after_merge": list(final_infos.values()),
@@ -478,7 +561,103 @@ def _edge_debug(edge: Mapping[str, object]) -> dict:
         "theta": float(edge.get("theta", 0.0)),
         "length_m": float(edge.get("length_m", 0.0)),
         "coverage_ratio": float(edge.get("coverage_ratio", 0.0)),
+        "p0_rc": _edge_point(edge, "p0"),
+        "p1_rc": _edge_point(edge, "p1"),
     }
+
+
+def _edge_total_length_after_noise_fill(edge: Mapping[str, object], wall_mask: np.ndarray, resolution_m: float) -> dict:
+    candidate = edge.get("candidate")
+    if not isinstance(candidate, SeparatorCandidate):
+        fallback = float(edge.get("length_m", 0.0))
+        return {"length_m": fallback, "source": "candidate_fallback", "p0_rc": None, "p1_rc": None}
+    shape = tuple(np.asarray(wall_mask, dtype=bool).shape[:2])
+    if len(shape) != 2 or shape[0] <= 0 or shape[1] <= 0:
+        fallback = float(candidate.length_m)
+        return {"length_m": fallback, "source": "candidate_fallback", "p0_rc": _edge_point(edge, "p0"), "p1_rc": _edge_point(edge, "p1")}
+    p0 = np.rint(np.asarray(candidate.p0_rc, dtype=np.float32)).astype(np.int32).reshape(-1)
+    p1 = np.rint(np.asarray(candidate.p1_rc, dtype=np.float32)).astype(np.int32).reshape(-1)
+    if p0.size < 2 or p1.size < 2:
+        fallback = float(candidate.length_m)
+        return {"length_m": fallback, "source": "candidate_fallback", "p0_rc": _edge_point(edge, "p0"), "p1_rc": _edge_point(edge, "p1")}
+    merged = np.asarray(wall_mask, dtype=bool).copy()
+    merged |= candidate.mask(shape)
+    horizontal = abs(int(p1[1]) - int(p0[1])) >= abs(int(p1[0]) - int(p0[0]))
+    if horizontal:
+        line = int(round(float(p0[0] + p1[0]) * 0.5))
+        span0 = int(min(p0[1], p1[1]))
+        span1 = int(max(p0[1], p1[1]))
+        lo = max(0, line - 1)
+        hi = min(shape[0], line + 2)
+        profile = np.any(merged[lo:hi, :], axis=0)
+        run = _overlapping_profile_run(profile, span0, span1)
+        if run is None:
+            length_m = float(candidate.length_m)
+            return {"length_m": length_m, "source": "candidate_fallback", "p0_rc": _edge_point(edge, "p0"), "p1_rc": _edge_point(edge, "p1")}
+        start, end = run
+        return {
+            "length_m": float((int(end) - int(start) + 1) * float(resolution_m)),
+            "source": "noise_gap_filled_wall_target_plus_candidate",
+            "p0_rc": [int(line), int(start)],
+            "p1_rc": [int(line), int(end)],
+        }
+    line = int(round(float(p0[1] + p1[1]) * 0.5))
+    span0 = int(min(p0[0], p1[0]))
+    span1 = int(max(p0[0], p1[0]))
+    lo = max(0, line - 1)
+    hi = min(shape[1], line + 2)
+    profile = np.any(merged[:, lo:hi], axis=1)
+    run = _overlapping_profile_run(profile, span0, span1)
+    if run is None:
+        length_m = float(candidate.length_m)
+        return {"length_m": length_m, "source": "candidate_fallback", "p0_rc": _edge_point(edge, "p0"), "p1_rc": _edge_point(edge, "p1")}
+    start, end = run
+    return {
+        "length_m": float((int(end) - int(start) + 1) * float(resolution_m)),
+        "source": "noise_gap_filled_wall_target_plus_candidate",
+        "p0_rc": [int(start), int(line)],
+        "p1_rc": [int(end), int(line)],
+    }
+
+
+def _overlapping_profile_run(profile: np.ndarray, span0: int, span1: int) -> tuple[int, int] | None:
+    arr = np.asarray(profile, dtype=bool)
+    if arr.size == 0:
+        return None
+    lo = max(0, int(min(span0, span1)))
+    hi = min(arr.size - 1, int(max(span0, span1)))
+    best: tuple[int, int] | None = None
+    best_overlap = -1
+    best_len = -1
+    for start, end_exclusive in _runs(arr):
+        end = int(end_exclusive) - 1
+        overlap = max(0, min(end, hi) - max(int(start), lo) + 1)
+        length = int(end) - int(start) + 1
+        if overlap <= 0:
+            continue
+        if overlap > best_overlap or (overlap == best_overlap and length > best_len):
+            best = (int(start), int(end))
+            best_overlap = int(overlap)
+            best_len = int(length)
+    return best
+
+
+def _edge_point(edge: Mapping[str, object], key: str) -> list[int] | None:
+    candidate = edge.get("candidate")
+    if not isinstance(candidate, SeparatorCandidate):
+        return None
+    raw = candidate.p0_rc if key == "p0" else candidate.p1_rc
+    arr = np.asarray(raw, dtype=np.float32).reshape(-1)
+    if arr.size < 2:
+        return None
+    return [int(round(float(arr[0]))), int(round(float(arr[1])))]
+
+
+def _label_centroid_rc(labels: np.ndarray, label: int) -> list[int] | None:
+    coords = np.argwhere(np.asarray(labels, dtype=np.int32) == int(label))
+    if coords.size == 0:
+        return None
+    return [int(round(float(coords[:, 0].mean()))), int(round(float(coords[:, 1].mean())))]
 
 
 def _add_corridor_axis_probes(
@@ -718,6 +897,29 @@ def _neighbor_labels(labels: np.ndarray, label: int, *, iterations: int = 1) -> 
     mask = labels == int(label)
     border = ndimage.binary_dilation(mask, iterations=max(1, int(iterations))) & ~mask
     return sorted(int(v) for v in np.unique(labels[border]) if int(v) > 0)
+
+
+def _free_reachable_neighbor_labels(labels: np.ndarray, free: np.ndarray, label: int, *, max_iterations: int = 10) -> list[int]:
+    arr = np.asarray(labels, dtype=np.int32)
+    free_arr = np.asarray(free, dtype=bool)
+    if arr.shape != free_arr.shape:
+        return []
+    seed = (arr == int(label)) & free_arr
+    if not np.any(seed):
+        return []
+    wave = seed.copy()
+    passable_unlabeled = free_arr & (arr == 0)
+    found: set[int] = set()
+    for _ in range(max(1, int(max_iterations))):
+        border = ndimage.binary_dilation(wave, iterations=1) & ~wave
+        found.update(int(v) for v in np.unique(arr[border & free_arr]) if int(v) > 0 and int(v) != int(label))
+        next_wave = border & passable_unlabeled
+        if not np.any(next_wave):
+            break
+        wave |= next_wave
+    final_border = ndimage.binary_dilation(wave, iterations=1) & ~wave
+    found.update(int(v) for v in np.unique(arr[final_border & free_arr]) if int(v) > 0 and int(v) != int(label))
+    return sorted(found)
 
 
 def _region_surrounding_unknown_ratio(

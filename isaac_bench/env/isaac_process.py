@@ -29,6 +29,45 @@ def _hashable_frame_value(value):
     return value
 
 
+class _KinematicUsdPosePrim:
+    """Small pose wrapper for a visual-only USD prim.
+
+    Closed-loop Isaac benchmark runs integrate robot motion kinematically.  We
+    still want Kaya visible in the GUI, but we do not need the Kaya wheel
+    articulation to participate in PhysX.  This wrapper gives the rest of this
+    module the one method it needs from the robot object: set_world_pose.
+    """
+
+    def __init__(self, prim_path: str) -> None:
+        import omni.usd
+        from pxr import UsdGeom
+
+        self.prim_path = str(prim_path)
+        stage = omni.usd.get_context().get_stage()
+        if stage is None:
+            raise RuntimeError("Isaac stage is unavailable; cannot bind Kaya visual prim")
+        prim = stage.GetPrimAtPath(self.prim_path)
+        if prim is None or not prim.IsValid():
+            raise RuntimeError("Kaya visual prim is unavailable at %s" % self.prim_path)
+        self._prim = prim
+        self._xform_api = UsdGeom.XformCommonAPI(prim)
+
+    def set_world_pose(self, *, position, orientation) -> None:
+        from pxr import Gf, UsdGeom
+
+        pos = [float(v) for v in position]
+        quat = [float(v) for v in orientation]
+        if len(pos) != 3 or len(quat) != 4:
+            raise ValueError("invalid kinematic USD pose")
+        w, _qx, _qy, qz = quat
+        yaw = math.atan2(2.0 * w * qz, 1.0 - 2.0 * qz * qz)
+        self._xform_api.SetTranslate(Gf.Vec3d(pos[0], pos[1], pos[2]))
+        self._xform_api.SetRotate(
+            Gf.Vec3f(0.0, 0.0, math.degrees(yaw)),
+            UsdGeom.XformCommonAPI.RotationOrderXYZ,
+        )
+
+
 class IsaacSimServer:
     def __init__(
         self,
@@ -91,6 +130,10 @@ class IsaacSimServer:
         self.last_camera_frame_token = None
         self.last_camera_frame_sync_updates = 0
         self._logged_cuda_rgb_fallback = False
+        self._kaya_physics_disabled_for_kinematic = False
+        self.robot_pose_sync_failures = 0
+        self.camera_pose_sync_failures = 0
+        self.nearfield_camera_pose_sync_failures = 0
 
     def log(self, message: str) -> None:
         if self.verbose:
@@ -142,36 +185,139 @@ class IsaacSimServer:
             self.log("[isaac] disabled %d imported scene rigid bodies" % removed)
 
     def spawn_kaya(self, pose_world: Tuple[float, float, float, float]) -> None:
-        from isaacsim.robot.wheeled_robots.controllers.holonomic_controller import HolonomicController
-        from isaacsim.robot.wheeled_robots.robots.holonomic_robot_usd_setup import HolonomicRobotUsdSetup
-        from isaacsim.storage.native import get_assets_root_path
+        self.log("[isaac] spawning Kaya kinematic visual proxy")
+        self.create_kaya_visual_proxy("/World/Kaya")
+        self.robot = _KinematicUsdPosePrim("/World/Kaya")
+        self.controller = None
+        self.set_pose_world(pose_world, sync_robot=True)
 
-        from isaac_bench.robot.kaya_spawn import spawn_kaya
+    def create_kaya_visual_proxy(self, prim_path: str) -> None:
+        """Create a lightweight non-PhysX robot marker for kinematic runs.
 
-        self.log("[isaac] spawning Kaya")
-        assets_root = get_assets_root_path()
-        if assets_root is None:
-            raise RuntimeError("Isaac assets root is unavailable; cannot find Kaya USD")
-        kaya_asset_path = assets_root + "/Isaac/Robots/NVIDIA/Kaya/kaya.usd"
-        x, y, z, yaw = pose_world
-        self.robot = spawn_kaya(
-            self.world,
-            "/World/Kaya",
-            "my_kaya",
-            kaya_asset_path,
-            np.asarray([x, y, z], dtype=np.float32),
-            yaw_to_quat_wxyz(yaw),
-        )
-        kaya_setup = HolonomicRobotUsdSetup(robot_prim_path=self.robot.prim_path, com_prim_path="/World/Kaya/base_link/control_offset")
-        wheel_radius, wheel_positions, wheel_orientations, mecanum_angles, wheel_axis, up_axis = kaya_setup.get_holonomic_controller_params()
-        self.controller = HolonomicController(
-            name="holonomic_controller",
-            wheel_radius=wheel_radius,
-            wheel_positions=wheel_positions,
-            wheel_orientations=wheel_orientations,
-            mecanum_angles=mecanum_angles,
-            wheel_axis=wheel_axis,
-            up_axis=up_axis,
+        The closed-loop benchmark owns the robot pose directly and only needs a
+        GUI-visible body aligned with the camera.  Referencing the full Kaya USD
+        brings in wheel articulation and roller rigid bodies; in Isaac 5.1 those
+        can produce invalid PhysX transforms when the benchmark also teleports
+        the base kinematically.  A pure USD proxy avoids the physics subsystem
+        entirely while preserving a visible robot pose in non-headless runs.
+        """
+        import omni.usd
+        from pxr import Gf, UsdGeom
+
+        stage = omni.usd.get_context().get_stage()
+        if stage is None:
+            raise RuntimeError("Isaac stage is unavailable; cannot create Kaya visual proxy")
+        root = stage.DefinePrim(str(prim_path), "Xform")
+        UsdGeom.XformCommonAPI(root).SetTranslate(Gf.Vec3d(0.0, 0.0, 0.0))
+
+        base = UsdGeom.Cylinder.Define(stage, str(prim_path) + "/base")
+        base.CreateRadiusAttr(0.24)
+        base.CreateHeightAttr(0.11)
+        base.CreateAxisAttr("Z")
+        base.CreateDisplayColorAttr([Gf.Vec3f(0.05, 0.28, 0.95)])
+        UsdGeom.XformCommonAPI(base.GetPrim()).SetTranslate(Gf.Vec3d(0.0, 0.0, 0.075))
+
+        heading = UsdGeom.Cube.Define(stage, str(prim_path) + "/heading")
+        heading.CreateSizeAttr(1.0)
+        heading.CreateDisplayColorAttr([Gf.Vec3f(1.0, 0.15, 0.05)])
+        heading_xform = UsdGeom.XformCommonAPI(heading.GetPrim())
+        heading_xform.SetTranslate(Gf.Vec3d(0.18, 0.0, 0.15))
+        heading_xform.SetScale(Gf.Vec3f(0.22, 0.035, 0.035))
+
+        mast = UsdGeom.Cylinder.Define(stage, str(prim_path) + "/camera_mast")
+        mast.CreateRadiusAttr(0.025)
+        mast.CreateHeightAttr(0.65)
+        mast.CreateAxisAttr("Z")
+        mast.CreateDisplayColorAttr([Gf.Vec3f(0.1, 0.1, 0.1)])
+        UsdGeom.XformCommonAPI(mast.GetPrim()).SetTranslate(Gf.Vec3d(0.0, 0.0, 0.43))
+
+    def disable_kaya_physics_for_kinematic_pose(self) -> None:
+        """Treat Kaya as a visual kinematic body during closed-loop benchmark runs.
+
+        The benchmark integrates robot motion kinematically and reads RGB-D from
+        cameras attached to that pose.  If the full Kaya articulation remains in
+        PhysX while we also set the robot pose directly, Isaac can emit repeated
+        "Invalid PhysX transform" warnings for roller child bodies.  Removing the
+        physics APIs from the Kaya subtree keeps the visual robot and cameras
+        synchronized without asking PhysX to solve the wheel articulation.
+        """
+        if self._kaya_physics_disabled_for_kinematic:
+            return
+        try:
+            import omni.usd
+            from pxr import Sdf, UsdPhysics
+        except Exception as exc:
+            self.log("[isaac] Kaya kinematic physics cleanup skipped: %s" % exc)
+            return
+        try:
+            from pxr import PhysxSchema
+        except Exception:
+            PhysxSchema = None
+        stage = omni.usd.get_context().get_stage()
+        if stage is None:
+            return
+
+        physics_apis = [
+            getattr(UsdPhysics, "RigidBodyAPI", None),
+            getattr(UsdPhysics, "CollisionAPI", None),
+            getattr(UsdPhysics, "MassAPI", None),
+            getattr(UsdPhysics, "ArticulationRootAPI", None),
+            getattr(UsdPhysics, "MeshCollisionAPI", None),
+            getattr(PhysxSchema, "PhysxRigidBodyAPI", None) if PhysxSchema is not None else None,
+            getattr(PhysxSchema, "PhysxCollisionAPI", None) if PhysxSchema is not None else None,
+            getattr(PhysxSchema, "PhysxArticulationAPI", None) if PhysxSchema is not None else None,
+            getattr(PhysxSchema, "PhysxMeshCollisionAPI", None) if PhysxSchema is not None else None,
+        ]
+        removed = 0
+        disabled_attrs = 0
+        deactivated = 0
+        for prim in stage.Traverse():
+            path = str(prim.GetPath())
+            if not path.startswith("/World/Kaya"):
+                continue
+            type_name = str(prim.GetTypeName() or "")
+            if ("Joint" in type_name and ("Physics" in type_name or "Physx" in type_name)) or type_name.startswith("Physics"):
+                try:
+                    prim.SetActive(False)
+                    deactivated += 1
+                    continue
+                except Exception:
+                    pass
+            try:
+                applied_schemas = list(prim.GetAppliedSchemas())
+                kept_schemas = [
+                    schema
+                    for schema in applied_schemas
+                    if "physics" not in str(schema).lower() and "physx" not in str(schema).lower()
+                ]
+                if len(kept_schemas) != len(applied_schemas):
+                    prim.SetMetadata("apiSchemas", Sdf.TokenListOp.CreateExplicit(kept_schemas))
+                    removed += len(applied_schemas) - len(kept_schemas)
+            except Exception:
+                pass
+            for api in physics_apis:
+                if api is None:
+                    continue
+                try:
+                    if prim.HasAPI(api):
+                        prim.RemoveAPI(api)
+                        removed += 1
+                except Exception:
+                    continue
+            for attr in prim.GetAttributes():
+                name = attr.GetName().lower()
+                if name in {"physics:collisionenabled", "physics:rigidbodyenabled"} or (
+                    (name.startswith("physics:") or name.startswith("physx")) and name.endswith(":enabled")
+                ):
+                    try:
+                        attr.Set(False)
+                        disabled_attrs += 1
+                    except Exception:
+                        continue
+        self._kaya_physics_disabled_for_kinematic = True
+        self.log(
+            "[isaac] Kaya visual-only sync: removed %d physics APIs, disabled %d attrs, deactivated %d physics prims"
+            % (removed, disabled_attrs, deactivated)
         )
 
     def camera_pose_from_base(self, pose_world: Tuple[float, float, float, float]) -> Tuple[float, float, float, float]:
@@ -358,8 +504,10 @@ class IsaacSimServer:
                     position=np.asarray([x, y, z], dtype=np.float32),
                     orientation=quat,
                 )
-            except Exception:
-                pass
+            except Exception as exc:
+                self.robot_pose_sync_failures += 1
+                if self.robot_pose_sync_failures == 1:
+                    self.log("[isaac] robot visual pose sync failed: %s" % exc)
         if self.camera is not None:
             cam_x, cam_y, cam_z, _ = self.camera_pose_from_base((x, y, z, yaw))
             try:
@@ -367,8 +515,10 @@ class IsaacSimServer:
                     position=np.asarray([cam_x, cam_y, cam_z], dtype=np.float32),
                     orientation=self.camera_orientation(yaw),
                 )
-            except Exception:
-                pass
+            except Exception as exc:
+                self.camera_pose_sync_failures += 1
+                if self.camera_pose_sync_failures == 1:
+                    self.log("[isaac] camera pose sync failed: %s" % exc)
         if self.nearfield_camera is not None:
             near_x, near_y, near_z, _ = self.nearfield_camera_pose_from_base((x, y, z, yaw))
             try:
@@ -376,8 +526,10 @@ class IsaacSimServer:
                     position=np.asarray([near_x, near_y, near_z], dtype=np.float32),
                     orientation=self.nearfield_camera_orientation((x, y, z, yaw)),
                 )
-            except Exception:
-                pass
+            except Exception as exc:
+                self.nearfield_camera_pose_sync_failures += 1
+                if self.nearfield_camera_pose_sync_failures == 1:
+                    self.log("[isaac] nearfield camera pose sync failed: %s" % exc)
 
     def reset_episode(
         self,
@@ -465,11 +617,11 @@ class IsaacSimServer:
             yaw -= 2.0 * math.pi
         while yaw < -math.pi:
             yaw += 2.0 * math.pi
-        # Closed-loop SG-Nav uses a kinematic observation pose.  Moving the
-        # PhysX Kaya articulation every frame with set_world_pose can corrupt
-        # the articulation transform/broadphase state after repeated updates.
-        # Keep the robot prim at its reset pose and move only the sensor pose.
-        self.set_pose_world((x + dx * dt, y + dy * dt, z, yaw), sync_robot=False)
+        # Keep the rendered Kaya body and the RGB-D camera on the same
+        # kinematic pose.  The closed-loop controller still computes its pose
+        # from this kinematic state; the visual robot must not lag behind the
+        # sensor in non-headless debugging.
+        self.set_pose_world((x + dx * dt, y + dy * dt, z, yaw), sync_robot=True)
         for _ in range(int(render_updates)):
             self.app.update()
         self._wait_for_fresh_camera_frame(previous_frame_token, read_depth=self.enable_depth if read_depth is None else bool(read_depth))
@@ -626,6 +778,10 @@ class IsaacSimServer:
             "camera_rendering_frame": frame.get("rendering_frame") if isinstance(frame, dict) else None,
             "camera_rendering_time": frame.get("rendering_time") if isinstance(frame, dict) else None,
             "camera_frame_sync_updates": int(self.last_camera_frame_sync_updates),
+            "visual_robot_proxy": True,
+            "robot_pose_sync_failures": int(self.robot_pose_sync_failures),
+            "camera_pose_sync_failures": int(self.camera_pose_sync_failures),
+            "nearfield_camera_pose_sync_failures": int(self.nearfield_camera_pose_sync_failures),
             "sim_time": 0.0,
             "collided": False,
         }

@@ -37,7 +37,7 @@ def _server_for_kinematic_step() -> IsaacSimServer:
     return server
 
 
-def test_kinematic_step_moves_cameras_without_forcing_robot_articulation_pose():
+def test_kinematic_step_moves_robot_and_cameras_together():
     server = _server_for_kinematic_step()
     server.set_pose_world((1.0, 2.0, 0.05, 0.0), sync_robot=True)
 
@@ -49,7 +49,7 @@ def test_kinematic_step_moves_cameras_without_forcing_robot_articulation_pose():
     assert obs["pose_world"][0] == pytest.approx(1.1)
     assert obs["pose_world"][3] == pytest.approx(0.2)
     assert server.app.updates == 3
-    assert len(server.robot.calls) == 1
+    assert len(server.robot.calls) == 2
     assert len(server.camera.calls) == 2
     assert len(server.nearfield_camera.calls) == 2
 

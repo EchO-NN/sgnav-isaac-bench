@@ -47,6 +47,34 @@ def test_frontier_commitment_reached_clears_active_and_selects_next():
     assert reached.metadata["active_frontier_id"] == manager.active.stable_id
 
 
+def test_frontier_commitment_does_not_reach_on_non_target_cluster_member():
+    planner = GridAStarPlanner(np.ones((40, 40), dtype=bool), resolution_m=0.1)
+    manager = FrontierCommitmentManager(resolution_m=0.1, reached_radius_m=0.25, no_progress_steps=999)
+    a = FrontierCluster((10, 10), (1.0, 1.0), [(10, 10), (10, 11), (20, 20)], 3, 5.0)
+    b = _frontier((25, 25))
+
+    manager.select([a, b], a, 1.0, (0, 0), 0, planner=planner, target_cells=[(10, 10)], scores_by_index=[1.0, 0.5])
+    out = manager.select([a, b], b, 0.8, (20, 20), 1, planner=planner, scores_by_index=[1.0, 0.8])
+
+    assert out.keep_existing
+    assert out.frontier is a
+    assert out.reason == "continue_committed_frontier"
+
+
+def test_frontier_commitment_reached_uses_frontier_center_not_fallback_target():
+    planner = GridAStarPlanner(np.ones((40, 40), dtype=bool), resolution_m=0.1)
+    manager = FrontierCommitmentManager(resolution_m=0.1, reached_radius_m=0.25, no_progress_steps=999)
+    a = FrontierCluster((10, 10), (1.0, 1.0), [(10, 10), (10, 11), (20, 20)], 3, 5.0)
+    b = _frontier((25, 25))
+
+    manager.select([a, b], a, 1.0, (0, 0), 0, planner=planner, target_cells=[(20, 20)], scores_by_index=[1.0, 0.5])
+    out = manager.select([a, b], b, 0.8, (20, 20), 1, planner=planner, scores_by_index=[1.0, 0.8])
+
+    assert out.keep_existing
+    assert out.frontier is a
+    assert out.reason == "continue_committed_frontier"
+
+
 def test_frontier_commitment_no_progress_blacklists_and_selects_new():
     planner = GridAStarPlanner(np.ones((40, 40), dtype=bool), resolution_m=0.1)
     manager = FrontierCommitmentManager(

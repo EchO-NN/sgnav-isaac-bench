@@ -169,7 +169,7 @@ class LineExtensionConfig:
     sample_step_m: float = 0.05
     hit_radius_m: float = 0.10
     free_ratio_min: float = 0.65
-    unknown_ratio_max: float = 0.10
+    unknown_ratio_max: float = 0.50
     wall_mid_ratio_max: float = 0.15
     require_free_between_start_and_hit: bool = True
     min_free_cells_between_start_and_hit: int = 3
@@ -349,6 +349,36 @@ def trace_line_extension(
         sampled.append((int(rc[0]), int(rc[1])))
         last_point = rc.astype(np.float32)
         free_count = int(sum(1 for r, c in sampled if bool(free[r, c])))
+        if bool(wall_mid[int(rc[0]), int(rc[1])]):
+            if free_count < int(config.min_free_cells_between_start_and_hit):
+                return _line_extension_result(
+                    line,
+                    endpoint,
+                    p_start,
+                    last_point,
+                    sampled,
+                    hit_type="blocked_wall",
+                    hit_candidate_id=None,
+                    reject_reason="reject_extension_blocked_by_near_wall",
+                    pass_id=pass_id,
+                    extension_id=extension_id,
+                    resolution_m=float(resolution_m),
+                    config=config,
+                    debug={
+                        "stop": "blocked_by_near_wall_before_min_free",
+                        "blocked_cell": [int(rc[0]), int(rc[1])],
+                        "_free_clean": free,
+                        "_wall_target": wall_mid,
+                        "_unknown_clean": unknown,
+                    },
+                )
+            hit_type = "real_wall"
+            hit_point = _snap_hit_point_to_target(rc, wall_mid, direction, radius_cells=hit_radius)
+            hit_debug = {
+                "hit_cell_before_snap": [int(rc[0]), int(rc[1])],
+                "hit_cell_snap_target": "real_wall",
+            }
+            break
         if free_count < int(config.min_free_cells_between_start_and_hit):
             continue
         if bool(wall[int(rc[0]), int(rc[1])]):
@@ -486,6 +516,117 @@ def build_door_neck_candidates_from_extensions(
         "rejected_extensions": rejected[:1024],
     }
     return candidates, debug
+
+
+def build_door_neck_candidates_from_extension_intersections(
+    extensions: Sequence[LineExtensionHit],
+    *,
+    free_clean: np.ndarray,
+    unknown_clean: np.ndarray,
+    resolution_m: float,
+    line_config: LineExtensionConfig | Mapping[str, object] | None = None,
+    door_config: DoorNeckConfig | Mapping[str, object] | None = None,
+    start_id: int = 1,
+) -> tuple[list[SeparatorCandidate], np.ndarray, dict]:
+    """Create door/neck candidates where two wall-extension probes cross.
+
+    A red extension probe crossing another red extension probe is meaningful
+    structural evidence, even when neither probe hits an already materialized
+    wall cell.  This helper turns that crossing into virtual-neck endpoints so
+    the normal topology test can decide whether the resulting separator really
+    splits navigable free space.
+    """
+    line_cfg = line_config if isinstance(line_config, LineExtensionConfig) else LineExtensionConfig.from_mapping(line_config)
+    door_cfg = door_config if isinstance(door_config, DoorNeckConfig) else DoorNeckConfig.from_mapping(door_config)
+    free = np.asarray(free_clean, dtype=bool)
+    unknown = np.asarray(unknown_clean, dtype=bool)
+    target = np.zeros_like(free, dtype=bool)
+    if not bool(line_cfg.enabled) or not bool(door_cfg.enabled):
+        return [], target, {"enabled": False, "candidate_count": 0, "reason": "disabled"}
+
+    usable: list[tuple[LineExtensionHit, str, int, int, int]] = []
+    for hit in extensions:
+        if not _extension_can_seed_intersection(hit):
+            continue
+        axis_info = _extension_axis_info(hit, free.shape)
+        if axis_info is None:
+            continue
+        axis, fixed, lo, hi = axis_info
+        if hi <= lo:
+            continue
+        usable.append((hit, axis, fixed, lo, hi))
+
+    candidates: list[SeparatorCandidate] = []
+    events: list[dict] = []
+    seen: set[tuple[int, int, int, int, int]] = set()
+    cid = int(start_id)
+    for idx, (a, axis_a, fixed_a, lo_a, hi_a) in enumerate(usable):
+        for b, axis_b, fixed_b, lo_b, hi_b in usable[idx + 1 :]:
+            if int(a.source_line_id) == int(b.source_line_id):
+                continue
+            if axis_a == axis_b:
+                continue
+            if axis_a == "horizontal":
+                rc = np.asarray([fixed_a, fixed_b], dtype=np.int32)
+                inside = lo_a <= fixed_b <= hi_a and lo_b <= fixed_a <= hi_b
+            else:
+                rc = np.asarray([fixed_b, fixed_a], dtype=np.int32)
+                inside = lo_b <= fixed_a <= hi_b and lo_a <= fixed_b <= hi_a
+            if not inside or not _inside(rc, free.shape) or not bool(free[int(rc[0]), int(rc[1])]):
+                continue
+            pair_events = []
+            for hit in (a, b):
+                candidate = _candidate_from_extension_intersection(
+                    hit,
+                    other_hit=b if hit is a else a,
+                    intersection_rc=rc,
+                    free_clean=free,
+                    unknown_clean=unknown,
+                    resolution_m=float(resolution_m),
+                    line_config=line_cfg,
+                    door_config=door_cfg,
+                    candidate_id=cid,
+                )
+                if candidate is None:
+                    continue
+                key = (
+                    int(candidate.source_segment_ids[0]),
+                    int(candidate.source_segment_ids[1]),
+                    int(round(float(candidate.p0_rc[0]))),
+                    int(round(float(candidate.p0_rc[1]))),
+                    int(rc[0]) * int(free.shape[1]) + int(rc[1]),
+                )
+                if key in seen:
+                    continue
+                seen.add(key)
+                candidates.append(candidate)
+                target[int(rc[0]), int(rc[1])] = True
+                pair_events.append(
+                    {
+                        "candidate_id": int(candidate.candidate_id),
+                        "source_extension_ids": list(candidate.debug.get("source_extension_ids", [])),
+                        "length_m": float(candidate.length_m),
+                    }
+                )
+                cid += 1
+            if pair_events:
+                events.append(
+                    {
+                        "intersection_rc": [int(rc[0]), int(rc[1])],
+                        "source_extension_ids": [int(a.extension_id), int(b.extension_id)],
+                        "source_line_ids": [int(a.source_line_id), int(b.source_line_id)],
+                        "candidates": pair_events,
+                    }
+                )
+    debug = {
+        "enabled": True,
+        "usable_extension_count": int(len(usable)),
+        "intersection_count": int(len(events)),
+        "candidate_count": int(len(candidates)),
+        "virtual_target_cell_count": int(np.count_nonzero(target)),
+        "events": events[:512],
+    }
+    return candidates, target.astype(bool), debug
 
 
 def rasterize_candidates(candidates: Sequence[SeparatorCandidate], shape: tuple[int, int], thickness_cells: int = 0) -> np.ndarray:
@@ -932,6 +1073,129 @@ def _extension_reason_counts(hits: Sequence[LineExtensionHit]) -> dict:
         reason = str(hit.reject_reason or "accepted")
         out[reason] = out.get(reason, 0) + 1
     return out
+
+
+def _extension_can_seed_intersection(hit: LineExtensionHit) -> bool:
+    reason = "" if hit.reject_reason is None else str(hit.reject_reason)
+    if reason in {
+        "reject_extension_blocked_by_near_wall",
+        "reject_extension_crosses_mid_wall",
+        "reject_extension_not_enough_free",
+        "reject_extension_length_out_of_door_range",
+        "reject_low_line_extension_confidence",
+    }:
+        return False
+    if str(hit.hit_type) == "blocked_wall":
+        return False
+    return bool(float(hit.length_m) > 0.0)
+
+
+def _extension_axis_info(hit: LineExtensionHit, shape: tuple[int, int]) -> tuple[str, int, int, int] | None:
+    p0 = np.rint(np.asarray(hit.p_start_rc, dtype=np.float32)).astype(np.int32)
+    p1 = np.rint(np.asarray(hit.p_hit_rc, dtype=np.float32)).astype(np.int32)
+    if not _inside(p0, shape) or not _inside(p1, shape):
+        return None
+    dr = int(p1[0] - p0[0])
+    dc = int(p1[1] - p0[1])
+    if abs(dc) >= abs(dr):
+        fixed = int(round(float((int(p0[0]) + int(p1[0])) / 2.0)))
+        return "horizontal", fixed, int(min(p0[1], p1[1])), int(max(p0[1], p1[1]))
+    fixed = int(round(float((int(p0[1]) + int(p1[1])) / 2.0)))
+    return "vertical", fixed, int(min(p0[0], p1[0])), int(max(p0[0], p1[0]))
+
+
+def _ordered_line_cells(p0_rc: np.ndarray, p1_rc: np.ndarray, shape: tuple[int, int]) -> np.ndarray:
+    p0 = np.rint(np.asarray(p0_rc, dtype=np.float32)).astype(np.int32)
+    p1 = np.rint(np.asarray(p1_rc, dtype=np.float32)).astype(np.int32)
+    dr = int(p1[0] - p0[0])
+    dc = int(p1[1] - p0[1])
+    steps = max(abs(dr), abs(dc))
+    if steps <= 0:
+        rows = np.asarray([int(p0[0])], dtype=np.int32)
+        cols = np.asarray([int(p0[1])], dtype=np.int32)
+    else:
+        rows = np.rint(np.linspace(int(p0[0]), int(p1[0]), steps + 1)).astype(np.int32)
+        cols = np.rint(np.linspace(int(p0[1]), int(p1[1]), steps + 1)).astype(np.int32)
+    inside = (rows >= 0) & (rows < int(shape[0])) & (cols >= 0) & (cols < int(shape[1]))
+    coords = np.stack([rows[inside], cols[inside]], axis=1)
+    if len(coords) <= 1:
+        return coords.astype(np.int32)
+    keep = np.ones(len(coords), dtype=bool)
+    keep[1:] = np.any(coords[1:] != coords[:-1], axis=1)
+    return coords[keep].astype(np.int32)
+
+
+def _candidate_from_extension_intersection(
+    hit: LineExtensionHit,
+    *,
+    other_hit: LineExtensionHit,
+    intersection_rc: np.ndarray,
+    free_clean: np.ndarray,
+    unknown_clean: np.ndarray,
+    resolution_m: float,
+    line_config: LineExtensionConfig,
+    door_config: DoorNeckConfig,
+    candidate_id: int,
+) -> SeparatorCandidate | None:
+    free = np.asarray(free_clean, dtype=bool)
+    unknown = np.asarray(unknown_clean, dtype=bool)
+    start = np.rint(np.asarray(hit.p_start_rc, dtype=np.float32)).astype(np.int32)
+    end = np.rint(np.asarray(intersection_rc, dtype=np.float32)).astype(np.int32)
+    if not _inside(start, free.shape) or not _inside(end, free.shape):
+        return None
+    cells = _ordered_line_cells(start.astype(np.float32), end.astype(np.float32), free.shape)
+    if len(cells) <= 1:
+        return None
+    interior = [(int(r), int(c)) for r, c in cells[1:]]
+    length_m = float((len(cells) - 1) * float(resolution_m))
+    if length_m < float(door_config.min_width_m) or length_m > float(door_config.max_width_m):
+        return None
+    free_ratio = _sample_ratio(interior, free)
+    unknown_ratio = _sample_ratio(interior, unknown)
+    if free_ratio < float(line_config.free_ratio_min) or unknown_ratio > float(line_config.unknown_ratio_max):
+        return None
+    theta = 0.0 if int(start[0]) == int(end[0]) else float(np.pi / 2.0)
+    confidence = float(
+        np.clip(
+            0.35 * float(hit.confidence)
+            + 0.25 * float(other_hit.confidence)
+            + 0.30 * float(free_ratio)
+            + 0.10 * (1.0 - min(1.0, unknown_ratio)),
+            0.0,
+            1.0,
+        )
+    )
+    if confidence < float(door_config.min_confidence):
+        return None
+    return SeparatorCandidate(
+        candidate_id=int(candidate_id),
+        kind="line_extension_door_neck",
+        p0_rc=start.astype(np.float32),
+        p1_rc=end.astype(np.float32),
+        theta=float(theta),
+        length_m=float(length_m),
+        confidence=float(confidence),
+        source_segment_ids=[int(hit.source_line_id), int(other_hit.source_line_id)],
+        wall_support_score=float(max(float(hit.confidence), float(other_hit.confidence))),
+        free_gap_score=float(free_ratio),
+        doorway_score=float(free_ratio),
+        debug={
+            "candidate_source": "extension_intersection",
+            "kind_detail": "door_neck",
+            "pass_id": int(max(int(hit.pass_id), int(other_hit.pass_id))),
+            "source_extension_ids": [int(hit.extension_id), int(other_hit.extension_id)],
+            "source_line_ids": [int(hit.source_line_id), int(other_hit.source_line_id)],
+            "hit_types": ["virtual_neck"],
+            "intersection_rc": [int(end[0]), int(end[1])],
+            "width_m": float(length_m),
+            "neck_score": float(free_ratio),
+            "doorway_score": float(free_ratio),
+            "intersection_free_ratio": float(free_ratio),
+            "intersection_unknown_ratio": float(unknown_ratio),
+            "primary_extension": hit.to_dict(),
+            "cross_extension": other_hit.to_dict(),
+        },
+    )
 
 
 def _candidate_points(axis: str, line: int, gap_start: int, gap_end: int) -> tuple[np.ndarray, np.ndarray, float]:

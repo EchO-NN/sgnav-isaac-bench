@@ -226,8 +226,11 @@ class FrontierCommitmentManager:
             if self.active.no_progress_steps >= self.no_progress_steps:
                 self.active.invalid_reason = "frontier_no_progress"
             return
-        cells = list(self.active.target_cells) + list(matched_active.members)
-        if self._distance_to_cells_m(current_grid, cells) <= self.reached_radius_m:
+        # Commit/reached semantics are tied to the selected frontier center.
+        # The controller may use a fallback member if the center is hard to
+        # plan to, but reaching any member of a wide frontier band would make
+        # exploration abandon the chosen frontier halfway.
+        if self._distance_to_cells_m(current_grid, [self.active.center_grid]) <= self.reached_radius_m:
             self.active.reached = True
             return
         self._update_progress(current_grid, step)

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import time
+from dataclasses import dataclass
 from typing import List, Tuple
 
 import numpy as np
@@ -65,6 +66,10 @@ class OnlineMapper:
         self.static_nearfield_mask = np.zeros_like(self.grid.free, dtype=np.uint8)
         self.roomseg_static_structural_occupied = np.zeros_like(self.grid.free, dtype=np.uint8)
         self.depth_free_mask = np.zeros_like(self.grid.free, dtype=np.uint8)
+        self.depth_obstacle_endpoint_count = np.zeros_like(self.grid.free, dtype=np.uint16)
+        self._obstacle_endpoint_evidence_increment = 2
+        self._free_ray_obstacle_endpoint_decay = 1
+        self.last_inflated_occupied = np.zeros_like(self.grid.free, dtype=bool)
         self.vertical_profile = VerticalProfileMap.zeros(self.grid.free.shape)
         self._reset_roomseg_ray_evidence()
 
@@ -77,6 +82,8 @@ class OnlineMapper:
         self.static_nearfield_mask = np.zeros_like(self.grid.free, dtype=np.uint8)
         self.roomseg_static_structural_occupied = np.zeros_like(self.grid.free, dtype=np.uint8)
         self.depth_free_mask = np.zeros_like(self.grid.free, dtype=np.uint8)
+        self.depth_obstacle_endpoint_count = np.zeros_like(self.grid.free, dtype=np.uint16)
+        self.last_inflated_occupied = np.zeros_like(self.grid.free, dtype=bool)
         self.vertical_profile = VerticalProfileMap.zeros(self.grid.free.shape)
         self._reset_roomseg_ray_evidence()
 
@@ -144,10 +151,7 @@ class OnlineMapper:
         floor_z = float(base_pose_world[2])
 
         rel_z = points_world[:, 2].astype(np.float32) - floor_z
-        rows_cols = np.asarray(
-            [self.grid.world_to_grid(float(point[0]), float(point[1])) for point in points_world],
-            dtype=np.int32,
-        )
+        rows_cols = _world_points_to_grid(points_world, self.grid.map_info)
         in_bounds = (
             (rows_cols[:, 0] >= 0)
             & (rows_cols[:, 0] < self.grid.map_info.height)
@@ -192,86 +196,73 @@ class OnlineMapper:
         ray_clear_mask = (rel_z >= self.free_min_height_m) & (rel_z <= self.obstacle_max_height_m)
         camera_rel_z = float(camera_pose_world[2]) - floor_z
         map_width = int(self.grid.map_info.width)
-        free_flat_values: list[int] = []
-        occupied_flat_values: list[int] = []
-        free_flat_by_band: list[list[int]] = [[] for _ in self.vertical_profile.band_names]
-        roomseg_ray_covered_flat_values: list[int] = []
-        ray_count = 0
-        skipped_height_rays = 0
-        vertical_profile_ray_count = 0
-        vertical_profile_skipped_height_rays = 0
         stage_started_at = time.perf_counter()
-        for endpoint, endpoint_rel_z, endpoint_depth_m, endpoint_is_obstacle, ray_can_clear in zip(
-            rows_cols,
-            rel_z,
-            in_bounds_depth,
-            obstacle_mask,
-            ray_clear_mask,
-        ):
-            nav_can_clear = bool(ray_can_clear)
-            if not nav_can_clear:
-                skipped_height_rays += 1
-            end_cell = (int(endpoint[0]), int(endpoint[1]))
-            line = _bresenham_cells((int(origin_cell[0]), int(origin_cell[1])), end_cell)
-            if not line:
-                continue
-            if nav_can_clear:
-                ray_count += 1
-                free_line = line[:-1] if bool(endpoint_is_obstacle) else line
-                for row, col in free_line:
-                    flat_idx = int(row) * map_width + int(col)
-                    free_flat_values.append(flat_idx)
-            roomseg_ray_valid = bool(
-                np.isfinite(float(endpoint_depth_m))
-                and self.depth_min_m < float(endpoint_depth_m) < self.depth_max_m
-                and is_inside_grid(int(end_cell[0]), int(end_cell[1]), self.grid.map_info)
-            )
-            if roomseg_ray_valid:
-                profile_free_line = line[:-1]
-                added_profile_cells = _append_vertical_profile_free_ray_cells(
-                    free_flat_by_band,
-                    profile_free_line,
-                    map_width=map_width,
-                    origin_rel_z_m=camera_rel_z,
-                    endpoint_rel_z_m=float(endpoint_rel_z),
-                    z_min_m=self.vertical_profile_free_min_height_m,
-                    z_max_m=self.vertical_profile_free_max_height_m,
-                    vertical_profile=self.vertical_profile,
-                )
-                if added_profile_cells > 0:
-                    vertical_profile_ray_count += 1
-                    for row, col in profile_free_line:
-                        roomseg_ray_covered_flat_values.append(int(row) * map_width + int(col))
-                else:
-                    vertical_profile_skipped_height_rays += 1
-                self._mark_roomseg_terminal_wall_cell(
-                    int(end_cell[0]),
-                    int(end_cell[1]),
-                    endpoint_depth_m=float(endpoint_depth_m),
-                    endpoint_rel_z_m=float(endpoint_rel_z),
-                )
-            else:
-                vertical_profile_skipped_height_rays += 1
-            if bool(endpoint_is_obstacle):
-                occupied_flat_values.append(int(end_cell[0]) * map_width + int(end_cell[1]))
-        self._mark_vertical_profile_free_flat(free_flat_by_band)
-        self._mark_roomseg_ray_covered_flat(roomseg_ray_covered_flat_values)
+        ray_result = _collect_ray_cast_evidence(
+            origin_cell=(int(origin_cell[0]), int(origin_cell[1])),
+            endpoints=rows_cols,
+            endpoint_rel_z=rel_z,
+            endpoint_depth_m=in_bounds_depth,
+            endpoint_is_obstacle=obstacle_mask,
+            ray_can_clear=ray_clear_mask,
+            map_width=map_width,
+            depth_min_m=float(self.depth_min_m),
+            depth_max_m=float(self.depth_max_m),
+            camera_rel_z_m=float(camera_rel_z),
+            z_min_m=float(self.vertical_profile_free_min_height_m),
+            z_max_m=float(self.vertical_profile_free_max_height_m),
+            band_ranges_m=self.vertical_profile.band_ranges_m,
+        )
+        self._mark_vertical_profile_free_weighted_flat(
+            ray_result.free_flat_by_band,
+            ray_result.free_weight_by_band,
+        )
+        self._mark_roomseg_ray_covered_weighted_flat(
+            ray_result.roomseg_ray_covered_flat,
+            ray_result.roomseg_ray_covered_weight,
+        )
+        self._mark_roomseg_terminal_wall_flat(
+            ray_result.terminal_wall_flat,
+            ray_result.terminal_wall_depth_m,
+            ray_result.terminal_wall_rel_z_m,
+        )
         self._refresh_roomseg_terminal_wall_splat(radius_cells=1)
         timings["ray_cast_ms"] = _elapsed_ms(stage_started_at)
 
         stage_started_at = time.perf_counter()
-        free_unique = _unique_flat(free_flat_values)
+        free_unique = _unique_flat_array(ray_result.free_flat)
+        free_protected_by_obstacle_endpoint = 0
+        stale_obstacle_endpoint_cells_cleared = 0
         if free_unique.size:
-            rows = free_unique // map_width
-            cols = free_unique % map_width
-            self.grid.free[rows, cols] = 1
-            self.grid.occupied[rows, cols] = 0
-            self.grid.observed[rows, cols] = 1
-            self.depth_free_mask[rows, cols] = 1
-        occupied_unique = _unique_flat(occupied_flat_values)
+            free_flat = np.asarray(free_unique, dtype=np.int64)
+            endpoint_counts = self.depth_obstacle_endpoint_count.reshape(-1)
+            protected = np.asarray(endpoint_counts[free_flat], dtype=np.uint16) > 0
+            free_protected_by_obstacle_endpoint = int(np.count_nonzero(protected))
+            if np.any(protected):
+                protected_flat = free_flat[protected]
+                decayed = np.maximum(
+                    endpoint_counts[protected_flat].astype(np.int32) - int(self._free_ray_obstacle_endpoint_decay),
+                    0,
+                ).astype(np.uint16)
+                endpoint_counts[protected_flat] = decayed
+                newly_clear = protected_flat[decayed == 0]
+                stale_obstacle_endpoint_cells_cleared = int(newly_clear.size)
+                free_flat = np.concatenate([free_flat[~protected], newly_clear]) if newly_clear.size else free_flat[~protected]
+            if free_flat.size:
+                rows = free_flat // map_width
+                cols = free_flat % map_width
+                self.grid.free[rows, cols] = 1
+                self.grid.occupied[rows, cols] = 0
+                self.grid.observed[rows, cols] = 1
+                self.depth_free_mask[rows, cols] = 1
+        occupied_unique = _unique_flat_array(ray_result.occupied_flat)
         if occupied_unique.size:
             rows = occupied_unique // map_width
             cols = occupied_unique % map_width
+            uint16_max = int(np.iinfo(np.uint16).max)
+            flat = np.asarray(occupied_unique, dtype=np.int64)
+            current = self.depth_obstacle_endpoint_count.reshape(-1).astype(np.uint32)
+            current[flat] = np.minimum(current[flat] + int(self._obstacle_endpoint_evidence_increment), uint16_max)
+            self.depth_obstacle_endpoint_count.reshape(-1)[:] = current.astype(np.uint16)
             self.grid.free[rows, cols] = 0
             self.grid.occupied[rows, cols] = 1
             self.grid.observed[rows, cols] = 1
@@ -289,10 +280,14 @@ class OnlineMapper:
             free_mask=free_mask,
             occupied_endpoint_cells=int(occupied_unique.size),
             free_ray_cells=int(free_unique.size),
-            ray_count=ray_count,
-            skipped_height_rays=skipped_height_rays,
-            vertical_profile_ray_count=vertical_profile_ray_count,
-            vertical_profile_skipped_height_rays=vertical_profile_skipped_height_rays,
+            free_protected_by_obstacle_endpoint=int(free_protected_by_obstacle_endpoint),
+            stale_obstacle_endpoint_cells_cleared=int(stale_obstacle_endpoint_cells_cleared),
+            ray_count=int(ray_result.nav_ray_count),
+            skipped_height_rays=int(ray_result.nav_skipped_height_rays),
+            vertical_profile_ray_count=int(ray_result.vertical_profile_ray_count),
+            vertical_profile_skipped_height_rays=int(ray_result.vertical_profile_skipped_height_rays),
+            ray_cast_backend=str(ray_result.backend),
+            ray_unique_endpoint_cells=int(ray_result.unique_endpoint_cells),
             base_pose_world=base_pose_world,
             camera_pose_world=camera_pose_world,
             ray_origin_cell=origin_cell,
@@ -554,6 +549,7 @@ class OnlineMapper:
 
     def traversible(self, unknown_is_obstacle: bool = True) -> np.ndarray:
         occupied = self.inflated_occupied()
+        self.last_inflated_occupied = np.asarray(occupied, dtype=bool)
         if unknown_is_obstacle:
             free = self.grid.free.astype(bool)
         else:
@@ -632,6 +628,17 @@ class OnlineMapper:
         updated = np.asarray(self.roomseg_ray_covered_count, dtype=np.uint32) + counts
         self.roomseg_ray_covered_count[:, :] = np.minimum(updated, uint16_max).astype(np.uint16)
 
+    def _mark_roomseg_ray_covered_weighted_flat(self, flat_values: np.ndarray, weights: np.ndarray) -> None:
+        h, w = self.grid.occupied.shape
+        total_cells = int(h * w)
+        flat, weight = _valid_flat_weight_arrays(flat_values, weights, total_cells)
+        if flat.size == 0:
+            return
+        uint16_max = int(np.iinfo(np.uint16).max)
+        counts = np.bincount(flat, weights=weight, minlength=total_cells).reshape(h, w).astype(np.uint32)
+        updated = np.asarray(self.roomseg_ray_covered_count, dtype=np.uint32) + counts
+        self.roomseg_ray_covered_count[:, :] = np.minimum(updated, uint16_max).astype(np.uint16)
+
     def _mark_roomseg_terminal_wall_cell(
         self,
         row: int,
@@ -671,6 +678,44 @@ class OnlineMapper:
             depth,
         )
 
+    def _mark_roomseg_terminal_wall_flat(
+        self,
+        flat_values: np.ndarray,
+        endpoint_depth_m: np.ndarray,
+        endpoint_rel_z_m: np.ndarray,
+    ) -> None:
+        h, w = self.grid.occupied.shape
+        total_cells = int(h * w)
+        flat = np.asarray(flat_values, dtype=np.int64).reshape(-1)
+        depth = np.asarray(endpoint_depth_m, dtype=np.float32).reshape(-1)
+        rel_z = np.asarray(endpoint_rel_z_m, dtype=np.float32).reshape(-1)
+        if flat.size == 0:
+            return
+        if depth.shape != flat.shape or rel_z.shape != flat.shape:
+            raise ValueError("terminal wall flat/depth/height arrays must have the same shape")
+        valid = (
+            (flat >= 0)
+            & (flat < total_cells)
+            & np.isfinite(depth)
+            & (depth > float(self.depth_min_m))
+            & (depth < float(self.depth_max_m))
+            & np.isfinite(rel_z)
+            & (rel_z >= float(self.vertical_profile_free_min_height_m))
+            & (rel_z <= float(self.vertical_profile_free_max_height_m))
+        )
+        if int(np.count_nonzero(valid)) == 0:
+            return
+        flat = flat[valid]
+        depth = depth[valid]
+        rel_z = rel_z[valid]
+        uint16_max = int(np.iinfo(np.uint16).max)
+        counts = np.bincount(flat, minlength=total_cells).astype(np.uint32)
+        current = self.roomseg_terminal_wall_count.reshape(-1).astype(np.uint32)
+        self.roomseg_terminal_wall_count.reshape(-1)[:] = np.minimum(current + counts, uint16_max).astype(np.uint16)
+        np.minimum.at(self.roomseg_terminal_wall_height_min.reshape(-1), flat, rel_z)
+        np.maximum.at(self.roomseg_terminal_wall_height_max.reshape(-1), flat, rel_z)
+        np.minimum.at(self.roomseg_terminal_wall_depth_min.reshape(-1), flat, depth)
+
     def _refresh_roomseg_terminal_wall_splat(self, radius_cells: int = 1, min_count: int = 1) -> None:
         terminal = np.asarray(self.roomseg_terminal_wall_count, dtype=np.uint32) >= max(1, int(min_count))
         self.roomseg_terminal_wall_splat[:, :] = _dilate_binary(terminal, int(radius_cells)).astype(np.uint8)
@@ -684,6 +729,27 @@ class OnlineMapper:
             if flat.size == 0:
                 continue
             counts = np.bincount(flat, minlength=total_cells).reshape(h, w).astype(np.uint32)
+            free_updated = np.asarray(self.vertical_profile.free_ray_count[band_idx], dtype=np.uint32) + counts
+            observed_updated = np.asarray(self.vertical_profile.observed_count[band_idx], dtype=np.uint32) + counts
+            self.vertical_profile.free_ray_count[band_idx][:, :] = np.minimum(free_updated, uint16_max).astype(np.uint16)
+            self.vertical_profile.observed_count[band_idx][:, :] = np.minimum(observed_updated, uint16_max).astype(np.uint16)
+            touched = np.flatnonzero(counts.reshape(-1) > 0)
+            if touched.size:
+                self.vertical_profile.unknown_count[band_idx].reshape(-1)[touched] = 0
+
+    def _mark_vertical_profile_free_weighted_flat(
+        self,
+        flat_indices_by_band: List[np.ndarray],
+        weights_by_band: List[np.ndarray],
+    ) -> None:
+        h, w = self.grid.occupied.shape
+        total_cells = int(h * w)
+        uint16_max = int(np.iinfo(np.uint16).max)
+        for band_idx, (flat_values, weights) in enumerate(zip(flat_indices_by_band, weights_by_band)):
+            flat, weight = _valid_flat_weight_arrays(flat_values, weights, total_cells)
+            if flat.size == 0:
+                continue
+            counts = np.bincount(flat, weights=weight, minlength=total_cells).reshape(h, w).astype(np.uint32)
             free_updated = np.asarray(self.vertical_profile.free_ray_count[band_idx], dtype=np.uint32) + counts
             observed_updated = np.asarray(self.vertical_profile.observed_count[band_idx], dtype=np.uint32) + counts
             self.vertical_profile.free_ray_count[band_idx][:, :] = np.minimum(free_updated, uint16_max).astype(np.uint16)
@@ -735,10 +801,14 @@ class OnlineMapper:
         free_mask: np.ndarray,
         occupied_endpoint_cells: int,
         free_ray_cells: int,
+        free_protected_by_obstacle_endpoint: int,
+        stale_obstacle_endpoint_cells_cleared: int,
         ray_count: int,
         skipped_height_rays: int,
         vertical_profile_ray_count: int,
         vertical_profile_skipped_height_rays: int,
+        ray_cast_backend: str,
+        ray_unique_endpoint_cells: int,
         base_pose_world: Tuple[float, float, float, float],
         camera_pose_world: Tuple[float, float, float, float],
         ray_origin_cell: Tuple[int, int],
@@ -754,6 +824,8 @@ class OnlineMapper:
             "depth_shape": [int(v) for v in depth_arr.shape],
             "depth_stride_px": int(self.depth_stride_px),
             "vertical_profile_depth_stride_px": int(self.depth_stride_px),
+            "ray_cast_backend": str(ray_cast_backend),
+            "ray_unique_endpoint_cells": int(ray_unique_endpoint_cells),
             "base_pose_world": [float(v) for v in base_pose_world],
             "camera_pose_world": [float(v) for v in camera_pose_world],
             "ray_origin_cell": [int(ray_origin_cell[0]), int(ray_origin_cell[1])],
@@ -775,6 +847,12 @@ class OnlineMapper:
             "negative_height_points": int(np.count_nonzero(rel_z < -0.05)),
             "occupied_endpoint_cells": int(occupied_endpoint_cells),
             "free_ray_cells": int(free_ray_cells),
+            "free_ray_cells_protected_by_obstacle_endpoint": int(free_protected_by_obstacle_endpoint),
+            "stale_obstacle_endpoint_cells_cleared_by_free_rays": int(stale_obstacle_endpoint_cells_cleared),
+            "obstacle_endpoint_evidence_increment": int(self._obstacle_endpoint_evidence_increment),
+            "free_ray_obstacle_endpoint_decay": int(self._free_ray_obstacle_endpoint_decay),
+            "depth_obstacle_endpoint_cells": int(np.count_nonzero(self.depth_obstacle_endpoint_count)),
+            "depth_obstacle_endpoint_count_sum": int(np.sum(self.depth_obstacle_endpoint_count, dtype=np.uint64)),
             "obstacle_splat_cells": int(occupied_endpoint_cells),
             "free_splat_cells": int(free_ray_cells),
             "image_bands": {
@@ -841,6 +919,169 @@ def _elapsed_ms(started_at: float) -> float:
     return max(0.0, (time.perf_counter() - float(started_at)) * 1000.0)
 
 
+@dataclass
+class _RayCastEvidence:
+    backend: str
+    free_flat: np.ndarray
+    occupied_flat: np.ndarray
+    free_flat_by_band: List[np.ndarray]
+    free_weight_by_band: List[np.ndarray]
+    roomseg_ray_covered_flat: np.ndarray
+    roomseg_ray_covered_weight: np.ndarray
+    terminal_wall_flat: np.ndarray
+    terminal_wall_depth_m: np.ndarray
+    terminal_wall_rel_z_m: np.ndarray
+    nav_ray_count: int
+    nav_skipped_height_rays: int
+    vertical_profile_ray_count: int
+    vertical_profile_skipped_height_rays: int
+    unique_endpoint_cells: int
+
+
+def _world_points_to_grid(points_world: np.ndarray, info: MapInfo) -> np.ndarray:
+    points = np.asarray(points_world, dtype=np.float32)
+    if points.size == 0:
+        return np.zeros((0, 2), dtype=np.int32)
+    cols = np.floor((points[:, 0].astype(np.float64) - float(info.min_x)) / float(info.resolution_m)).astype(np.int32)
+    rows = np.floor((float(info.max_y) - points[:, 1].astype(np.float64)) / float(info.resolution_m)).astype(np.int32)
+    return np.stack([rows, cols], axis=1)
+
+
+def _collect_ray_cast_evidence(
+    *,
+    origin_cell: Tuple[int, int],
+    endpoints: np.ndarray,
+    endpoint_rel_z: np.ndarray,
+    endpoint_depth_m: np.ndarray,
+    endpoint_is_obstacle: np.ndarray,
+    ray_can_clear: np.ndarray,
+    map_width: int,
+    depth_min_m: float,
+    depth_max_m: float,
+    camera_rel_z_m: float,
+    z_min_m: float,
+    z_max_m: float,
+    band_ranges_m: Tuple[Tuple[float, float], ...],
+) -> _RayCastEvidence:
+    cells = np.asarray(endpoints, dtype=np.int32).reshape(-1, 2)
+    rel_z = np.asarray(endpoint_rel_z, dtype=np.float32).reshape(-1)
+    depth = np.asarray(endpoint_depth_m, dtype=np.float32).reshape(-1)
+    obstacle = np.asarray(endpoint_is_obstacle, dtype=bool).reshape(-1)
+    clear = np.asarray(ray_can_clear, dtype=bool).reshape(-1)
+    n = int(cells.shape[0])
+    if not (len(rel_z) == len(depth) == len(obstacle) == len(clear) == n):
+        raise ValueError("ray evidence arrays must have matching lengths")
+    band_count = len(tuple(band_ranges_m))
+    empty_i64 = np.zeros((0,), dtype=np.int64)
+    empty_f32 = np.zeros((0,), dtype=np.float32)
+    if n == 0:
+        return _RayCastEvidence(
+            backend="endpoint_grouped_bresenham",
+            free_flat=empty_i64,
+            occupied_flat=empty_i64,
+            free_flat_by_band=[empty_i64.copy() for _ in range(band_count)],
+            free_weight_by_band=[empty_i64.copy() for _ in range(band_count)],
+            roomseg_ray_covered_flat=empty_i64,
+            roomseg_ray_covered_weight=empty_i64,
+            terminal_wall_flat=empty_i64,
+            terminal_wall_depth_m=empty_f32,
+            terminal_wall_rel_z_m=empty_f32,
+            nav_ray_count=0,
+            nav_skipped_height_rays=0,
+            vertical_profile_ray_count=0,
+            vertical_profile_skipped_height_rays=0,
+            unique_endpoint_cells=0,
+        )
+
+    width = int(map_width)
+    endpoint_flat = cells[:, 0].astype(np.int64) * width + cells[:, 1].astype(np.int64)
+    order = np.argsort(endpoint_flat, kind="stable")
+    sorted_flat = endpoint_flat[order]
+    unique_flat, starts, counts = np.unique(sorted_flat, return_index=True, return_counts=True)
+
+    lo = np.maximum(float(z_min_m), np.minimum(float(camera_rel_z_m), rel_z.astype(np.float32)))
+    hi = np.minimum(float(z_max_m), np.maximum(float(camera_rel_z_m), rel_z.astype(np.float32)))
+    valid_interval = hi >= lo
+    band_bits = np.zeros((n,), dtype=np.uint8)
+    for band_idx, (band_lo, band_hi) in enumerate(band_ranges_m):
+        band_mask = valid_interval & (float(band_hi) > lo) & (float(band_lo) < hi)
+        if np.any(band_mask):
+            band_bits[band_mask] |= np.uint8(1 << int(band_idx))
+
+    roomseg_ray_valid = np.isfinite(depth) & (depth > float(depth_min_m)) & (depth < float(depth_max_m))
+    terminal_valid = roomseg_ray_valid & np.isfinite(rel_z) & (rel_z >= float(z_min_m)) & (rel_z <= float(z_max_m))
+
+    free_chunks: list[np.ndarray] = []
+    covered_chunks: list[np.ndarray] = []
+    covered_weight_chunks: list[np.ndarray] = []
+    band_flat_chunks: list[list[np.ndarray]] = [[] for _ in range(band_count)]
+    band_weight_chunks: list[list[np.ndarray]] = [[] for _ in range(band_count)]
+    nav_ray_count = 0
+    vertical_profile_ray_count = 0
+
+    for endpoint, start, count in zip(unique_flat, starts, counts):
+        group_indices = order[int(start) : int(start) + int(count)]
+        end_row = int(endpoint // width)
+        end_col = int(endpoint % width)
+        line = _bresenham_cells(origin_cell, (end_row, end_col))
+        if not line:
+            continue
+        line_flat = np.fromiter((int(row) * width + int(col) for row, col in line), dtype=np.int64)
+        group_clear = group_indices[clear[group_indices]]
+        if group_clear.size:
+            nav_ray_count += int(group_clear.size)
+            if np.any(~obstacle[group_clear]):
+                free_chunks.append(line_flat)
+            elif line_flat.size > 1:
+                free_chunks.append(line_flat[:-1])
+
+        profile_line_flat = line_flat[:-1]
+        if profile_line_flat.size == 0:
+            continue
+        valid_group = group_indices[roomseg_ray_valid[group_indices] & (band_bits[group_indices] > 0)]
+        if valid_group.size == 0:
+            continue
+        group_bits = band_bits[valid_group]
+        unique_bits, bit_counts = np.unique(group_bits, return_counts=True)
+        for bits, bits_count in zip(unique_bits, bit_counts):
+            count_int = int(bits_count)
+            if count_int <= 0:
+                continue
+            vertical_profile_ray_count += count_int
+            covered_chunks.append(profile_line_flat)
+            covered_weight_chunks.append(np.full(profile_line_flat.shape, count_int, dtype=np.int64))
+            for band_idx in range(band_count):
+                if int(bits) & (1 << int(band_idx)):
+                    band_flat_chunks[band_idx].append(profile_line_flat)
+                    band_weight_chunks[band_idx].append(np.full(profile_line_flat.shape, count_int, dtype=np.int64))
+
+    occupied_flat = endpoint_flat[obstacle]
+    terminal_flat = endpoint_flat[terminal_valid]
+    return _RayCastEvidence(
+        backend="endpoint_grouped_bresenham",
+        free_flat=_concat_i64(free_chunks),
+        occupied_flat=np.asarray(occupied_flat, dtype=np.int64),
+        free_flat_by_band=[_concat_i64(chunks) for chunks in band_flat_chunks],
+        free_weight_by_band=[_concat_i64(chunks) for chunks in band_weight_chunks],
+        roomseg_ray_covered_flat=_concat_i64(covered_chunks),
+        roomseg_ray_covered_weight=_concat_i64(covered_weight_chunks),
+        terminal_wall_flat=np.asarray(terminal_flat, dtype=np.int64),
+        terminal_wall_depth_m=np.asarray(depth[terminal_valid], dtype=np.float32),
+        terminal_wall_rel_z_m=np.asarray(rel_z[terminal_valid], dtype=np.float32),
+        nav_ray_count=int(nav_ray_count),
+        nav_skipped_height_rays=int(n - nav_ray_count),
+        vertical_profile_ray_count=int(vertical_profile_ray_count),
+        vertical_profile_skipped_height_rays=int(n - vertical_profile_ray_count),
+        unique_endpoint_cells=int(len(unique_flat)),
+    )
+
+
+def _concat_i64(chunks: list[np.ndarray]) -> np.ndarray:
+    if not chunks:
+        return np.zeros((0,), dtype=np.int64)
+    return np.concatenate([np.asarray(chunk, dtype=np.int64).reshape(-1) for chunk in chunks]).astype(np.int64, copy=False)
+
+
 def _valid_flat_array(values: List[int], total_cells: int) -> np.ndarray:
     if not values:
         return np.zeros((0,), dtype=np.int64)
@@ -848,10 +1089,28 @@ def _valid_flat_array(values: List[int], total_cells: int) -> np.ndarray:
     return arr[(arr >= 0) & (arr < int(total_cells))]
 
 
+def _valid_flat_weight_arrays(values: np.ndarray, weights: np.ndarray, total_cells: int) -> tuple[np.ndarray, np.ndarray]:
+    arr = np.asarray(values, dtype=np.int64).reshape(-1)
+    weight = np.asarray(weights, dtype=np.float64).reshape(-1)
+    if arr.size == 0:
+        return np.zeros((0,), dtype=np.int64), np.zeros((0,), dtype=np.float64)
+    if arr.shape != weight.shape:
+        raise ValueError("flat value and weight arrays must have the same shape")
+    valid = (arr >= 0) & (arr < int(total_cells)) & np.isfinite(weight) & (weight > 0.0)
+    return arr[valid], weight[valid]
+
+
 def _unique_flat(values: List[int]) -> np.ndarray:
     if not values:
         return np.zeros((0,), dtype=np.int64)
     return np.unique(np.asarray(values, dtype=np.int64))
+
+
+def _unique_flat_array(values: np.ndarray) -> np.ndarray:
+    arr = np.asarray(values, dtype=np.int64).reshape(-1)
+    if arr.size == 0:
+        return np.zeros((0,), dtype=np.int64)
+    return np.unique(arr)
 
 
 def _append_vertical_profile_free_ray_cells(

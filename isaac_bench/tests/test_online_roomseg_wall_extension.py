@@ -169,8 +169,12 @@ def test_virtual_separator_cells_are_absorbed_into_room_masks():
     result = _run(free, occupied)
     structural = result.layers["structural_wall_free_overlap"]
     virtual_separator = result.layers["accepted_separators_after_corridor_merge"] & result.layers["free_clean"] & ~structural
+    pass2_completion = result.layers["pass2_line_extension_completion"]
+    wall_after_extension = result.layers["wall_target_after_line_extension"]
 
     assert np.count_nonzero(virtual_separator) > 0
+    assert np.count_nonzero(pass2_completion) > 0
+    assert np.all(wall_after_extension[pass2_completion])
     assert not np.any(virtual_separator & (result.room_label_map <= 0))
     assert result.debug["virtual_separator_label_fill"]["filled_cell_count"] > 0
 
@@ -297,6 +301,12 @@ def test_debug_report_written(tmp_path):
     report = json.loads(open(paths["separator_report"], "r", encoding="utf-8").read())
 
     assert report["accepted_count"] >= 1
+    assert report["line_extension_passes_requested"] == 2
+    assert report["pass2_extension_enabled"] is True
+    assert report["pass1_extension_count"] == 0
+    assert report["pass1_candidate_count"] == 0
+    assert report["pass2_extension_count"] > 0
+    assert report["pass2_candidate_count"] >= 1
     assert report["wall_segment_count"] > 0
     assert report["snapped_wall_run_count"] > 0
     assert report["merged_wall_run_count"] > 0
