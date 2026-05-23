@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from isaac_bench.mapping.online_roomseg import OnlineRoseStyleConfig, run_online_rose_style_roomseg
+from isaac_bench.mapping.online_roomseg import ONLINE_LINE_EXTEND_ROOMSEG_V4_BACKEND, OnlineRoseStyleConfig, run_online_rose_style_roomseg
 from isaac_bench.mapping.online_roomseg.separator_candidates import LineExtensionConfig
 
 
@@ -14,6 +14,8 @@ def test_open_living_room_without_valid_extension_stays_single_room():
     wall[8, 50:60] = True
     unknown = ~(free | wall)
     cfg = OnlineRoseStyleConfig(
+        backend=ONLINE_LINE_EXTEND_ROOMSEG_V4_BACKEND,
+        algorithm=ONLINE_LINE_EXTEND_ROOMSEG_V4_BACKEND,
         resolution_m=0.1,
         min_observed_free_cells=1,
         line_extension=LineExtensionConfig(max_extension_m=1.0, max_probe_m=1.1),

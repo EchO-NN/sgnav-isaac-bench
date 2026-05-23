@@ -168,12 +168,12 @@ mapping:
   frontier_allow_near_fallback: false
   frontier_debug_dump: false
   frontier_debug_dir: data/debug_frontier
-  room_map_mode: online_line_extend_roomseg_v4_vlm
+  room_map_mode: height_profile_door_wall_v6_2_vlm
   strict_no_oracle_rooms: true
   room_segmentation:
     enabled: true
-    algorithm: online_line_extend_roomseg_v4
-    backend: online_line_extend_roomseg_v4
+    algorithm: height_profile_door_wall_v6_2
+    backend: height_profile_door_wall_v6_2
     source_mode: declutter_reconstruct_external
     legacy_watershed_allowed: debug_only
     local_rose2_lite_allowed: debug_only
@@ -467,10 +467,62 @@ mapping:
       corridor_keep_enabled: true
       corridor_as_room_min_area_m2: 1.00
       corridor_as_room_aspect_ratio: 4.0
+    height_profile_v6_2:
+      enabled: true
+      floor_ceiling:
+        floor_percentile: 0.02
+        ceiling_percentile: 0.98
+        ema_alpha: 0.25
+        min_height_m: 2.0
+        max_height_m: 4.0
+        fallback_floor_z: 0.0
+        fallback_ceiling_z: 2.8
+      vertical_range:
+        inner_low_percent: 0.05
+        inner_high_percent: 0.95
+        z_bin_m: 0.05
+      bin_support:
+        min_free_hits_per_bin: 1
+        min_endpoint_hits_per_bin: 1
+        free_dominance_ratio: 0.70
+        endpoint_dominance_ratio: 0.70
+        ambiguous_bin_counts_as_unknown: true
+      classifier:
+        wall_endpoint_ratio_min: 0.95
+        door_lower_free_ratio_min: 0.95
+        door_upper_occupied_ratio_min: 0.95
+        door_transition_min_height_m: 1.80
+        min_upper_span_m: 0.15
+        min_lower_span_m: 1.20
+      repair:
+        enabled: true
+        close_kernel_m: 0.10
+        fill_gap_max_m: 0.15
+        remove_island_max_area_m2: 0.02
+        preserve_door_class: true
+      corridor:
+        enabled: true
+        use_wall_and_door_as_wall_line: true
+        l_corner_min_leg_m: 0.15
+        extension_max_m: 2.00
+        extension_free_ratio_min: 0.85
+        extension_thickness_m: 0.07
+        ignore_intersection_with_door: true
+        min_split_area_m2: 0.25
+      labels:
+        connectivity: 4
+        min_room_area_m2: 0.25
+        merge_small_regions: true
+      debug:
+        enabled: true
+        show_wall_mask: true
+        show_door_mask: true
+        show_corridor_separator: true
+        show_height_profile_layers: true
     online_roomseg:
       enabled: true
-      backend: online_line_extend_roomseg_v4
-      algorithm: online_line_extend_roomseg_v4
+      backend: height_profile_door_wall_v6_2
+      algorithm: height_profile_door_wall_v6_2
       depth:
         roomseg_depth_stride_px: 2
         roomseg_depth_stride_debug_px: 2
@@ -943,7 +995,7 @@ sgnav:
     long_edge_geometric_pruning: true
     group_nodes: true
     room_nodes:
-      source: online_line_extend_roomseg_v4_vlm
+      source: height_profile_door_wall_v6_2_vlm
       use_dataset_room_labels_in_metric: false
       strict_no_oracle_rooms: true
       room_label_backend: vlm

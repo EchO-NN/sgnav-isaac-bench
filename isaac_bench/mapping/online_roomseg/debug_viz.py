@@ -61,6 +61,17 @@ BOOL_LAYERS = [
     "virtual_separator_label_fill",
     "corridor_like_regions",
     "open_living_room_like_regions",
+    "wall_mask_raw",
+    "door_mask_raw",
+    "wall_mask_repaired",
+    "door_mask_repaired",
+    "wall_line_support_mask",
+    "corridor_l_corner_candidates",
+    "accepted_corridor_separator_mask",
+    "room_cut_mask",
+    "v6_2_free_mask",
+    "v6_2_unknown_mask",
+    "planner_obstacle_roomseg",
 ]
 
 
@@ -100,6 +111,16 @@ def save_online_roomseg_debug(
             path = root / "room_confidence_map.png"
             _save_float(path, np.asarray(layers["room_confidence_map"], dtype=np.float32))
             paths["room_confidence_map"] = str(path)
+        for name in (
+            "height_profile_wall_endpoint_ratio",
+            "height_profile_best_door_lower_free_ratio",
+            "height_profile_best_door_upper_occ_ratio",
+            "height_profile_best_door_transition_z",
+        ):
+            if name in layers:
+                path = root / ("%s.png" % name)
+                _save_float(path, np.asarray(layers[name], dtype=np.float32))
+                paths[name] = str(path)
         paths.update(_save_red_wall_composites(root, layers))
     if save_candidate_json:
         path = root / "separator_report.json"

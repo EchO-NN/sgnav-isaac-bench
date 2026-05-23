@@ -52,6 +52,8 @@ from isaac_bench.mapping.online_roomseg import (
     ONLINE_LINE_EXTEND_ROOMSEG_V4_CONTEXT,
     ONLINE_ROSE_STYLE_BACKEND,
     ONLINE_ROSE_STYLE_CONTEXT,
+    HEIGHT_PROFILE_DOOR_WALL_V6_2_BACKEND,
+    HEIGHT_PROFILE_DOOR_WALL_V6_2_CONTEXT,
     ROOMSEG_EVIDENCE_LINE_CLOSURE_V3_BACKEND,
     ROOMSEG_EVIDENCE_LINE_CLOSURE_V3_CONTEXT,
     OnlineRoseStyleConfig,
@@ -1566,6 +1568,8 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
         )
         last_room_semantics_debug["backend"] = room_labeler.backend
     elif room_map_mode in {
+        HEIGHT_PROFILE_DOOR_WALL_V6_2_BACKEND,
+        HEIGHT_PROFILE_DOOR_WALL_V6_2_CONTEXT,
         ROOMSEG_EVIDENCE_LINE_CLOSURE_V3_BACKEND,
         ROOMSEG_EVIDENCE_LINE_CLOSURE_V3_CONTEXT,
         ONLINE_LINE_EXTEND_ROOMSEG_V4_BACKEND,
@@ -1586,6 +1590,7 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
             or ROOMSEG_EVIDENCE_LINE_CLOSURE_V3_BACKEND
         ).strip().lower()
         allowed_online_roomseg_backends = {
+            HEIGHT_PROFILE_DOOR_WALL_V6_2_BACKEND,
             ROOMSEG_EVIDENCE_LINE_CLOSURE_V3_BACKEND,
             ONLINE_LINE_EXTEND_ROOMSEG_V4_BACKEND,
             "online_line_extend_roomseg_v3",
@@ -4430,6 +4435,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             "rose2_source_external",
             "rose2_source_external_runner",
             "legacy_rose2_style_debug",
+            HEIGHT_PROFILE_DOOR_WALL_V6_2_BACKEND,
             ROOMSEG_EVIDENCE_LINE_CLOSURE_V3_BACKEND,
             ONLINE_LINE_EXTEND_ROOMSEG_V2_BACKEND,
             ONLINE_LINE_EXTEND_ROOMSEG_V4_BACKEND,
@@ -4917,6 +4923,15 @@ def main(argv: Optional[List[str]] = None) -> int:
     roomseg_ovb_cfg = dict(args.room_segmentation_config.get("online_visibility_bottleneck", {}) or {})
     if args.roomseg_backend is not None:
         args.room_segmentation_config["backend"] = str(args.roomseg_backend)
+        if str(args.roomseg_backend).strip().lower() in {
+            HEIGHT_PROFILE_DOOR_WALL_V6_2_BACKEND,
+            ROOMSEG_EVIDENCE_LINE_CLOSURE_V3_BACKEND,
+            ONLINE_LINE_EXTEND_ROOMSEG_V4_BACKEND,
+            ONLINE_LINE_EXTEND_ROOMSEG_V2_BACKEND,
+            ONLINE_ROSE_STYLE_BACKEND,
+        }:
+            roomseg_online_cfg["backend"] = str(args.roomseg_backend)
+            roomseg_online_cfg["algorithm"] = str(args.roomseg_backend)
     if args.debug_rose2_source is not None:
         args.room_segmentation_config["debug_rose2_source"] = bool(args.debug_rose2_source)
     if args.rose2_source_work_dir is not None:

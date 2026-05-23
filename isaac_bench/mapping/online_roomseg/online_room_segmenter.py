@@ -25,13 +25,19 @@ from .corridor import (
     merge_false_parallel_door_corridor_regions,
 )
 from .debug_viz import save_online_roomseg_debug
+from .debug_viz_v6_2 import build_v6_2_debug_layers, save_v6_2_debug_panel
+from .door_wall_repair_v6_2 import repair_door_wall_v6_2
 from .evidence_maps import FreeCleanConfig, WallCandidateConfig, build_evidence_maps
 from .evidence_v4 import (
     ONLINE_LINE_EXTEND_ROOMSEG_V4_BACKEND,
     RoomSegEvidenceV4,
     build_roomseg_evidence_v4,
 )
+from .corridor_l_corner_v6_2 import detect_corridor_l_corners_v6_2
+from .height_profile_v6_2 import build_height_profile_v6_2
 from .labeler_v3 import label_rooms_from_accepted_boundaries
+from .profile_classifier_v6_2 import classify_height_profile_v6_2
+from .room_labeler_v6_2 import label_rooms_v6_2
 from .separator_candidates import (
     DoorwayVirtualCutConfig,
     DoorNeckConfig,
@@ -76,13 +82,15 @@ ROOMSEG_EVIDENCE_LINE_CLOSURE_V3_CONTEXT = "roomseg_evidence_line_closure_v3_vlm
 ONLINE_LINE_EXTEND_ROOMSEG_V4_CONTEXT = "online_line_extend_roomseg_v4_vlm"
 ONLINE_ROSE_STYLE_BACKEND = "online_rose_style_v1"
 ONLINE_ROSE_STYLE_CONTEXT = "online_rose_style_v1_vlm"
+HEIGHT_PROFILE_DOOR_WALL_V6_2_BACKEND = "height_profile_door_wall_v6_2"
+HEIGHT_PROFILE_DOOR_WALL_V6_2_CONTEXT = "height_profile_door_wall_v6_2_vlm"
 
 
 @dataclass
 class OnlineRoseStyleConfig:
     enabled: bool = True
-    backend: str = ONLINE_LINE_EXTEND_ROOMSEG_V4_BACKEND
-    algorithm: str = ONLINE_LINE_EXTEND_ROOMSEG_V4_BACKEND
+    backend: str = HEIGHT_PROFILE_DOOR_WALL_V6_2_BACKEND
+    algorithm: str = HEIGHT_PROFILE_DOOR_WALL_V6_2_BACKEND
     resolution_m: float = 0.05
     map_info: MapInfo | None = None
     z_min_m: float = 0.10
@@ -116,6 +124,7 @@ class OnlineRoseStyleConfig:
     separator_group_v4: Mapping[str, object] = field(default_factory=dict)
     frontier_v4: Mapping[str, object] = field(default_factory=dict)
     final_labeler_v4: Mapping[str, object] = field(default_factory=dict)
+    height_profile_v6_2: Mapping[str, object] = field(default_factory=dict)
     navigation_consistency: Mapping[str, object] = field(default_factory=dict)
     structural_wall_v3: Mapping[str, object] = field(default_factory=dict)
     separator_v3: Mapping[str, object] = field(default_factory=dict)
@@ -138,6 +147,7 @@ class OnlineRoseStyleConfig:
             "separator_group_v4",
             "frontier_v4",
             "final_labeler_v4",
+            "height_profile_v6_2",
             "navigation_consistency",
             "structural_wall_v3",
             "separator_v3",
@@ -211,7 +221,7 @@ class OnlineRoseStyleResult:
 
 
 class OnlineRoseStyleRoomSegmenter:
-    context_source = ONLINE_LINE_EXTEND_ROOMSEG_V4_CONTEXT
+    context_source = HEIGHT_PROFILE_DOOR_WALL_V6_2_CONTEXT
 
     def __init__(self, config: OnlineRoseStyleConfig | Mapping[str, object] | None = None, map_info: MapInfo | None = None):
         if isinstance(config, OnlineRoseStyleConfig):
@@ -283,7 +293,7 @@ class OnlineRoseStyleRoomSegmenter:
         state = RoomProposalState(
             proposal_labels=np.asarray(result.room_label_map, dtype=np.int32),
             structural_free_mask=np.asarray(result.layers["free_clean"], dtype=bool),
-            structural_obstacle_mask=np.asarray(result.separator_map, dtype=bool),
+            structural_obstacle_mask=np.asarray(result.layers.get("planner_obstacle_roomseg", result.separator_map), dtype=bool),
             unknown_mask=np.asarray(result.layers["unknown_clean"], dtype=bool),
             distance_m=ndimage.distance_transform_edt(np.asarray(result.layers["free_clean"], dtype=bool)) * float(self.config.resolution_m),
             step=int(step),
@@ -321,6 +331,19 @@ def run_online_rose_style_roomseg(
 ) -> OnlineRoseStyleResult:
     backend_name = _backend_for_config(config)
     context_source = _context_for_backend(backend_name)
+    if _is_v6_2_backend(backend_name):
+        return _run_height_profile_door_wall_v6_2(
+            occupancy_map=occupancy_map,
+            observed_free_mask=observed_free_mask,
+            obstacle_mask=obstacle_mask,
+            unknown_mask=unknown_mask,
+            vertical_profile=vertical_profile,
+            roomseg_ray_evidence=roomseg_ray_evidence,
+            config=config,
+            step=int(step),
+            backend_name=backend_name,
+            context_source=context_source,
+        )
     use_v4 = _is_v4_backend(backend_name)
     use_v3 = _is_v3_backend(backend_name)
     if use_v4:
@@ -1129,6 +1152,222 @@ def run_online_rose_style_roomseg(
     )
 
 
+def _run_height_profile_door_wall_v6_2(
+    *,
+    occupancy_map: np.ndarray,
+    observed_free_mask: np.ndarray,
+    obstacle_mask: np.ndarray,
+    unknown_mask: np.ndarray,
+    vertical_profile: VerticalProfileMap | None,
+    roomseg_ray_evidence: Mapping[str, np.ndarray] | None,
+    config: OnlineRoseStyleConfig,
+    step: int,
+    backend_name: str,
+    context_source: str,
+) -> OnlineRoseStyleResult:
+    _ = np.asarray(occupancy_map)
+    v6_cfg = dict(config.height_profile_v6_2 or {})
+    profile = build_height_profile_v6_2(
+        observed_free_mask=observed_free_mask,
+        obstacle_mask=obstacle_mask,
+        unknown_mask=unknown_mask,
+        vertical_profile=vertical_profile,
+        roomseg_ray_evidence=roomseg_ray_evidence,
+        config=v6_cfg,
+        resolution_m=float(config.resolution_m),
+    )
+    classification = classify_height_profile_v6_2(profile, config=v6_cfg)
+    repair = repair_door_wall_v6_2(
+        wall_mask_raw=classification.wall_mask_raw,
+        door_mask_raw=classification.door_mask_raw,
+        unknown_mask=classification.unknown_mask,
+        resolution_m=float(config.resolution_m),
+        config=v6_cfg,
+    )
+    free_for_navigation = (np.asarray(classification.free_mask_raw, dtype=bool) | np.asarray(repair.door_mask, dtype=bool)) & ~np.asarray(
+        classification.unknown_mask, dtype=bool
+    )
+    corridor = detect_corridor_l_corners_v6_2(
+        wall_line_support_mask=repair.wall_line_support_mask,
+        stable_free_mask=free_for_navigation,
+        door_mask=repair.door_mask,
+        resolution_m=float(config.resolution_m),
+        config=v6_cfg,
+    )
+    door_confidence = np.minimum(
+        np.asarray(classification.best_door_lower_free_ratio, dtype=np.float32),
+        np.asarray(classification.best_door_upper_occupied_ratio, dtype=np.float32),
+    )
+    labels = label_rooms_v6_2(
+        free_for_navigation=free_for_navigation,
+        wall_mask=repair.wall_mask,
+        door_mask=repair.door_mask,
+        corridor_separator_mask=corridor.accepted_separator_mask,
+        unknown_mask=classification.unknown_mask,
+        resolution_m=float(config.resolution_m),
+        config=v6_cfg,
+        door_confidence_map=door_confidence,
+    )
+    v6_layers = build_v6_2_debug_layers(
+        wall_endpoint_ratio=classification.wall_endpoint_ratio,
+        best_door_lower_free_ratio=classification.best_door_lower_free_ratio,
+        best_door_upper_occ_ratio=classification.best_door_upper_occupied_ratio,
+        best_door_transition_z=classification.best_door_transition_z,
+        wall_mask_raw=classification.wall_mask_raw,
+        door_mask_raw=classification.door_mask_raw,
+        wall_mask_repaired=repair.wall_mask,
+        door_mask_repaired=repair.door_mask,
+        wall_line_support_mask=repair.wall_line_support_mask,
+        corridor_l_corner_candidates=corridor.corridor_l_corner_candidates,
+        accepted_corridor_separator_mask=corridor.accepted_separator_mask,
+        room_cut_mask=labels.room_cut_mask,
+        final_room_labels=labels.room_label_map,
+        free_mask=free_for_navigation,
+        unknown_mask=classification.unknown_mask,
+    )
+    final_room_count = int(len([v for v in np.unique(labels.room_label_map) if int(v) > 0]))
+    room_cut_mask = np.asarray(labels.room_cut_mask, dtype=bool)
+    layers = {
+        "vertical_free_raw": np.asarray(classification.free_mask_raw, dtype=bool),
+        "vertical_occupied_raw": np.asarray(repair.wall_mask, dtype=bool),
+        "vertical_observed_raw": ~np.asarray(classification.unknown_mask, dtype=bool),
+        "vertical_unknown_raw": np.asarray(classification.unknown_mask, dtype=bool),
+        "roomseg_free_raw": np.asarray(classification.free_mask_raw, dtype=bool),
+        "roomseg_free_stable": free_for_navigation,
+        "roomseg_free_clean": free_for_navigation,
+        "roomseg_unknown_raw": np.asarray(classification.unknown_mask, dtype=bool),
+        "roomseg_unknown_clean": np.asarray(classification.unknown_mask, dtype=bool),
+        "raw_endpoint_occupied": np.asarray(profile.endpoint_supported, dtype=bool).any(axis=0),
+        "terminal_wall_candidate": np.zeros_like(free_for_navigation, dtype=bool),
+        "terminal_wall_structural_candidate": np.zeros_like(free_for_navigation, dtype=bool),
+        "terminal_wall_structural_clean": np.zeros_like(free_for_navigation, dtype=bool),
+        "structural_wall_candidate": np.asarray(classification.wall_mask_raw, dtype=bool),
+        "structural_wall_clean": np.asarray(repair.wall_mask, dtype=bool),
+        "structural_wall_confidence": np.asarray(classification.wall_endpoint_ratio, dtype=np.float32),
+        "free_clean": free_for_navigation,
+        "wall_candidate_clean": np.asarray(repair.wall_mask, dtype=bool),
+        "unknown_clean": np.asarray(classification.unknown_mask, dtype=bool),
+        "line_supported_walls": np.asarray(repair.wall_line_support_mask, dtype=bool),
+        "line_supported_wall_mask": np.asarray(repair.wall_line_support_mask, dtype=bool),
+        "raw_line_supported_walls": np.asarray(repair.wall_line_support_mask, dtype=bool),
+        "filtered_wall_lines": np.asarray(repair.wall_mask, dtype=bool),
+        "corridor_candidate_map": np.asarray(corridor.corridor_l_corner_candidates, dtype=bool),
+        "accepted_virtual_boundary_map": room_cut_mask,
+        "separator_map": room_cut_mask,
+        "accepted_separators": room_cut_mask,
+        "rejected_separators": np.asarray(corridor.rejected_separator_mask, dtype=bool),
+        "room_labels_before_separators": labels.raw_room_labels,
+        "room_labels_after_separators": labels.room_label_map,
+        "raw_room_labels_before_merge": labels.raw_room_labels,
+        "raw_room_labels_before_corridor_merge": labels.raw_room_labels,
+        "room_labels_after_corridor_merge_before_virtual_fill": labels.room_label_map,
+        "room_labels_after_corridor_merge": labels.room_label_map,
+        "final_room_labels": labels.room_label_map,
+        "architectural_room_label_map": labels.room_label_map,
+        "room_confidence_map": _room_confidence_layer(labels.room_label_map, free_for_navigation, room_cut_mask),
+        "functional_zone_map": np.zeros_like(labels.room_label_map, dtype=np.int32),
+        "topology_reject_reason_map": np.zeros_like(labels.room_label_map, dtype=np.int32),
+        "planner_obstacle_roomseg": np.asarray(repair.wall_mask, dtype=bool),
+        **v6_layers,
+    }
+    separator_report = {
+        "step": int(step),
+        "backend": backend_name,
+        "algorithm": backend_name,
+        "context_source": context_source,
+        "stage_order": [
+            "height_profile_v6_2",
+            "strict_profile_classifier_v6_2",
+            "door_wall_repair_v6_2",
+            "corridor_l_corner_v6_2",
+            "room_labeler_v6_2",
+        ],
+        "connected_components_formula": "room_core = free_for_navigation & ~room_cut_mask & ~unknown_mask; connected_components(room_core, connectivity=4)",
+        "wall_mask_cells": int(np.count_nonzero(repair.wall_mask)),
+        "door_mask_cells": int(np.count_nonzero(repair.door_mask)),
+        "free_for_navigation_cells": int(np.count_nonzero(free_for_navigation)),
+        "unknown_cells": int(np.count_nonzero(classification.unknown_mask)),
+        "accepted_corridor_separator_cells": int(np.count_nonzero(corridor.accepted_separator_mask)),
+        "accepted_corridor_separator_count": int(len(corridor.accepted)),
+        "rejected_corridor_separator_count": int(len(corridor.rejected)),
+        "room_cut_cells": int(np.count_nonzero(room_cut_mask)),
+        "final_room_count": int(final_room_count),
+        "room_graph_edge_count": int(len(labels.room_graph_edges)),
+        "navigation_obstacle_written": False,
+        "door_not_planner_obstacle": True,
+        "door_counts_as_room_boundary": True,
+        "door_counts_as_wall_line_support": True,
+        "no_fallback": True,
+        "warnings": [],
+    }
+    classifier_cfg = dict(v6_cfg.get("classifier", {}) or {})
+    debug = {
+        "backend": backend_name,
+        "actual_backend": backend_name,
+        "source_backend": backend_name,
+        "roomseg_backend": backend_name,
+        "algorithm": backend_name,
+        "source": backend_name,
+        "context_source": context_source,
+        "room_map_mode": context_source,
+        "strict_fallback_used": False,
+        "silent_fallback_used": False,
+        "legacy_style_used": False,
+        "navigation_obstacle_written": False,
+        "door_not_planner_obstacle": True,
+        "step": int(step),
+        "resolution_m": float(config.resolution_m),
+        "final_room_count": int(final_room_count),
+        "room_count": int(final_room_count),
+        "separator_report": separator_report,
+        "height_profile_report": dict(profile.debug),
+        "profile_classifier_report": dict(classification.debug),
+        "door_wall_repair_report": dict(repair.debug),
+        "corridor_l_corner_report": dict(corridor.debug),
+        "room_labeler_report": dict(labels.debug),
+        "room_graph_edges": list(labels.room_graph_edges),
+        "accepted_separators": [item.to_dict() for item in corridor.accepted],
+        "rejected_separators": [item.to_dict() for item in corridor.rejected],
+        "proposal_room_masks": _proposal_masks_debug(labels.room_label_map),
+        "wall_endpoint_ratio_min": float(classifier_cfg.get("wall_endpoint_ratio_min", 0.95)),
+        "door_lower_free_ratio_min": float(classifier_cfg.get("door_lower_free_ratio_min", 0.95)),
+        "door_upper_occupied_ratio_min": float(classifier_cfg.get("door_upper_occupied_ratio_min", 0.95)),
+        "door_transition_min_height_m": float(classifier_cfg.get("door_transition_min_height_m", 1.80)),
+    }
+    debug["evidence_report"] = dict(profile.debug)
+    debug_cfg = dict(config.debug or {})
+    if bool(debug_cfg.get("save_layers", False)) or bool(debug_cfg.get("save_candidate_json", False)):
+        out_dir = Path(str(config.debug_dir)) / ("online_roomseg_step_%06d" % int(step))
+        dump = save_online_roomseg_debug(
+            out_dir=out_dir,
+            layers=layers,
+            separator_report=separator_report,
+            extra_reports={
+                "height_profile_report": debug["height_profile_report"],
+                "profile_classifier_report": debug["profile_classifier_report"],
+                "door_wall_repair_report": debug["door_wall_repair_report"],
+                "corridor_l_corner_report": debug["corridor_l_corner_report"],
+                "room_labeler_report": debug["room_labeler_report"],
+            },
+            save_layers=bool(debug_cfg.get("save_layers", True)),
+            save_candidate_json=bool(debug_cfg.get("save_candidate_json", True)),
+        )
+        try:
+            panel_path = save_v6_2_debug_panel(out_dir=out_dir, layers=layers, debug=debug)
+            dump.setdefault("paths", {})["roomseg_v6_2_panel"] = panel_path
+        except Exception as exc:  # pragma: no cover - debug export must not break segmentation
+            debug["roomseg_v6_2_panel_error"] = str(exc)
+        debug["online_roomseg_debug_paths"] = dict(dump.get("paths", {}))
+    return OnlineRoseStyleResult(
+        room_label_map=labels.room_label_map.astype(np.int32),
+        separator_map=room_cut_mask.astype(bool),
+        accepted_candidates=[],
+        rejected_candidates=[],
+        layers=layers,
+        debug=debug,
+    )
+
+
 def _rooms_from_labels(labels: np.ndarray, unknown: np.ndarray, config: RoomSegmentationConfig, step: int, debug: Mapping[str, object]) -> list[RoomMask]:
     out: list[RoomMask] = []
     min_cells = max(1, int(config.min_observed_free_cells))
@@ -1204,8 +1443,10 @@ def _free_assignment_ratio(labels: np.ndarray, free_clean: np.ndarray) -> float:
 def _backend_for_config(config: OnlineRoseStyleConfig | Mapping[str, object] | object) -> str:
     backend = str(getattr(config, "backend", "") or "")
     algorithm = str(getattr(config, "algorithm", "") or "")
-    value = backend or algorithm or ONLINE_LINE_EXTEND_ROOMSEG_V4_BACKEND
+    value = backend or algorithm or HEIGHT_PROFILE_DOOR_WALL_V6_2_BACKEND
     value = value.strip().lower()
+    if value in {HEIGHT_PROFILE_DOOR_WALL_V6_2_CONTEXT, "roomseg_v6_2", "roomseg_v62", "online_roomseg_v6_2"}:
+        return HEIGHT_PROFILE_DOOR_WALL_V6_2_BACKEND
     if value in {"online_line_extend_roomseg", "online_line_extend_roomseg_vlm"}:
         return ONLINE_LINE_EXTEND_ROOMSEG_V2_BACKEND
     if value in {"online_rose_style", "online_rose_style_vlm"}:
@@ -1215,6 +1456,16 @@ def _backend_for_config(config: OnlineRoseStyleConfig | Mapping[str, object] | o
     if value in {"roomseg_evidence_line_closure_v3_vlm", "online_line_extend_roomseg_v3", "online_line_extend_roomseg_v3_vlm"}:
         return ROOMSEG_EVIDENCE_LINE_CLOSURE_V3_BACKEND
     return value
+
+
+def _is_v6_2_backend(backend: str) -> bool:
+    return str(backend).strip().lower() in {
+        HEIGHT_PROFILE_DOOR_WALL_V6_2_BACKEND,
+        HEIGHT_PROFILE_DOOR_WALL_V6_2_CONTEXT,
+        "roomseg_v6_2",
+        "roomseg_v62",
+        "online_roomseg_v6_2",
+    }
 
 
 def _is_v4_backend(backend: str) -> bool:
@@ -1237,6 +1488,8 @@ def _is_v3_backend(backend: str) -> bool:
 
 def _context_for_backend(backend: str) -> str:
     backend = str(backend).strip().lower()
+    if _is_v6_2_backend(backend):
+        return HEIGHT_PROFILE_DOOR_WALL_V6_2_CONTEXT
     if _is_v4_backend(backend):
         return ONLINE_LINE_EXTEND_ROOMSEG_V4_CONTEXT
     if _is_v3_backend(backend):

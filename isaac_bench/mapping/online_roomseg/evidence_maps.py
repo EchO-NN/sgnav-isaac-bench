@@ -160,12 +160,15 @@ def _merge_terminal_wall_endpoints(
     terminal_splat = _optional_like(evidence, free.shape, "terminal_wall_splat", "roomseg_terminal_wall_splat", dtype=np.uint8)
     terminal = (np.asarray(terminal_count, dtype=np.uint16) > 0) | np.asarray(terminal_splat, dtype=bool)
     terminal_no_free = terminal & ~free
-    occupied |= terminal_no_free
+    # v6.2 requires terminal endpoints to remain endpoint/profile evidence
+    # until a height-profile classifier accepts them.  Do not promote a 2D
+    # terminal splat directly into occupied/wall evidence here.
     observed |= terminal_no_free
     return occupied.astype(bool), observed.astype(bool), {
         "terminal_wall_endpoint_cells": int(np.count_nonzero(np.asarray(terminal_count, dtype=np.uint16) > 0)),
         "terminal_wall_splat_cells": int(np.count_nonzero(np.asarray(terminal_splat, dtype=bool))),
-        "terminal_wall_added_to_occupied_cells": int(np.count_nonzero(terminal_no_free & ~occupied_before)),
+        "terminal_wall_raw_endpoint_evidence_cells": int(np.count_nonzero(terminal_no_free)),
+        "terminal_wall_added_to_occupied_cells": 0,
         "terminal_wall_added_to_observed_cells": int(np.count_nonzero(terminal_no_free & ~observed_before)),
         "terminal_wall_suppressed_by_vertical_free_cells": int(np.count_nonzero(terminal & free)),
     }
