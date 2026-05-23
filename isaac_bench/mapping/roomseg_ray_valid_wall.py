@@ -10,6 +10,7 @@ from isaac_bench.mapping.vertical_profile import VerticalProfileMap
 
 RAY_VALID_WALL_INFERENCE_MODE = "ray_valid_terminal_wall"
 RAY_VALID_WALL_INFERENCE_MODE_V3 = "roomseg_evidence_line_closure_v3"
+RAY_VALID_WALL_INFERENCE_MODE_V4 = "online_line_extend_roomseg_v4"
 
 
 def build_ray_valid_wall_inference(
@@ -45,12 +46,13 @@ def build_ray_valid_wall_inference(
     shape = vf.shape
     root_cfg = _root_config(config)
     ev_cfg = _section(root_cfg, "roomseg_evidence_v3")
+    ev4_cfg = _section(root_cfg, "roomseg_evidence_v4")
     force_legacy = bool(ev_cfg.get("force_legacy_ray_valid_wall", False))
     strict = bool(ev_cfg.get("strict_benchmark", root_cfg.get("strict_benchmark", False)))
     if force_legacy and strict:
         raise ValueError("strict roomseg_evidence_v3 forbids force_legacy_ray_valid_wall=true")
-    if not force_legacy and bool(ev_cfg.get("enabled", True)):
-        return build_ray_valid_wall_inference_v3(
+    if not force_legacy and (bool(ev_cfg.get("enabled", True)) or bool(ev4_cfg.get("enabled", False))):
+        result = build_ray_valid_wall_inference_v3(
             vertical_free=vf,
             vertical_occupied=vo,
             vertical_observed=vertical_observed,
@@ -68,6 +70,13 @@ def build_ray_valid_wall_inference(
             resolution_m=float(resolution_m),
             config=root_cfg,
         )
+        if bool(ev4_cfg.get("enabled", False)):
+            result["debug"] = {
+                **dict(result.get("debug", {})),
+                "ray_valid_wall_inference_mode": RAY_VALID_WALL_INFERENCE_MODE_V4,
+                "strict_v4_endpoint_contract": True,
+            }
+        return result
     cfg = _config_dict(config)
     enabled = bool(cfg.get("enabled", True))
     min_terminal_wall_count = max(1, int(cfg.get("min_terminal_wall_count", 1)))

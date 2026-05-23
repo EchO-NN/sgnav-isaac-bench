@@ -8,6 +8,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import numpy as np
 
 from isaac_bench.mapping.coordinate_transform import MapInfo, grid_to_world_xy
+from isaac_bench.mapping.frontier_stability_v4 import stable_frontier_cells_v4
 from isaac_bench.navigation.astar import astar_distance_map
 
 GridCell = Tuple[int, int]
@@ -276,20 +277,42 @@ def extract_frontiers(
     cluster_distance_mode: str = "mean",
     allow_near_frontier_fallback: bool = False,
     require_reachable: bool = True,
+    frontier_v4_config: Optional[dict] = None,
+    stable_roomseg_free: Optional[np.ndarray] = None,
+    roomseg_unknown_clean: Optional[np.ndarray] = None,
+    roomseg_free_noise_rejected: Optional[np.ndarray] = None,
+    ray_fan_spur_rejected: Optional[np.ndarray] = None,
 ) -> List[FrontierCluster]:
     if cluster_distance_mode not in {"mean", "min", "center"}:
         raise ValueError(
             f"cluster_distance_mode must be 'mean', 'min', or 'center', got {cluster_distance_mode!r}"
         )
-    cells = frontier_cells(
-        free=free,
-        observed=observed,
-        occupancy=occupancy,
-        obstacle_dilation_radius_cells=obstacle_dilation_radius_cells,
-        unknown_dilation_radius_cells=unknown_dilation_radius_cells,
-        exclude_mask=exclude_mask,
-        unknown_source=unknown_source,
-    )
+    v4_cfg = dict(frontier_v4_config or {})
+    if bool(v4_cfg.get("enabled", False)) and stable_roomseg_free is not None:
+        v4_result = stable_frontier_cells_v4(
+            reachable_free=free,
+            observed=observed,
+            stable_roomseg_free=stable_roomseg_free,
+            occupancy=occupancy,
+            roomseg_unknown_clean=roomseg_unknown_clean,
+            roomseg_free_noise_rejected=roomseg_free_noise_rejected,
+            ray_fan_spur_rejected=ray_fan_spur_rejected,
+            obstacle_dilation_radius_cells=obstacle_dilation_radius_cells,
+            unknown_dilation_radius_cells=unknown_dilation_radius_cells,
+            exclude_mask=exclude_mask,
+            config=v4_cfg,
+        )
+        cells = v4_result.frontier
+    else:
+        cells = frontier_cells(
+            free=free,
+            observed=observed,
+            occupancy=occupancy,
+            obstacle_dilation_radius_cells=obstacle_dilation_radius_cells,
+            unknown_dilation_radius_cells=unknown_dilation_radius_cells,
+            exclude_mask=exclude_mask,
+            unknown_source=unknown_source,
+        )
     dist_map = astar_distance_map(traversible, agent_grid, map_info.resolution_m, allow_diagonal=True)
     clusters: List[FrontierCluster] = []
     near_clusters: List[FrontierCluster] = []

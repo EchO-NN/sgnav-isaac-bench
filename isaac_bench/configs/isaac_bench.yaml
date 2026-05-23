@@ -157,9 +157,9 @@ mapping:
   free_splat_point_threshold: 1
   debug: false
   inflation_radius_m: 0.0
-  frontier_min_cluster_size: 1
+  frontier_min_cluster_size: 12
   frontier_min_distance_m: 1.0
-  frontier_max_count: 0
+  frontier_max_count: 24
   frontier_obstacle_dilation_radius_cells: 4
   frontier_wall_blacklist_clearance_m: 0.05
   frontier_unknown_dilation_radius_cells: 1
@@ -168,12 +168,12 @@ mapping:
   frontier_allow_near_fallback: false
   frontier_debug_dump: false
   frontier_debug_dir: data/debug_frontier
-  room_map_mode: roomseg_evidence_line_closure_v3_vlm
+  room_map_mode: online_line_extend_roomseg_v4_vlm
   strict_no_oracle_rooms: true
   room_segmentation:
     enabled: true
-    algorithm: roomseg_evidence_line_closure_v3
-    backend: roomseg_evidence_line_closure_v3
+    algorithm: online_line_extend_roomseg_v4
+    backend: online_line_extend_roomseg_v4
     source_mode: declutter_reconstruct_external
     legacy_watershed_allowed: debug_only
     local_rose2_lite_allowed: debug_only
@@ -349,6 +349,52 @@ mapping:
       room_iou_threshold: 0.30
       match_score_threshold: 0.45
       max_unseen_frames: 50
+    roomseg_evidence_v4:
+      enabled: true
+      min_free_rays_for_stable_free: 2
+      min_observed_rays_for_stable_cell: 2
+      allow_single_ray_free_if_nav_reachable: true
+      require_nav_reachable_for_roomseg_free: true
+      nav_reachable_dilation_m: 0.10
+      free_close_radius_m: 0.05
+      free_open_radius_m: 0.00
+      spur_prune_radius_m: 0.00
+      min_free_component_area_m2: 0.20
+      terminal_wall_min_count: 2
+      terminal_wall_min_views: 1
+      terminal_wall_min_line_length_m: 0.50
+      structural_wall_confidence_min: 0.68
+    corridor_axis_v4:
+      enabled: true
+      min_axis_width_m: 0.45
+      max_axis_width_m: 1.80
+      max_mean_width_m: 1.80
+      min_length_m: 0.90
+      min_neck_width_m: 0.35
+      max_neck_width_m: 1.80
+      min_room_side_area_m2: 0.30
+      junction_nms_cells: 4
+      max_candidates: 96
+    separator_group_v4:
+      enabled: true
+      pending_score_min: 0.35
+      accept_score_min: 0.55
+      max_group_size: 4
+      max_groups_per_component: 64
+      max_candidate_distance_m: 1.20
+      min_group_topology_gain: 1
+      min_side_area_m2: 0.30
+      accept_no_single_topology_gain_only: true
+    frontier_v4:
+      enabled: true
+      min_cluster_size_cells: 12
+      min_arc_length_m: 0.35
+      max_count: 24
+      noise_reject_dilation_cells: 1
+      morphology_open_cells: 0
+    final_labeler_v4:
+      fill_virtual_boundary_cells_for_membership: true
+      topology_labels_use_free_minus_accepted_boundary: true
     vertical_free_roomseg:
       enabled: true
       debug_dump: false
@@ -423,8 +469,8 @@ mapping:
       corridor_as_room_aspect_ratio: 4.0
     online_roomseg:
       enabled: true
-      backend: roomseg_evidence_line_closure_v3
-      algorithm: roomseg_evidence_line_closure_v3
+      backend: online_line_extend_roomseg_v4
+      algorithm: online_line_extend_roomseg_v4
       depth:
         roomseg_depth_stride_px: 2
         roomseg_depth_stride_debug_px: 2
@@ -897,7 +943,7 @@ sgnav:
     long_edge_geometric_pruning: true
     group_nodes: true
     room_nodes:
-      source: roomseg_evidence_line_closure_v3_vlm
+      source: online_line_extend_roomseg_v4_vlm
       use_dataset_room_labels_in_metric: false
       strict_no_oracle_rooms: true
       room_label_backend: vlm

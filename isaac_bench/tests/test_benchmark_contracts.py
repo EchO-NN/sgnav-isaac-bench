@@ -208,10 +208,10 @@ def test_config_defaults_match_benchmark_contract():
     assert cfg["nearfield_static_map"]["enabled"] is False
     assert cfg["mapping"]["frontier_allow_near_fallback"] is False
     assert cfg["mapping"]["frontier_min_distance_m"] == 1.0
-    assert cfg["mapping"]["room_map_mode"] == "roomseg_evidence_line_closure_v3_vlm"
+    assert cfg["mapping"]["room_map_mode"] == "online_line_extend_roomseg_v4_vlm"
     assert cfg["mapping"]["strict_no_oracle_rooms"] is True
-    assert cfg["mapping"]["room_segmentation"]["algorithm"] == "roomseg_evidence_line_closure_v3"
-    assert cfg["mapping"]["room_segmentation"]["backend"] == "roomseg_evidence_line_closure_v3"
+    assert cfg["mapping"]["room_segmentation"]["algorithm"] == "online_line_extend_roomseg_v4"
+    assert cfg["mapping"]["room_segmentation"]["backend"] == "online_line_extend_roomseg_v4"
     assert cfg["mapping"]["room_segmentation"]["source_mode"] == "declutter_reconstruct_external"
     assert cfg["mapping"]["room_segmentation"]["legacy_watershed_allowed"] == "debug_only"
     assert cfg["mapping"]["room_segmentation"]["local_rose2_lite_allowed"] == "debug_only"

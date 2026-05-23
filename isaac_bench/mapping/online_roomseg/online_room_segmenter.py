@@ -15,6 +15,7 @@ from isaac_bench.mapping.roomseg_evidence_v3 import RoomSegEvidenceV3, build_roo
 from isaac_bench.mapping.vertical_profile import VerticalProfileMap
 
 from .accepted_boundary_v3 import generate_mandatory_rescue_candidates
+from .corridor_axis_v4 import CorridorAxisV4Result, detect_corridor_axis_v4
 from .corridor import (
     CorridorConfig,
     CorridorMergeConfig,
@@ -25,6 +26,11 @@ from .corridor import (
 )
 from .debug_viz import save_online_roomseg_debug
 from .evidence_maps import FreeCleanConfig, WallCandidateConfig, build_evidence_maps
+from .evidence_v4 import (
+    ONLINE_LINE_EXTEND_ROOMSEG_V4_BACKEND,
+    RoomSegEvidenceV4,
+    build_roomseg_evidence_v4,
+)
 from .labeler_v3 import label_rooms_from_accepted_boundaries
 from .separator_candidates import (
     DoorwayVirtualCutConfig,
@@ -46,6 +52,7 @@ from .separator_candidates import (
     reject_candidates_ending_on_other_door_middle,
 )
 from .topology_tests import TopologyTestConfig, greedily_select_separators
+from .separator_groups_v4 import SeparatorGroupV4Config, greedily_select_separator_groups
 from .utils import label_components, relabel_compact
 from .wall_lines import (
     LineWallsConfig,
@@ -66,6 +73,7 @@ ONLINE_LINE_EXTEND_ROOMSEG_V2_BACKEND = "online_line_extend_roomseg_v2"
 ONLINE_LINE_EXTEND_ROOMSEG_V2_CONTEXT = "online_line_extend_roomseg_v2_vlm"
 ROOMSEG_EVIDENCE_LINE_CLOSURE_V3_BACKEND = "roomseg_evidence_line_closure_v3"
 ROOMSEG_EVIDENCE_LINE_CLOSURE_V3_CONTEXT = "roomseg_evidence_line_closure_v3_vlm"
+ONLINE_LINE_EXTEND_ROOMSEG_V4_CONTEXT = "online_line_extend_roomseg_v4_vlm"
 ONLINE_ROSE_STYLE_BACKEND = "online_rose_style_v1"
 ONLINE_ROSE_STYLE_CONTEXT = "online_rose_style_v1_vlm"
 
@@ -73,8 +81,8 @@ ONLINE_ROSE_STYLE_CONTEXT = "online_rose_style_v1_vlm"
 @dataclass
 class OnlineRoseStyleConfig:
     enabled: bool = True
-    backend: str = ROOMSEG_EVIDENCE_LINE_CLOSURE_V3_BACKEND
-    algorithm: str = ROOMSEG_EVIDENCE_LINE_CLOSURE_V3_BACKEND
+    backend: str = ONLINE_LINE_EXTEND_ROOMSEG_V4_BACKEND
+    algorithm: str = ONLINE_LINE_EXTEND_ROOMSEG_V4_BACKEND
     resolution_m: float = 0.05
     map_info: MapInfo | None = None
     z_min_m: float = 0.10
@@ -103,6 +111,11 @@ class OnlineRoseStyleConfig:
     corridor_merge: CorridorMergeConfig = field(default_factory=CorridorMergeConfig)
     topology_test: TopologyTestConfig = field(default_factory=TopologyTestConfig)
     roomseg_evidence_v3: Mapping[str, object] = field(default_factory=dict)
+    roomseg_evidence_v4: Mapping[str, object] = field(default_factory=dict)
+    corridor_axis_v4: Mapping[str, object] = field(default_factory=dict)
+    separator_group_v4: Mapping[str, object] = field(default_factory=dict)
+    frontier_v4: Mapping[str, object] = field(default_factory=dict)
+    final_labeler_v4: Mapping[str, object] = field(default_factory=dict)
     navigation_consistency: Mapping[str, object] = field(default_factory=dict)
     structural_wall_v3: Mapping[str, object] = field(default_factory=dict)
     separator_v3: Mapping[str, object] = field(default_factory=dict)
@@ -117,7 +130,20 @@ class OnlineRoseStyleConfig:
         for key in ("enabled", "backend"):
             if key in raw_root and key not in raw:
                 raw[key] = raw_root[key]
-        for key in ("algorithm", "roomseg_evidence_v3", "navigation_consistency", "structural_wall_v3", "separator_v3", "topology_v3", "temporal_v3"):
+        for key in (
+            "algorithm",
+            "roomseg_evidence_v3",
+            "roomseg_evidence_v4",
+            "corridor_axis_v4",
+            "separator_group_v4",
+            "frontier_v4",
+            "final_labeler_v4",
+            "navigation_consistency",
+            "structural_wall_v3",
+            "separator_v3",
+            "topology_v3",
+            "temporal_v3",
+        ):
             if key in raw_root and key not in raw:
                 raw[key] = raw_root[key]
         vertical_or_free = dict(raw_root.get("vertical_or_free", {}) or {})
@@ -185,7 +211,7 @@ class OnlineRoseStyleResult:
 
 
 class OnlineRoseStyleRoomSegmenter:
-    context_source = ROOMSEG_EVIDENCE_LINE_CLOSURE_V3_CONTEXT
+    context_source = ONLINE_LINE_EXTEND_ROOMSEG_V4_CONTEXT
 
     def __init__(self, config: OnlineRoseStyleConfig | Mapping[str, object] | None = None, map_info: MapInfo | None = None):
         if isinstance(config, OnlineRoseStyleConfig):
@@ -295,8 +321,23 @@ def run_online_rose_style_roomseg(
 ) -> OnlineRoseStyleResult:
     backend_name = _backend_for_config(config)
     context_source = _context_for_backend(backend_name)
+    use_v4 = _is_v4_backend(backend_name)
     use_v3 = _is_v3_backend(backend_name)
-    if use_v3:
+    if use_v4:
+        evidence_v3 = None
+        evidence = build_roomseg_evidence_v4(
+            occupancy_map=occupancy_map,
+            observed_free_mask=observed_free_mask,
+            obstacle_mask=obstacle_mask,
+            unknown_mask=unknown_mask,
+            vertical_profile=vertical_profile,
+            roomseg_ray_evidence=roomseg_ray_evidence,
+            traversible=np.asarray(observed_free_mask, dtype=bool) & ~np.asarray(obstacle_mask, dtype=bool),
+            agent_grid=robot_rc,
+            map_info=config.map_info,
+            config=config,
+        )
+    elif use_v3:
         evidence_v3 = build_roomseg_evidence_v3(
             vertical_profile=vertical_profile
             or _synthetic_vertical_profile_from_masks(
@@ -365,7 +406,7 @@ def run_online_rose_style_roomseg(
         resolution_m=float(config.resolution_m),
         config=config.noise_wall_gap_fill,
     )
-    if use_v3:
+    if use_v3 or use_v4:
         structural_wall_free_overlap_map = np.zeros_like(evidence.free_clean, dtype=bool)
         noise_gap_room_separator_map = np.zeros_like(evidence.free_clean, dtype=bool)
         roomseg_free_clean = np.asarray(evidence.free_clean, dtype=bool).copy()
@@ -376,12 +417,30 @@ def run_online_rose_style_roomseg(
         roomseg_free_clean = evidence.free_clean & ~structural_wall_free_overlap_map
         roomseg_unknown_clean = evidence.unknown_clean & ~noise_gap_room_separator_map
     roomseg_wall_target_map = evidence.wall_candidate_clean | raw_line_map | filtered_line_map | noise_gap_fill_map
-    corridor_debug = build_corridor_debug(
-        roomseg_free_clean,
-        resolution_m=float(config.resolution_m),
-        config=config.corridor,
-    )
-    corridor_skeleton = np.asarray(corridor_debug.get("corridor_skeleton", np.zeros_like(roomseg_free_clean)), dtype=bool)
+    corridor_axis_v4_result: CorridorAxisV4Result | None = None
+    if use_v4:
+        corridor_axis_v4_result = detect_corridor_axis_v4(
+            roomseg_free_clean,
+            structural_wall_clean=roomseg_wall_target_map,
+            unknown_clean=roomseg_unknown_clean,
+            resolution_m=float(config.resolution_m),
+            config=config.corridor_axis_v4,
+            start_id=1,
+        )
+        corridor_debug = {
+            **dict(corridor_axis_v4_result.debug),
+            "corridor_skeleton": corridor_axis_v4_result.corridor_axis,
+            "corridor_candidate_map": corridor_axis_v4_result.narrow_axis,
+            "corridor_axis_v4": True,
+        }
+        corridor_skeleton = np.asarray(corridor_axis_v4_result.corridor_axis, dtype=bool)
+    else:
+        corridor_debug = build_corridor_debug(
+            roomseg_free_clean,
+            resolution_m=float(config.resolution_m),
+            config=config.corridor,
+        )
+        corridor_skeleton = np.asarray(corridor_debug.get("corridor_skeleton", np.zeros_like(roomseg_free_clean)), dtype=bool)
 
     pass1_gap_candidates, pass1_gap_candidate_debug = generate_wall_gap_candidates(
         segments,
@@ -445,14 +504,17 @@ def run_online_rose_style_roomseg(
             "skipped_reason": "line_extension_passes_lt_1",
         }
     pass1_candidates = [*pass1_gap_candidates, *pass1_extension_candidates]
-    pass1_accepted, pass1_rejected, pass1_separator_map, pass1_labels, pass1_topology = greedily_select_separators(
+    pass1_accepted, pass1_rejected, pass1_separator_map, pass1_labels, pass1_topology = _select_roomseg_separators(
         pass1_candidates,
         free_clean=roomseg_free_clean,
         unknown_clean=roomseg_unknown_clean,
         wall_candidate_clean=roomseg_wall_target_map,
         corridor_skeleton=corridor_skeleton,
+        corridor_axis=corridor_axis_v4_result.corridor_axis if corridor_axis_v4_result is not None else None,
         resolution_m=float(config.resolution_m),
-        config=config.topology_test,
+        topology_config=config.topology_test,
+        group_config=config.separator_group_v4,
+        use_groups=use_v4,
     )
     pass1_topology = {**dict(pass1_topology), "pass_id": 1, "stage": "prepass_anchor_topology"}
     pass1_candidate_debug = {
@@ -555,15 +617,26 @@ def run_online_rose_style_roomseg(
             "extension_intersection": pass2_intersection_debug,
             "l_corner_door_neck": pass2_l_corner_debug,
         }
-    pass2_corridor_room_neck_candidates, pass2_corridor_room_neck_debug = generate_corridor_room_neck_candidates(
-        roomseg_free_clean,
-        resolution_m=float(config.resolution_m),
-        corridor_config=config.corridor,
-        neck_config=config.corridor_room_neck_cut,
-        corridor_debug=corridor_debug,
-        wall_candidate_clean=roomseg_wall_target_map,
-        start_id=pass2_start_id + len(pass2_candidates),
-    )
+    if use_v4 and corridor_axis_v4_result is not None:
+        pass2_corridor_room_neck_candidates = []
+        for idx, candidate in enumerate(corridor_axis_v4_result.corridor_neck_candidates):
+            candidate.candidate_id = int(pass2_start_id + len(pass2_candidates) + idx)
+            pass2_corridor_room_neck_candidates.append(candidate)
+        pass2_corridor_room_neck_debug = {
+            **dict(corridor_axis_v4_result.debug),
+            "source": "corridor_axis_v4",
+            "candidate_count": int(len(pass2_corridor_room_neck_candidates)),
+        }
+    else:
+        pass2_corridor_room_neck_candidates, pass2_corridor_room_neck_debug = generate_corridor_room_neck_candidates(
+            roomseg_free_clean,
+            resolution_m=float(config.resolution_m),
+            corridor_config=config.corridor,
+            neck_config=config.corridor_room_neck_cut,
+            corridor_debug=corridor_debug,
+            wall_candidate_clean=roomseg_wall_target_map,
+            start_id=pass2_start_id + len(pass2_candidates),
+        )
     pass2_candidates = [*pass2_candidates, *pass2_corridor_room_neck_candidates]
     pass2_candidate_debug = {
         **dict(pass2_candidate_debug),
@@ -604,14 +677,17 @@ def run_online_rose_style_roomseg(
     }
     candidates = [*pass1_accepted, *pass2_candidates]
     pass2_virtual_target_map = (virtual_target_map | pass2_extension_intersection_targets) if pass2_enabled else np.zeros_like(virtual_target_map, dtype=bool)
-    accepted, topology_rejected, separator_map, raw_labels, topology_debug = greedily_select_separators(
+    accepted, topology_rejected, separator_map, raw_labels, topology_debug = _select_roomseg_separators(
         candidates,
         free_clean=roomseg_free_clean,
         unknown_clean=roomseg_unknown_clean,
         wall_candidate_clean=roomseg_wall_target_map,
         corridor_skeleton=corridor_skeleton,
+        corridor_axis=corridor_axis_v4_result.corridor_axis if corridor_axis_v4_result is not None else None,
         resolution_m=float(config.resolution_m),
-        config=config.topology_test,
+        topology_config=config.topology_test,
+        group_config=config.separator_group_v4,
+        use_groups=use_v4,
     )
     mandatory_rescue_candidates: list[SeparatorCandidate] = []
     mandatory_rescue_debug: dict = {"mandatory_rescue_triggered": False}
@@ -628,14 +704,17 @@ def run_online_rose_style_roomseg(
         )
         if mandatory_rescue_candidates:
             candidates = [*candidates, *mandatory_rescue_candidates]
-            accepted, topology_rejected, separator_map, raw_labels, topology_debug = greedily_select_separators(
+            accepted, topology_rejected, separator_map, raw_labels, topology_debug = _select_roomseg_separators(
                 candidates,
                 free_clean=roomseg_free_clean,
                 unknown_clean=roomseg_unknown_clean,
                 wall_candidate_clean=roomseg_wall_target_map,
                 corridor_skeleton=corridor_skeleton,
+                corridor_axis=corridor_axis_v4_result.corridor_axis if corridor_axis_v4_result is not None else None,
                 resolution_m=float(config.resolution_m),
-                config=config.topology_test,
+                topology_config=config.topology_test,
+                group_config=config.separator_group_v4,
+                use_groups=use_v4,
             )
             topology_debug = {
                 **dict(topology_debug),
@@ -645,44 +724,62 @@ def run_online_rose_style_roomseg(
     initial_accepted_virtual_boundary_map = (separator_map | structural_wall_free_overlap_map).astype(bool)
     initial_raw_labels, _ = label_components(roomseg_free_clean & ~initial_accepted_virtual_boundary_map, 4)
     initial_raw_labels = relabel_compact(initial_raw_labels)
-    _initial_corridor_labels, initial_corridor_merge_debug = merge_false_parallel_door_corridor_regions(
-        initial_raw_labels,
-        accepted_candidates=accepted,
-        free_clean=roomseg_free_clean,
-        unknown_clean=roomseg_unknown_clean,
-        wall_candidate_clean=roomseg_wall_target_map,
-        filtered_lines=filtered_lines,
-        resolution_m=float(config.resolution_m),
-        config=config.corridor_merge,
-    )
-    active_accepted = [candidate for candidate in accepted if not bool(candidate.debug.get("rejected_after_corridor_merge", False))]
-    accepted_virtual_boundary_map = (_rasterize_many(active_accepted, roomseg_free_clean.shape) | structural_wall_free_overlap_map).astype(bool)
-    raw_labels, _ = label_components(roomseg_free_clean & ~accepted_virtual_boundary_map, 4)
-    raw_labels = relabel_compact(raw_labels)
-    final_labels_raw, corridor_merge_debug = merge_false_parallel_door_corridor_regions(
-        raw_labels,
-        accepted_candidates=active_accepted,
-        free_clean=roomseg_free_clean,
-        unknown_clean=roomseg_unknown_clean,
-        wall_candidate_clean=roomseg_wall_target_map,
-        filtered_lines=filtered_lines,
-        resolution_m=float(config.resolution_m),
-        config=config.corridor_merge,
-    )
-    newly_rejected_after_merge = [candidate for candidate in active_accepted if bool(candidate.debug.get("rejected_after_corridor_merge", False))]
-    if newly_rejected_after_merge:
-        active_accepted = [candidate for candidate in accepted if not bool(candidate.debug.get("rejected_after_corridor_merge", False))]
+    if use_v4:
+        initial_corridor_merge_debug = {"enabled": False, "reason": "v4_final_labels_use_accepted_boundary_components"}
+        active_accepted = list(accepted)
         accepted_virtual_boundary_map = (_rasterize_many(active_accepted, roomseg_free_clean.shape) | structural_wall_free_overlap_map).astype(bool)
         raw_labels, _ = label_components(roomseg_free_clean & ~accepted_virtual_boundary_map, 4)
         raw_labels = relabel_compact(raw_labels)
         final_labels_raw = raw_labels.copy()
-    corridor_merge_debug = {
-        **dict(corridor_merge_debug),
-        "pre_rejection_pass": _strip_arrays(initial_corridor_merge_debug),
-        "accepted_separator_count_after_corridor_merge": int(len(active_accepted)),
-        "accepted_virtual_boundary_cells": int(np.count_nonzero(accepted_virtual_boundary_map)),
-    }
-    corridor_rejected = [candidate for candidate in accepted if bool(candidate.debug.get("rejected_after_corridor_merge", False))]
+        corridor_merge_debug = {
+            "enabled": False,
+            "reason": "v4_final_labels_use_connected_components_free_minus_accepted_boundary",
+            "pre_rejection_pass": dict(initial_corridor_merge_debug),
+            "accepted_separator_count_after_corridor_merge": int(len(active_accepted)),
+            "accepted_virtual_boundary_cells": int(np.count_nonzero(accepted_virtual_boundary_map)),
+            "merge_events": [],
+            "sliver_merge_events": [],
+        }
+        corridor_rejected = []
+    else:
+        _initial_corridor_labels, initial_corridor_merge_debug = merge_false_parallel_door_corridor_regions(
+            initial_raw_labels,
+            accepted_candidates=accepted,
+            free_clean=roomseg_free_clean,
+            unknown_clean=roomseg_unknown_clean,
+            wall_candidate_clean=roomseg_wall_target_map,
+            filtered_lines=filtered_lines,
+            resolution_m=float(config.resolution_m),
+            config=config.corridor_merge,
+        )
+        active_accepted = [candidate for candidate in accepted if not bool(candidate.debug.get("rejected_after_corridor_merge", False))]
+        accepted_virtual_boundary_map = (_rasterize_many(active_accepted, roomseg_free_clean.shape) | structural_wall_free_overlap_map).astype(bool)
+        raw_labels, _ = label_components(roomseg_free_clean & ~accepted_virtual_boundary_map, 4)
+        raw_labels = relabel_compact(raw_labels)
+        final_labels_raw, corridor_merge_debug = merge_false_parallel_door_corridor_regions(
+            raw_labels,
+            accepted_candidates=active_accepted,
+            free_clean=roomseg_free_clean,
+            unknown_clean=roomseg_unknown_clean,
+            wall_candidate_clean=roomseg_wall_target_map,
+            filtered_lines=filtered_lines,
+            resolution_m=float(config.resolution_m),
+            config=config.corridor_merge,
+        )
+        newly_rejected_after_merge = [candidate for candidate in active_accepted if bool(candidate.debug.get("rejected_after_corridor_merge", False))]
+        if newly_rejected_after_merge:
+            active_accepted = [candidate for candidate in accepted if not bool(candidate.debug.get("rejected_after_corridor_merge", False))]
+            accepted_virtual_boundary_map = (_rasterize_many(active_accepted, roomseg_free_clean.shape) | structural_wall_free_overlap_map).astype(bool)
+            raw_labels, _ = label_components(roomseg_free_clean & ~accepted_virtual_boundary_map, 4)
+            raw_labels = relabel_compact(raw_labels)
+            final_labels_raw = raw_labels.copy()
+        corridor_merge_debug = {
+            **dict(corridor_merge_debug),
+            "pre_rejection_pass": _strip_arrays(initial_corridor_merge_debug),
+            "accepted_separator_count_after_corridor_merge": int(len(active_accepted)),
+            "accepted_virtual_boundary_cells": int(np.count_nonzero(accepted_virtual_boundary_map)),
+        }
+        corridor_rejected = [candidate for candidate in accepted if bool(candidate.debug.get("rejected_after_corridor_merge", False))]
     for candidate in corridor_rejected:
         candidate.accepted = False
         candidate.reject_reason = str(candidate.reject_reason or candidate.debug.get("corridor_merge_reject_reason", "reject_corridor_false_parallel_door"))
@@ -741,21 +838,30 @@ def run_online_rose_style_roomseg(
     functional_zone_map = np.zeros_like(final_labels, dtype=np.int32)
     topology_reject_reason_map = _reject_reason_layer(rejected, roomseg_free_clean.shape)
     v3_layers = _v3_layers(evidence_v3, evidence, roomseg_free_clean.shape)
+    v4_layers = _v4_layers(evidence, roomseg_free_clean.shape)
     layers = {
         "vertical_free_raw": evidence.vertical_free_raw,
         "vertical_occupied_raw": evidence.vertical_occupied_raw,
         "vertical_observed_raw": evidence.vertical_observed_raw,
         "vertical_unknown_raw": evidence.vertical_unknown_raw,
         "roomseg_free_raw": v3_layers["roomseg_free_raw"],
+        "roomseg_free_stable": v4_layers["roomseg_free_stable"],
         "roomseg_free_clean": roomseg_free_clean,
         "roomseg_unknown_raw": v3_layers["roomseg_unknown_raw"],
         "roomseg_unknown_clean": roomseg_unknown_clean,
         "raw_endpoint_occupied": v3_layers["raw_endpoint_occupied"],
         "terminal_wall_candidate": v3_layers["terminal_wall_candidate"],
+        "terminal_wall_structural_candidate": v4_layers["terminal_wall_structural_candidate"],
+        "terminal_wall_structural_clean": v4_layers["terminal_wall_structural_clean"],
         "structural_wall_candidate": v3_layers["structural_wall_candidate"],
         "structural_wall_clean": v3_layers["structural_wall_clean"],
+        "structural_wall_confidence": v4_layers["structural_wall_confidence"],
         "ray_covered_count": v3_layers["ray_covered_count"],
         "navigation_reachable_support": v3_layers["navigation_reachable_support"],
+        "nav_reachable_free": v4_layers["nav_reachable_free"],
+        "free_noise_rejected": v4_layers["free_noise_rejected"],
+        "ray_fan_spur_rejected": v4_layers["ray_fan_spur_rejected"],
+        "isolated_free_rejected": v4_layers["isolated_free_rejected"],
         "vertical_free_without_nav_support": v3_layers["vertical_free_without_nav_support"],
         "nav_free_without_vertical_free": v3_layers["nav_free_without_vertical_free"],
         "nav_obstacle_but_vertical_free": v3_layers["nav_obstacle_but_vertical_free"],
@@ -782,6 +888,9 @@ def run_online_rose_style_roomseg(
         "extension_intersection_cut_candidates": candidate_layers["extension_intersection_cut"],
         "single_sided_wall_extension_candidates": candidate_layers["single_sided_wall_extension"],
         "corridor_skeleton": corridor_skeleton,
+        "corridor_axis_v4": v4_layers["corridor_axis_v4"] if corridor_axis_v4_result is None else corridor_axis_v4_result.corridor_axis,
+        "corridor_junctions_v4": v4_layers["corridor_junctions_v4"] if corridor_axis_v4_result is None else corridor_axis_v4_result.corridor_junctions,
+        "corridor_side_branch_points_v4": v4_layers["corridor_side_branch_points_v4"] if corridor_axis_v4_result is None else corridor_axis_v4_result.side_branch_points,
         "corridor_candidate_map": np.asarray(corridor_debug.get("corridor_candidate_map", np.zeros_like(evidence.free_clean)), dtype=bool),
         "corridor_room_neck_cut_candidates": candidate_layers["corridor_room_neck_cut"],
         "mandatory_rescue_wall_endpoint_cut_candidates": candidate_layers["mandatory_rescue_wall_endpoint_cut"],
@@ -862,6 +971,8 @@ def run_online_rose_style_roomseg(
         "pass2_extension_intersection_candidate_count": int(len(pass2_intersection_candidates)) if pass2_enabled else 0,
         "pass2_l_corner_candidate_count": int(len(pass2_l_corner_candidates)) if pass2_enabled else 0,
         "pass2_corridor_room_neck_candidate_count": int(len(pass2_corridor_room_neck_candidates)),
+        "corridor_axis_v4_cells": int(np.count_nonzero(corridor_axis_v4_result.corridor_axis)) if corridor_axis_v4_result is not None else 0,
+        "corridor_axis_v4_junction_cells": int(np.count_nonzero(corridor_axis_v4_result.corridor_junctions)) if corridor_axis_v4_result is not None else 0,
         "pre_topology_rejected_count": int(len(pre_topology_rejected)),
         "endpoint_on_other_door_middle_rejected_count": int(len(endpoint_middle_rejected)),
         "pass2_extension_intersection_target_cells": int(np.count_nonzero(pass2_extension_intersection_targets)),
@@ -873,6 +984,9 @@ def run_online_rose_style_roomseg(
         "candidate_count": int(len(candidates)),
         "accepted_count": int(len(final_accepted)),
         "accepted_closure_count": int(len(final_accepted)),
+        "accepted_single_count": int(sum(1 for item in final_accepted if str(item.debug.get("accepted_as", "single")) == "single")),
+        "accepted_group_count": int(topology_debug.get("accepted_group_count", 0)),
+        "pending_no_single_topology_gain_count": int(topology_debug.get("pending_no_single_topology_gain_count", 0)),
         "rejected_count": int(len(rejected)),
         "candidate_count_by_kind": _kind_counts(candidates),
         "accepted_count_by_kind": _kind_counts(final_accepted),
@@ -1090,15 +1204,26 @@ def _free_assignment_ratio(labels: np.ndarray, free_clean: np.ndarray) -> float:
 def _backend_for_config(config: OnlineRoseStyleConfig | Mapping[str, object] | object) -> str:
     backend = str(getattr(config, "backend", "") or "")
     algorithm = str(getattr(config, "algorithm", "") or "")
-    value = backend or algorithm or ROOMSEG_EVIDENCE_LINE_CLOSURE_V3_BACKEND
+    value = backend or algorithm or ONLINE_LINE_EXTEND_ROOMSEG_V4_BACKEND
     value = value.strip().lower()
     if value in {"online_line_extend_roomseg", "online_line_extend_roomseg_vlm"}:
         return ONLINE_LINE_EXTEND_ROOMSEG_V2_BACKEND
     if value in {"online_rose_style", "online_rose_style_vlm"}:
         return ONLINE_ROSE_STYLE_BACKEND
+    if value in {ONLINE_LINE_EXTEND_ROOMSEG_V4_CONTEXT, "roomseg_v4", "online_roomseg_v4"}:
+        return ONLINE_LINE_EXTEND_ROOMSEG_V4_BACKEND
     if value in {"roomseg_evidence_line_closure_v3_vlm", "online_line_extend_roomseg_v3", "online_line_extend_roomseg_v3_vlm"}:
         return ROOMSEG_EVIDENCE_LINE_CLOSURE_V3_BACKEND
     return value
+
+
+def _is_v4_backend(backend: str) -> bool:
+    return str(backend).strip().lower() in {
+        ONLINE_LINE_EXTEND_ROOMSEG_V4_BACKEND,
+        ONLINE_LINE_EXTEND_ROOMSEG_V4_CONTEXT,
+        "roomseg_v4",
+        "online_roomseg_v4",
+    }
 
 
 def _is_v3_backend(backend: str) -> bool:
@@ -1112,6 +1237,8 @@ def _is_v3_backend(backend: str) -> bool:
 
 def _context_for_backend(backend: str) -> str:
     backend = str(backend).strip().lower()
+    if _is_v4_backend(backend):
+        return ONLINE_LINE_EXTEND_ROOMSEG_V4_CONTEXT
     if _is_v3_backend(backend):
         return ROOMSEG_EVIDENCE_LINE_CLOSURE_V3_CONTEXT
     if backend == ONLINE_ROSE_STYLE_BACKEND:
@@ -1122,6 +1249,7 @@ def _context_for_backend(backend: str) -> str:
 def _v3_config_mapping(config: OnlineRoseStyleConfig) -> dict[str, object]:
     return {
         "roomseg_evidence_v3": dict(config.roomseg_evidence_v3 or {}),
+        "roomseg_evidence_v4": dict(config.roomseg_evidence_v4 or {}),
         "navigation_consistency": dict(config.navigation_consistency or {}),
         "structural_wall_v3": dict(config.structural_wall_v3 or {}),
         "separator_v3": dict(config.separator_v3 or {}),
@@ -1173,6 +1301,42 @@ def _evidence_shim_from_v3(evidence: RoomSegEvidenceV3) -> SimpleNamespace:
     )
 
 
+def _select_roomseg_separators(
+    candidates: Sequence[SeparatorCandidate],
+    *,
+    free_clean: np.ndarray,
+    unknown_clean: np.ndarray,
+    wall_candidate_clean: np.ndarray | None,
+    corridor_skeleton: np.ndarray | None,
+    corridor_axis: np.ndarray | None,
+    resolution_m: float,
+    topology_config: TopologyTestConfig,
+    group_config: Mapping[str, object] | SeparatorGroupV4Config | None,
+    use_groups: bool,
+) -> tuple[list[SeparatorCandidate], list[SeparatorCandidate], np.ndarray, np.ndarray, dict]:
+    if bool(use_groups):
+        return greedily_select_separator_groups(
+            candidates,
+            free_clean=free_clean,
+            unknown_clean=unknown_clean,
+            wall_candidate_clean=wall_candidate_clean,
+            corridor_skeleton=corridor_skeleton,
+            corridor_axis=corridor_axis,
+            resolution_m=float(resolution_m),
+            topology_config=topology_config,
+            group_config=group_config,
+        )
+    return greedily_select_separators(
+        candidates,
+        free_clean=free_clean,
+        unknown_clean=unknown_clean,
+        wall_candidate_clean=wall_candidate_clean,
+        corridor_skeleton=corridor_skeleton,
+        resolution_m=float(resolution_m),
+        config=topology_config,
+    )
+
+
 def _v3_layers(evidence_v3: RoomSegEvidenceV3 | None, evidence: object, shape: tuple[int, int]) -> dict[str, np.ndarray | float]:
     if evidence_v3 is None:
         free_raw = np.asarray(getattr(evidence, "vertical_free_raw"), dtype=bool)
@@ -1181,20 +1345,24 @@ def _v3_layers(evidence_v3: RoomSegEvidenceV3 | None, evidence: object, shape: t
         wall = np.asarray(getattr(evidence, "wall_candidate_clean"), dtype=bool)
         zeros_bool = np.zeros(shape, dtype=bool)
         zeros_u16 = np.zeros(shape, dtype=np.uint16)
+        terminal = np.asarray(getattr(evidence, "terminal_wall_structural_candidate", zeros_bool), dtype=bool)
+        structural_candidate = np.asarray(getattr(evidence, "structural_wall_candidate", wall), dtype=bool)
+        ray_count = np.asarray(getattr(evidence, "ray_covered_count", zeros_u16), dtype=np.uint16)
+        nav_reachable = np.asarray(getattr(evidence, "nav_reachable_free", zeros_bool), dtype=bool)
         return {
             "roomseg_free_raw": free_raw,
             "roomseg_unknown_raw": unknown_raw,
             "roomseg_unknown_clean": unknown_clean,
             "raw_endpoint_occupied": np.asarray(getattr(evidence, "vertical_occupied_raw"), dtype=bool),
-            "terminal_wall_candidate": zeros_bool,
-            "structural_wall_candidate": wall,
+            "terminal_wall_candidate": terminal,
+            "structural_wall_candidate": structural_candidate,
             "structural_wall_clean": wall,
-            "ray_covered_count": zeros_u16,
-            "navigation_reachable_support": zeros_bool,
-            "vertical_free_without_nav_support": zeros_bool,
+            "ray_covered_count": ray_count,
+            "navigation_reachable_support": nav_reachable,
+            "vertical_free_without_nav_support": free_raw & ~nav_reachable if np.any(nav_reachable) else zeros_bool,
             "nav_free_without_vertical_free": zeros_bool,
             "nav_obstacle_but_vertical_free": zeros_bool,
-            "largest_free_area_m2": 0.0,
+            "largest_free_area_m2": float(getattr(evidence, "debug", {}).get("largest_free_area_m2", 0.0)) if hasattr(evidence, "debug") else 0.0,
         }
     disagreement = np.asarray(evidence_v3.disagreement_map, dtype=np.uint8)
     return {
@@ -1211,6 +1379,24 @@ def _v3_layers(evidence_v3: RoomSegEvidenceV3 | None, evidence: object, shape: t
         "nav_free_without_vertical_free": disagreement == 2,
         "nav_obstacle_but_vertical_free": disagreement == 3,
         "largest_free_area_m2": float(evidence_v3.debug.get("largest_free_area_m2", 0.0)),
+    }
+
+
+def _v4_layers(evidence: object, shape: tuple[int, int]) -> dict[str, np.ndarray]:
+    zeros_bool = np.zeros(shape, dtype=bool)
+    zeros_float = np.zeros(shape, dtype=np.float32)
+    return {
+        "roomseg_free_stable": np.asarray(getattr(evidence, "roomseg_free_stable", getattr(evidence, "free_clean", zeros_bool)), dtype=bool),
+        "terminal_wall_structural_candidate": np.asarray(getattr(evidence, "terminal_wall_structural_candidate", zeros_bool), dtype=bool),
+        "terminal_wall_structural_clean": np.asarray(getattr(evidence, "terminal_wall_structural_clean", zeros_bool), dtype=bool),
+        "structural_wall_confidence": np.asarray(getattr(evidence, "structural_wall_confidence", zeros_float), dtype=np.float32),
+        "nav_reachable_free": np.asarray(getattr(evidence, "nav_reachable_free", zeros_bool), dtype=bool),
+        "free_noise_rejected": np.asarray(getattr(evidence, "free_noise_rejected", zeros_bool), dtype=bool),
+        "ray_fan_spur_rejected": np.asarray(getattr(evidence, "ray_fan_spur_rejected", zeros_bool), dtype=bool),
+        "isolated_free_rejected": np.asarray(getattr(evidence, "isolated_free_rejected", zeros_bool), dtype=bool),
+        "corridor_axis_v4": zeros_bool,
+        "corridor_junctions_v4": zeros_bool,
+        "corridor_side_branch_points_v4": zeros_bool,
     }
 
 

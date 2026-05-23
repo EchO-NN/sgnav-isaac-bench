@@ -41,6 +41,8 @@ def _vp(free: np.ndarray, occupied: np.ndarray) -> VerticalProfileMap:
 def _run(free: np.ndarray, occupied: np.ndarray, *, tmp_path=None):
     cfg_data = {
         "online_roomseg": {
+            "backend": "roomseg_evidence_line_closure_v3",
+            "algorithm": "roomseg_evidence_line_closure_v3",
             "debug": {"save_layers": bool(tmp_path), "save_candidate_json": bool(tmp_path)},
             "debug_dir": str(tmp_path / "online_roomseg") if tmp_path else "debug/test_online_roomseg",
             "topology_test": {"min_split_area_m2": 0.2},
