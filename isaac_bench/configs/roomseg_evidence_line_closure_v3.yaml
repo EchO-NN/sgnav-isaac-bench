@@ -1,0 +1,77 @@
+mapping:
+  room_map_mode: roomseg_evidence_line_closure_v3_vlm
+  depth_max_m: 3.0
+  room_segmentation:
+    enabled: true
+    algorithm: roomseg_evidence_line_closure_v3
+    backend: roomseg_evidence_line_closure_v3
+    online_roomseg:
+      enabled: true
+      backend: roomseg_evidence_line_closure_v3
+      algorithm: roomseg_evidence_line_closure_v3
+    ray_valid_wall_inference:
+      enabled: true
+      depth_max_m: 3.0
+      min_terminal_wall_count: 2
+      terminal_wall_splat_radius_cells: 0
+      require_no_vertical_free: true
+    roomseg_evidence_v3:
+      enabled: true
+      force_legacy_ray_valid_wall: false
+      min_free_count_low: 1
+      min_free_count_robot: 1
+      min_free_count_mid: 1
+      min_free_count_upper: 1
+      min_any_free_count: 1
+      min_observed_count: 1
+      min_endpoint_count_raw: 1
+      min_terminal_wall_count: 2
+      terminal_wall_splat_radius_cells: 0
+      depth_far_margin_m: 0.08
+      min_ray_support_near_endpoint: 2
+      min_endpoint_component_area_m2: 0.02
+      unknown_is_wall: false
+      ray_covered_is_free: false
+      raw_endpoint_is_wall: false
+    navigation_consistency:
+      enabled: true
+      robot_seed_snap_radius_m: 0.50
+      nav_support_dilation_m: 0.15
+      strong_vertical_free_min_bands: 2
+      strong_vertical_free_min_count_sum: 3
+      min_free_component_area_m2: 0.25
+      keep_largest_component_if_no_nav_support: true
+      remove_components_not_touching_nav_free: true
+      max_roomseg_nav_iou_warning: 0.35
+    structural_wall_v3:
+      candidate_score_threshold: 0.55
+      clean_score_threshold: 0.68
+      min_occupied_bands_for_clean_wall: 2
+      min_wall_component_area_m2: 0.05
+      min_wall_line_length_m: 0.50
+      tiny_island_area_m2: 0.12
+      two_side_free_check_radius_m: 0.25
+      allow_wall_override_weak_free: false
+    separator_v3:
+      mandatory_rescue_enabled: true
+      rescue_largest_free_area_m2: 8.0
+      rescue_min_wall_run_count: 3
+      rescue_max_candidates: 80
+      accept_score_min: 0.55
+      min_anchor_score_default: 0.75
+    topology_v3:
+      connectivity: 4
+      min_side_area_m2_default: 0.45
+      min_side_area_m2_by_kind:
+        doorway_virtual_cut: 0.30
+        corridor_room_neck_cut: 0.30
+        extension_intersection_cut: 0.35
+        mandatory_rescue_wall_endpoint_cut: 0.50
+        physical_wall_completion: 0.40
+        missed_scan_gap_closure: 0.35
+        short_unknown_gap_closure: 0.35
+        single_sided_wall_extension: 0.50
+sgnav:
+  scene_graph:
+    room_nodes:
+      source: roomseg_evidence_line_closure_v3_vlm

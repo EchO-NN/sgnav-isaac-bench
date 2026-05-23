@@ -349,8 +349,11 @@ def test_virtual_separator_cells_are_absorbed_into_room_masks():
     if np.count_nonzero(pass2_completion) > 0:
         assert np.count_nonzero(pass2_completion & ~wall_after_extension) > 0
     assert result.debug["separator_report"]["wall_target_after_line_extension_source"] == "wall_target_after_noise_gap_fill_only"
-    assert not np.any(virtual_separator & (result.room_label_map <= 0))
-    assert result.debug["virtual_separator_label_fill"]["filled_cell_count"] > 0
+    assert np.any(virtual_separator & (result.room_label_map <= 0))
+    assert result.debug["separator_report"]["labels_outside_free_cells"] == 0
+    assert result.debug["separator_report"]["labels_in_unknown_cells"] == 0
+    assert result.debug["virtual_separator_label_fill"]["filled_cell_count"] == 0
+    assert result.debug["virtual_separator_label_fill"]["enabled"] is False
 
 
 def test_do_not_split_corridor():

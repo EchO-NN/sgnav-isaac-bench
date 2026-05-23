@@ -17,10 +17,10 @@ def test_required_sgnav_defaults():
     assert cfg["perception"]["grounding_dino"]["checkpoint"].endswith("groundingdino_swinb_cogcoor.pth")
     assert cfg["perception"]["grounding_dino"]["config"].endswith("GroundingDINO_SwinB.cfg.py")
     assert cfg["sgnav"]["candidate_start_min_confidence"] == 0.45
-    assert cfg["mapping"]["room_map_mode"] == "online_line_extend_roomseg_v2_vlm"
+    assert cfg["mapping"]["room_map_mode"] == "roomseg_evidence_line_closure_v3_vlm"
     assert cfg["mapping"]["strict_no_oracle_rooms"] is True
-    assert cfg["mapping"]["room_segmentation"]["algorithm"] == "online_line_extend_roomseg_v2"
-    assert cfg["mapping"]["room_segmentation"]["backend"] == "online_line_extend_roomseg_v2"
+    assert cfg["mapping"]["room_segmentation"]["algorithm"] == "roomseg_evidence_line_closure_v3"
+    assert cfg["mapping"]["room_segmentation"]["backend"] == "roomseg_evidence_line_closure_v3"
     assert cfg["mapping"]["room_segmentation"]["source_mode"] == "declutter_reconstruct_external"
     assert cfg["mapping"]["room_segmentation"]["legacy_watershed_allowed"] == "debug_only"
     assert cfg["mapping"]["room_segmentation"]["local_rose2_lite_allowed"] == "debug_only"
@@ -93,7 +93,10 @@ def test_required_sgnav_defaults():
     assert cfg["object_memory"]["footprint_iou_track_match_threshold"] == 0.20
     assert cfg["object_memory"]["child_containment_threshold"] == 0.70
     assert cfg["object_memory"]["child_object_area_ratio_max"] == 0.35
-    assert cfg["sgnav"]["scene_graph"]["room_nodes"]["source"] == "online_line_extend_roomseg_v2_vlm"
+    assert cfg["mapping"]["room_segmentation"]["roomseg_evidence_v3"]["force_legacy_ray_valid_wall"] is False
+    assert cfg["mapping"]["room_segmentation"]["ray_valid_wall_inference"]["terminal_wall_splat_radius_cells"] == 0
+    assert cfg["mapping"]["room_segmentation"]["online_roomseg"]["backend"] == "roomseg_evidence_line_closure_v3"
+    assert cfg["sgnav"]["scene_graph"]["room_nodes"]["source"] == "roomseg_evidence_line_closure_v3_vlm"
     assert cfg["visualization"]["show_gt_goal_cells"] is False
     assert cfg["visualization"]["show_roomseg_debug_red_lines"] is False
     assert cfg["visualization"]["show_room_proposals"] is True

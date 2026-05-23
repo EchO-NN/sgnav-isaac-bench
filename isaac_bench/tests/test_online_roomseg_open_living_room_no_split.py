@@ -31,4 +31,4 @@ def test_open_living_room_without_valid_extension_stays_single_room():
 
     labels = [int(v) for v in np.unique(result.room_label_map) if int(v) > 0]
     assert len(labels) == 1
-    assert result.debug["algorithm"] == "online_line_extend_roomseg_v2"
+    assert result.debug["algorithm"] == "roomseg_evidence_line_closure_v3"

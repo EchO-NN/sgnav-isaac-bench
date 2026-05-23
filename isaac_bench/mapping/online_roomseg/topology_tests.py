@@ -58,7 +58,7 @@ class TopologyTestConfig:
             return int(sep.doorway_thickness_cells)
         if str(kind) in {"physical_wall_completion", "missed_scan_gap_closure", "short_unknown_gap_closure", "single_sided_wall_extension"}:
             return int(sep.wall_completion_thickness_cells)
-        if str(kind) == "corridor_room_neck_cut":
+        if str(kind) in {"corridor_room_neck_cut", "mandatory_rescue_wall_endpoint_cut"}:
             return int(sep.corridor_neck_thickness_cells)
         if str(kind) == "line_extension_door_neck":
             return int(sep.doorway_thickness_cells)
@@ -339,7 +339,7 @@ def _anchor_accepts(candidate: SeparatorCandidate, sep_cfg: SeparatorAnchorConfi
     needs_two = bool(sep_cfg.require_two_anchors)
     if kind in {"physical_wall_completion", "missed_scan_gap_closure", "short_unknown_gap_closure", "single_sided_wall_extension"}:
         needs_two = bool(sep_cfg.require_two_anchors_for_wall_completion)
-    if kind in {"doorway_virtual_cut", "line_extension_door_neck", "extension_intersection_cut", "corridor_room_neck_cut"}:
+    if kind in {"doorway_virtual_cut", "line_extension_door_neck", "extension_intersection_cut", "corridor_room_neck_cut", "mandatory_rescue_wall_endpoint_cut"}:
         needs_two = bool(sep_cfg.require_two_anchors_for_doorway)
     if needs_two and strong < 2:
         one_strong_one_unknown = bool(
@@ -569,6 +569,7 @@ def _kind_order(kind: str) -> int:
         "extension_intersection_cut": 3,
         "single_sided_wall_extension": 4,
         "corridor_room_neck_cut": 5,
+        "mandatory_rescue_wall_endpoint_cut": 6,
     }.get(str(kind), 99)
 
 

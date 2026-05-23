@@ -168,12 +168,12 @@ mapping:
   frontier_allow_near_fallback: false
   frontier_debug_dump: false
   frontier_debug_dir: data/debug_frontier
-  room_map_mode: online_line_extend_roomseg_v2_vlm
+  room_map_mode: roomseg_evidence_line_closure_v3_vlm
   strict_no_oracle_rooms: true
   room_segmentation:
     enabled: true
-    algorithm: online_line_extend_roomseg_v2
-    backend: online_line_extend_roomseg_v2
+    algorithm: roomseg_evidence_line_closure_v3
+    backend: roomseg_evidence_line_closure_v3
     source_mode: declutter_reconstruct_external
     legacy_watershed_allowed: debug_only
     local_rose2_lite_allowed: debug_only
@@ -263,13 +263,92 @@ mapping:
       depth_max_m: 3.0
       min_endpoint_height_m: 0.10
       max_endpoint_height_m: 2.50
-      min_terminal_wall_count: 1
-      terminal_wall_splat_radius_cells: 1
+      min_terminal_wall_count: 2
+      terminal_wall_splat_radius_cells: 0
       require_no_vertical_free: true
       mark_ray_covered_debug: true
       decouple_roomseg_rays_from_nav_clear: true
       strict_no_navigation_obstacle_overlay: true
       strict_no_navigation_free_overlay: true
+    roomseg_evidence_v3:
+      enabled: true
+      force_legacy_ray_valid_wall: false
+      min_free_count_low: 1
+      min_free_count_robot: 1
+      min_free_count_mid: 1
+      min_free_count_upper: 1
+      min_any_free_count: 1
+      min_observed_count: 1
+      min_endpoint_count_raw: 1
+      min_terminal_wall_count: 2
+      terminal_wall_splat_radius_cells: 0
+      depth_far_margin_m: 0.08
+      min_ray_support_near_endpoint: 2
+      min_endpoint_component_area_m2: 0.02
+      unknown_is_wall: false
+      ray_covered_is_free: false
+      raw_endpoint_is_wall: false
+      strict_no_navigation_obstacle_overlay: true
+      strict_no_navigation_free_overlay: false
+    navigation_consistency:
+      enabled: true
+      robot_seed_snap_radius_m: 0.50
+      nav_support_dilation_m: 0.15
+      strong_vertical_free_min_bands: 2
+      strong_vertical_free_min_count_sum: 3
+      min_free_component_area_m2: 0.25
+      keep_largest_component_if_no_nav_support: true
+      remove_components_not_touching_nav_free: true
+      max_roomseg_nav_iou_warning: 0.35
+    structural_wall_v3:
+      candidate_score_threshold: 0.55
+      clean_score_threshold: 0.68
+      min_occupied_bands_for_clean_wall: 2
+      min_wall_component_area_m2: 0.05
+      min_wall_line_length_m: 0.50
+      tiny_island_area_m2: 0.12
+      two_side_free_check_radius_m: 0.25
+      allow_wall_override_weak_free: false
+    separator_v3:
+      mandatory_rescue_enabled: true
+      rescue_largest_free_area_m2: 8.0
+      rescue_min_wall_run_count: 3
+      rescue_max_candidates: 80
+      max_candidates_total: 240
+      accept_score_min: 0.55
+      high_confidence_score_min: 0.70
+      min_anchor_score_default: 0.75
+      min_anchor_score_by_kind:
+        physical_wall_completion: 0.80
+        missed_scan_gap_closure: 0.70
+        short_unknown_gap_closure: 0.70
+        doorway_virtual_cut: 0.70
+        single_sided_wall_extension: 0.75
+        extension_intersection_cut: 0.70
+        corridor_room_neck_cut: 0.70
+        mandatory_rescue_wall_endpoint_cut: 0.75
+    topology_v3:
+      connectivity: 4
+      min_side_area_m2_default: 0.45
+      min_side_area_m2_by_kind:
+        doorway_virtual_cut: 0.30
+        corridor_room_neck_cut: 0.30
+        extension_intersection_cut: 0.35
+        mandatory_rescue_wall_endpoint_cut: 0.50
+        physical_wall_completion: 0.40
+        missed_scan_gap_closure: 0.35
+        short_unknown_gap_closure: 0.35
+        single_sided_wall_extension: 0.50
+      largest_component_drop_min_m2: 0.35
+      sliver_area_m2: 0.20
+      sliver_aspect_ratio_min: 6.0
+    temporal_v3:
+      enabled: true
+      separator_score_ema_alpha: 0.40
+      separator_seen_count_min: 2
+      room_iou_threshold: 0.30
+      match_score_threshold: 0.45
+      max_unseen_frames: 50
     vertical_free_roomseg:
       enabled: true
       debug_dump: false
@@ -344,8 +423,8 @@ mapping:
       corridor_as_room_aspect_ratio: 4.0
     online_roomseg:
       enabled: true
-      backend: online_line_extend_roomseg_v2
-      algorithm: online_line_extend_roomseg_v2
+      backend: roomseg_evidence_line_closure_v3
+      algorithm: roomseg_evidence_line_closure_v3
       depth:
         roomseg_depth_stride_px: 2
         roomseg_depth_stride_debug_px: 2
@@ -818,7 +897,7 @@ sgnav:
     long_edge_geometric_pruning: true
     group_nodes: true
     room_nodes:
-      source: online_line_extend_roomseg_v2_vlm
+      source: roomseg_evidence_line_closure_v3_vlm
       use_dataset_room_labels_in_metric: false
       strict_no_oracle_rooms: true
       room_label_backend: vlm

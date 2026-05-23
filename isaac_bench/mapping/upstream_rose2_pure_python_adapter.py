@@ -144,8 +144,8 @@ class UpstreamROSE2Config:
     exterior_margin_cells: int = 2
     wall_like_aspect_ratio_min: float = 4.0
     vertical_or_free_enabled: bool = True
-    vertical_or_free_z_min_m: float = 0.20
-    vertical_or_free_z_max_m: float = 2.00
+    vertical_or_free_z_min_m: float = 0.10
+    vertical_or_free_z_max_m: float = 2.50
     vertical_or_free_min_free_rays: int = 1
     vertical_or_free_min_observed_rays: int = 1
     roomseg_evidence_fusion_enabled: bool = True
@@ -159,8 +159,8 @@ class UpstreamROSE2Config:
     ray_valid_wall_inference_enabled: bool = True
     ray_valid_wall_inference_mode: str = RAY_VALID_WALL_INFERENCE_MODE
     ray_valid_wall_depth_max_m: float = 3.0
-    ray_valid_wall_min_endpoint_height_m: float = 0.20
-    ray_valid_wall_max_endpoint_height_m: float = 2.00
+    ray_valid_wall_min_endpoint_height_m: float = 0.10
+    ray_valid_wall_max_endpoint_height_m: float = 2.50
     ray_valid_wall_min_terminal_wall_count: int = 1
     ray_valid_wall_terminal_wall_splat_radius_cells: int = 1
     ray_valid_wall_require_no_vertical_free: bool = True
@@ -1549,9 +1549,13 @@ def _vertical_profile_structural_maps(
 
     if vertical_band_indices:
         vertical_occupied_count = np.sum(np.asarray(vp.occupied_count[vertical_band_indices], dtype=np.uint32), axis=0)
+        vertical_unknown_count = np.sum(np.asarray(vp.unknown_count[vertical_band_indices], dtype=np.uint32), axis=0)
     else:
         vertical_occupied_count = np.zeros_like(occ, dtype=np.uint32)
-    vertical_occupied_map = vertical_occupied_count >= 1
+        vertical_unknown_count = np.ones_like(occ, dtype=np.uint32)
+    vertical_occupied_before_unknown_guard = vertical_occupied_count >= 1
+    vertical_partial_unknown = vertical_unknown_count > 0
+    vertical_occupied_map = vertical_occupied_before_unknown_guard & ~vertical_partial_unknown
     if synthetic_nav_free_bootstrap:
         vertical_occupied_map |= occ & ~vertical_free_room_domain
     ray_evidence = _normalize_roomseg_ray_evidence(roomseg_ray_evidence, occ.shape)
@@ -1565,6 +1569,11 @@ def _vertical_profile_structural_maps(
         terminal_wall_height_min=ray_evidence.get("terminal_wall_height_min"),
         terminal_wall_height_max=ray_evidence.get("terminal_wall_height_max"),
         terminal_wall_depth_min=ray_evidence.get("terminal_wall_depth_min"),
+        vertical_profile=vp,
+        grid_free=free_arr,
+        grid_occupied=occ,
+        grid_observed=(~unknown_arr) | free_arr | occ | vertical_observed,
+        resolution_m=float(room_config.resolution_m),
         config=config,
     )
     initial_roomseg_free = np.asarray(ray_wall["initial_roomseg_free"], dtype=bool)
@@ -1586,6 +1595,11 @@ def _vertical_profile_structural_maps(
     ray_wall_debug = dict(ray_wall.get("debug", {}) or {})
     fusion_debug.update(ray_wall_debug)
     fusion_debug["compat_synthetic_nav_free_bootstrap"] = bool(synthetic_nav_free_bootstrap)
+    fusion_debug["vertical_partial_unknown_occupied_suppressed_cells"] = int(
+        np.count_nonzero(vertical_occupied_before_unknown_guard & vertical_partial_unknown)
+    )
+    fusion_debug["vertical_occupied_before_unknown_guard_cells"] = int(np.count_nonzero(vertical_occupied_before_unknown_guard))
+    fusion_debug["vertical_unknown_band_cells"] = int(np.count_nonzero(vertical_partial_unknown))
 
     occupied_bands = (occ_counts > 0) & initial_roomseg_occupied[None, :, :]
     continuity = np.count_nonzero(occupied_bands, axis=0).astype(np.float32) / float(max(1, occ_counts.shape[0]))
@@ -1662,7 +1676,7 @@ def _vertical_profile_structural_maps(
         ),
         "vertical_or_free_z_min_m": float(config.vertical_or_free_z_min_m),
         "vertical_or_free_z_max_m": float(config.vertical_or_free_z_max_m),
-        "vertical_free_source": "vertical_profile_0p2_2p0",
+        "vertical_free_source": "vertical_profile_0p1_2p5",
         "vertical_free_overrides_occupied": True,
         "vertical_free_overridden_occupied_cells": int(np.count_nonzero(occ & vertical_or_free)),
         "roomseg_input_source": "vertical_profile_plus_ray_valid_terminal_wall",
@@ -1670,8 +1684,19 @@ def _vertical_profile_structural_maps(
         "ray_valid_wall_inference_enabled": bool(ray_wall_debug.get("ray_valid_wall_inference_enabled", True)),
         "ray_valid_wall_inference_mode": str(ray_wall_debug.get("ray_valid_wall_inference_mode", RAY_VALID_WALL_INFERENCE_MODE)),
         "ray_valid_wall_inference_debug": ray_wall_debug,
+        "vertical_occupied_0p1_2p5": np.asarray(ray_wall["vertical_occupied_0p1_2p5"], dtype=bool),
+        "vertical_occupied_0p1_2p5_cells": int(np.count_nonzero(ray_wall["vertical_occupied_0p1_2p5"])),
         "vertical_occupied_0p2_2p0": np.asarray(ray_wall["vertical_occupied_0p2_2p0"], dtype=bool),
         "vertical_occupied_0p2_2p0_cells": int(np.count_nonzero(ray_wall["vertical_occupied_0p2_2p0"])),
+        "vertical_occupied_before_unknown_guard": vertical_occupied_before_unknown_guard.astype(bool),
+        "vertical_occupied_before_unknown_guard_cells": int(np.count_nonzero(vertical_occupied_before_unknown_guard)),
+        "vertical_partial_unknown_occupied_suppressed_cells": int(
+            np.count_nonzero(vertical_occupied_before_unknown_guard & vertical_partial_unknown)
+        ),
+        "vertical_unknown_band_map": vertical_partial_unknown.astype(bool),
+        "vertical_unknown_band_cells": int(np.count_nonzero(vertical_partial_unknown)),
+        "vertical_observed_0p1_2p5": np.asarray(ray_wall["vertical_observed_0p1_2p5"], dtype=bool),
+        "vertical_observed_0p1_2p5_cells": int(np.count_nonzero(ray_wall["vertical_observed_0p1_2p5"])),
         "vertical_observed_0p2_2p0": np.asarray(ray_wall["vertical_observed_0p2_2p0"], dtype=bool),
         "vertical_observed_0p2_2p0_cells": int(np.count_nonzero(ray_wall["vertical_observed_0p2_2p0"])),
         "roomseg_ray_covered_count": np.asarray(ray_wall["roomseg_ray_covered_count"], dtype=np.uint16),

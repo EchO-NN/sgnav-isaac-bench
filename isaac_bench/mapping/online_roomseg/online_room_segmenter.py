@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Iterable, Mapping, Sequence
 
 import numpy as np
@@ -10,8 +11,10 @@ from scipy import ndimage
 from isaac_bench.mapping.coordinate_transform import MapInfo
 from isaac_bench.mapping.room_segmentation import RoomMask, RoomProposalState, RoomSegmentationConfig
 from isaac_bench.mapping.room_segmentation import _proposal_masks_debug, _room_from_mask  # reuse canonical metadata/stable room shape
+from isaac_bench.mapping.roomseg_evidence_v3 import RoomSegEvidenceV3, build_roomseg_evidence_v3
 from isaac_bench.mapping.vertical_profile import VerticalProfileMap
 
+from .accepted_boundary_v3 import generate_mandatory_rescue_candidates
 from .corridor import (
     CorridorConfig,
     CorridorMergeConfig,
@@ -22,6 +25,7 @@ from .corridor import (
 )
 from .debug_viz import save_online_roomseg_debug
 from .evidence_maps import FreeCleanConfig, WallCandidateConfig, build_evidence_maps
+from .labeler_v3 import label_rooms_from_accepted_boundaries
 from .separator_candidates import (
     DoorwayVirtualCutConfig,
     DoorNeckConfig,
@@ -60,6 +64,8 @@ from .wall_lines import (
 
 ONLINE_LINE_EXTEND_ROOMSEG_V2_BACKEND = "online_line_extend_roomseg_v2"
 ONLINE_LINE_EXTEND_ROOMSEG_V2_CONTEXT = "online_line_extend_roomseg_v2_vlm"
+ROOMSEG_EVIDENCE_LINE_CLOSURE_V3_BACKEND = "roomseg_evidence_line_closure_v3"
+ROOMSEG_EVIDENCE_LINE_CLOSURE_V3_CONTEXT = "roomseg_evidence_line_closure_v3_vlm"
 ONLINE_ROSE_STYLE_BACKEND = "online_rose_style_v1"
 ONLINE_ROSE_STYLE_CONTEXT = "online_rose_style_v1_vlm"
 
@@ -67,7 +73,8 @@ ONLINE_ROSE_STYLE_CONTEXT = "online_rose_style_v1_vlm"
 @dataclass
 class OnlineRoseStyleConfig:
     enabled: bool = True
-    backend: str = ONLINE_LINE_EXTEND_ROOMSEG_V2_BACKEND
+    backend: str = ROOMSEG_EVIDENCE_LINE_CLOSURE_V3_BACKEND
+    algorithm: str = ROOMSEG_EVIDENCE_LINE_CLOSURE_V3_BACKEND
     resolution_m: float = 0.05
     map_info: MapInfo | None = None
     z_min_m: float = 0.10
@@ -95,6 +102,12 @@ class OnlineRoseStyleConfig:
     corridor_room_neck_cut: CorridorRoomNeckCutConfig = field(default_factory=CorridorRoomNeckCutConfig)
     corridor_merge: CorridorMergeConfig = field(default_factory=CorridorMergeConfig)
     topology_test: TopologyTestConfig = field(default_factory=TopologyTestConfig)
+    roomseg_evidence_v3: Mapping[str, object] = field(default_factory=dict)
+    navigation_consistency: Mapping[str, object] = field(default_factory=dict)
+    structural_wall_v3: Mapping[str, object] = field(default_factory=dict)
+    separator_v3: Mapping[str, object] = field(default_factory=dict)
+    topology_v3: Mapping[str, object] = field(default_factory=dict)
+    temporal_v3: Mapping[str, object] = field(default_factory=dict)
     debug: Mapping[str, object] = field(default_factory=dict)
 
     @classmethod
@@ -102,6 +115,9 @@ class OnlineRoseStyleConfig:
         raw_root = dict(data or {})
         raw = dict(raw_root.get("online_roomseg", {}) or {})
         for key in ("enabled", "backend"):
+            if key in raw_root and key not in raw:
+                raw[key] = raw_root[key]
+        for key in ("algorithm", "roomseg_evidence_v3", "navigation_consistency", "structural_wall_v3", "separator_v3", "topology_v3", "temporal_v3"):
             if key in raw_root and key not in raw:
                 raw[key] = raw_root[key]
         vertical_or_free = dict(raw_root.get("vertical_or_free", {}) or {})
@@ -145,10 +161,11 @@ class OnlineRoseStyleConfig:
         return cls(**base)
 
     def room_config(self) -> RoomSegmentationConfig:
+        backend = _backend_for_config(self)
         return RoomSegmentationConfig(
-            algorithm=ONLINE_LINE_EXTEND_ROOMSEG_V2_BACKEND,
+            algorithm=backend,
             source_grid="vertical_profile_free_0p1_2p5",
-            proposal_mode=ONLINE_LINE_EXTEND_ROOMSEG_V2_BACKEND,
+            proposal_mode=backend,
             finalization_mode="no_merge",
             min_observed_free_cells=int(self.min_observed_free_cells),
             min_room_area_m2=float(self.min_room_area_m2),
@@ -168,7 +185,7 @@ class OnlineRoseStyleResult:
 
 
 class OnlineRoseStyleRoomSegmenter:
-    context_source = ONLINE_LINE_EXTEND_ROOMSEG_V2_CONTEXT
+    context_source = ROOMSEG_EVIDENCE_LINE_CLOSURE_V3_CONTEXT
 
     def __init__(self, config: OnlineRoseStyleConfig | Mapping[str, object] | None = None, map_info: MapInfo | None = None):
         if isinstance(config, OnlineRoseStyleConfig):
@@ -192,6 +209,7 @@ class OnlineRoseStyleRoomSegmenter:
         vertical_profile: VerticalProfileMap | None = None,
         roomseg_static_structural_occupied: np.ndarray | None = None,
         roomseg_ray_evidence: Mapping[str, np.ndarray] | None = None,
+        robot_rc: tuple[int, int] | None = None,
     ) -> list[RoomMask]:
         proposals, state = self.build_proposals(
             occupancy_map,
@@ -203,6 +221,7 @@ class OnlineRoseStyleRoomSegmenter:
             vertical_profile=vertical_profile,
             roomseg_static_structural_occupied=roomseg_static_structural_occupied,
             roomseg_ray_evidence=roomseg_ray_evidence,
+            robot_rc=robot_rc,
         )
         _ = proposals
         return self.finalize_proposals(state, proposal_semantic_labels=None)
@@ -218,6 +237,7 @@ class OnlineRoseStyleRoomSegmenter:
         vertical_profile: VerticalProfileMap | None = None,
         roomseg_static_structural_occupied: np.ndarray | None = None,
         roomseg_ray_evidence: Mapping[str, np.ndarray] | None = None,
+        robot_rc: tuple[int, int] | None = None,
     ) -> tuple[list[RoomMask], RoomProposalState]:
         result = run_online_rose_style_roomseg(
             occupancy_map=occupancy_map,
@@ -226,6 +246,7 @@ class OnlineRoseStyleRoomSegmenter:
             unknown_mask=unknown_mask,
             vertical_profile=vertical_profile,
             roomseg_ray_evidence=roomseg_ray_evidence,
+            robot_rc=robot_rc,
             config=self.config,
             step=int(step),
         )
@@ -270,22 +291,50 @@ def run_online_rose_style_roomseg(
     config: OnlineRoseStyleConfig,
     step: int = 0,
     roomseg_ray_evidence: Mapping[str, np.ndarray] | None = None,
+    robot_rc: tuple[int, int] | None = None,
 ) -> OnlineRoseStyleResult:
-    evidence = build_evidence_maps(
-        occupancy_map=occupancy_map,
-        observed_free_mask=observed_free_mask,
-        obstacle_mask=obstacle_mask,
-        unknown_mask=unknown_mask,
-        vertical_profile=vertical_profile,
-        roomseg_ray_evidence=roomseg_ray_evidence,
-        resolution_m=float(config.resolution_m),
-        free_clean_config=config.free_clean,
-        wall_candidate_config=config.wall_candidate,
-        z_min_m=float(config.z_min_m),
-        z_max_m=float(config.z_max_m),
-        min_free_rays=int(config.min_free_rays),
-        min_observed_rays=int(config.min_observed_rays),
-    )
+    backend_name = _backend_for_config(config)
+    context_source = _context_for_backend(backend_name)
+    use_v3 = _is_v3_backend(backend_name)
+    if use_v3:
+        evidence_v3 = build_roomseg_evidence_v3(
+            vertical_profile=vertical_profile
+            or _synthetic_vertical_profile_from_masks(
+                observed_free_mask,
+                obstacle_mask,
+                ~np.asarray(unknown_mask, dtype=bool),
+            ),
+            grid_free=np.asarray(observed_free_mask, dtype=bool),
+            grid_occupied=np.asarray(obstacle_mask, dtype=bool),
+            grid_observed=~np.asarray(unknown_mask, dtype=bool),
+            roomseg_ray_covered_count=_ray_evidence_value(roomseg_ray_evidence, "ray_covered_count", "roomseg_ray_covered_count"),
+            roomseg_terminal_wall_count=_ray_evidence_value(roomseg_ray_evidence, "terminal_wall_count", "roomseg_terminal_wall_count"),
+            roomseg_terminal_wall_splat=_ray_evidence_value(roomseg_ray_evidence, "terminal_wall_splat", "roomseg_terminal_wall_splat"),
+            roomseg_terminal_wall_height_min=_ray_evidence_value(roomseg_ray_evidence, "terminal_wall_height_min", "roomseg_terminal_wall_height_min"),
+            roomseg_terminal_wall_height_max=_ray_evidence_value(roomseg_ray_evidence, "terminal_wall_height_max", "roomseg_terminal_wall_height_max"),
+            roomseg_terminal_wall_depth_min=_ray_evidence_value(roomseg_ray_evidence, "terminal_wall_depth_min", "roomseg_terminal_wall_depth_min"),
+            robot_rc=robot_rc,
+            resolution_m=float(config.resolution_m),
+            config=_v3_config_mapping(config),
+        )
+        evidence = _evidence_shim_from_v3(evidence_v3)
+    else:
+        evidence_v3 = None
+        evidence = build_evidence_maps(
+            occupancy_map=occupancy_map,
+            observed_free_mask=observed_free_mask,
+            obstacle_mask=obstacle_mask,
+            unknown_mask=unknown_mask,
+            vertical_profile=vertical_profile,
+            roomseg_ray_evidence=roomseg_ray_evidence,
+            resolution_m=float(config.resolution_m),
+            free_clean_config=config.free_clean,
+            wall_candidate_config=config.wall_candidate,
+            z_min_m=float(config.z_min_m),
+            z_max_m=float(config.z_max_m),
+            min_free_rays=int(config.min_free_rays),
+            min_observed_rays=int(config.min_observed_rays),
+        )
     segments, wall_debug = extract_line_supported_walls(
         evidence.wall_candidate_clean,
         resolution_m=float(config.resolution_m),
@@ -316,10 +365,16 @@ def run_online_rose_style_roomseg(
         resolution_m=float(config.resolution_m),
         config=config.noise_wall_gap_fill,
     )
-    structural_wall_free_overlap_map = (evidence.wall_candidate_clean | noise_gap_fill_map) & evidence.free_clean
-    noise_gap_room_separator_map = noise_gap_fill_map & evidence.free_clean
-    roomseg_free_clean = evidence.free_clean & ~structural_wall_free_overlap_map
-    roomseg_unknown_clean = evidence.unknown_clean & ~noise_gap_room_separator_map
+    if use_v3:
+        structural_wall_free_overlap_map = np.zeros_like(evidence.free_clean, dtype=bool)
+        noise_gap_room_separator_map = np.zeros_like(evidence.free_clean, dtype=bool)
+        roomseg_free_clean = np.asarray(evidence.free_clean, dtype=bool).copy()
+        roomseg_unknown_clean = np.asarray(evidence.unknown_clean, dtype=bool).copy()
+    else:
+        structural_wall_free_overlap_map = (evidence.wall_candidate_clean | noise_gap_fill_map) & evidence.free_clean
+        noise_gap_room_separator_map = noise_gap_fill_map & evidence.free_clean
+        roomseg_free_clean = evidence.free_clean & ~structural_wall_free_overlap_map
+        roomseg_unknown_clean = evidence.unknown_clean & ~noise_gap_room_separator_map
     roomseg_wall_target_map = evidence.wall_candidate_clean | raw_line_map | filtered_line_map | noise_gap_fill_map
     corridor_debug = build_corridor_debug(
         roomseg_free_clean,
@@ -558,6 +613,34 @@ def run_online_rose_style_roomseg(
         resolution_m=float(config.resolution_m),
         config=config.topology_test,
     )
+    mandatory_rescue_candidates: list[SeparatorCandidate] = []
+    mandatory_rescue_debug: dict = {"mandatory_rescue_triggered": False}
+    if use_v3:
+        mandatory_rescue_candidates, mandatory_rescue_debug = generate_mandatory_rescue_candidates(
+            roomseg_free_clean=roomseg_free_clean,
+            structural_wall_clean=roomseg_wall_target_map,
+            filtered_lines=filtered_lines,
+            wall_runs=noise_gap_runs,
+            accepted_closure_count=len(accepted),
+            resolution_m=float(config.resolution_m),
+            config=_v3_config_mapping(config),
+            start_id=1 + len(candidates) + len(topology_rejected) + len(pre_topology_rejected),
+        )
+        if mandatory_rescue_candidates:
+            candidates = [*candidates, *mandatory_rescue_candidates]
+            accepted, topology_rejected, separator_map, raw_labels, topology_debug = greedily_select_separators(
+                candidates,
+                free_clean=roomseg_free_clean,
+                unknown_clean=roomseg_unknown_clean,
+                wall_candidate_clean=roomseg_wall_target_map,
+                corridor_skeleton=corridor_skeleton,
+                resolution_m=float(config.resolution_m),
+                config=config.topology_test,
+            )
+            topology_debug = {
+                **dict(topology_debug),
+                "mandatory_rescue": mandatory_rescue_debug,
+            }
     rejected = [*pre_topology_rejected, *topology_rejected]
     initial_accepted_virtual_boundary_map = (separator_map | structural_wall_free_overlap_map).astype(bool)
     initial_raw_labels, _ = label_components(roomseg_free_clean & ~initial_accepted_virtual_boundary_map, 4)
@@ -608,12 +691,34 @@ def run_online_rose_style_roomseg(
         candidate.accepted = True
         candidate.reject_reason = ""
     rejected = [*rejected, *corridor_rejected]
-    final_labels_before_virtual_fill = final_labels_raw.copy()
-    final_labels, virtual_separator_fill_debug = _fill_virtual_separator_label_gaps(
-        final_labels_raw,
-        free_clean=roomseg_free_clean,
-        virtual_separator_map=accepted_virtual_boundary_map,
-    )
+    if use_v3:
+        label_result = label_rooms_from_accepted_boundaries(
+            roomseg_free_clean=roomseg_free_clean,
+            accepted_virtual_boundary_map=accepted_virtual_boundary_map,
+            structural_wall_clean=roomseg_wall_target_map,
+            unknown_clean=roomseg_unknown_clean,
+            resolution_m=float(config.resolution_m),
+            config=_v3_config_mapping(config),
+        )
+        raw_labels = label_result.raw_room_labels.astype(np.int32)
+        final_labels_raw = label_result.final_room_labels.astype(np.int32)
+        final_labels_before_virtual_fill = final_labels_raw.copy()
+        final_labels = final_labels_raw.copy()
+        virtual_separator_fill_debug = {
+            "enabled": False,
+            "reason": "v3_final_labels_are_connected_components_of_free_minus_accepted_boundary",
+            "filled_cell_count": 0,
+            "remaining_unlabeled_separator_cells": int(np.count_nonzero(accepted_virtual_boundary_map & roomseg_free_clean)),
+            "_filled_mask": np.zeros_like(roomseg_free_clean, dtype=bool),
+            **dict(label_result.debug),
+        }
+    else:
+        final_labels_before_virtual_fill = final_labels_raw.copy()
+        final_labels, virtual_separator_fill_debug = _fill_virtual_separator_label_gaps(
+            final_labels_raw,
+            free_clean=roomseg_free_clean,
+            virtual_separator_map=accepted_virtual_boundary_map,
+        )
     candidate_layers = _candidate_layers([*pass1_candidates, *pass2_candidates, *final_accepted, *rejected], roomseg_free_clean.shape)
     rejected_map = _rasterize_many(rejected, roomseg_free_clean.shape)
     pass1_extension_layers = _extension_layers(pass1_extensions, roomseg_free_clean.shape)
@@ -635,11 +740,25 @@ def run_online_rose_style_roomseg(
     room_confidence_map = _room_confidence_layer(final_labels, roomseg_free_clean, accepted_virtual_boundary_map)
     functional_zone_map = np.zeros_like(final_labels, dtype=np.int32)
     topology_reject_reason_map = _reject_reason_layer(rejected, roomseg_free_clean.shape)
+    v3_layers = _v3_layers(evidence_v3, evidence, roomseg_free_clean.shape)
     layers = {
         "vertical_free_raw": evidence.vertical_free_raw,
         "vertical_occupied_raw": evidence.vertical_occupied_raw,
         "vertical_observed_raw": evidence.vertical_observed_raw,
         "vertical_unknown_raw": evidence.vertical_unknown_raw,
+        "roomseg_free_raw": v3_layers["roomseg_free_raw"],
+        "roomseg_free_clean": roomseg_free_clean,
+        "roomseg_unknown_raw": v3_layers["roomseg_unknown_raw"],
+        "roomseg_unknown_clean": roomseg_unknown_clean,
+        "raw_endpoint_occupied": v3_layers["raw_endpoint_occupied"],
+        "terminal_wall_candidate": v3_layers["terminal_wall_candidate"],
+        "structural_wall_candidate": v3_layers["structural_wall_candidate"],
+        "structural_wall_clean": v3_layers["structural_wall_clean"],
+        "ray_covered_count": v3_layers["ray_covered_count"],
+        "navigation_reachable_support": v3_layers["navigation_reachable_support"],
+        "vertical_free_without_nav_support": v3_layers["vertical_free_without_nav_support"],
+        "nav_free_without_vertical_free": v3_layers["nav_free_without_vertical_free"],
+        "nav_obstacle_but_vertical_free": v3_layers["nav_obstacle_but_vertical_free"],
         "free_clean_before_noise_wall_gap_fill": evidence.free_clean,
         "free_clean": roomseg_free_clean,
         "wall_candidate_clean": evidence.wall_candidate_clean,
@@ -665,6 +784,7 @@ def run_online_rose_style_roomseg(
         "corridor_skeleton": corridor_skeleton,
         "corridor_candidate_map": np.asarray(corridor_debug.get("corridor_candidate_map", np.zeros_like(evidence.free_clean)), dtype=bool),
         "corridor_room_neck_cut_candidates": candidate_layers["corridor_room_neck_cut"],
+        "mandatory_rescue_wall_endpoint_cut_candidates": candidate_layers["mandatory_rescue_wall_endpoint_cut"],
         "pass1_line_extensions_all": pass1_extension_layers["all"],
         "pass1_line_extensions_accepted": pass1_extension_layers["accepted"],
         "pass1_line_extensions_rejected": pass1_extension_layers["rejected"],
@@ -680,16 +800,20 @@ def run_online_rose_style_roomseg(
         "accepted_separators_before_corridor_merge": accepted_before_corridor_merge,
         "accepted_separators_after_corridor_merge": accepted_after_corridor_merge,
         "accepted_virtual_boundary_map": accepted_virtual_boundary_map,
+        "candidate_separator_map": _rasterize_many([*pass1_candidates, *pass2_candidates, *mandatory_rescue_candidates], roomseg_free_clean.shape),
+        "rejected_separator_map": rejected_map,
         "separator_map": accepted_virtual_boundary_map,
         "rejected_false_parallel_doors": false_parallel_rejected_map,
         "accepted_separators": final_separator_map,
         "rejected_separators": rejected_map,
         "room_labels_before_separators": before_labels,
         "room_labels_after_separators": raw_labels,
+        "raw_room_labels_before_merge": raw_labels,
         "raw_room_labels_before_corridor_merge": raw_labels,
         "room_labels_after_corridor_merge_before_virtual_fill": final_labels_before_virtual_fill,
         "room_labels_after_corridor_merge": final_labels,
         "final_room_labels": final_labels,
+        "architectural_room_label_map": final_labels,
         "room_confidence_map": room_confidence_map,
         "functional_zone_map": functional_zone_map,
         "topology_reject_reason_map": topology_reject_reason_map,
@@ -699,9 +823,9 @@ def run_online_rose_style_roomseg(
     }
     report = {
         "step": int(step),
-        "backend": ONLINE_LINE_EXTEND_ROOMSEG_V2_BACKEND,
-        "algorithm": ONLINE_LINE_EXTEND_ROOMSEG_V2_BACKEND,
-        "context_source": ONLINE_LINE_EXTEND_ROOMSEG_V2_CONTEXT,
+        "backend": backend_name,
+        "algorithm": backend_name,
+        "context_source": context_source,
         "stage_order": [
             "vertical_evidence_projection",
             "evidence_cleaning",
@@ -719,6 +843,7 @@ def run_online_rose_style_roomseg(
         "pass1_stage": "prepass_anchor_topology",
         "pass2_stage": "line_extension_pass2",
         "wall_segment_count": int(len(segments)),
+        "wall_run_count": int(len(filtered_lines) + len(noise_gap_runs)),
         "snapped_wall_run_count": int(filter_debug.get("snapped_wall_run_count", 0)),
         "merged_wall_run_count": int(filter_debug.get("merged_wall_run_count", 0)),
         "filtered_wall_line_count": int(len(filtered_lines)),
@@ -747,6 +872,7 @@ def run_online_rose_style_roomseg(
         "wall_target_after_line_extension_source": "wall_target_after_noise_gap_fill_only",
         "candidate_count": int(len(candidates)),
         "accepted_count": int(len(final_accepted)),
+        "accepted_closure_count": int(len(final_accepted)),
         "rejected_count": int(len(rejected)),
         "candidate_count_by_kind": _kind_counts(candidates),
         "accepted_count_by_kind": _kind_counts(final_accepted),
@@ -758,6 +884,12 @@ def run_online_rose_style_roomseg(
         "room_count_after_separators": int(len([v for v in np.unique(raw_labels) if int(v) > 0])),
         "room_count_after_corridor_merge_before_virtual_fill": int(len([v for v in np.unique(final_labels_before_virtual_fill) if int(v) > 0])),
         "final_room_count": int(len([v for v in np.unique(final_labels) if int(v) > 0])),
+        "raw_component_count": int(len([v for v in np.unique(raw_labels) if int(v) > 0])),
+        "largest_room_area_m2": _largest_room_area_m2(final_labels, float(config.resolution_m)),
+        "labels_outside_free_cells": int(np.count_nonzero((final_labels > 0) & ~roomseg_free_clean)),
+        "labels_in_unknown_cells": int(np.count_nonzero((final_labels > 0) & roomseg_unknown_clean)),
+        "mandatory_rescue_triggered": bool(mandatory_rescue_debug.get("mandatory_rescue_triggered", False)),
+        "mandatory_rescue_candidate_count": int(len(mandatory_rescue_candidates)),
         "largest_room_area_ratio": _largest_room_area_ratio(final_labels),
         "corridor_merge_event_count": int(len(corridor_merge_debug.get("merge_events", []) or [])),
         "corridor_sliver_merge_event_count": int(len(corridor_merge_debug.get("sliver_merge_events", []) or [])),
@@ -766,17 +898,30 @@ def run_online_rose_style_roomseg(
         "final_free_assignment_ratio": _free_assignment_ratio(final_labels, roomseg_free_clean),
         "navigation_obstacle_written": False,
         "no_fallback": True,
+        "warnings": _v3_warnings(
+            accepted_closure_count=len(final_accepted),
+            largest_free_area_m2=float(v3_layers.get("largest_free_area_m2", 0.0)),
+            final_room_count=int(len([v for v in np.unique(final_labels) if int(v) > 0])),
+            wall_run_count=int(len(filtered_lines) + len(noise_gap_runs)),
+            candidate_count=int(len(candidates)),
+            labels_outside_free_cells=int(np.count_nonzero((final_labels > 0) & ~roomseg_free_clean)),
+            labels_in_unknown_cells=int(np.count_nonzero((final_labels > 0) & roomseg_unknown_clean)),
+            roomseg_free_clean=roomseg_free_clean,
+            nav_reachable=v3_layers["navigation_reachable_support"],
+        )
+        if use_v3
+        else [],
         "candidates": [candidate.to_dict() for candidate in [*final_accepted, *rejected]],
     }
     debug = {
-        "backend": ONLINE_LINE_EXTEND_ROOMSEG_V2_BACKEND,
-        "actual_backend": ONLINE_LINE_EXTEND_ROOMSEG_V2_BACKEND,
-        "source_backend": ONLINE_LINE_EXTEND_ROOMSEG_V2_BACKEND,
-        "roomseg_backend": ONLINE_LINE_EXTEND_ROOMSEG_V2_BACKEND,
-        "algorithm": ONLINE_LINE_EXTEND_ROOMSEG_V2_BACKEND,
-        "source": ONLINE_LINE_EXTEND_ROOMSEG_V2_BACKEND,
-        "context_source": ONLINE_LINE_EXTEND_ROOMSEG_V2_CONTEXT,
-        "room_map_mode": ONLINE_LINE_EXTEND_ROOMSEG_V2_CONTEXT,
+        "backend": backend_name,
+        "actual_backend": backend_name,
+        "source_backend": backend_name,
+        "roomseg_backend": backend_name,
+        "algorithm": backend_name,
+        "source": backend_name,
+        "context_source": context_source,
+        "room_map_mode": context_source,
         "strict_fallback_used": False,
         "silent_fallback_used": False,
         "legacy_style_used": False,
@@ -815,6 +960,7 @@ def run_online_rose_style_roomseg(
         },
         "accepted_separators": [candidate.to_dict() for candidate in final_accepted],
         "rejected_separators": [candidate.to_dict() for candidate in rejected],
+        "mandatory_rescue": mandatory_rescue_debug,
         "proposal_room_masks": _proposal_masks_debug(final_labels),
         **evidence.debug,
         "line_walls": wall_debug,
@@ -830,14 +976,14 @@ def run_online_rose_style_roomseg(
     debug["evidence_report"] = dict(evidence.debug)
     debug.update(
         {
-            "backend": ONLINE_LINE_EXTEND_ROOMSEG_V2_BACKEND,
-            "actual_backend": ONLINE_LINE_EXTEND_ROOMSEG_V2_BACKEND,
-            "source_backend": ONLINE_LINE_EXTEND_ROOMSEG_V2_BACKEND,
-            "roomseg_backend": ONLINE_LINE_EXTEND_ROOMSEG_V2_BACKEND,
-            "algorithm": ONLINE_LINE_EXTEND_ROOMSEG_V2_BACKEND,
-            "source": ONLINE_LINE_EXTEND_ROOMSEG_V2_BACKEND,
-            "context_source": ONLINE_LINE_EXTEND_ROOMSEG_V2_CONTEXT,
-            "room_map_mode": ONLINE_LINE_EXTEND_ROOMSEG_V2_CONTEXT,
+            "backend": backend_name,
+            "actual_backend": backend_name,
+            "source_backend": backend_name,
+            "roomseg_backend": backend_name,
+            "algorithm": backend_name,
+            "source": backend_name,
+            "context_source": context_source,
+            "room_map_mode": context_source,
         }
     )
     debug_cfg = dict(config.debug or {})
@@ -872,16 +1018,18 @@ def run_online_rose_style_roomseg(
 def _rooms_from_labels(labels: np.ndarray, unknown: np.ndarray, config: RoomSegmentationConfig, step: int, debug: Mapping[str, object]) -> list[RoomMask]:
     out: list[RoomMask] = []
     min_cells = max(1, int(config.min_observed_free_cells))
+    backend = str(debug.get("algorithm") or config.algorithm or ROOMSEG_EVIDENCE_LINE_CLOSURE_V3_BACKEND)
+    context_source = str(debug.get("context_source") or _context_for_backend(backend))
     for label in sorted(int(v) for v in np.unique(labels) if int(v) > 0):
         mask = np.asarray(labels == label, dtype=bool)
         if int(np.count_nonzero(mask)) < min_cells and out:
             continue
         room = _room_from_mask("pending", mask, unknown, [], config, int(step))
-        room.source = ONLINE_LINE_EXTEND_ROOMSEG_V2_BACKEND
+        room.source = backend
         room.metadata["label_id"] = int(label)
         room.metadata["proposal_labels"] = [int(label)]
-        room.metadata["source_finalization_mode"] = ONLINE_LINE_EXTEND_ROOMSEG_V2_BACKEND
-        room.metadata["context_source"] = ONLINE_LINE_EXTEND_ROOMSEG_V2_CONTEXT
+        room.metadata["source_finalization_mode"] = backend
+        room.metadata["context_source"] = context_source
         room.metadata["room_type"] = room.metadata.get("room_type", "room")
         room.metadata["functional_zone_label"] = room.metadata.get("functional_zone_label", "unknown_functional_zone")
         room.metadata["navigation_obstacle_written"] = False
@@ -900,6 +1048,7 @@ def _candidate_layers(candidates: Sequence[SeparatorCandidate], shape: tuple[int
         "extension_intersection_cut": np.zeros(shape, dtype=bool),
         "single_sided_wall_extension": np.zeros(shape, dtype=bool),
         "corridor_room_neck_cut": np.zeros(shape, dtype=bool),
+        "mandatory_rescue_wall_endpoint_cut": np.zeros(shape, dtype=bool),
     }
     for candidate in candidates:
         if candidate.kind in out:
@@ -936,6 +1085,173 @@ def _free_assignment_ratio(labels: np.ndarray, free_clean: np.ndarray) -> float:
     if int(np.count_nonzero(free)) <= 0:
         return 0.0
     return float(np.count_nonzero((np.asarray(labels, dtype=np.int32) > 0) & free) / max(1, int(np.count_nonzero(free))))
+
+
+def _backend_for_config(config: OnlineRoseStyleConfig | Mapping[str, object] | object) -> str:
+    backend = str(getattr(config, "backend", "") or "")
+    algorithm = str(getattr(config, "algorithm", "") or "")
+    value = backend or algorithm or ROOMSEG_EVIDENCE_LINE_CLOSURE_V3_BACKEND
+    value = value.strip().lower()
+    if value in {"online_line_extend_roomseg", "online_line_extend_roomseg_vlm"}:
+        return ONLINE_LINE_EXTEND_ROOMSEG_V2_BACKEND
+    if value in {"online_rose_style", "online_rose_style_vlm"}:
+        return ONLINE_ROSE_STYLE_BACKEND
+    if value in {"roomseg_evidence_line_closure_v3_vlm", "online_line_extend_roomseg_v3", "online_line_extend_roomseg_v3_vlm"}:
+        return ROOMSEG_EVIDENCE_LINE_CLOSURE_V3_BACKEND
+    return value
+
+
+def _is_v3_backend(backend: str) -> bool:
+    return str(backend).strip().lower() in {
+        ROOMSEG_EVIDENCE_LINE_CLOSURE_V3_BACKEND,
+        ROOMSEG_EVIDENCE_LINE_CLOSURE_V3_CONTEXT,
+        "online_line_extend_roomseg_v3",
+        "online_line_extend_roomseg_v3_vlm",
+    }
+
+
+def _context_for_backend(backend: str) -> str:
+    backend = str(backend).strip().lower()
+    if _is_v3_backend(backend):
+        return ROOMSEG_EVIDENCE_LINE_CLOSURE_V3_CONTEXT
+    if backend == ONLINE_ROSE_STYLE_BACKEND:
+        return ONLINE_ROSE_STYLE_CONTEXT
+    return ONLINE_LINE_EXTEND_ROOMSEG_V2_CONTEXT
+
+
+def _v3_config_mapping(config: OnlineRoseStyleConfig) -> dict[str, object]:
+    return {
+        "roomseg_evidence_v3": dict(config.roomseg_evidence_v3 or {}),
+        "navigation_consistency": dict(config.navigation_consistency or {}),
+        "structural_wall_v3": dict(config.structural_wall_v3 or {}),
+        "separator_v3": dict(config.separator_v3 or {}),
+        "topology_v3": dict(config.topology_v3 or {}),
+    }
+
+
+def _ray_evidence_value(roomseg_ray_evidence: Mapping[str, np.ndarray] | None, *names: str) -> np.ndarray | None:
+    evidence = dict(roomseg_ray_evidence or {})
+    for name in names:
+        if name in evidence and evidence[name] is not None:
+            return np.asarray(evidence[name])
+    return None
+
+
+def _synthetic_vertical_profile_from_masks(free_mask: np.ndarray, occupied_mask: np.ndarray, observed_mask: np.ndarray) -> VerticalProfileMap:
+    free = np.asarray(free_mask, dtype=bool)
+    occupied = np.asarray(occupied_mask, dtype=bool)
+    observed = np.asarray(observed_mask, dtype=bool) | free | occupied
+    bands = 4
+    free_count = np.zeros((bands, *free.shape), dtype=np.uint16)
+    occupied_count = np.zeros_like(free_count)
+    observed_count = np.zeros_like(free_count)
+    unknown_count = np.ones_like(free_count)
+    free_count[:, free] = 1
+    occupied_count[:, occupied & ~free] = 1
+    observed_count[:, observed] = 1
+    unknown_count[observed_count > 0] = 0
+    return VerticalProfileMap.from_counts(
+        occupied_count=occupied_count,
+        free_ray_count=free_count,
+        observed_count=observed_count,
+        unknown_count=unknown_count,
+    )
+
+
+def _evidence_shim_from_v3(evidence: RoomSegEvidenceV3) -> SimpleNamespace:
+    observed_raw = ~np.asarray(evidence.roomseg_unknown_raw, dtype=bool)
+    return SimpleNamespace(
+        vertical_free_raw=np.asarray(evidence.roomseg_free_raw, dtype=bool),
+        vertical_occupied_raw=np.asarray(evidence.raw_endpoint_occupied, dtype=bool),
+        vertical_observed_raw=observed_raw.astype(bool),
+        vertical_unknown_raw=np.asarray(evidence.roomseg_unknown_raw, dtype=bool),
+        free_clean=np.asarray(evidence.roomseg_free_clean, dtype=bool),
+        wall_candidate_clean=np.asarray(evidence.structural_wall_clean, dtype=bool),
+        unknown_clean=np.asarray(evidence.roomseg_unknown_clean, dtype=bool),
+        resolution_m=0.05,
+        debug=dict(evidence.debug),
+    )
+
+
+def _v3_layers(evidence_v3: RoomSegEvidenceV3 | None, evidence: object, shape: tuple[int, int]) -> dict[str, np.ndarray | float]:
+    if evidence_v3 is None:
+        free_raw = np.asarray(getattr(evidence, "vertical_free_raw"), dtype=bool)
+        unknown_raw = np.asarray(getattr(evidence, "vertical_unknown_raw"), dtype=bool)
+        unknown_clean = np.asarray(getattr(evidence, "unknown_clean"), dtype=bool)
+        wall = np.asarray(getattr(evidence, "wall_candidate_clean"), dtype=bool)
+        zeros_bool = np.zeros(shape, dtype=bool)
+        zeros_u16 = np.zeros(shape, dtype=np.uint16)
+        return {
+            "roomseg_free_raw": free_raw,
+            "roomseg_unknown_raw": unknown_raw,
+            "roomseg_unknown_clean": unknown_clean,
+            "raw_endpoint_occupied": np.asarray(getattr(evidence, "vertical_occupied_raw"), dtype=bool),
+            "terminal_wall_candidate": zeros_bool,
+            "structural_wall_candidate": wall,
+            "structural_wall_clean": wall,
+            "ray_covered_count": zeros_u16,
+            "navigation_reachable_support": zeros_bool,
+            "vertical_free_without_nav_support": zeros_bool,
+            "nav_free_without_vertical_free": zeros_bool,
+            "nav_obstacle_but_vertical_free": zeros_bool,
+            "largest_free_area_m2": 0.0,
+        }
+    disagreement = np.asarray(evidence_v3.disagreement_map, dtype=np.uint8)
+    return {
+        "roomseg_free_raw": evidence_v3.roomseg_free_raw.astype(bool),
+        "roomseg_unknown_raw": evidence_v3.roomseg_unknown_raw.astype(bool),
+        "roomseg_unknown_clean": evidence_v3.roomseg_unknown_clean.astype(bool),
+        "raw_endpoint_occupied": evidence_v3.raw_endpoint_occupied.astype(bool),
+        "terminal_wall_candidate": evidence_v3.terminal_wall_candidate.astype(bool),
+        "structural_wall_candidate": evidence_v3.structural_wall_candidate.astype(bool),
+        "structural_wall_clean": evidence_v3.structural_wall_clean.astype(bool),
+        "ray_covered_count": evidence_v3.ray_covered_count.astype(np.uint16),
+        "navigation_reachable_support": evidence_v3.navigation_reachable_support.astype(bool),
+        "vertical_free_without_nav_support": disagreement == 1,
+        "nav_free_without_vertical_free": disagreement == 2,
+        "nav_obstacle_but_vertical_free": disagreement == 3,
+        "largest_free_area_m2": float(evidence_v3.debug.get("largest_free_area_m2", 0.0)),
+    }
+
+
+def _largest_room_area_m2(labels: np.ndarray, resolution_m: float) -> float:
+    arr = np.asarray(labels, dtype=np.int32)
+    best = 0
+    for label in np.unique(arr):
+        if int(label) <= 0:
+            continue
+        best = max(best, int(np.count_nonzero(arr == int(label))))
+    return float(best) * float(resolution_m) ** 2
+
+
+def _v3_warnings(
+    *,
+    accepted_closure_count: int,
+    largest_free_area_m2: float,
+    final_room_count: int,
+    wall_run_count: int,
+    candidate_count: int,
+    labels_outside_free_cells: int,
+    labels_in_unknown_cells: int,
+    roomseg_free_clean: np.ndarray,
+    nav_reachable: np.ndarray,
+) -> list[str]:
+    warnings: list[str] = []
+    if int(accepted_closure_count) == 0 and float(largest_free_area_m2) >= 8.0:
+        warnings.append("accepted_closure_count_zero_on_large_free_component")
+    if int(final_room_count) == 1 and int(wall_run_count) >= 3 and int(candidate_count) > 0:
+        warnings.append("single_room_with_wall_runs_and_candidates")
+    nav_cells = int(np.count_nonzero(nav_reachable))
+    free_cells = int(np.count_nonzero(roomseg_free_clean))
+    if nav_cells > 0:
+        ratio = float(free_cells / max(1, nav_cells))
+        if ratio < 0.50 or ratio > 1.80:
+            warnings.append("roomseg_free_nav_reachable_ratio_out_of_range")
+    if int(labels_outside_free_cells) > 0:
+        warnings.append("labels_outside_free_cells_nonzero")
+    if int(labels_in_unknown_cells) > 0:
+        warnings.append("labels_in_unknown_cells_nonzero")
+    return warnings
 
 
 def _room_confidence_layer(labels: np.ndarray, free_clean: np.ndarray, accepted_virtual_boundary_map: np.ndarray) -> np.ndarray:
@@ -1006,7 +1322,24 @@ def _merge_topology_config(raw: Mapping[str, object]) -> dict:
     topology = dict(raw.get("topology_test", raw.get("topology", {})) or {})
     if "topology" in raw:
         topology.update(dict(raw.get("topology", {}) or {}))
+    topology_v3 = dict(raw.get("topology_v3", {}) or {})
+    if topology_v3:
+        if "min_side_area_m2_default" in topology_v3:
+            topology["min_split_area_m2"] = topology_v3["min_side_area_m2_default"]
+        if "min_side_area_m2_by_kind" in topology_v3:
+            per_kind = dict(topology.get("per_kind_min_split_area_m2", {}) or {})
+            per_kind.update(dict(topology_v3.get("min_side_area_m2_by_kind", {}) or {}))
+            topology["per_kind_min_split_area_m2"] = per_kind
+        for key in ("connectivity",):
+            if key in topology_v3:
+                topology[key] = topology_v3[key]
     separator = dict(raw.get("separator", {}) or {})
+    separator_v3 = dict(raw.get("separator_v3", {}) or {})
+    if separator_v3:
+        if "accept_score_min" in separator_v3:
+            topology["accept_score_min"] = separator_v3["accept_score_min"]
+        if "min_anchor_score_default" in separator_v3:
+            topology["accept_anchor_score_min"] = separator_v3["min_anchor_score_default"]
     if separator:
         topology["separator"] = separator
     return topology

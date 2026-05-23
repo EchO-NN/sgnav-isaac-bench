@@ -1940,19 +1940,22 @@ def _anchor_type(point: np.ndarray, free: np.ndarray, wall: np.ndarray, unknown:
 def _anchor_score(anchor_type: str) -> float:
     return float(
         {
+            "structural_wall": 1.0,
             "wall": 1.0,
-            "wall_endpoint": 1.0,
-            "other_separator": 1.0,
-            "extension_intersection": 1.0,
+            "wall_endpoint": 0.95,
+            "accepted_separator": 0.90,
+            "other_separator": 0.90,
+            "extension_intersection": 0.80,
+            "navigation_obstacle_edge": 0.55,
             "map_boundary": 0.75,
             "room_boundary": 0.75,
-            "unknown_frontier": 0.5,
+            "unknown_frontier": 0.40,
             "none": 0.0,
             "": 0.0,
             # Backward-compatible aliases from v1 debug payloads.
             "touch_wall": 1.0,
-            "touch_existing_separator": 1.0,
-            "touch_unknown_boundary": 0.5,
+            "touch_existing_separator": 0.90,
+            "touch_unknown_boundary": 0.40,
             "touch_map_boundary": 0.75,
             "touch_room_boundary": 0.75,
         }.get(str(anchor_type), 0.0)

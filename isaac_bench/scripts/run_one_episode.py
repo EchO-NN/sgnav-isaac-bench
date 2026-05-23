@@ -50,6 +50,8 @@ from isaac_bench.mapping.online_roomseg import (
     ONLINE_LINE_EXTEND_ROOMSEG_V2_CONTEXT,
     ONLINE_ROSE_STYLE_BACKEND,
     ONLINE_ROSE_STYLE_CONTEXT,
+    ROOMSEG_EVIDENCE_LINE_CLOSURE_V3_BACKEND,
+    ROOMSEG_EVIDENCE_LINE_CLOSURE_V3_CONTEXT,
     OnlineRoseStyleConfig,
     OnlineRoseStyleRoomSegmenter,
 )
@@ -1553,6 +1555,10 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
         )
         last_room_semantics_debug["backend"] = room_labeler.backend
     elif room_map_mode in {
+        ROOMSEG_EVIDENCE_LINE_CLOSURE_V3_BACKEND,
+        ROOMSEG_EVIDENCE_LINE_CLOSURE_V3_CONTEXT,
+        "online_line_extend_roomseg_v3",
+        "online_line_extend_roomseg_v3_vlm",
         ONLINE_LINE_EXTEND_ROOMSEG_V2_BACKEND,
         ONLINE_LINE_EXTEND_ROOMSEG_V2_CONTEXT,
         ONLINE_ROSE_STYLE_BACKEND,
@@ -1563,14 +1569,19 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
         "online_rose_style_vlm",
     }:
         roomseg_backend = str(
-            getattr(args, "room_segmentation_config", {}).get("backend", ONLINE_LINE_EXTEND_ROOMSEG_V2_BACKEND)
-            or ONLINE_LINE_EXTEND_ROOMSEG_V2_BACKEND
+            getattr(args, "room_segmentation_config", {}).get("backend", ROOMSEG_EVIDENCE_LINE_CLOSURE_V3_BACKEND)
+            or ROOMSEG_EVIDENCE_LINE_CLOSURE_V3_BACKEND
         ).strip().lower()
-        allowed_online_roomseg_backends = {ONLINE_LINE_EXTEND_ROOMSEG_V2_BACKEND, ONLINE_ROSE_STYLE_BACKEND}
+        allowed_online_roomseg_backends = {
+            ROOMSEG_EVIDENCE_LINE_CLOSURE_V3_BACKEND,
+            "online_line_extend_roomseg_v3",
+            ONLINE_LINE_EXTEND_ROOMSEG_V2_BACKEND,
+            ONLINE_ROSE_STYLE_BACKEND,
+        }
         if roomseg_backend not in allowed_online_roomseg_backends:
             raise ValueError(
-                "online_line_extend_roomseg_v2 room_map_mode requires --roomseg-backend %s"
-                % ONLINE_LINE_EXTEND_ROOMSEG_V2_BACKEND
+                "online roomseg room_map_mode requires --roomseg-backend %s"
+                % ROOMSEG_EVIDENCE_LINE_CLOSURE_V3_BACKEND
             )
         online_cfg = OnlineRoseStyleConfig.from_mapping(
             getattr(args, "room_segmentation_config", {}),
@@ -2474,6 +2485,8 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
             roomseg_ray_evidence = getattr(mapper, "roomseg_ray_evidence", None)
             if callable(roomseg_ray_evidence):
                 update_kwargs["roomseg_ray_evidence"] = roomseg_ray_evidence()
+            if "current_grid_local" in locals() and current_grid_local is not None:
+                update_kwargs["robot_rc"] = tuple(int(v) for v in current_grid_local)
             try:
                 masks = room_segmenter.update(
                     map_state["occupancy"],
@@ -2486,6 +2499,7 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
                 update_kwargs.pop("vertical_profile", None)
                 update_kwargs.pop("roomseg_static_structural_occupied", None)
                 update_kwargs.pop("roomseg_ray_evidence", None)
+                update_kwargs.pop("robot_rc", None)
                 masks = room_segmenter.update(
                     map_state["occupancy"],
                     map_state["free"],
@@ -4402,6 +4416,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             "rose2_source_external",
             "rose2_source_external_runner",
             "legacy_rose2_style_debug",
+            ROOMSEG_EVIDENCE_LINE_CLOSURE_V3_BACKEND,
             ONLINE_LINE_EXTEND_ROOMSEG_V2_BACKEND,
             ONLINE_ROSE_STYLE_BACKEND,
             ONLINE_WATERSHED_ROOMSEG_BACKEND,

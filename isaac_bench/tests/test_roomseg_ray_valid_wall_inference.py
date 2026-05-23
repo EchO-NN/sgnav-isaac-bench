@@ -28,8 +28,9 @@ def test_valid_depth_terminal_wall_is_not_unknown():
 
     assert result["initial_roomseg_free"][0, 1]
     assert result["initial_roomseg_free"][0, 2]
-    assert result["initial_roomseg_occupied"][0, 3]
-    assert not result["initial_roomseg_unknown"][0, 3]
+    assert not result["initial_roomseg_occupied"][0, 3]
+    assert result["initial_roomseg_unknown"][0, 3]
+    assert result["debug"]["ray_valid_wall_inference_mode"] == "roomseg_evidence_line_closure_v3"
 
 
 def test_vertical_free_cannot_be_overwritten_by_terminal_wall_splat():
@@ -76,8 +77,8 @@ def test_high_wall_endpoint_writes_roomseg_evidence_without_navigation_free():
         resolution_m=0.1,
         depth_max_m=3.0,
         obstacle_max_height_m=0.9,
-        vertical_profile_free_min_height_m=0.2,
-        vertical_profile_free_max_height_m=2.0,
+        vertical_profile_free_min_height_m=0.1,
+        vertical_profile_free_max_height_m=2.5,
     )
     mapper.reset((0.0, 0.0))
     map_width = int(mapper.grid.map_info.width)
@@ -143,3 +144,45 @@ def test_adapter_does_not_use_navigation_obstacle_overlay_as_wall():
     assert result["initial_roomseg_unknown"][2, 2]
     assert result["navigation_free_added_to_strict_roomseg_cells"] == 0
     assert result["evidence_fusion"]["navigation_obstacle_overlay_for_roomseg_occupied"] is False
+
+
+def test_adapter_keeps_vertical_occupied_with_remaining_unknown_band_unknown():
+    shape = (4, 4)
+    free = np.zeros(shape, dtype=bool)
+    unknown = np.ones(shape, dtype=bool)
+    nav_obstacle = np.zeros(shape, dtype=bool)
+    vp = VerticalProfileMap.zeros(shape)
+    vp.occupied_count[1, 2, 2] = 1
+    vp.observed_count[1, 2, 2] = 1
+    vp.unknown_count[1, 2, 2] = 0
+    cfg = UpstreamROSE2Config(
+        source_root=None,
+        backend="vertical_free_gap_closure_v1",
+        fail_on_missing_source=False,
+        ray_valid_wall_strict_no_navigation_obstacle_overlay=True,
+    )
+    room_cfg = RoomSegmentationConfig(
+        algorithm="vertical_free_gap_closure_v1",
+        source_grid="online_depth_observed",
+        resolution_m=0.05,
+        map_info=MapInfo(resolution_m=0.05, min_x=0.0, max_x=0.2, min_y=0.0, max_y=0.2, width=4, height=4),
+    )
+
+    result = _vertical_profile_structural_maps(
+        occupied=nav_obstacle,
+        free=free,
+        unknown=unknown,
+        vertical_profile=vp,
+        vertical_profile_provided=True,
+        roomseg_static_structural_occupied=None,
+        roomseg_ray_evidence={},
+        object_memory=[],
+        map_info=room_cfg.map_info,
+        config=cfg,
+        room_config=room_cfg,
+    )
+
+    assert not result["vertical_occupied_0p2_2p0"][2, 2]
+    assert result["initial_roomseg_unknown"][2, 2]
+    assert result["vertical_partial_unknown_occupied_suppressed_cells"] == 1
+    assert result["evidence_fusion"]["vertical_partial_unknown_occupied_suppressed_cells"] == 1
