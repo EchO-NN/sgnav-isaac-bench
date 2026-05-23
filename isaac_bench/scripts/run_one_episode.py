@@ -28,10 +28,16 @@ from isaac_bench.graph.room_context import (
 )
 from isaac_bench.graph.sgnav_scenegraph_adapter import SGNAV_ROOM_NAMES, SGNavSceneGraphAdapter
 from isaac_bench.mapping.coordinate_transform import MapInfo, grid_to_world_xy, is_inside_grid, world_xy_to_grid
-from isaac_bench.mapping.frontier import extract_frontiers, frontier_debug_layers
+from isaac_bench.mapping.frontier import (
+    extract_frontiers,
+    frontier_debug_layers,
+    split_wall_adjacent_frontiers,
+    wall_adjacency_mask,
+)
 from isaac_bench.mapping.frontier_room_context import assign_frontier_room_context
 from isaac_bench.mapping.frontier_debug import save_frontier_debug_snapshot
 from isaac_bench.mapping.online_mapper import OnlineMapper
+from isaac_bench.mapping.vertical_profile import VerticalProfileMap
 from isaac_bench.mapping.room_map_from_rooms_json import build_room_index_map, load_rooms
 from isaac_bench.mapping.room_segmentation import (
     OnlineRoomSegmenter,
@@ -40,6 +46,8 @@ from isaac_bench.mapping.room_segmentation import (
 )
 from isaac_bench.mapping.rose2_room_segmentation import OnlineROSE2RoomSegmenter
 from isaac_bench.mapping.online_roomseg import (
+    ONLINE_LINE_EXTEND_ROOMSEG_V2_BACKEND,
+    ONLINE_LINE_EXTEND_ROOMSEG_V2_CONTEXT,
     ONLINE_ROSE_STYLE_BACKEND,
     ONLINE_ROSE_STYLE_CONTEXT,
     OnlineRoseStyleConfig,
@@ -174,8 +182,10 @@ def _roomseg_debug_for_layer_dump(room_debug: Mapping[str, object], room_segment
     if isinstance(layers, Mapping):
         aliases = {
             "vertical_free_room_domain": "vertical_free_raw",
+            "vertical_occupied_0p1_2p5": "vertical_occupied_raw",
             "vertical_occupied_0p2_2p0": "vertical_occupied_raw",
             "vertical_observed_map": "vertical_observed_raw",
+            "vertical_observed_0p1_2p5": "vertical_observed_raw",
             "vertical_observed_0p2_2p0": "vertical_observed_raw",
             "vertical_unknown_before_overlay": "vertical_unknown_raw",
             "navigation_free_room_domain": "free_clean",
@@ -189,6 +199,9 @@ def _roomseg_debug_for_layer_dump(room_debug: Mapping[str, object], room_segment
             "pass2_line_extension_completion": "pass2_line_extension_completion",
             "wall_target_after_line_extension": "wall_target_after_line_extension",
             "completed_wall_after_line_extension": "completed_wall_after_line_extension",
+            "accepted_separators": "accepted_separators",
+            "rejected_separators": "rejected_separators",
+            "virtual_separator_label_fill": "virtual_separator_label_fill",
             "structural_free_mask": "free_clean",
             "wall_boundary_map": "wall_candidate_clean",
             "candidate_wall": "wall_candidate_clean",
@@ -197,8 +210,15 @@ def _roomseg_debug_for_layer_dump(room_debug: Mapping[str, object], room_segment
             "room_proposal_labels_before_merge": "room_labels_before_separators",
         }
         for out_key, layer_key in aliases.items():
-            if out_key not in debug and layer_key in layers:
-                debug[out_key] = np.asarray(layers[layer_key])
+            if layer_key not in layers:
+                continue
+            layer_arr = np.asarray(layers[layer_key])
+            try:
+                existing_shape = np.asarray(debug.get(out_key)).shape if out_key in debug else None
+            except Exception:
+                existing_shape = None
+            if out_key not in debug or existing_shape != layer_arr.shape:
+                debug[out_key] = layer_arr
     if "final_room_label_map" not in debug and result is not None and hasattr(result, "room_label_map"):
         debug["final_room_label_map"] = np.asarray(getattr(result, "room_label_map"))
     return debug
@@ -246,6 +266,131 @@ def apply_dynamic_astar_edge_clearance(
         if 0 <= rr < out.shape[0] and 0 <= cc < out.shape[1] and bool(np.asarray(traversible, dtype=bool)[rr, cc]):
             out[rr, cc] = True
     return out
+
+
+def build_frontier_reachability_traversible(
+    observed_free: np.ndarray,
+    occupied_walls: np.ndarray,
+    resolution_m: float,
+    obstacle_clearance_m: float,
+    current_grid: Optional[Tuple[int, int]] = None,
+) -> np.ndarray:
+    """Traversible mask for frontier selection: obstacle clearance only, no unknown clearance."""
+    observed_free_bool = np.asarray(observed_free, dtype=bool)
+    out = apply_dynamic_astar_edge_clearance(
+        observed_free_bool,
+        np.asarray(occupied_walls, dtype=bool),
+        resolution_m,
+        obstacle_clearance_m,
+        current_grid=current_grid,
+    )
+    if current_grid is None:
+        return out
+    radius_cells = int(math.ceil(max(0.0, float(obstacle_clearance_m)) / max(1e-6, float(resolution_m))))
+    if radius_cells <= 0:
+        return out
+    rr, cc = int(current_grid[0]), int(current_grid[1])
+    h, w = out.shape
+    if not (0 <= rr < h and 0 <= cc < w):
+        return out
+    for dr in range(-radius_cells, radius_cells + 1):
+        for dc in range(-radius_cells, radius_cells + 1):
+            if dr * dr + dc * dc > radius_cells * radius_cells:
+                continue
+            r2, c2 = rr + dr, cc + dc
+            if 0 <= r2 < h and 0 <= c2 < w and bool(observed_free_bool[r2, c2]):
+                out[r2, c2] = True
+    return out
+
+
+def vertical_profile_frontier_maps(
+    vertical_profile: VerticalProfileMap | None,
+    shape: tuple[int, int],
+    *,
+    z_min_m: float = 0.10,
+    z_max_m: float = 2.50,
+    min_free_rays: int = 1,
+    min_observed_rays: int = 1,
+) -> dict[str, np.ndarray | dict]:
+    """Build frontier extraction layers from vertical free-space evidence.
+
+    Unseen vertical columns remain unknown. In particular, cells with no
+    vertical observations are never promoted to occupied just because the
+    navigation map currently treats them as blocked.
+    """
+
+    h, w = int(shape[0]), int(shape[1])
+    empty = np.zeros((h, w), dtype=bool)
+    if vertical_profile is None or tuple(vertical_profile.shape) != (h, w):
+        return {
+            "free": empty.copy(),
+            "occupied": empty.copy(),
+            "observed": empty.copy(),
+            "unknown": ~empty,
+            "debug": {
+                "frontier_source": "vertical_profile_missing",
+                "vertical_frontier_free_cells": 0,
+                "vertical_frontier_occupied_cells": 0,
+                "vertical_frontier_observed_cells": 0,
+                "vertical_frontier_unknown_cells": int(h * w),
+            },
+        }
+
+    indices = [
+        idx
+        for idx, (_name, (lo, hi)) in enumerate(zip(vertical_profile.band_names, vertical_profile.band_ranges_m))
+        if float(hi) > float(z_min_m) and float(lo) < float(z_max_m)
+    ]
+    if not indices:
+        return {
+            "free": empty.copy(),
+            "occupied": empty.copy(),
+            "observed": empty.copy(),
+            "unknown": ~empty,
+            "debug": {
+                "frontier_source": "vertical_profile_no_matching_bands",
+                "vertical_frontier_free_cells": 0,
+                "vertical_frontier_occupied_cells": 0,
+                "vertical_frontier_observed_cells": 0,
+                "vertical_frontier_unknown_cells": int(h * w),
+            },
+        }
+
+    band_names = tuple(str(vertical_profile.band_names[idx]) for idx in indices)
+    free = vertical_profile.reliable_free_mask(
+        min_free_rays=int(min_free_rays),
+        min_observed_rays=int(min_observed_rays),
+        band_names=band_names,
+    ).astype(bool)
+    observed_count = np.sum(np.asarray(vertical_profile.observed_count[indices], dtype=np.uint32), axis=0)
+    occupied_count = np.sum(np.asarray(vertical_profile.occupied_count[indices], dtype=np.uint32), axis=0)
+    unknown_count = np.sum(np.asarray(vertical_profile.unknown_count[indices], dtype=np.uint32), axis=0)
+    observed = observed_count >= int(min_observed_rays)
+    has_unknown_band = unknown_count > 0
+    occupied_before_unknown_guard = (occupied_count > 0) & observed & ~free
+    occupied = occupied_before_unknown_guard & ~has_unknown_band
+    unknown = (~observed) | has_unknown_band
+    return {
+        "free": free.astype(bool),
+        "occupied": occupied.astype(bool),
+        "observed": observed.astype(bool),
+        "unknown": unknown.astype(bool),
+        "debug": {
+            "frontier_source": "vertical_profile_free",
+            "vertical_frontier_band_names": list(band_names),
+            "vertical_frontier_z_min_m": float(z_min_m),
+            "vertical_frontier_z_max_m": float(z_max_m),
+            "vertical_frontier_min_free_rays": int(min_free_rays),
+            "vertical_frontier_min_observed_rays": int(min_observed_rays),
+            "vertical_frontier_free_cells": int(np.count_nonzero(free)),
+            "vertical_frontier_occupied_cells": int(np.count_nonzero(occupied)),
+            "vertical_frontier_observed_cells": int(np.count_nonzero(observed)),
+            "vertical_frontier_unknown_cells": int(np.count_nonzero(unknown)),
+            "vertical_frontier_partial_unknown_occupied_suppressed_cells": int(
+                np.count_nonzero(occupied_before_unknown_guard & has_unknown_band)
+            ),
+        },
+    }
 
 
 def _disk_dilate_bool(mask: np.ndarray, radius_cells: int) -> np.ndarray:
@@ -939,6 +1084,9 @@ def final_log_row(row: dict) -> dict:
         "frontier_unreachable_reason",
         "frontier_stop_at_current_grid",
         "frontier_blacklisted",
+        "frontier_reachability_clearance_m",
+        "frontier_reachability_clearance_source",
+        "frontier_reachability_unknown_clearance_m",
         "active_long_term_goal_mode",
         "active_long_term_goal_age",
         "long_term_goal",
@@ -1234,12 +1382,14 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
         frontier_scenegraph_score_norm=str(args.frontier_scenegraph_score_norm),
         frontier_selection_mode=str(args.frontier_selection_mode),
         frontier_random_seed=int(args.frontier_random_seed),
+        frontier_near_target_radius_m=float(args.frontier_commit_reached_radius_m),
     )
     follower = HolonomicWaypointFollower(
         max_vx=float(args.max_vx_mps),
         max_vy=float(args.max_vy_mps),
         max_wz=float(args.max_wz_radps),
         lookahead_m=float(args.lookahead_m),
+        turn_in_place_yaw_tolerance_rad=float(args.turn_in_place_yaw_tolerance_rad),
     )
     vertical_or_free_cfg = dict(getattr(args, "room_segmentation_config", {}).get("vertical_or_free", {}) or {})
     roomseg_depth_stride_px = _resolve_roomseg_depth_stride_px(
@@ -1262,8 +1412,8 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
         obstacle_max_height_m=float(args.obstacle_max_height_m),
         free_min_height_m=float(args.free_min_height_m),
         free_max_height_m=float(args.free_max_height_m),
-        vertical_profile_free_min_height_m=float(vertical_or_free_cfg.get("z_min_m", 0.20)),
-        vertical_profile_free_max_height_m=float(vertical_or_free_cfg.get("z_max_m", 2.00)),
+        vertical_profile_free_min_height_m=float(vertical_or_free_cfg.get("z_min_m", 0.10)),
+        vertical_profile_free_max_height_m=float(vertical_or_free_cfg.get("z_max_m", 2.50)),
         splat_point_threshold=int(args.splat_point_threshold),
         free_splat_point_threshold=int(args.free_splat_point_threshold),
         robot_radius_m=float(args.robot_radius_m),
@@ -1403,14 +1553,25 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
         )
         last_room_semantics_debug["backend"] = room_labeler.backend
     elif room_map_mode in {
+        ONLINE_LINE_EXTEND_ROOMSEG_V2_BACKEND,
+        ONLINE_LINE_EXTEND_ROOMSEG_V2_CONTEXT,
         ONLINE_ROSE_STYLE_BACKEND,
         ONLINE_ROSE_STYLE_CONTEXT,
+        "online_line_extend_roomseg",
+        "online_line_extend_roomseg_vlm",
         "online_rose_style",
         "online_rose_style_vlm",
     }:
-        roomseg_backend = str(getattr(args, "room_segmentation_config", {}).get("backend", ONLINE_ROSE_STYLE_BACKEND) or ONLINE_ROSE_STYLE_BACKEND).strip().lower()
-        if roomseg_backend != ONLINE_ROSE_STYLE_BACKEND:
-            raise ValueError("online_rose_style room_map_mode requires --roomseg-backend %s" % ONLINE_ROSE_STYLE_BACKEND)
+        roomseg_backend = str(
+            getattr(args, "room_segmentation_config", {}).get("backend", ONLINE_LINE_EXTEND_ROOMSEG_V2_BACKEND)
+            or ONLINE_LINE_EXTEND_ROOMSEG_V2_BACKEND
+        ).strip().lower()
+        allowed_online_roomseg_backends = {ONLINE_LINE_EXTEND_ROOMSEG_V2_BACKEND, ONLINE_ROSE_STYLE_BACKEND}
+        if roomseg_backend not in allowed_online_roomseg_backends:
+            raise ValueError(
+                "online_line_extend_roomseg_v2 room_map_mode requires --roomseg-backend %s"
+                % ONLINE_LINE_EXTEND_ROOMSEG_V2_BACKEND
+            )
         online_cfg = OnlineRoseStyleConfig.from_mapping(
             getattr(args, "room_segmentation_config", {}),
             resolution_m=float(dynamic_map_info.resolution_m),
@@ -1521,7 +1682,7 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
         )
         if "vertical_free" in room_map_mode:
             room_cfg.algorithm = "legacy_watershed_vertical_free_ablation"
-            room_cfg.source_grid = "vertical_profile_free_0p2_2p0"
+            room_cfg.source_grid = "vertical_profile_free_0p1_2p5"
         else:
             room_cfg.algorithm = "legacy_watershed_ablation"
         room_segmenter = OnlineRoomSegmenter(room_cfg)
@@ -1568,6 +1729,7 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
         "random_frontier_mask_probe",
         "nearest_frontier_mask_probe",
     }
+    frontier_blacklist_enabled = not bool(frontier_mask_probe or explore_until_no_frontiers)
     current_path: List[Tuple[int, int]] = []
     full_path: List[Tuple[int, int]] = []
     failure_reason = None
@@ -1576,6 +1738,8 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
     gt_success_region_reached = False
     gt_success_without_sgnav_stop_steps = 0
     gt_success_ignored_steps = 0
+    metric_pose_outside_static_map_count = 0
+    last_metric_pose_outside_static_map = None
     target_radius_reached_steps = 0
     nav_execution_progress_key = None
     nav_execution_best_distance_m = float("inf")
@@ -1719,6 +1883,8 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
             show_room_proposals=bool(args.show_room_proposals),
             show_room_masks=bool(args.show_room_masks),
             show_room_labels=bool(args.show_room_labels),
+            show_roomseg_debug_red_lines=bool(args.show_roomseg_debug_red_lines),
+            map_base_layer=str(args.sgnav_viz_map_base_layer),
             show_frontier_member_cells=bool(args.show_frontier_member_cells),
             show_object_nodes=bool(args.show_object_nodes),
             show_candidate_markers=bool(args.show_candidate_markers),
@@ -1901,6 +2067,15 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
                 planner_init_started_at = time.perf_counter()
                 nav_planner_local = GridAStarPlanner(astar_navigable_local, dynamic_map_info.resolution_m, allow_diagonal=True)
                 record_mapping_timing("planner_init_ms", (time.perf_counter() - planner_init_started_at) * 1000.0)
+            frontier_maps_local = vertical_profile_frontier_maps(
+                getattr(mapper, "vertical_profile", None),
+                free_local.shape,
+                z_min_m=float(vertical_or_free_cfg.get("z_min_m", 0.10)),
+                z_max_m=float(vertical_or_free_cfg.get("z_max_m", 2.50)),
+                min_free_rays=int(vertical_or_free_cfg.get("min_free_rays", 1)),
+                min_observed_rays=int(vertical_or_free_cfg.get("min_observed_rays", 1)),
+            )
+            mapper.last_debug_stats["frontier_vertical_profile"] = dict(frontier_maps_local.get("debug", {}))
             last_dynamic_occupancy = occupancy_local
             last_dynamic_free = free_local
             last_dynamic_navigable = navigable_local
@@ -1914,6 +2089,11 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
                 "occupancy": occupancy_local,
                 "free": free_local,
                 "observed": observed_local,
+                "frontier_free": np.asarray(frontier_maps_local["free"], dtype=bool),
+                "frontier_occupancy": np.asarray(frontier_maps_local["occupied"], dtype=bool),
+                "frontier_observed": np.asarray(frontier_maps_local["observed"], dtype=bool),
+                "frontier_unknown": np.asarray(frontier_maps_local["unknown"], dtype=bool),
+                "frontier_source_debug": dict(frontier_maps_local.get("debug", {})),
                 "navigable": navigable_local,
                 "astar_navigable": astar_navigable_local,
                 "base_nav_planner": base_nav_planner_local,
@@ -2119,6 +2299,9 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
                 include_selected_frontier_sector=False,
             )
 
+        def viz_roomseg_debug() -> dict:
+            return _roomseg_debug_for_layer_dump(last_room_segmentation_debug, room_segmenter)
+
         def update_room_context_for_frontier_scoring(step_idx: int, map_state: dict) -> RoomContextResult:
             nonlocal last_room_masks, room_semantic_labels, last_room_segmentation_debug
             nonlocal last_room_semantics_debug, last_room_context_result, last_room_context_metadata
@@ -2145,7 +2328,7 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
             last_room_context_metadata = result.metadata(full_order=False)
             setattr(scenegraph, "room_context_debug", dict(last_room_context_metadata))
             if viz is not None:
-                viz.set_room_context(last_room_masks, room_semantic_labels, last_room_segmentation_debug)
+                viz.set_room_context(last_room_masks, room_semantic_labels, viz_roomseg_debug())
             return result
 
         def save_selected_roomseg_snapshot(
@@ -2178,7 +2361,71 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
             }
             setattr(scenegraph, "room_context_debug", dict(last_room_context_metadata))
             if viz is not None:
-                viz.set_room_context(last_room_masks, room_semantic_labels, last_room_segmentation_debug)
+                viz.set_room_context(last_room_masks, room_semantic_labels, viz_roomseg_debug())
+
+        def save_frontier_probe_roomseg_snapshot(
+            step_idx: int,
+            map_state: dict,
+            frontier_layers: Mapping[str, np.ndarray],
+            selected_frontier,
+            target_cells: Sequence[Sequence[int]] | None,
+            *,
+            force: bool = False,
+        ) -> None:
+            nonlocal last_roomseg_snapshot_frontier_key
+            if selected_frontier is None:
+                return
+            selected_center = tuple(int(v) for v in selected_frontier.center_grid)
+            selected_target = tuple(int(v) for v in (target_cells[0] if target_cells else selected_center))
+            snapshot_key = (selected_center, selected_target)
+            if not force and snapshot_key == last_roomseg_snapshot_frontier_key:
+                return
+            update_room_context_for_frontier_scoring(step_idx, map_state)
+            save_selected_roomseg_snapshot(
+                step_idx,
+                map_state,
+                frontier_layers,
+                selected_frontier,
+            )
+            last_roomseg_snapshot_frontier_key = snapshot_key
+
+        def mark_navigation_target_reached(
+            step_idx: int,
+            reached_grid: Sequence[int],
+            target_distance_m: float,
+        ) -> None:
+            nonlocal current_path, force_perception_step, target_radius_reached_steps
+            nonlocal last_decision_reason, last_frontier_commitment_reason, last_frontier_commitment_metadata
+            reason = "target_radius_reached"
+            target_radius_reached_steps += 1
+            if frontier_commitment is not None and last_decision_mode == "frontier":
+                frontier_commitment.invalidate_active(
+                    step_idx,
+                    reason,
+                    blacklist=frontier_blacklist_enabled,
+                )
+            if paper_mode:
+                long_term_goal.clear("reached")
+            current_path = []
+            force_perception_step = True
+            full_path.append(tuple(int(v) for v in reached_grid))
+            last_decision_reason = reason
+            if last_nav_decision is not None:
+                last_nav_decision.reason = reason
+                last_nav_decision.metadata = {
+                    **dict(last_nav_decision.metadata or {}),
+                    "target_radius_reached": True,
+                    "target_reached_distance_m": float(target_distance_m),
+                    "target_reached_radius_m": float(args.frontier_commit_reached_radius_m),
+                }
+            last_frontier_commitment_reason = reason
+            last_frontier_commitment_metadata = {
+                **dict(last_frontier_commitment_metadata),
+                "frontier_commitment_reason": reason,
+                "target_radius_reached": True,
+                "target_reached_distance_m": float(target_distance_m),
+                "target_reached_radius_m": float(args.frontier_commit_reached_radius_m),
+            }
 
         def update_roomseg_debug_only(step_idx: int, map_state: dict) -> None:
             nonlocal last_room_masks, room_semantic_labels, last_room_segmentation_debug
@@ -2210,7 +2457,7 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
                     "reason": "room_segmenter_not_configured",
                 }
                 if viz is not None:
-                    viz.set_room_context(last_room_masks, room_semantic_labels, last_room_segmentation_debug)
+                    viz.set_room_context(last_room_masks, room_semantic_labels, viz_roomseg_debug())
                 return
 
             started_at = time.perf_counter()
@@ -2331,7 +2578,7 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
                     "roomseg_debug_likely_cause": dict(dump.get("summary", {})).get("likely_cause"),
                 }
             if viz is not None:
-                viz.set_room_context(last_room_masks, room_semantic_labels, last_room_segmentation_debug)
+                viz.set_room_context(last_room_masks, room_semantic_labels, viz_roomseg_debug())
 
         panorama_steps = max(0, int(getattr(args, "panorama_steps", 0)))
         if panorama_steps > 0:
@@ -2439,11 +2686,21 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
             if current_grid is None:
                 failure_reason = "agent_off_navigable_map"
                 break
-            metric_grid = metric_planner.snap_to_free(world_xy_to_grid(float(pose[0]), float(pose[1]), static_map_info))
+            raw_metric_grid = world_xy_to_grid(float(pose[0]), float(pose[1]), static_map_info)
+            metric_grid = metric_planner.snap_to_free(raw_metric_grid)
+            metric_pose_valid_this_step = metric_grid is not None
             if metric_grid is None:
-                failure_reason = "agent_off_static_metric_map"
-                break
-            evaluator.update_pose(pose, metric_grid, collided=bool(obs.get("collided", False)))
+                metric_pose_outside_static_map_count += 1
+                last_metric_pose_outside_static_map = {
+                    "step": int(step),
+                    "pose_xy": [float(pose[0]), float(pose[1])],
+                    "raw_metric_grid": [int(raw_metric_grid[0]), int(raw_metric_grid[1])],
+                }
+                if bool(getattr(args, "strict_benchmark", False)):
+                    failure_reason = "agent_off_static_metric_map"
+                    break
+            else:
+                evaluator.update_pose(pose, metric_grid, collided=bool(obs.get("collided", False)))
             if roomseg_debug_only:
                 update_roomseg_debug_only(step, map_state)
                 if viz is not None and step % viz_every == 0:
@@ -2482,12 +2739,12 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
                     )
                     continue
                 break
-            if evaluator.final_distance_to_goal <= success_distance:
+            if metric_pose_valid_this_step and evaluator.final_distance_to_goal <= success_distance:
                 gt_success_region_reached = True
                 if explore_until_no_frontiers:
                     gt_success_ignored_steps += 1
             if success_region_can_finish(
-                evaluator.final_distance_to_goal,
+                evaluator.final_distance_to_goal if metric_pose_valid_this_step else float("inf"),
                 success_distance,
                 require_sgnav_stop=bool(args.require_sgnav_stop),
                 policy_stop_confirmed=False,
@@ -2495,7 +2752,7 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
             ):
                 stop_called = True
                 break
-            if evaluator.final_distance_to_goal <= success_distance and bool(args.require_sgnav_stop):
+            if metric_pose_valid_this_step and evaluator.final_distance_to_goal <= success_distance and bool(args.require_sgnav_stop):
                 gt_success_without_sgnav_stop_steps += 1
                 stop_blocked_reason = "sgnav_stop_required"
                 if not logged_gt_success_without_sgnav_stop:
@@ -2505,6 +2762,20 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
                     )
                     logged_gt_success_without_sgnav_stop = True
 
+            target_reached, target_distance_m = navigation_target_reached(
+                current_grid,
+                last_nav_decision,
+                dynamic_map_info.resolution_m,
+                float(args.frontier_commit_reached_radius_m),
+            )
+            if (
+                target_reached
+                and bool(frontier_mask_probe or explore_until_no_frontiers)
+                and last_nav_decision is not None
+                and last_nav_decision.mode == "frontier"
+            ):
+                mark_navigation_target_reached(step, current_grid, target_distance_m)
+
             perception_due = detector is not None and (step % perception_every == 0 or force_perception_step)
             if perception_due:
                 obs = run_detector_update(obs, step, dynamic_map_info, occupancy, navigable)
@@ -2513,6 +2784,7 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
                 update_scenegraph_frame(obs, step, map_state)
 
             needs_replan = not current_path or step % replan_every == 0
+            planned_this_step = False
             if current_path:
                 suffix = trim_path_to_nearest(current_path, current_grid) if paper_mode else trim_path_to_current(current_path, current_grid)
                 if suffix:
@@ -2524,8 +2796,18 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
                 planning_started_at = time.perf_counter()
                 llm_requests_before = total_llm_requests()
                 astar_traversible = np.asarray(map_state.get("astar_navigable", navigable), dtype=bool)
-                frontier_traversible = navigable.astype(bool)
-                frontier_free = free.astype(bool) & frontier_traversible
+                frontier_source_free = np.asarray(map_state.get("frontier_free", free), dtype=bool)
+                frontier_source_observed = np.asarray(map_state.get("frontier_observed", observed), dtype=bool)
+                frontier_source_occupancy = np.asarray(map_state.get("frontier_occupancy", occupancy), dtype=bool)
+                frontier_traversible = build_frontier_reachability_traversible(
+                    free,
+                    occupancy,
+                    dynamic_map_info.resolution_m,
+                    float(args.runtime_planning_clearance_m),
+                    current_grid=current_grid,
+                )
+                frontier_nav_planner = GridAStarPlanner(frontier_traversible, dynamic_map_info.resolution_m, allow_diagonal=True)
+                frontier_free = frontier_source_free.astype(bool)
                 distance_traversible = frontier_traversible.copy()
                 rr, cc = int(current_grid[0]), int(current_grid[1])
                 if 0 <= rr < distance_traversible.shape[0] and 0 <= cc < distance_traversible.shape[1]:
@@ -2538,17 +2820,20 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
                     static_only_nearfield = None
                 frontier_layers = frontier_debug_layers(
                     frontier_free,
-                    observed=observed,
-                    occupancy=occupancy,
+                    observed=frontier_source_observed,
+                    occupancy=frontier_source_occupancy,
                     obstacle_dilation_radius_cells=int(args.frontier_obstacle_dilation_radius_cells),
                     unknown_dilation_radius_cells=int(args.frontier_unknown_dilation_radius_cells),
                     exclude_mask=static_only_nearfield,
                     unknown_source=str(args.frontier_unknown_source),
                 )
                 if bool(getattr(args, "frontier_debug_dump", False)):
-                    assert frontier_free.shape == observed.shape == occupancy.shape == distance_traversible.shape
+                    assert frontier_free.shape == frontier_source_observed.shape == frontier_source_occupancy.shape == distance_traversible.shape
                     assert int(np.count_nonzero(frontier_layers["frontier"] & ~frontier_free)) == 0
                 frontiers = list(last_frontiers)
+                selectable_frontiers = list(frontiers)
+                frontier_blacklist_filtered_count = 0
+                frontier_wall_blacklist_stats = {}
                 locked_goal_used = False
                 candidate_override = None
                 if paper_mode and long_term_goal.exists() and long_term_goal.mode == "frontier":
@@ -2582,27 +2867,89 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
                     last_frontier_raw_cells = int(np.count_nonzero(frontier_layers["frontier"]))
                     frontiers = extract_frontiers(
                         free=frontier_free,
-                        observed=observed,
+                        observed=frontier_source_observed,
                         traversible=distance_traversible,
                         map_info=dynamic_map_info,
                         agent_grid=current_grid,
                         min_cluster_size=int(args.frontier_min_cluster_size),
                         min_distance_m=float(args.frontier_min_distance_m),
                         max_count=int(args.frontier_max_count),
-                        occupancy=occupancy,
+                        occupancy=frontier_source_occupancy,
                         obstacle_dilation_radius_cells=int(args.frontier_obstacle_dilation_radius_cells),
                         unknown_dilation_radius_cells=int(args.frontier_unknown_dilation_radius_cells),
                         exclude_mask=static_only_nearfield,
                         unknown_source=str(args.frontier_unknown_source),
                         cluster_distance_mode=str(args.frontier_cluster_distance_mode),
                         allow_near_frontier_fallback=bool(args.frontier_allow_near_fallback),
-                        require_reachable=not bool(frontier_mask_probe or explore_until_no_frontiers),
+                        require_reachable=False,
                     )
+                    frontier_clusters_before_wall_blacklist = int(len(frontiers))
+                    wall_blacklist_clearance_m = max(0.0, float(args.frontier_wall_blacklist_clearance_m))
+                    if wall_blacklist_clearance_m > 0.0:
+                        wall_blacklist_radius_cells = int(
+                            math.ceil(wall_blacklist_clearance_m / max(float(dynamic_map_info.resolution_m), 1e-6))
+                        )
+                        wall_blacklist_occupancy = np.asarray(map_state.get("occupancy", occupancy), dtype=bool)
+                        wall_adjacent = wall_adjacency_mask(
+                            wall_blacklist_occupancy,
+                            wall_blacklist_radius_cells,
+                        )
+                        filtered_frontiers, wall_rejected_frontiers, frontier_wall_blacklist_stats = (
+                            split_wall_adjacent_frontiers(frontiers, wall_adjacent)
+                        )
+                        if wall_rejected_frontiers:
+                            visible_frontier = np.asarray(frontier_layers["frontier"], dtype=bool).copy()
+                            for rejected_frontier in wall_rejected_frontiers:
+                                for row, col in rejected_frontier.members:
+                                    rr2, cc2 = int(row), int(col)
+                                    if 0 <= rr2 < visible_frontier.shape[0] and 0 <= cc2 < visible_frontier.shape[1]:
+                                        visible_frontier[rr2, cc2] = False
+                                if frontier_commitment is not None:
+                                    frontier_commitment.blacklist_frontier(
+                                        rejected_frontier,
+                                        step,
+                                        "frontier_wall_adjacent",
+                                    )
+                            frontier_layers = {
+                                **dict(frontier_layers),
+                                "frontier": visible_frontier,
+                            }
+                            frontier_blacklist_filtered_count += int(len(wall_rejected_frontiers))
+                            frontiers = filtered_frontiers
+                        if frontier_commitment is not None and frontier_commitment.active is not None:
+                            active_cells = [
+                                tuple(int(v) for v in frontier_commitment.active.center_grid),
+                                *[tuple(int(v) for v in cell) for cell in frontier_commitment.active.target_cells],
+                            ]
+                            active_wall_adjacent = False
+                            for active_row, active_col in active_cells:
+                                if (
+                                    0 <= active_row < wall_adjacent.shape[0]
+                                    and 0 <= active_col < wall_adjacent.shape[1]
+                                    and bool(wall_adjacent[active_row, active_col])
+                                ):
+                                    active_wall_adjacent = True
+                                    break
+                            if active_wall_adjacent:
+                                frontier_commitment.invalidate_active(
+                                    step,
+                                    "frontier_wall_adjacent",
+                                    blacklist=True,
+                                )
+                        frontier_wall_blacklist_stats = {
+                            **dict(frontier_wall_blacklist_stats),
+                            "frontier_wall_blacklist_clearance_m": float(wall_blacklist_clearance_m),
+                            "frontier_wall_blacklist_radius_cells": int(wall_blacklist_radius_cells),
+                            "frontier_wall_blacklist_source": "navigation_occupied",
+                            "frontier_clusters_before_wall_blacklist": int(frontier_clusters_before_wall_blacklist),
+                            "frontier_clusters_after_wall_blacklist": int(len(frontiers)),
+                        }
                     last_frontier_clusters = len(frontiers)
                     last_frontiers = list(frontiers)
+                    selectable_frontiers = list(frontiers)
                     room_context_result = None
                     candidate_preview = None
-                    if paper_mode and frontiers and candidate_override is None and not frontier_mask_probe:
+                    if paper_mode and selectable_frontiers and candidate_override is None and not frontier_mask_probe:
                         candidate_preview = decision_policy.select_goal_candidate(
                             object_memory,
                             episode["goal_category"],
@@ -2612,17 +2959,43 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
                         if bool(args.score_frontiers_before_candidate) or candidate_preview is None:
                             room_context_result = update_room_context_for_frontier_scoring(step, map_state)
                             update_scenegraph_frame(obs, step, map_state)
-                    nav_decision = candidate_override or decision_policy.choose_navigation_target(
-                        object_memory,
-                        episode["goal_category"],
-                        current_grid,
-                        frontiers,
-                        base_nav_planner if bool(frontier_mask_probe or explore_until_no_frontiers) else nav_planner,
-                        dynamic_map_info,
-                        pose,
-                        allow_frontier=True,
-                        current_step=step,
-                    )
+                    if candidate_override is not None:
+                        nav_decision = candidate_override
+                    else:
+                        nav_decision = decision_policy.choose_navigation_target(
+                            object_memory,
+                            episode["goal_category"],
+                            current_grid,
+                            selectable_frontiers,
+                            frontier_nav_planner if bool(frontier_mask_probe or explore_until_no_frontiers) else nav_planner,
+                            dynamic_map_info,
+                            pose,
+                            allow_frontier=True,
+                            current_step=step,
+                        )
+                    if frontier_blacklist_filtered_count > 0:
+                        nav_decision.metadata = {
+                            **dict(nav_decision.metadata or {}),
+                            "frontier_blacklist_filtered_count": int(frontier_blacklist_filtered_count),
+                            "frontier_clusters_before_blacklist": int(frontier_clusters_before_wall_blacklist),
+                            "frontier_clusters_after_blacklist": int(len(selectable_frontiers)),
+                            **dict(frontier_wall_blacklist_stats),
+                        }
+                    if bool(frontier_mask_probe or explore_until_no_frontiers):
+                        nav_decision.metadata = {
+                            **dict(nav_decision.metadata or {}),
+                            "frontier_reachability_clearance_m": float(args.runtime_planning_clearance_m),
+                            "frontier_reachability_clearance_source": "raw_obstacles_only",
+                            "frontier_reachability_unknown_clearance_m": 0.0,
+                        }
+                    nav_decision.metadata = {
+                        **dict(nav_decision.metadata or {}),
+                        **{
+                            key: value
+                            for key, value in dict(map_state.get("frontier_source_debug", {})).items()
+                            if str(key).startswith("frontier_") or str(key).startswith("vertical_frontier_")
+                        },
+                    }
                     if nav_decision.mode == "none" and nav_decision.reason == "no_frontiers" and last_frontier_raw_cells > 0:
                         nav_decision.reason = "no_selectable_frontiers"
                         nav_decision.metadata = {
@@ -2637,12 +3010,12 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
                     if room_context_result is not None:
                         last_room_context_metadata = room_context_result.metadata(full_order=True)
                         frontier_room_contexts = frontier_room_contexts_for_debug(
-                            frontiers=frontiers,
+                            frontiers=selectable_frontiers,
                             room_debug=last_room_segmentation_debug,
                             room_masks=last_room_masks,
                             room_semantic_labels=room_semantic_labels,
-                            observed_free=free,
-                            unknown=~np.asarray(observed, dtype=bool),
+                            observed_free=frontier_source_free,
+                            unknown=~np.asarray(frontier_source_observed, dtype=bool),
                             agent_grid=current_grid,
                             resolution_m=float(dynamic_map_info.resolution_m),
                             config=dict(getattr(args, "room_segmentation_config", {}).get("frontier_room_context", {}) or {}),
@@ -2714,7 +3087,7 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
                             }
                             setattr(scenegraph, "room_context_debug", dict(last_room_context_metadata))
                             if viz is not None:
-                                viz.set_room_context(last_room_masks, room_semantic_labels, last_room_segmentation_debug)
+                                viz.set_room_context(last_room_masks, room_semantic_labels, viz_roomseg_debug())
                 if frontier_commitment is not None and nav_decision.mode == "frontier" and not locked_goal_used:
                     frontier_decision = nav_decision.frontier_decision
                     proposed_frontier = frontier_decision.selected_frontier if frontier_decision is not None else None
@@ -2725,7 +3098,7 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
                         if frontier_decision.selected_index is not None and frontier_decision.selected_index < len(scores_by_index):
                             proposed_score = float(scores_by_index[int(frontier_decision.selected_index)])
                     commit_decision = frontier_commitment.select(
-                        frontiers,
+                        selectable_frontiers,
                         proposed_frontier,
                         proposed_score,
                         current_grid,
@@ -2733,6 +3106,7 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
                         planner=None if bool(frontier_mask_probe or explore_until_no_frontiers) else nav_planner,
                         target_cells=nav_decision.target_cells,
                         scores_by_index=scores_by_index,
+                        blacklist_enabled=frontier_blacklist_enabled,
                     )
                     last_frontier_commitment_metadata = dict(commit_decision.metadata)
                     last_frontier_commitment_metadata["frontier_commitment_reason"] = commit_decision.reason
@@ -2743,7 +3117,7 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
                         frontier_decision.selected_frontier = commit_decision.frontier
                         if commit_decision.frontier is not None:
                             try:
-                                frontier_decision.selected_index = frontiers.index(commit_decision.frontier)
+                                frontier_decision.selected_index = selectable_frontiers.index(commit_decision.frontier)
                             except ValueError:
                                 frontier_decision.selected_index = None
                         else:
@@ -2761,23 +3135,74 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
                     frontier_unreachable_reason = nav_meta.get("frontier_unreachable_reason")
                     if nav_decision.frontier_decision is not None and not nav_decision.target_cells:
                         selected_frontier = nav_decision.frontier_decision.selected_frontier
-                        if frontier_commitment is not None and selected_frontier is not None:
-                            frontier_commitment.blacklist_frontier(
-                                selected_frontier,
-                                step,
-                                str(frontier_unreachable_reason or "frontier_unreachable"),
+                        if selected_frontier is None:
+                            no_frontier_reason = str(
+                                last_frontier_commitment_reason
+                                or frontier_unreachable_reason
+                                or nav_decision.reason
+                                or "no_available_frontier"
                             )
-                        frontier_blacklisted = True
-                        long_term_goal.invalidate(str(frontier_unreachable_reason or "frontier_unreachable"))
-                        current_path = []
-                        force_perception_step = True
-                        last_frontier_commitment_reason = str(frontier_unreachable_reason or "frontier_unreachable")
-                        last_frontier_commitment_metadata = {
-                            **dict(last_frontier_commitment_metadata),
-                            "frontier_commitment_reason": last_frontier_commitment_reason,
-                            "frontier_blacklisted": True,
-                        }
-                        continue
+                            nav_decision.reason = no_frontier_reason
+                            nav_decision.metadata = {
+                                **dict(nav_decision.metadata or {}),
+                                "frontier_selectable_failure_reason": no_frontier_reason,
+                                "frontier_blacklisted": bool(frontier_blacklist_enabled),
+                                "frontier_blacklist_count": int(
+                                    last_frontier_commitment_metadata.get("frontier_blacklist_count", 0) or 0
+                                ),
+                            }
+                            frontier_blacklisted = bool(frontier_blacklist_enabled)
+                            last_frontier_commitment_reason = no_frontier_reason
+                            last_frontier_commitment_metadata = {
+                                **dict(last_frontier_commitment_metadata),
+                                "frontier_commitment_reason": no_frontier_reason,
+                                "frontier_blacklisted": bool(frontier_blacklist_enabled),
+                            }
+                            if frontier_commitment is not None:
+                                frontier_commitment.invalidate_active(
+                                    step,
+                                    no_frontier_reason,
+                                    blacklist=frontier_blacklist_enabled,
+                                )
+                            if bool(frontier_mask_probe or explore_until_no_frontiers) and (frontiers or last_frontier_raw_cells > 0):
+                                current_path = []
+                                force_perception_step = True
+                                last_nav_decision = nav_decision
+                                last_decision_mode = nav_decision.mode
+                                last_decision_reason = no_frontier_reason
+                            nav_decision.mode = "none"
+                        else:
+                            if bool(frontier_mask_probe or explore_until_no_frontiers):
+                                save_frontier_probe_roomseg_snapshot(
+                                    step,
+                                    map_state,
+                                    frontier_layers,
+                                    selected_frontier,
+                                    nav_decision.target_cells,
+                                    force=True,
+                                )
+                            if frontier_commitment is not None:
+                                frontier_commitment.invalidate_active(
+                                    step,
+                                    str(frontier_unreachable_reason or "frontier_unreachable"),
+                                    blacklist=frontier_blacklist_enabled,
+                                )
+                            frontier_blacklisted = bool(frontier_blacklist_enabled)
+                            long_term_goal.invalidate(str(frontier_unreachable_reason or "frontier_unreachable"))
+                            current_path = []
+                            force_perception_step = True
+                            last_frontier_commitment_reason = str(frontier_unreachable_reason or "frontier_unreachable")
+                            last_frontier_commitment_metadata = {
+                                **dict(last_frontier_commitment_metadata),
+                                "frontier_commitment_reason": last_frontier_commitment_reason,
+                                "frontier_blacklisted": bool(frontier_blacklist_enabled),
+                            }
+                            if bool(frontier_mask_probe or explore_until_no_frontiers):
+                                last_nav_decision = nav_decision
+                                last_decision_mode = nav_decision.mode
+                                last_decision_reason = last_frontier_commitment_reason
+                                continue
+                            continue
                 if paper_mode and not locked_goal_used and nav_decision.mode in {"frontier", "candidate"} and nav_decision.target_cells:
                     long_term_goal.set_from(nav_decision, step)
                 last_nav_decision = nav_decision
@@ -2814,8 +3239,8 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
                         args.frontier_debug_dir,
                         step,
                         free=frontier_free,
-                        occupied=occupancy,
-                        observed=observed,
+                        occupied=frontier_source_occupancy,
+                        observed=frontier_source_observed,
                         unknown=frontier_layers["unknown"],
                         unknown_dilated=frontier_layers["unknown_dilated"],
                         frontier=frontier_layers["frontier"],
@@ -2958,19 +3383,23 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
                         or "frontier_empty_target"
                     )
                     if frontier_commitment is not None:
-                        frontier_commitment.invalidate_active(step, reason, blacklist=True)
+                        frontier_commitment.invalidate_active(
+                            step,
+                            reason,
+                            blacklist=frontier_blacklist_enabled,
+                        )
                     long_term_goal.invalidate(reason)
                     current_path = []
                     force_perception_step = True
                     frontier_unreachable_recovery = True
                     frontier_unreachable_reason = reason
-                    frontier_blacklisted = True
+                    frontier_blacklisted = bool(frontier_blacklist_enabled)
                     frontier_stop_at_current_grid = [int(current_grid[0]), int(current_grid[1])]
-                    last_frontier_commitment_reason = "%s_blacklisted" % reason
+                    last_frontier_commitment_reason = "%s_blacklisted" % reason if frontier_blacklist_enabled else reason
                     last_frontier_commitment_metadata = {
                         **dict(last_frontier_commitment_metadata),
                         "frontier_commitment_reason": last_frontier_commitment_reason,
-                        "frontier_blacklisted": True,
+                        "frontier_blacklisted": bool(frontier_blacklist_enabled),
                         "frontier_stop_at_current_grid": frontier_stop_at_current_grid,
                     }
                     continue
@@ -3005,10 +3434,15 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
                     )
                     break
                 planning_goals = nav_goals
+                planning_traversible = astar_traversible
+                planning_planner = nav_planner
+                if nav_decision.mode == "frontier" and bool(frontier_mask_probe or explore_until_no_frontiers):
+                    planning_traversible = frontier_traversible
+                    planning_planner = frontier_nav_planner
                 if nav_decision.mode == "frontier":
                     radius_goals = planning_target_cells_within_radius(
                         nav_goals,
-                        astar_traversible,
+                        planning_traversible,
                         dynamic_map_info.resolution_m,
                         float(args.frontier_commit_reached_radius_m),
                     )
@@ -3020,24 +3454,28 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
                             "frontier_planning_goal_cells_count": int(len(radius_goals)),
                             "frontier_planning_goal_radius_m": float(args.frontier_commit_reached_radius_m),
                         }
-                result = nav_planner.plan(current_grid, planning_goals)
+                result = planning_planner.plan(current_grid, planning_goals)
                 if not result.path:
                     if paper_mode and nav_decision.mode == "frontier":
                         reason = "frontier_center_unreachable"
                         long_term_goal.invalidate(reason)
                         if frontier_commitment is not None:
-                            frontier_commitment.invalidate_active(step, reason, blacklist=True)
+                            frontier_commitment.invalidate_active(
+                                step,
+                                reason,
+                                blacklist=frontier_blacklist_enabled,
+                            )
                         current_path = []
                         force_perception_step = True
                         frontier_unreachable_recovery = True
                         frontier_unreachable_reason = reason
-                        frontier_blacklisted = True
+                        frontier_blacklisted = bool(frontier_blacklist_enabled)
                         frontier_stop_at_current_grid = [int(current_grid[0]), int(current_grid[1])]
-                        last_frontier_commitment_reason = "%s_blacklisted" % reason
+                        last_frontier_commitment_reason = "%s_blacklisted" % reason if frontier_blacklist_enabled else reason
                         last_frontier_commitment_metadata = {
                             **dict(last_frontier_commitment_metadata),
                             "frontier_commitment_reason": last_frontier_commitment_reason,
-                            "frontier_blacklisted": True,
+                            "frontier_blacklisted": bool(frontier_blacklist_enabled),
                             "frontier_stop_at_current_grid": frontier_stop_at_current_grid,
                         }
                         continue
@@ -3067,28 +3505,68 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
                         )
                     break
                 if frontier_mask_probe and nav_decision.mode == "frontier" and len(result.path) <= 1:
-                    reason = "frontier_trivial_path"
                     selected_frontier = (
                         nav_decision.frontier_decision.selected_frontier
                         if nav_decision.frontier_decision is not None
                         else None
                     )
-                    if frontier_commitment is not None:
+                    target_distance_now = distance_to_target_cells_m(
+                        current_grid,
+                        nav_decision.target_cells or [],
+                        dynamic_map_info.resolution_m,
+                    )
+                    center_distance_now = float("inf")
+                    if selected_frontier is not None:
+                        center_distance_now = distance_to_target_cells_m(
+                            current_grid,
+                            [selected_frontier.center_grid],
+                            dynamic_map_info.resolution_m,
+                        )
+                    reached_distance_now = min(float(target_distance_now), float(center_distance_now))
+                    reached_tolerance_m = float(args.frontier_commit_reached_radius_m) + 0.5 * float(dynamic_map_info.resolution_m)
+                    if np.isfinite(reached_distance_now) and reached_distance_now <= reached_tolerance_m:
                         if selected_frontier is not None:
+                            save_frontier_probe_roomseg_snapshot(
+                                step,
+                                map_state,
+                                frontier_layers,
+                                selected_frontier,
+                                nav_decision.target_cells,
+                                force=True,
+                            )
+                        mark_navigation_target_reached(step, current_grid, reached_distance_now)
+                        continue
+
+                    reason = "frontier_trivial_path"
+                    if selected_frontier is not None:
+                        save_frontier_probe_roomseg_snapshot(
+                            step,
+                            map_state,
+                            frontier_layers,
+                            selected_frontier,
+                            nav_decision.target_cells,
+                            force=True,
+                        )
+                    if frontier_commitment is not None:
+                        if selected_frontier is not None and frontier_blacklist_enabled:
                             frontier_commitment.blacklist_frontier(selected_frontier, step, reason)
-                        frontier_commitment.invalidate_active(step, reason, blacklist=True)
+                        frontier_commitment.invalidate_active(
+                            step,
+                            reason,
+                            blacklist=frontier_blacklist_enabled,
+                        )
                     long_term_goal.invalidate(reason)
                     current_path = []
                     force_perception_step = True
                     frontier_unreachable_recovery = True
                     frontier_unreachable_reason = reason
-                    frontier_blacklisted = True
+                    frontier_blacklisted = bool(frontier_blacklist_enabled)
                     frontier_stop_at_current_grid = [int(current_grid[0]), int(current_grid[1])]
-                    last_frontier_commitment_reason = "%s_blacklisted" % reason
+                    last_frontier_commitment_reason = "%s_blacklisted" % reason if frontier_blacklist_enabled else reason
                     last_frontier_commitment_metadata = {
                         **dict(last_frontier_commitment_metadata),
                         "frontier_commitment_reason": last_frontier_commitment_reason,
-                        "frontier_blacklisted": True,
+                        "frontier_blacklisted": bool(frontier_blacklist_enabled),
                         "frontier_stop_at_current_grid": frontier_stop_at_current_grid,
                     }
                     continue
@@ -3099,19 +3577,15 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
                     and nav_decision.frontier_decision.selected_frontier is not None
                 ):
                     selected_frontier = nav_decision.frontier_decision.selected_frontier
-                    selected_center = tuple(int(v) for v in selected_frontier.center_grid)
-                    selected_target = tuple(int(v) for v in (nav_decision.target_cells[0] if nav_decision.target_cells else selected_center))
-                    snapshot_key = (selected_center, selected_target)
-                    if snapshot_key != last_roomseg_snapshot_frontier_key:
-                        update_room_context_for_frontier_scoring(step, map_state)
-                        save_selected_roomseg_snapshot(
-                            step,
-                            map_state,
-                            frontier_layers,
-                            selected_frontier,
-                        )
-                        last_roomseg_snapshot_frontier_key = snapshot_key
+                    save_frontier_probe_roomseg_snapshot(
+                        step,
+                        map_state,
+                        frontier_layers,
+                        selected_frontier,
+                        nav_decision.target_cells,
+                    )
                 current_path = result.path
+                planned_this_step = True
                 full_path.extend(result.path)
                 record_latency("planning", planning_started_at)
                 if total_llm_requests() > llm_requests_before:
@@ -3146,33 +3620,14 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
                 dynamic_map_info.resolution_m,
                 float(args.frontier_commit_reached_radius_m),
             )
-            if target_reached:
-                reason = "target_radius_reached"
-                target_radius_reached_steps += 1
-                if frontier_commitment is not None and last_decision_mode == "frontier":
-                    frontier_commitment.invalidate_active(step, reason, blacklist=True)
-                if paper_mode:
-                    long_term_goal.clear("reached")
-                current_path = []
-                force_perception_step = True
-                full_path.append(tuple(int(v) for v in current_grid))
-                last_decision_reason = reason
-                if last_nav_decision is not None:
-                    last_nav_decision.reason = reason
-                    last_nav_decision.metadata = {
-                        **dict(last_nav_decision.metadata or {}),
-                        "target_radius_reached": True,
-                        "target_reached_distance_m": float(target_distance_m),
-                        "target_reached_radius_m": float(args.frontier_commit_reached_radius_m),
-                    }
-                last_frontier_commitment_reason = reason
-                last_frontier_commitment_metadata = {
-                    **dict(last_frontier_commitment_metadata),
-                    "frontier_commitment_reason": reason,
-                    "target_radius_reached": True,
-                    "target_reached_distance_m": float(target_distance_m),
-                    "target_reached_radius_m": float(args.frontier_commit_reached_radius_m),
-                }
+            if target_reached and not planned_this_step:
+                mark_navigation_target_reached(step, current_grid, target_distance_m)
+                if (
+                    bool(frontier_mask_probe or explore_until_no_frontiers)
+                    and last_nav_decision is not None
+                    and last_nav_decision.mode == "frontier"
+                ):
+                    continue
                 obs = server.step_kinematic_velocity(
                     0.0,
                     0.0,
@@ -3206,12 +3661,16 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
                         else None
                     )
                     if frontier_commitment is not None:
-                        if selected_frontier is not None:
+                        if selected_frontier is not None and frontier_blacklist_enabled:
                             frontier_commitment.blacklist_frontier(selected_frontier, step, reason)
-                        frontier_commitment.invalidate_active(step, reason, blacklist=True)
+                        frontier_commitment.invalidate_active(
+                            step,
+                            reason,
+                            blacklist=frontier_blacklist_enabled,
+                        )
                     long_term_goal.invalidate(reason)
                     frontier_stop_at_current_grid = [int(current_grid[0]), int(current_grid[1])]
-                    frontier_blacklisted = True
+                    frontier_blacklisted = bool(frontier_blacklist_enabled)
                     frontier_unreachable_recovery = True
                     frontier_unreachable_reason = reason
                     last_decision_reason = reason
@@ -3221,11 +3680,11 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
                     nav_execution_progress_key = None
                     nav_execution_best_distance_m = float("inf")
                     nav_execution_no_progress_steps = 0
-                    last_frontier_commitment_reason = "%s_blacklisted" % reason
+                    last_frontier_commitment_reason = "%s_blacklisted" % reason if frontier_blacklist_enabled else reason
                     last_frontier_commitment_metadata = {
                         **dict(last_frontier_commitment_metadata),
                         "frontier_commitment_reason": last_frontier_commitment_reason,
-                        "frontier_blacklisted": True,
+                        "frontier_blacklisted": bool(frontier_blacklist_enabled),
                         "frontier_stop_at_current_grid": frontier_stop_at_current_grid,
                         "frontier_execution_no_progress_steps": int(args.frontier_commit_no_progress_steps),
                         "frontier_execution_best_distance_m": float(execution_best_distance_m),
@@ -3239,6 +3698,8 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
                             "frontier_execution_distance_m": float(target_distance_m),
                             "frontier_execution_no_progress_steps": int(args.frontier_commit_no_progress_steps),
                         }
+                    if bool(frontier_mask_probe or explore_until_no_frontiers):
+                        continue
                     obs = server.step_kinematic_velocity(
                         0.0,
                         0.0,
@@ -3326,6 +3787,8 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
                             scenegraph_backend="original" if scenegraph.scenegraph is not None else "fallback",
                             score_debug=scenegraph.last_score_debug,
                         )
+                    if bool(frontier_mask_probe or explore_until_no_frontiers) and last_decision_mode == "frontier":
+                        continue
                     obs = server.step_kinematic_velocity(
                         0.0,
                         0.0,
@@ -3376,22 +3839,28 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
                 if paper_mode and last_decision_mode == "frontier":
                     reason = "frontier_unreachable_stop_at_current_pose"
                     if frontier_commitment is not None:
-                        frontier_commitment.invalidate_active(step, reason, blacklist=True)
+                        frontier_commitment.invalidate_active(
+                            step,
+                            reason,
+                            blacklist=frontier_blacklist_enabled,
+                        )
                     long_term_goal.invalidate(reason)
                     frontier_stop_at_current_grid = [int(current_grid[0]), int(current_grid[1])]
-                    frontier_blacklisted = True
+                    frontier_blacklisted = bool(frontier_blacklist_enabled)
                     frontier_unreachable_recovery = True
                     frontier_unreachable_reason = reason
-                    last_frontier_commitment_reason = "%s_blacklisted" % reason
+                    last_frontier_commitment_reason = "%s_blacklisted" % reason if frontier_blacklist_enabled else reason
                     last_frontier_commitment_metadata = {
                         **dict(last_frontier_commitment_metadata),
                         "frontier_commitment_reason": last_frontier_commitment_reason,
-                        "frontier_blacklisted": True,
+                        "frontier_blacklisted": bool(frontier_blacklist_enabled),
                         "frontier_stop_at_current_grid": frontier_stop_at_current_grid,
                     }
                     current_path = []
                     full_path.append(tuple(int(v) for v in current_grid))
                     force_perception_step = True
+                    if bool(frontier_mask_probe or explore_until_no_frontiers):
+                        continue
                     obs = server.step_kinematic_velocity(
                         0.0,
                         0.0,
@@ -3434,6 +3903,10 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
         row["goal_success_ignored_steps"] = int(gt_success_ignored_steps)
         row["target_radius_reached_steps"] = int(target_radius_reached_steps)
         row["target_reached_radius_m"] = float(args.frontier_commit_reached_radius_m)
+        row["metric_pose_outside_static_map_count"] = int(metric_pose_outside_static_map_count)
+        row["last_metric_pose_outside_static_map"] = dict(last_metric_pose_outside_static_map or {})
+        if metric_pose_outside_static_map_count > 0:
+            row["metric_valid"] = False
         row["stop_blocked_reason"] = stop_blocked_reason
         row["seeded_object_memory_count"] = int(seeded)
         row["object_memory_count"] = int(len(object_memory.nodes))
@@ -3444,6 +3917,9 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
         row["sgnav_state"] = getattr(decision_policy, "state", last_decision_mode)
         decision_metadata = dict(getattr(last_nav_decision, "metadata", {}) or {})
         row["sgnav_decision_metadata"] = decision_metadata
+        row["frontier_reachability_clearance_m"] = decision_metadata.get("frontier_reachability_clearance_m")
+        row["frontier_reachability_clearance_source"] = decision_metadata.get("frontier_reachability_clearance_source")
+        row["frontier_reachability_unknown_clearance_m"] = decision_metadata.get("frontier_reachability_unknown_clearance_m")
         row["target_cells_count"] = int(len(getattr(last_nav_decision, "target_cells", []) or []))
         row["selected_frontier_index"] = (
             int(last_nav_decision.frontier_decision.selected_index)
@@ -3634,6 +4110,7 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
         row["max_vx_mps"] = float(args.max_vx_mps)
         row["max_vy_mps"] = float(args.max_vy_mps)
         row["max_wz_radps"] = float(args.max_wz_radps)
+        row["turn_in_place_yaw_tolerance_rad"] = float(args.turn_in_place_yaw_tolerance_rad)
         row["perception_latency_ms"] = float(latency_totals_ms["perception"])
         row["mapping_latency_ms"] = float(latency_totals_ms["mapping"])
         row["graph_latency_ms"] = float(latency_totals_ms["graph"])
@@ -3814,6 +4291,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--max-vx-mps", type=float, default=None)
     parser.add_argument("--max-vy-mps", type=float, default=None)
     parser.add_argument("--max-wz-radps", type=float, default=None)
+    parser.add_argument("--turn-in-place-yaw-tolerance-rad", type=float, default=None)
     parser.add_argument("--render-updates-per-step", type=int, default=None)
     parser.add_argument("--isaac-width", type=int, default=None)
     parser.add_argument("--isaac-height", type=int, default=None)
@@ -3861,6 +4339,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--frontier-min-distance-m", type=float, default=None)
     parser.add_argument("--frontier-max-count", type=int, default=None)
     parser.add_argument("--frontier-obstacle-dilation-radius-cells", type=int, default=None)
+    parser.add_argument("--frontier-wall-blacklist-clearance-m", "--frontier_wall_blacklist_clearance_m", type=float, default=None)
     parser.add_argument("--frontier-unknown-dilation-radius-cells", type=int, default=None)
     parser.add_argument("--frontier-unknown-source", "--frontier_unknown_source", default=None, choices=["observed", "implicit"])
     parser.add_argument(
@@ -3923,6 +4402,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             "rose2_source_external",
             "rose2_source_external_runner",
             "legacy_rose2_style_debug",
+            ONLINE_LINE_EXTEND_ROOMSEG_V2_BACKEND,
             ONLINE_ROSE_STYLE_BACKEND,
             ONLINE_WATERSHED_ROOMSEG_BACKEND,
             ONLINE_VISIBILITY_BOTTLENECK_ROOMSEG_BACKEND,
@@ -4046,6 +4526,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--show-room-proposals", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--show-room-masks", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--show-room-labels", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--show-roomseg-debug-red-lines", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--sgnav-viz-map-base-layer", default=None, choices=["default", "vertical_free"])
     parser.add_argument("--show-frontier-member-cells", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--show-object-nodes", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--show-candidate-markers", action=argparse.BooleanOptionalAction, default=None)
@@ -4185,6 +4667,16 @@ def main(argv: Optional[List[str]] = None) -> int:
         if args.show_room_labels is not None
         else get_nested(cfg, "visualization.show_room_labels", True)
     )
+    args.show_roomseg_debug_red_lines = bool(
+        args.show_roomseg_debug_red_lines
+        if args.show_roomseg_debug_red_lines is not None
+        else get_nested(cfg, "visualization.show_roomseg_debug_red_lines", False)
+    )
+    args.sgnav_viz_map_base_layer = str(
+        args.sgnav_viz_map_base_layer
+        if args.sgnav_viz_map_base_layer is not None
+        else get_nested(cfg, "visualization.map_base_layer", "default")
+    ).strip().lower()
     args.show_frontier_member_cells = bool(
         args.show_frontier_member_cells
         if args.show_frontier_member_cells is not None
@@ -4232,6 +4724,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     args.max_vx_mps = float(args.max_vx_mps if args.max_vx_mps is not None else get_nested(cfg, "robot.max_vx_mps", 0.15))
     args.max_vy_mps = float(args.max_vy_mps if args.max_vy_mps is not None else get_nested(cfg, "robot.max_vy_mps", 0.15))
     args.max_wz_radps = float(args.max_wz_radps if args.max_wz_radps is not None else get_nested(cfg, "robot.max_wz_radps", 0.35))
+    args.turn_in_place_yaw_tolerance_rad = float(
+        args.turn_in_place_yaw_tolerance_rad
+        if args.turn_in_place_yaw_tolerance_rad is not None
+        else get_nested(cfg, "robot.turn_in_place_yaw_tolerance_rad", 0.20)
+    )
     args.render_updates_per_step = int(args.render_updates_per_step or get_nested(cfg, "isaac.render_updates_per_step", 2))
     args.isaac_width = int(args.isaac_width or get_nested(cfg, "camera.width", 640))
     args.isaac_height = int(args.isaac_height or get_nested(cfg, "camera.height", 480))
@@ -4240,7 +4737,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     args.camera_forward_offset_m = float(args.camera_forward_offset_m if args.camera_forward_offset_m is not None else get_nested(cfg, "camera.forward_offset_m", 0.0))
     args.camera_pitch_deg = float(args.camera_pitch_deg if args.camera_pitch_deg is not None else get_nested(cfg, "camera.pitch_deg", 0.0))
     args.camera_near_m = float(args.camera_near_m if args.camera_near_m is not None else get_nested(cfg, "camera.near_m", 0.02))
-    args.camera_far_m = float(args.camera_far_m if args.camera_far_m is not None else get_nested(cfg, "camera.far_m", 5.0))
+    args.camera_far_m = float(args.camera_far_m if args.camera_far_m is not None else get_nested(cfg, "camera.far_m", 10.0))
     args.camera_annotator_device = str(args.camera_annotator_device or get_nested(cfg, "isaac.camera_annotator_device", "cuda")).strip().lower()
     args.read_depth = bool(args.read_depth if args.read_depth is not None else get_nested(cfg, "isaac.read_depth", False))
     args.nearfield_depth = bool(args.nearfield_depth if args.nearfield_depth is not None else get_nested(cfg, "nearfield_depth.enabled", False))
@@ -4251,7 +4748,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     args.nearfield_near_m = float(args.nearfield_near_m if args.nearfield_near_m is not None else get_nested(cfg, "nearfield_depth.near_m", 0.02))
     args.nearfield_far_m = float(args.nearfield_far_m if args.nearfield_far_m is not None else get_nested(cfg, "nearfield_depth.far_m", 1.8))
     args.nearfield_radius_m = float(args.nearfield_radius_m if args.nearfield_radius_m is not None else get_nested(cfg, "nearfield_depth.radius_m", 1.2))
-    args.nearfield_ignore_radius_m = float(args.nearfield_ignore_radius_m if args.nearfield_ignore_radius_m is not None else get_nested(cfg, "nearfield_depth.ignore_radius_m", 0.14))
+    args.nearfield_ignore_radius_m = float(args.nearfield_ignore_radius_m if args.nearfield_ignore_radius_m is not None else get_nested(cfg, "nearfield_depth.ignore_radius_m", 0.10))
     args.nearfield_depth_stride_px = int(args.nearfield_depth_stride_px if args.nearfield_depth_stride_px is not None else get_nested(cfg, "nearfield_depth.depth_stride_px", 3))
     args.nearfield_floor_tolerance_m = float(args.nearfield_floor_tolerance_m if args.nearfield_floor_tolerance_m is not None else get_nested(cfg, "nearfield_depth.floor_tolerance_m", 0.12))
     args.nearfield_obstacle_min_height_m = float(args.nearfield_obstacle_min_height_m if args.nearfield_obstacle_min_height_m is not None else get_nested(cfg, "nearfield_depth.obstacle_min_height_m", 0.18))
@@ -4294,6 +4791,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         args.frontier_obstacle_dilation_radius_cells
         if args.frontier_obstacle_dilation_radius_cells is not None
         else get_nested(cfg, "mapping.frontier_obstacle_dilation_radius_cells", 4)
+    )
+    args.frontier_wall_blacklist_clearance_m = float(
+        args.frontier_wall_blacklist_clearance_m
+        if args.frontier_wall_blacklist_clearance_m is not None
+        else get_nested(cfg, "mapping.frontier_wall_blacklist_clearance_m", 0.05)
     )
     args.frontier_unknown_dilation_radius_cells = int(
         args.frontier_unknown_dilation_radius_cells

@@ -5,9 +5,11 @@ import numpy as np
 from isaac_bench.mapping.online_roomseg.separator_candidates import (
     DoorNeckConfig,
     LineExtensionConfig,
+    SeparatorCandidate,
     build_door_neck_candidates_from_extension_intersections,
     build_door_neck_candidates_from_extensions,
     extend_wall_lines_once,
+    reject_candidates_ending_on_other_door_middle,
 )
 from isaac_bench.mapping.online_roomseg.wall_lines import FilteredWallLine
 
@@ -196,3 +198,51 @@ def test_crossing_extension_probes_create_virtual_neck_candidates():
     assert virtual_targets[15, 20]
     assert {c.debug["candidate_source"] for c in candidates} == {"extension_intersection"}
     assert all(c.debug["hit_types"] == ["virtual_neck"] for c in candidates)
+
+
+def test_line_extension_door_ending_on_other_door_middle_is_rejected():
+    other = SeparatorCandidate(
+        candidate_id=1,
+        kind="line_extension_door_neck",
+        p0_rc=np.asarray([10, 10], dtype=np.float32),
+        p1_rc=np.asarray([10, 20], dtype=np.float32),
+        theta=0.0,
+        length_m=1.1,
+        confidence=0.9,
+        source_segment_ids=[1],
+        debug={"candidate_source": "line_extension"},
+    )
+    middle_hit = SeparatorCandidate(
+        candidate_id=2,
+        kind="line_extension_door_neck",
+        p0_rc=np.asarray([10, 15], dtype=np.float32),
+        p1_rc=np.asarray([5, 15], dtype=np.float32),
+        theta=float(np.pi / 2.0),
+        length_m=0.6,
+        confidence=0.8,
+        source_segment_ids=[2],
+        debug={"candidate_source": "extension_intersection"},
+    )
+    endpoint_hit = SeparatorCandidate(
+        candidate_id=3,
+        kind="line_extension_door_neck",
+        p0_rc=np.asarray([10, 11], dtype=np.float32),
+        p1_rc=np.asarray([5, 11], dtype=np.float32),
+        theta=float(np.pi / 2.0),
+        length_m=0.6,
+        confidence=0.8,
+        source_segment_ids=[3],
+        debug={"candidate_source": "extension_intersection"},
+    )
+
+    kept, rejected, debug = reject_candidates_ending_on_other_door_middle(
+        [other, middle_hit, endpoint_hit],
+        (30, 30),
+        config=DoorNeckConfig(endpoint_on_other_tolerance_cells=0),
+    )
+
+    assert [candidate.candidate_id for candidate in kept] == [1, 3]
+    assert [candidate.candidate_id for candidate in rejected] == [2]
+    assert rejected[0].reject_reason == "reject_endpoint_on_other_door_middle"
+    assert rejected[0].debug["endpoint_on_other_door_middle"]["other_path_ratio"] == 0.5
+    assert debug["rejected_count"] == 1

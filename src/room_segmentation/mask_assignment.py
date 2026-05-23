@@ -49,19 +49,38 @@ class MaskAssigner:
         split_mask = cut_score >= 0.55
         component_labels, component_count = label_components(free & ~split_mask, connectivity=8)
         component_labels = relabel_compact(component_labels)
-        seeds: dict[int, list[tuple[int, int]]] = {}
+        partition_seeds: dict[int, list[tuple[int, int]]] = {
+            int(label): [(int(cell[0]), int(cell[1])) for cell in cells]
+            for label, cells in partition.seed_cells_by_label.items()
+            if int(label) > 0 and cells
+        }
+        component_seeds: dict[int, list[tuple[int, int]]] = {}
         if component_count > 0:
             min_component_cells = max(1, int(round(0.35 / max(float(self.grid_spec.resolution_m) ** 2, 1e-9))))
             next_label = 1
             for label in sorted(int(v) for v in np.unique(component_labels) if int(v) > 0):
                 comp = component_labels == label
-                if int(np.count_nonzero(comp)) < min_component_cells and len(seeds) > 0:
+                if int(np.count_nonzero(comp)) < min_component_cells and len(component_seeds) > 0:
                     continue
                 rows, cols = np.nonzero(comp)
-                seeds[next_label] = [(int(rows[len(rows) // 2]), int(cols[len(cols) // 2]))]
+                component_seeds[next_label] = [(int(rows[len(rows) // 2]), int(cols[len(cols) // 2]))]
                 next_label += 1
-        if not seeds:
-            seeds = {int(label): list(cells) for label, cells in partition.seed_cells_by_label.items() if int(label) > 0 and cells}
+        component_positive_count = int(len(component_seeds))
+        partition_reasonable = bool(
+            np.any(np.asarray(partition.separator_map, dtype=bool))
+            and
+            partition_seeds
+            and (
+                component_positive_count <= 1
+                or len(partition_seeds) <= component_positive_count + 1
+            )
+        )
+        if partition_reasonable:
+            seeds = partition_seeds
+            seed_source = "graph_partition"
+        else:
+            seeds = component_seeds
+            seed_source = "connected_components_fallback"
 
         unknown_penalty = dilate(unknown, radius_cells(0.20, self.grid_spec.resolution_m)).astype(np.float32)
         wall_boundary = dilate(np.asarray(structural_map.p_wall, dtype=np.float32) >= 0.62, 1).astype(np.float32)
@@ -134,6 +153,7 @@ class MaskAssigner:
                 "hard_separator_map": hard_separator.astype(np.uint8),
                 "soft_separator_map": (cut_score >= 0.55).astype(np.uint8),
                 "raw_room_id_map": room_id_map.astype(np.int32),
+                "seed_source": np.asarray([0 if seed_source == "graph_partition" else 1], dtype=np.int32),
             },
         )
         setattr(result, "_grid_spec", self.grid_spec)

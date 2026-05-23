@@ -39,7 +39,7 @@ class GraphPartitioner:
         separator_map = np.zeros(shape, dtype=np.float32)
         hard_map = np.zeros(shape, dtype=bool)
         for candidate in cut_candidates:
-            if not candidate.is_soft_separator and float(candidate.final_score) < float(self.config.soft_split_score_threshold):
+            if not bool(candidate.is_soft_separator) and not bool(candidate.is_hard_separator):
                 continue
             for cell in candidate.cut_cells:
                 if in_bounds(cell[0], cell[1], shape):
@@ -115,4 +115,3 @@ class GraphPartitioner:
             if side > 0:
                 out[node.node_id] = next_label
         return out
-

@@ -414,6 +414,8 @@ def _infer_fallbacks(row: Mapping[str, object], args: object | None) -> list[str
         fallbacks.append("static_map_planning")
     if bool(_get_arg(args, "static_nearfield_map", row.get("static_nearfield_map", False))):
         fallbacks.append("static_nearfield_map")
+    if int(row.get("metric_pose_outside_static_map_count", 0) or 0) > 0:
+        fallbacks.append("metric_pose_outside_static_map")
     if bool(_get_arg(args, "frontier_allow_near_fallback", row.get("frontier_allow_near_fallback", False))):
         fallbacks.append("frontier_near_fallback")
     return fallbacks

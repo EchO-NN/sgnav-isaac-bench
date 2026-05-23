@@ -105,6 +105,8 @@ class FreeSpaceConfig:
     robot_radius_m: float = 0.18
     safety_margin_m: float = 0.05
     erosion_radius_m: float = 0.20
+    roomseg_erosion_radius_m: float | None = None
+    navigation_erosion_radius_m: float | None = None
     min_free_component_area_m2: float = 0.12
     frontier_band_m: float = 0.25
     unknown_as_boundary_for_distance: bool = True
@@ -457,4 +459,3 @@ def load_ovb_config(path: str | Path | None = None, overrides: Mapping[str, obje
     if overrides:
         raw.update(dict(overrides))
     return OVBConfig.from_mapping(raw)
-

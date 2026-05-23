@@ -1,0 +1,43 @@
+mapping:
+  room_map_mode: online_line_extend_roomseg_v2_vlm
+  room_segmentation:
+    enabled: true
+    algorithm: online_line_extend_roomseg_v2
+    backend: online_line_extend_roomseg_v2
+    require_upstream_source_for_strict: false
+    online_roomseg:
+      enabled: true
+      backend: online_line_extend_roomseg_v2
+      algorithm: online_line_extend_roomseg_v2
+      line_extension:
+        enabled: true
+        passes: 2
+        min_extension_m: 0.35
+        max_extension_m: 1.60
+        max_probe_m: 1.80
+        allow_hit_virtual_door_on_pass2: true
+      separator:
+        accept_anchor_score_min: 0.75
+        require_two_anchors: true
+        require_two_anchors_for_wall_completion: true
+        require_two_anchors_for_doorway: true
+        allow_one_strong_one_unknown_frontier: true
+      topology_test:
+        enabled: true
+        connectivity: 4
+        accept_anchor_score_min: 0.75
+        accept_score_min: 0.25
+        per_kind_min_split_area_m2:
+          physical_wall_completion: 0.50
+          missed_scan_gap_closure: 0.35
+          short_unknown_gap_closure: 0.35
+          doorway_virtual_cut: 0.30
+          line_extension_door_neck: 0.30
+          extension_intersection_cut: 0.30
+          single_sided_wall_extension: 0.50
+          corridor_room_neck_cut: 0.30
+
+sgnav:
+  scene_graph:
+    room_nodes:
+      source: online_line_extend_roomseg_v2_vlm

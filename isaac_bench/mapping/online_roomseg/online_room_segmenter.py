@@ -17,6 +17,7 @@ from .corridor import (
     CorridorMergeConfig,
     CorridorRoomNeckCutConfig,
     build_corridor_debug,
+    generate_corridor_room_neck_candidates,
     merge_false_parallel_door_corridor_regions,
 )
 from .debug_viz import save_online_roomseg_debug
@@ -33,13 +34,15 @@ from .separator_candidates import (
     SingleSidedWallExtensionConfig,
     build_door_neck_candidates_from_extension_intersections,
     build_door_neck_candidates_from_extensions,
+    build_l_corner_door_neck_candidates,
     extend_wall_lines_once,
     fill_noise_wall_gaps_from_runs,
     generate_wall_gap_candidates,
     rasterize_candidates,
+    reject_candidates_ending_on_other_door_middle,
 )
 from .topology_tests import TopologyTestConfig, greedily_select_separators
-from .utils import relabel_compact
+from .utils import label_components, relabel_compact
 from .wall_lines import (
     LineWallsConfig,
     LineFilteringConfig,
@@ -55,6 +58,8 @@ from .wall_lines import (
 )
 
 
+ONLINE_LINE_EXTEND_ROOMSEG_V2_BACKEND = "online_line_extend_roomseg_v2"
+ONLINE_LINE_EXTEND_ROOMSEG_V2_CONTEXT = "online_line_extend_roomseg_v2_vlm"
 ONLINE_ROSE_STYLE_BACKEND = "online_rose_style_v1"
 ONLINE_ROSE_STYLE_CONTEXT = "online_rose_style_v1_vlm"
 
@@ -62,11 +67,11 @@ ONLINE_ROSE_STYLE_CONTEXT = "online_rose_style_v1_vlm"
 @dataclass
 class OnlineRoseStyleConfig:
     enabled: bool = True
-    backend: str = ONLINE_ROSE_STYLE_BACKEND
+    backend: str = ONLINE_LINE_EXTEND_ROOMSEG_V2_BACKEND
     resolution_m: float = 0.05
     map_info: MapInfo | None = None
-    z_min_m: float = 0.20
-    z_max_m: float = 2.00
+    z_min_m: float = 0.10
+    z_max_m: float = 2.50
     min_free_rays: int = 1
     min_observed_rays: int = 1
     min_observed_free_cells: int = 20
@@ -101,8 +106,8 @@ class OnlineRoseStyleConfig:
                 raw[key] = raw_root[key]
         vertical_or_free = dict(raw_root.get("vertical_or_free", {}) or {})
         if vertical_or_free:
-            raw.setdefault("z_min_m", vertical_or_free.get("z_min_m", 0.20))
-            raw.setdefault("z_max_m", vertical_or_free.get("z_max_m", 2.00))
+            raw.setdefault("z_min_m", vertical_or_free.get("z_min_m", 0.10))
+            raw.setdefault("z_max_m", vertical_or_free.get("z_max_m", 2.50))
             raw.setdefault("min_free_rays", vertical_or_free.get("min_free_rays", 1))
             raw.setdefault("min_observed_rays", vertical_or_free.get("min_observed_rays", 1))
         debug_layers = dict(raw_root.get("debug_layers", {}) or {})
@@ -141,9 +146,9 @@ class OnlineRoseStyleConfig:
 
     def room_config(self) -> RoomSegmentationConfig:
         return RoomSegmentationConfig(
-            algorithm="online_line_extend_roomseg_v1",
-            source_grid="vertical_profile_free_0p2_2p0",
-            proposal_mode=ONLINE_ROSE_STYLE_BACKEND,
+            algorithm=ONLINE_LINE_EXTEND_ROOMSEG_V2_BACKEND,
+            source_grid="vertical_profile_free_0p1_2p5",
+            proposal_mode=ONLINE_LINE_EXTEND_ROOMSEG_V2_BACKEND,
             finalization_mode="no_merge",
             min_observed_free_cells=int(self.min_observed_free_cells),
             min_room_area_m2=float(self.min_room_area_m2),
@@ -163,7 +168,7 @@ class OnlineRoseStyleResult:
 
 
 class OnlineRoseStyleRoomSegmenter:
-    context_source = ONLINE_ROSE_STYLE_CONTEXT
+    context_source = ONLINE_LINE_EXTEND_ROOMSEG_V2_CONTEXT
 
     def __init__(self, config: OnlineRoseStyleConfig | Mapping[str, object] | None = None, map_info: MapInfo | None = None):
         if isinstance(config, OnlineRoseStyleConfig):
@@ -323,67 +328,121 @@ def run_online_rose_style_roomseg(
     )
     corridor_skeleton = np.asarray(corridor_debug.get("corridor_skeleton", np.zeros_like(roomseg_free_clean)), dtype=bool)
 
-    pass1_extensions = []
-    pass1_candidates = []
-    pass1_accepted = []
-    pass1_rejected = []
-    pass1_separator_map = np.zeros_like(roomseg_free_clean, dtype=bool)
-    pass1_topology = {
-        "enabled": False,
-        "pass_id": 1,
-        "stage": "short_gap_fill_prepass",
-        "skipped_reason": "pass1_reserved_for_short_gap_fill",
-        "noise_wall_gap_fill_count": int(noise_gap_debug.get("filled_gap_count", 0)),
-        "noise_wall_gap_fill_cells": int(np.count_nonzero(noise_gap_room_separator_map)),
-    }
-    pass1_extension_debug = {
-        "enabled": False,
-        "pass_id": 1,
-        "stage": "short_gap_fill_prepass",
-        "extension_count": 0,
-        "accepted_extension_count": 0,
-        "rejected_by_reason": {},
-        "extensions": [],
-        "skipped_reason": "pass1_reserved_for_short_gap_fill",
-        "noise_wall_gap_fill_count": int(noise_gap_debug.get("filled_gap_count", 0)),
-        "noise_wall_gap_fill_cells": int(np.count_nonzero(noise_gap_room_separator_map)),
-    }
-    pass1_candidate_debug = {
-        "enabled": False,
-        "pass_id": 1,
-        "stage": "short_gap_fill_prepass",
-        "candidate_count": 0,
-        "rejected_extension_count": 0,
-        "candidates": [],
-        "rejected_extensions": [],
-        "skipped_reason": "pass1_reserved_for_short_gap_fill",
-    }
-    before_labels, _ = ndimage.label(roomseg_free_clean, structure=np.asarray([[0, 1, 0], [1, 1, 1], [0, 1, 0]], dtype=np.uint8))
-    before_labels = relabel_compact(before_labels)
-    virtual_target_map = np.zeros_like(roomseg_free_clean, dtype=bool)
-    pass2_enabled = bool(config.line_extension.enabled) and int(config.line_extension.passes) >= 2
-    if pass2_enabled:
-        pass2_extensions, pass2_extension_debug = extend_wall_lines_once(
+    pass1_gap_candidates, pass1_gap_candidate_debug = generate_wall_gap_candidates(
+        segments,
+        free_clean=roomseg_free_clean,
+        wall_candidate_clean=roomseg_wall_target_map,
+        unknown_clean=roomseg_unknown_clean,
+        resolution_m=float(config.resolution_m),
+        physical_config=config.physical_wall_completion,
+        doorway_config=config.doorway_virtual_cut,
+        missed_scan_config=config.missed_scan_gap_closure,
+        short_unknown_config=config.short_unknown_gap_closure,
+        single_sided_config=config.single_sided_wall_extension,
+        runs=noise_gap_runs,
+        start_id=1,
+    )
+    pass1_extension_enabled = bool(config.line_extension.enabled) and int(config.line_extension.passes) >= 1
+    if pass1_extension_enabled:
+        pass1_extensions, pass1_extension_debug = extend_wall_lines_once(
             filtered_lines,
             free_clean=roomseg_free_clean,
             wall_target_mask=roomseg_wall_target_map,
             virtual_target_mask=None,
             unknown_clean=roomseg_unknown_clean,
             resolution_m=float(config.resolution_m),
-            pass_id=2,
+            pass_id=1,
             config=config.line_extension,
             start_id=1,
         )
-        pass2_extension_debug = {
-            **dict(pass2_extension_debug),
-            "stage": "line_extension_after_short_gap_fill",
+        pass1_extension_debug = {
+            **dict(pass1_extension_debug),
+            "stage": "line_extension_pass1",
         }
-        pass2_candidates, pass2_candidate_debug = build_door_neck_candidates_from_extensions(
-            pass2_extensions,
+        pass1_extension_candidates, pass1_extension_candidate_debug = build_door_neck_candidates_from_extensions(
+            pass1_extensions,
             accepted_virtual_targets=None,
             resolution_m=float(config.resolution_m),
             config=config.door_neck,
-            start_id=1,
+            start_id=1 + len(pass1_gap_candidates),
+        )
+    else:
+        pass1_extensions = []
+        pass1_extension_candidates = []
+        pass1_extension_debug = {
+            "enabled": False,
+            "pass_id": 1,
+            "stage": "line_extension_pass1",
+            "extension_count": 0,
+            "accepted_extension_count": 0,
+            "rejected_by_reason": {},
+            "extensions": [],
+            "skipped_reason": "line_extension_passes_lt_1",
+        }
+        pass1_extension_candidate_debug = {
+            "enabled": bool(config.door_neck.enabled),
+            "pass_id": 1,
+            "stage": "line_extension_pass1",
+            "candidate_count": 0,
+            "rejected_extension_count": 0,
+            "candidates": [],
+            "rejected_extensions": [],
+            "skipped_reason": "line_extension_passes_lt_1",
+        }
+    pass1_candidates = [*pass1_gap_candidates, *pass1_extension_candidates]
+    pass1_accepted, pass1_rejected, pass1_separator_map, pass1_labels, pass1_topology = greedily_select_separators(
+        pass1_candidates,
+        free_clean=roomseg_free_clean,
+        unknown_clean=roomseg_unknown_clean,
+        wall_candidate_clean=roomseg_wall_target_map,
+        corridor_skeleton=corridor_skeleton,
+        resolution_m=float(config.resolution_m),
+        config=config.topology_test,
+    )
+    pass1_topology = {**dict(pass1_topology), "pass_id": 1, "stage": "prepass_anchor_topology"}
+    pass1_candidate_debug = {
+        "enabled": True,
+        "pass_id": 1,
+        "stage": "prepass_anchor_topology",
+        "wall_gap_candidates": pass1_gap_candidate_debug,
+        "line_extension_candidates": pass1_extension_candidate_debug,
+        "candidate_count": int(len(pass1_candidates)),
+        "accepted_count": int(len(pass1_accepted)),
+        "rejected_count": int(len(pass1_rejected)),
+        "candidate_count_by_kind": _kind_counts(pass1_candidates),
+        "accepted_count_by_kind": _kind_counts(pass1_accepted),
+        "rejected_count_by_reason": _reason_counts(pass1_rejected),
+        "candidates": [candidate.to_dict() for candidate in pass1_candidates[:1024]],
+    }
+    before_labels, _ = ndimage.label(roomseg_free_clean, structure=np.asarray([[0, 1, 0], [1, 1, 1], [0, 1, 0]], dtype=np.uint8))
+    before_labels = relabel_compact(before_labels)
+    virtual_target_map = pass1_separator_map.astype(bool)
+    pre_topology_rejected: list[SeparatorCandidate] = [*pass1_rejected]
+    pass2_enabled = bool(config.line_extension.enabled) and int(config.line_extension.passes) >= 2
+    pass2_start_id = 1 + len(pass1_candidates) + len(pass1_rejected)
+    if pass2_enabled:
+        pass2_extensions, pass2_extension_debug = extend_wall_lines_once(
+            filtered_lines,
+            free_clean=roomseg_free_clean,
+            wall_target_mask=roomseg_wall_target_map,
+            virtual_target_mask=virtual_target_map,
+            unknown_clean=roomseg_unknown_clean,
+            resolution_m=float(config.resolution_m),
+            pass_id=2,
+            config=config.line_extension,
+            start_id=1 + len(pass1_extensions),
+        )
+        pass2_extension_debug = {
+            **dict(pass2_extension_debug),
+            "stage": "line_extension_pass2",
+            "virtual_target_cell_count": int(np.count_nonzero(virtual_target_map)),
+        }
+        pass2_candidates, pass2_candidate_debug = build_door_neck_candidates_from_extensions(
+            pass2_extensions,
+            accepted_virtual_targets=pass1_accepted,
+            resolution_m=float(config.resolution_m),
+            config=config.door_neck,
+            start_id=pass2_start_id,
         )
         pass2_intersection_candidates, pass2_extension_intersection_targets, pass2_intersection_debug = (
             build_door_neck_candidates_from_extension_intersections(
@@ -393,26 +452,38 @@ def run_online_rose_style_roomseg(
                 resolution_m=float(config.resolution_m),
                 line_config=config.line_extension,
                 door_config=config.door_neck,
-                start_id=1 + len(pass2_candidates),
+                start_id=pass2_start_id + len(pass2_candidates),
             )
         )
-        pass2_candidates = [*pass2_candidates, *pass2_intersection_candidates]
+        pass2_l_corner_candidates, pass2_l_corner_debug = build_l_corner_door_neck_candidates(
+            filtered_lines,
+            free_clean=roomseg_free_clean,
+            unknown_clean=roomseg_unknown_clean,
+            resolution_m=float(config.resolution_m),
+            line_config=config.line_extension,
+            door_config=config.door_neck,
+            start_id=pass2_start_id + len(pass2_candidates) + len(pass2_intersection_candidates),
+        )
+        pass2_candidates = [*pass2_candidates, *pass2_intersection_candidates, *pass2_l_corner_candidates]
         pass2_candidate_debug = {
             **dict(pass2_candidate_debug),
             "pass_id": 2,
-            "stage": "line_extension_after_short_gap_fill",
+            "stage": "line_extension_pass2",
             "extension_intersection": pass2_intersection_debug,
+            "l_corner_door_neck": pass2_l_corner_debug,
             "candidate_count": int(len(pass2_candidates)),
         }
     else:
         pass2_extensions = []
         pass2_candidates = []
+        pass2_l_corner_candidates = []
         pass2_extension_intersection_targets = np.zeros_like(roomseg_free_clean, dtype=bool)
         pass2_intersection_debug = {"enabled": False, "candidate_count": 0, "reason": "line_extension_passes_lt_2"}
+        pass2_l_corner_debug = {"enabled": False, "candidate_count": 0, "reason": "line_extension_passes_lt_2"}
         pass2_extension_debug = {
             "enabled": False,
             "pass_id": 2,
-            "stage": "line_extension_after_short_gap_fill",
+            "stage": "line_extension_pass2",
             "extension_count": 0,
             "accepted_extension_count": 0,
             "skipped_reason": "line_extension_passes_lt_2",
@@ -421,25 +492,78 @@ def run_online_rose_style_roomseg(
         pass2_candidate_debug = {
             "enabled": bool(config.door_neck.enabled),
             "pass_id": 2,
-            "stage": "line_extension_after_short_gap_fill",
+            "stage": "line_extension_pass2",
             "candidate_count": 0,
             "rejected_extension_count": 0,
             "skipped_reason": "line_extension_passes_lt_2",
             "configured_passes": int(config.line_extension.passes),
+            "extension_intersection": pass2_intersection_debug,
+            "l_corner_door_neck": pass2_l_corner_debug,
         }
+    pass2_corridor_room_neck_candidates, pass2_corridor_room_neck_debug = generate_corridor_room_neck_candidates(
+        roomseg_free_clean,
+        resolution_m=float(config.resolution_m),
+        corridor_config=config.corridor,
+        neck_config=config.corridor_room_neck_cut,
+        corridor_debug=corridor_debug,
+        wall_candidate_clean=roomseg_wall_target_map,
+        start_id=pass2_start_id + len(pass2_candidates),
+    )
+    pass2_candidates = [*pass2_candidates, *pass2_corridor_room_neck_candidates]
+    pass2_candidate_debug = {
+        **dict(pass2_candidate_debug),
+        "corridor_room_neck": pass2_corridor_room_neck_debug,
+        "candidate_count": int(len(pass2_candidates)),
+    }
+    pass2_candidates, endpoint_middle_rejected, endpoint_middle_filter_debug = (
+        reject_candidates_ending_on_other_door_middle(
+            pass2_candidates,
+            roomseg_free_clean.shape,
+            config=config.door_neck,
+        )
+    )
+    pre_topology_rejected.extend(endpoint_middle_rejected)
+    if endpoint_middle_rejected and pass2_enabled:
+        kept_intersection_cells = {
+            tuple(int(v) for v in candidate.debug.get("intersection_rc", []))
+            for candidate in pass2_candidates
+            if str(candidate.debug.get("candidate_source", "")) == "extension_intersection"
+            and len(candidate.debug.get("intersection_rc", []) or []) == 2
+        }
+        for rejected_candidate in endpoint_middle_rejected:
+            if str(rejected_candidate.debug.get("candidate_source", "")) != "extension_intersection":
+                continue
+            raw_rc = rejected_candidate.debug.get("intersection_rc", [])
+            if len(raw_rc or []) != 2:
+                continue
+            rc = tuple(int(v) for v in raw_rc)
+            if rc in kept_intersection_cells:
+                continue
+            if 0 <= rc[0] < pass2_extension_intersection_targets.shape[0] and 0 <= rc[1] < pass2_extension_intersection_targets.shape[1]:
+                pass2_extension_intersection_targets[rc[0], rc[1]] = False
+    pass2_candidate_debug = {
+        **dict(pass2_candidate_debug),
+        "endpoint_on_other_door_middle_filter": endpoint_middle_filter_debug,
+        "candidate_count": int(len(pass2_candidates)),
+        "pre_topology_rejected_count": int(len(pre_topology_rejected)),
+    }
     candidates = [*pass1_accepted, *pass2_candidates]
     pass2_virtual_target_map = (virtual_target_map | pass2_extension_intersection_targets) if pass2_enabled else np.zeros_like(virtual_target_map, dtype=bool)
-    accepted, rejected, separator_map, raw_labels, topology_debug = greedily_select_separators(
+    accepted, topology_rejected, separator_map, raw_labels, topology_debug = greedily_select_separators(
         candidates,
         free_clean=roomseg_free_clean,
         unknown_clean=roomseg_unknown_clean,
-        wall_candidate_clean=roomseg_wall_target_map | pass2_virtual_target_map,
+        wall_candidate_clean=roomseg_wall_target_map,
         corridor_skeleton=corridor_skeleton,
         resolution_m=float(config.resolution_m),
         config=config.topology_test,
     )
-    final_labels_raw, corridor_merge_debug = merge_false_parallel_door_corridor_regions(
-        raw_labels,
+    rejected = [*pre_topology_rejected, *topology_rejected]
+    initial_accepted_virtual_boundary_map = (separator_map | structural_wall_free_overlap_map).astype(bool)
+    initial_raw_labels, _ = label_components(roomseg_free_clean & ~initial_accepted_virtual_boundary_map, 4)
+    initial_raw_labels = relabel_compact(initial_raw_labels)
+    _initial_corridor_labels, initial_corridor_merge_debug = merge_false_parallel_door_corridor_regions(
+        initial_raw_labels,
         accepted_candidates=accepted,
         free_clean=roomseg_free_clean,
         unknown_clean=roomseg_unknown_clean,
@@ -448,31 +572,69 @@ def run_online_rose_style_roomseg(
         resolution_m=float(config.resolution_m),
         config=config.corridor_merge,
     )
+    active_accepted = [candidate for candidate in accepted if not bool(candidate.debug.get("rejected_after_corridor_merge", False))]
+    accepted_virtual_boundary_map = (_rasterize_many(active_accepted, roomseg_free_clean.shape) | structural_wall_free_overlap_map).astype(bool)
+    raw_labels, _ = label_components(roomseg_free_clean & ~accepted_virtual_boundary_map, 4)
+    raw_labels = relabel_compact(raw_labels)
+    final_labels_raw, corridor_merge_debug = merge_false_parallel_door_corridor_regions(
+        raw_labels,
+        accepted_candidates=active_accepted,
+        free_clean=roomseg_free_clean,
+        unknown_clean=roomseg_unknown_clean,
+        wall_candidate_clean=roomseg_wall_target_map,
+        filtered_lines=filtered_lines,
+        resolution_m=float(config.resolution_m),
+        config=config.corridor_merge,
+    )
+    newly_rejected_after_merge = [candidate for candidate in active_accepted if bool(candidate.debug.get("rejected_after_corridor_merge", False))]
+    if newly_rejected_after_merge:
+        active_accepted = [candidate for candidate in accepted if not bool(candidate.debug.get("rejected_after_corridor_merge", False))]
+        accepted_virtual_boundary_map = (_rasterize_many(active_accepted, roomseg_free_clean.shape) | structural_wall_free_overlap_map).astype(bool)
+        raw_labels, _ = label_components(roomseg_free_clean & ~accepted_virtual_boundary_map, 4)
+        raw_labels = relabel_compact(raw_labels)
+        final_labels_raw = raw_labels.copy()
+    corridor_merge_debug = {
+        **dict(corridor_merge_debug),
+        "pre_rejection_pass": _strip_arrays(initial_corridor_merge_debug),
+        "accepted_separator_count_after_corridor_merge": int(len(active_accepted)),
+        "accepted_virtual_boundary_cells": int(np.count_nonzero(accepted_virtual_boundary_map)),
+    }
+    corridor_rejected = [candidate for candidate in accepted if bool(candidate.debug.get("rejected_after_corridor_merge", False))]
+    for candidate in corridor_rejected:
+        candidate.accepted = False
+        candidate.reject_reason = str(candidate.reject_reason or candidate.debug.get("corridor_merge_reject_reason", "reject_corridor_false_parallel_door"))
+    final_accepted = [candidate for candidate in accepted if not bool(candidate.debug.get("rejected_after_corridor_merge", False))]
+    for candidate in final_accepted:
+        candidate.accepted = True
+        candidate.reject_reason = ""
+    rejected = [*rejected, *corridor_rejected]
     final_labels_before_virtual_fill = final_labels_raw.copy()
     final_labels, virtual_separator_fill_debug = _fill_virtual_separator_label_gaps(
         final_labels_raw,
         free_clean=roomseg_free_clean,
-        virtual_separator_map=separator_map,
+        virtual_separator_map=accepted_virtual_boundary_map,
     )
-    candidate_layers = _candidate_layers([*pass1_candidates, *pass2_candidates, *accepted, *rejected], roomseg_free_clean.shape)
+    candidate_layers = _candidate_layers([*pass1_candidates, *pass2_candidates, *final_accepted, *rejected], roomseg_free_clean.shape)
     rejected_map = _rasterize_many(rejected, roomseg_free_clean.shape)
     pass1_extension_layers = _extension_layers(pass1_extensions, roomseg_free_clean.shape)
     pass2_extension_layers = _extension_layers(pass2_extensions, roomseg_free_clean.shape)
     pass2_extension_completion_map = _rasterize_many(
         [
             c
-            for c in accepted
-            if str(c.kind) == "line_extension_door_neck"
-            and not bool(c.debug.get("rejected_after_corridor_merge", False))
+            for c in final_accepted
+            if str(c.kind) in {"line_extension_door_neck", "extension_intersection_cut"}
         ],
         roomseg_free_clean.shape,
     )
-    wall_target_after_line_extension = roomseg_wall_target_map | pass2_extension_completion_map
-    final_separator_map = separator_map | structural_wall_free_overlap_map | pass2_extension_completion_map
-    accepted_before_corridor_merge = final_separator_map.copy()
-    accepted_after_corridor_merge = _rasterize_many([c for c in accepted if not bool(c.debug.get("rejected_after_corridor_merge", False))], roomseg_free_clean.shape) | structural_wall_free_overlap_map
-    false_parallel_rejected_map = _rasterize_many([c for c in accepted if bool(c.debug.get("rejected_after_corridor_merge", False))], roomseg_free_clean.shape)
+    wall_target_after_line_extension = roomseg_wall_target_map.copy()
+    final_separator_map = accepted_virtual_boundary_map.copy()
+    accepted_before_corridor_merge = initial_accepted_virtual_boundary_map.copy()
+    accepted_after_corridor_merge = accepted_virtual_boundary_map.copy()
+    false_parallel_rejected_map = _rasterize_many(corridor_rejected, roomseg_free_clean.shape)
     corridor_like_regions, open_living_room_like_regions = _region_type_layers(final_labels, corridor_merge_debug)
+    room_confidence_map = _room_confidence_layer(final_labels, roomseg_free_clean, accepted_virtual_boundary_map)
+    functional_zone_map = np.zeros_like(final_labels, dtype=np.int32)
+    topology_reject_reason_map = _reject_reason_layer(rejected, roomseg_free_clean.shape)
     layers = {
         "vertical_free_raw": evidence.vertical_free_raw,
         "vertical_occupied_raw": evidence.vertical_occupied_raw,
@@ -498,6 +660,7 @@ def run_online_rose_style_roomseg(
         "missed_scan_gap_closure_candidates": candidate_layers["missed_scan_gap_closure"],
         "short_unknown_gap_closure_candidates": candidate_layers["short_unknown_gap_closure"],
         "doorway_virtual_cut_candidates": candidate_layers["doorway_virtual_cut"],
+        "extension_intersection_cut_candidates": candidate_layers["extension_intersection_cut"],
         "single_sided_wall_extension_candidates": candidate_layers["single_sided_wall_extension"],
         "corridor_skeleton": corridor_skeleton,
         "corridor_candidate_map": np.asarray(corridor_debug.get("corridor_candidate_map", np.zeros_like(evidence.free_clean)), dtype=bool),
@@ -516,6 +679,8 @@ def run_online_rose_style_roomseg(
         "pass2_door_neck_candidates": _rasterize_many(pass2_candidates, roomseg_free_clean.shape),
         "accepted_separators_before_corridor_merge": accepted_before_corridor_merge,
         "accepted_separators_after_corridor_merge": accepted_after_corridor_merge,
+        "accepted_virtual_boundary_map": accepted_virtual_boundary_map,
+        "separator_map": accepted_virtual_boundary_map,
         "rejected_false_parallel_doors": false_parallel_rejected_map,
         "accepted_separators": final_separator_map,
         "rejected_separators": rejected_map,
@@ -525,17 +690,34 @@ def run_online_rose_style_roomseg(
         "room_labels_after_corridor_merge_before_virtual_fill": final_labels_before_virtual_fill,
         "room_labels_after_corridor_merge": final_labels,
         "final_room_labels": final_labels,
+        "room_confidence_map": room_confidence_map,
+        "functional_zone_map": functional_zone_map,
+        "topology_reject_reason_map": topology_reject_reason_map,
         "virtual_separator_label_fill": np.asarray(virtual_separator_fill_debug.get("_filled_mask", np.zeros_like(roomseg_free_clean)), dtype=bool),
         "corridor_like_regions": corridor_like_regions,
         "open_living_room_like_regions": open_living_room_like_regions,
     }
     report = {
         "step": int(step),
-        "backend": ONLINE_ROSE_STYLE_BACKEND,
-        "algorithm": "online_line_extend_roomseg_v1",
-        "stage_order": ["short_gap_fill_prepass", "line_extension_after_short_gap_fill"],
-        "pass1_stage": "short_gap_fill_prepass",
-        "pass2_stage": "line_extension_after_short_gap_fill",
+        "backend": ONLINE_LINE_EXTEND_ROOMSEG_V2_BACKEND,
+        "algorithm": ONLINE_LINE_EXTEND_ROOMSEG_V2_BACKEND,
+        "context_source": ONLINE_LINE_EXTEND_ROOMSEG_V2_CONTEXT,
+        "stage_order": [
+            "vertical_evidence_projection",
+            "evidence_cleaning",
+            "wall_line_extraction",
+            "prepass_separator_candidates",
+            "pass1_topology_verification",
+            "pass1_accepted_virtual_targets",
+            "line_extension_pass2",
+            "extension_intersection_candidates",
+            "final_greedy_topology_verification",
+            "accepted_virtual_boundary_connected_components",
+            "post_label_refinement",
+            "temporal_id_matching",
+        ],
+        "pass1_stage": "prepass_anchor_topology",
+        "pass2_stage": "line_extension_pass2",
         "wall_segment_count": int(len(segments)),
         "snapped_wall_run_count": int(filter_debug.get("snapped_wall_run_count", 0)),
         "merged_wall_run_count": int(filter_debug.get("merged_wall_run_count", 0)),
@@ -553,14 +735,21 @@ def run_online_rose_style_roomseg(
         "pass2_extension_count": int(len(pass2_extensions)),
         "pass2_candidate_count": int(len(pass2_candidates)),
         "pass2_extension_intersection_candidate_count": int(len(pass2_intersection_candidates)) if pass2_enabled else 0,
+        "pass2_l_corner_candidate_count": int(len(pass2_l_corner_candidates)) if pass2_enabled else 0,
+        "pass2_corridor_room_neck_candidate_count": int(len(pass2_corridor_room_neck_candidates)),
+        "pre_topology_rejected_count": int(len(pre_topology_rejected)),
+        "endpoint_on_other_door_middle_rejected_count": int(len(endpoint_middle_rejected)),
         "pass2_extension_intersection_target_cells": int(np.count_nonzero(pass2_extension_intersection_targets)),
         "pass2_line_extension_completion_cells": int(np.count_nonzero(pass2_extension_completion_map)),
+        "accepted_virtual_boundary_cells": int(np.count_nonzero(accepted_virtual_boundary_map)),
+        "connected_components_formula": "raw_room_labels = connected_components(free_clean & ~accepted_virtual_boundary_map, connectivity=4)",
         "wall_target_after_line_extension_cells": int(np.count_nonzero(wall_target_after_line_extension)),
+        "wall_target_after_line_extension_source": "wall_target_after_noise_gap_fill_only",
         "candidate_count": int(len(candidates)),
-        "accepted_count": int(len(accepted)),
+        "accepted_count": int(len(final_accepted)),
         "rejected_count": int(len(rejected)),
         "candidate_count_by_kind": _kind_counts(candidates),
-        "accepted_count_by_kind": _kind_counts(accepted),
+        "accepted_count_by_kind": _kind_counts(final_accepted),
         "rejected_count_by_reason": _reason_counts(rejected),
         "unanchored_candidate_count": int(sum(1 for item in rejected if str(item.reject_reason).startswith("reject_unanchored") or str(item.reject_reason) == "reject_one_sided_unanchored")),
         "corridor_to_corridor_rejected_count": int(topology_debug.get("corridor_to_corridor_rejected_count", 0)),
@@ -574,18 +763,20 @@ def run_online_rose_style_roomseg(
         "corridor_sliver_merge_event_count": int(len(corridor_merge_debug.get("sliver_merge_events", []) or [])),
         "virtual_separator_label_fill_cells": int(virtual_separator_fill_debug.get("filled_cell_count", 0)),
         "virtual_separator_label_fill_remaining_unlabeled_cells": int(virtual_separator_fill_debug.get("remaining_unlabeled_separator_cells", 0)),
+        "final_free_assignment_ratio": _free_assignment_ratio(final_labels, roomseg_free_clean),
+        "navigation_obstacle_written": False,
         "no_fallback": True,
-        "candidates": [candidate.to_dict() for candidate in [*accepted, *rejected]],
+        "candidates": [candidate.to_dict() for candidate in [*final_accepted, *rejected]],
     }
     debug = {
-        "backend": ONLINE_ROSE_STYLE_BACKEND,
-        "actual_backend": ONLINE_ROSE_STYLE_BACKEND,
-        "source_backend": ONLINE_ROSE_STYLE_BACKEND,
-        "roomseg_backend": ONLINE_ROSE_STYLE_BACKEND,
-        "algorithm": "online_line_extend_roomseg_v1",
-        "source": ONLINE_ROSE_STYLE_BACKEND,
-        "context_source": ONLINE_ROSE_STYLE_CONTEXT,
-        "room_map_mode": ONLINE_ROSE_STYLE_CONTEXT,
+        "backend": ONLINE_LINE_EXTEND_ROOMSEG_V2_BACKEND,
+        "actual_backend": ONLINE_LINE_EXTEND_ROOMSEG_V2_BACKEND,
+        "source_backend": ONLINE_LINE_EXTEND_ROOMSEG_V2_BACKEND,
+        "roomseg_backend": ONLINE_LINE_EXTEND_ROOMSEG_V2_BACKEND,
+        "algorithm": ONLINE_LINE_EXTEND_ROOMSEG_V2_BACKEND,
+        "source": ONLINE_LINE_EXTEND_ROOMSEG_V2_BACKEND,
+        "context_source": ONLINE_LINE_EXTEND_ROOMSEG_V2_CONTEXT,
+        "room_map_mode": ONLINE_LINE_EXTEND_ROOMSEG_V2_CONTEXT,
         "strict_fallback_used": False,
         "silent_fallback_used": False,
         "legacy_style_used": False,
@@ -622,7 +813,7 @@ def run_online_rose_style_roomseg(
             "largest_room_area_ratio": _largest_room_area_ratio(final_labels),
             "rooms": _proposal_masks_debug(final_labels),
         },
-        "accepted_separators": [candidate.to_dict() for candidate in accepted],
+        "accepted_separators": [candidate.to_dict() for candidate in final_accepted],
         "rejected_separators": [candidate.to_dict() for candidate in rejected],
         "proposal_room_masks": _proposal_masks_debug(final_labels),
         **evidence.debug,
@@ -636,6 +827,19 @@ def run_online_rose_style_roomseg(
         "corridor_merge": corridor_merge_debug,
         "topology": topology_debug,
     }
+    debug["evidence_report"] = dict(evidence.debug)
+    debug.update(
+        {
+            "backend": ONLINE_LINE_EXTEND_ROOMSEG_V2_BACKEND,
+            "actual_backend": ONLINE_LINE_EXTEND_ROOMSEG_V2_BACKEND,
+            "source_backend": ONLINE_LINE_EXTEND_ROOMSEG_V2_BACKEND,
+            "roomseg_backend": ONLINE_LINE_EXTEND_ROOMSEG_V2_BACKEND,
+            "algorithm": ONLINE_LINE_EXTEND_ROOMSEG_V2_BACKEND,
+            "source": ONLINE_LINE_EXTEND_ROOMSEG_V2_BACKEND,
+            "context_source": ONLINE_LINE_EXTEND_ROOMSEG_V2_CONTEXT,
+            "room_map_mode": ONLINE_LINE_EXTEND_ROOMSEG_V2_CONTEXT,
+        }
+    )
     debug_cfg = dict(config.debug or {})
     if bool(debug_cfg.get("save_layers", False)) or bool(debug_cfg.get("save_candidate_json", False)):
         dump = save_online_roomseg_debug(
@@ -658,7 +862,7 @@ def run_online_rose_style_roomseg(
     return OnlineRoseStyleResult(
         room_label_map=final_labels.astype(np.int32),
         separator_map=final_separator_map.astype(bool),
-        accepted_candidates=list(accepted),
+        accepted_candidates=list(final_accepted),
         rejected_candidates=list(rejected),
         layers=layers,
         debug=debug,
@@ -673,10 +877,14 @@ def _rooms_from_labels(labels: np.ndarray, unknown: np.ndarray, config: RoomSegm
         if int(np.count_nonzero(mask)) < min_cells and out:
             continue
         room = _room_from_mask("pending", mask, unknown, [], config, int(step))
-        room.source = ONLINE_ROSE_STYLE_BACKEND
+        room.source = ONLINE_LINE_EXTEND_ROOMSEG_V2_BACKEND
         room.metadata["label_id"] = int(label)
         room.metadata["proposal_labels"] = [int(label)]
-        room.metadata["source_finalization_mode"] = ONLINE_ROSE_STYLE_BACKEND
+        room.metadata["source_finalization_mode"] = ONLINE_LINE_EXTEND_ROOMSEG_V2_BACKEND
+        room.metadata["context_source"] = ONLINE_LINE_EXTEND_ROOMSEG_V2_CONTEXT
+        room.metadata["room_type"] = room.metadata.get("room_type", "room")
+        room.metadata["functional_zone_label"] = room.metadata.get("functional_zone_label", "unknown_functional_zone")
+        room.metadata["navigation_obstacle_written"] = False
         room.metadata["accepted_separator_count"] = int(len(debug.get("accepted_separators", []) or []))
         out.append(room)
     return out
@@ -689,6 +897,7 @@ def _candidate_layers(candidates: Sequence[SeparatorCandidate], shape: tuple[int
         "short_unknown_gap_closure": np.zeros(shape, dtype=bool),
         "doorway_virtual_cut": np.zeros(shape, dtype=bool),
         "line_extension_door_neck": np.zeros(shape, dtype=bool),
+        "extension_intersection_cut": np.zeros(shape, dtype=bool),
         "single_sided_wall_extension": np.zeros(shape, dtype=bool),
         "corridor_room_neck_cut": np.zeros(shape, dtype=bool),
     }
@@ -720,6 +929,37 @@ def _largest_room_area_ratio(labels: np.ndarray) -> float:
     if total <= 0:
         return 0.0
     return float(max(counts) / total)
+
+
+def _free_assignment_ratio(labels: np.ndarray, free_clean: np.ndarray) -> float:
+    free = np.asarray(free_clean, dtype=bool)
+    if int(np.count_nonzero(free)) <= 0:
+        return 0.0
+    return float(np.count_nonzero((np.asarray(labels, dtype=np.int32) > 0) & free) / max(1, int(np.count_nonzero(free))))
+
+
+def _room_confidence_layer(labels: np.ndarray, free_clean: np.ndarray, accepted_virtual_boundary_map: np.ndarray) -> np.ndarray:
+    label_arr = np.asarray(labels, dtype=np.int32)
+    free = np.asarray(free_clean, dtype=bool)
+    boundary = np.asarray(accepted_virtual_boundary_map, dtype=bool)
+    confidence = np.zeros(label_arr.shape, dtype=np.float32)
+    confidence[free & (label_arr > 0)] = 0.90
+    confidence[boundary & free & (label_arr > 0)] = 0.72
+    return confidence.astype(np.float32)
+
+
+def _reject_reason_layer(candidates: Sequence[SeparatorCandidate], shape: tuple[int, int]) -> np.ndarray:
+    out = np.zeros(shape, dtype=np.int32)
+    reason_to_code: dict[str, int] = {}
+    next_code = 1
+    for candidate in candidates:
+        reason = str(candidate.reject_reason or candidate.debug.get("corridor_merge_reject_reason", "") or "rejected")
+        if reason not in reason_to_code:
+            reason_to_code[reason] = next_code
+            next_code += 1
+        mask = candidate.mask(shape)
+        out[mask] = int(reason_to_code[reason])
+    return out.astype(np.int32)
 
 
 def _fill_virtual_separator_label_gaps(

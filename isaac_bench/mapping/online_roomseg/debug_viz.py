@@ -34,6 +34,7 @@ BOOL_LAYERS = [
     "missed_scan_gap_closure_candidates",
     "short_unknown_gap_closure_candidates",
     "doorway_virtual_cut_candidates",
+    "extension_intersection_cut_candidates",
     "single_sided_wall_extension_candidates",
     "corridor_skeleton",
     "corridor_candidate_map",
@@ -52,6 +53,8 @@ BOOL_LAYERS = [
     "pass2_door_neck_candidates",
     "accepted_separators_before_corridor_merge",
     "accepted_separators_after_corridor_merge",
+    "accepted_virtual_boundary_map",
+    "separator_map",
     "rejected_false_parallel_doors",
     "accepted_separators",
     "rejected_separators",
@@ -86,11 +89,17 @@ def save_online_roomseg_debug(
             "room_labels_after_corridor_merge_before_virtual_fill",
             "room_labels_after_corridor_merge",
             "final_room_labels",
+            "functional_zone_map",
+            "topology_reject_reason_map",
         ):
             if name in layers:
                 path = root / ("%s.png" % name)
                 _save_labels(path, np.asarray(layers[name], dtype=np.int32))
                 paths[name] = str(path)
+        if "room_confidence_map" in layers:
+            path = root / "room_confidence_map.png"
+            _save_float(path, np.asarray(layers["room_confidence_map"], dtype=np.float32))
+            paths["room_confidence_map"] = str(path)
         paths.update(_save_red_wall_composites(root, layers))
     if save_candidate_json:
         path = root / "separator_report.json"
@@ -165,6 +174,11 @@ def _save_labels(path: Path, labels: np.ndarray) -> None:
         color = _label_color(label)
         arr[labels == label] = color
     Image.fromarray(arr, mode="RGB").save(path)
+
+
+def _save_float(path: Path, values: np.ndarray) -> None:
+    arr = np.clip(np.asarray(values, dtype=np.float32), 0.0, 1.0)
+    Image.fromarray((arr * 255.0).astype(np.uint8), mode="L").save(path)
 
 
 def _label_color(label: int) -> tuple[int, int, int]:

@@ -69,8 +69,8 @@ def build_evidence_maps(
     roomseg_ray_evidence: Mapping[str, np.ndarray] | None = None,
     free_clean_config: FreeCleanConfig | Mapping[str, object] | None = None,
     wall_candidate_config: WallCandidateConfig | Mapping[str, object] | None = None,
-    z_min_m: float = 0.20,
-    z_max_m: float = 2.00,
+    z_min_m: float = 0.10,
+    z_max_m: float = 2.50,
     min_free_rays: int = 1,
     min_observed_rays: int = 1,
 ) -> RoomSegEvidence:
@@ -95,7 +95,12 @@ def build_evidence_maps(
         vertical_observed=vertical_observed,
         roomseg_ray_evidence=roomseg_ray_evidence,
     )
-    vertical_unknown = ~vertical_observed
+    # "Observed" only means a depth ray touched or traversed this xy column in
+    # the vertical band.  If the column has neither reliable free-space evidence
+    # nor explicit occupied/terminal-wall evidence, keep it unknown.  Treating
+    # every observed non-free cell as a wall creates large false wall targets and
+    # long line-extension cuts can then shred open rooms.
+    vertical_unknown = ~(vertical_free | vertical_occupied)
     free_clean, free_debug = clean_free_map(
         vertical_free,
         vertical_occupied,
@@ -225,11 +230,25 @@ def clean_wall_candidate_map(
     resolution_m: float,
     config: WallCandidateConfig,
 ) -> tuple[np.ndarray, dict]:
-    raw = (np.asarray(vertical_occupied_raw, dtype=bool) | (np.asarray(vertical_observed_raw, dtype=bool) & ~np.asarray(vertical_free_raw, dtype=bool))) & ~np.asarray(free_clean, dtype=bool)
+    occupied = np.asarray(vertical_occupied_raw, dtype=bool)
+    observed_nonfree_ambiguous = (
+        np.asarray(vertical_observed_raw, dtype=bool)
+        & ~np.asarray(vertical_free_raw, dtype=bool)
+        & ~occupied
+    )
+    raw = occupied & ~np.asarray(free_clean, dtype=bool)
     if not bool(config.enabled):
-        return raw.astype(bool), {"enabled": False, "input_cells": int(np.count_nonzero(raw)), "kept_cells": int(np.count_nonzero(raw)), "components": []}
+        return raw.astype(bool), {
+            "enabled": False,
+            "input_cells": int(np.count_nonzero(raw)),
+            "kept_cells": int(np.count_nonzero(raw)),
+            "observed_nonfree_ambiguous_cells_ignored": int(np.count_nonzero(observed_nonfree_ambiguous)),
+            "components": [],
+        }
     if str(getattr(config, "mode", "jitter_permissive")) == "jitter_permissive":
-        return _clean_wall_candidate_map_jitter_permissive(raw, float(resolution_m), config)
+        out, debug = _clean_wall_candidate_map_jitter_permissive(raw, float(resolution_m), config)
+        debug["observed_nonfree_ambiguous_cells_ignored"] = int(np.count_nonzero(observed_nonfree_ambiguous))
+        return out, debug
     labels, count = label_components(raw, 8)
     out = np.zeros_like(raw, dtype=bool)
     components: list[dict] = []
@@ -250,6 +269,7 @@ def clean_wall_candidate_map(
         "mode": "shape_gate",
         "input_cells": int(np.count_nonzero(raw)),
         "kept_cells": int(np.count_nonzero(out)),
+        "observed_nonfree_ambiguous_cells_ignored": int(np.count_nonzero(observed_nonfree_ambiguous)),
         "components": components[:256],
     }
 
@@ -333,12 +353,18 @@ def _vertical_maps(
         ).astype(bool)
         occupied_count = np.sum(np.asarray(vp.occupied_count[indices], dtype=np.uint32), axis=0)
         observed_count = np.sum(np.asarray(vp.observed_count[indices], dtype=np.uint32), axis=0)
-        occupied = (occupied_count > 0) & ~free
+        unknown_count = np.sum(np.asarray(vp.unknown_count[indices], dtype=np.uint32), axis=0)
+        has_unknown_band = unknown_count > 0
+        occupied_before_unknown_guard = (occupied_count > 0) & ~free
+        occupied = occupied_before_unknown_guard & ~has_unknown_band
         observed = observed_count >= int(min_observed_rays)
         if np.any(observed):
             return free.astype(bool), occupied.astype(bool), observed.astype(bool), {
-                "vertical_source": "vertical_profile_0p2_2p0",
+                "vertical_source": "vertical_profile_0p1_2p5",
                 "vertical_band_names": list(band_names),
+                "vertical_partial_unknown_occupied_suppressed_cells": int(
+                    np.count_nonzero(occupied_before_unknown_guard & has_unknown_band)
+                ),
             }
     unknown = np.asarray(unknown_mask, dtype=bool)
     free = np.asarray(observed_free_mask, dtype=bool) & ~unknown

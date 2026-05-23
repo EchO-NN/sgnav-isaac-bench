@@ -5,7 +5,7 @@ from typing import Mapping
 
 import numpy as np
 
-from .config import PlaceGraphConfig
+from .config import PlaceGraphConfig, StructuralWallConfig
 from .data_types import CutCandidate, GridSpec, PlaceEdge, PlaceGraph, PlaceNode, SkeletonGraph, StructuralMap
 from .utils import grid_to_world, in_bounds, path_crosses
 from .visibility import VisibilityComputer, jaccard
@@ -151,7 +151,12 @@ def _room_centers(distance_m: np.ndarray, free: np.ndarray, config: PlaceGraphCo
 
 
 def _line_of_sight(a: tuple[int, int], b: tuple[int, int], structural_map: StructuralMap) -> bool:
-    blocked = np.asarray(structural_map.hard_wall_mask, dtype=bool) | (np.asarray(structural_map.p_unknown, dtype=np.float32) >= 0.65)
+    scfg = StructuralWallConfig()
+    blocked = (
+        np.asarray(structural_map.hard_wall_mask, dtype=bool)
+        | (np.asarray(structural_map.p_wall, dtype=np.float32) >= float(scfg.wall_probability_threshold))
+        | (np.asarray(structural_map.p_unknown, dtype=np.float32) >= float(scfg.unknown_probability_threshold))
+    )
     return not path_crosses(blocked, a, b)
 
 
@@ -179,4 +184,3 @@ def _xy_distance(a: tuple[float, float], b: tuple[float, float]) -> float:
 
 def _angle_diff(a: float, b: float) -> float:
     return float((a - b + math.pi) % (2.0 * math.pi) - math.pi)
-

@@ -47,3 +47,22 @@ def test_wall_candidate_filtering_removes_only_isolated_single_cell_noise():
     assert not bool(cleaned[5, 5])
     assert np.all(cleaned[12, 4:12])
     assert debug["removed_isolated_component_count"] == 1
+
+
+def test_wall_candidate_filtering_ignores_observed_nonfree_without_occupied_evidence():
+    free = np.zeros((12, 12), dtype=bool)
+    occupied = np.zeros_like(free)
+    observed = np.zeros_like(free)
+    observed[5, 3:9] = True
+
+    cleaned, debug = clean_wall_candidate_map(
+        vertical_free_raw=free,
+        vertical_occupied_raw=occupied,
+        vertical_observed_raw=observed,
+        free_clean=free,
+        resolution_m=0.05,
+        config=WallCandidateConfig(mode="jitter_permissive"),
+    )
+
+    assert not np.any(cleaned)
+    assert debug["observed_nonfree_ambiguous_cells_ignored"] == 6

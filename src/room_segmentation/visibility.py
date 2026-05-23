@@ -101,7 +101,7 @@ class VisibilityComputer:
                 col = int(round(float(seed[1]) + dc * cur))
                 if not in_bounds(row, col, shape):
                     break
-                if hard[row, col] or float(p_wall[row, col]) >= float(self.structural_config.hard_wall_probability_threshold):
+                if hard[row, col] or float(p_wall[row, col]) >= float(self.structural_config.wall_probability_threshold):
                     break
                 if float(p_unknown[row, col]) >= float(self.structural_config.unknown_probability_threshold):
                     break
@@ -127,4 +127,3 @@ def compute_visibility_signature(
 
 def jaccard(a: Set[GridCell], b: Set[GridCell], eps: float = 1e-6) -> float:
     return float(len(a & b) / (len(a | b) + float(eps)))
-

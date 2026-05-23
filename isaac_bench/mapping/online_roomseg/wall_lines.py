@@ -14,7 +14,7 @@ class LineWallsConfig:
     enabled: bool = True
     hough_enabled: bool = True
     pca_enabled: bool = True
-    min_line_length_m: float = 0.45
+    min_line_length_m: float = 0.15
     min_support_ratio: float = 0.35
     max_angle_to_dominant_deg: float = 15.0
     axis_snap_lateral_tolerance_cells: int = 2
@@ -58,7 +58,7 @@ class LineFilteringConfig:
     max_snap_angle_deg: float = 12.0
     merge_collinear_gap_m: float = 0.35
     merge_lateral_offset_m: float = 0.12
-    min_filtered_line_length_m: float = 0.60
+    min_filtered_line_length_m: float = 0.15
     min_filtered_support_ratio: float = 0.45
     endpoint_refine_window_m: float = 0.25
     endpoint_min_wall_support_m: float = 0.20
@@ -111,7 +111,7 @@ class WallRunSnapConfig:
     enabled: bool = True
     max_angle_to_axis_deg: float = 25.0
     support_band_cells: int = 2
-    min_run_length_m: float = 0.35
+    min_run_length_m: float = 0.25
     min_support_ratio: float = 0.25
     close_holes_m: float = 0.20
 

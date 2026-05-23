@@ -6,7 +6,11 @@ from pathlib import Path
 
 import numpy as np
 
-from isaac_bench.mapping.online_roomseg import OnlineRoseStyleConfig, run_online_rose_style_roomseg
+from isaac_bench.mapping.online_roomseg import (
+    ONLINE_LINE_EXTEND_ROOMSEG_V2_BACKEND,
+    OnlineRoseStyleConfig,
+    run_online_rose_style_roomseg,
+)
 from isaac_bench.mapping.online_watershed_roomseg import (
     ONLINE_WATERSHED_ROOMSEG_BACKEND,
     OnlineWatershedRoomSegConfig,
@@ -18,7 +22,7 @@ from isaac_bench.mapping.vertical_profile import VerticalProfileMap
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Replay one saved roomseg NPZ through online room segmentation without Isaac.")
     parser.add_argument("--input", required=True)
-    parser.add_argument("--backend", default="online_rose_style_v1", choices=["online_rose_style_v1", ONLINE_WATERSHED_ROOMSEG_BACKEND])
+    parser.add_argument("--backend", default=ONLINE_LINE_EXTEND_ROOMSEG_V2_BACKEND, choices=[ONLINE_LINE_EXTEND_ROOMSEG_V2_BACKEND, "online_rose_style_v1", ONLINE_WATERSHED_ROOMSEG_BACKEND])
     parser.add_argument("--out-dir", required=True)
     parser.add_argument("--resolution-m", type=float, default=0.05)
     parser.add_argument("--save-layers", action="store_true")

@@ -88,6 +88,16 @@ def test_seeded_gt_memory_marks_row_non_metric():
     assert "seeded_gt_object_memory" in row["fallbacks_used"]
 
 
+def test_metric_pose_outside_static_map_marks_row_non_metric():
+    row = complete_result_row(
+        {**_base_row(), "metric_pose_outside_static_map_count": 2},
+        _args(),
+    )
+
+    assert row["metric_valid"] is False
+    assert "metric_pose_outside_static_map" in row["fallbacks_used"]
+
+
 def test_unmarked_local_deterministic_llm_marks_row_non_metric():
     row = complete_result_row(_base_row(), _args())
 
@@ -198,10 +208,10 @@ def test_config_defaults_match_benchmark_contract():
     assert cfg["nearfield_static_map"]["enabled"] is False
     assert cfg["mapping"]["frontier_allow_near_fallback"] is False
     assert cfg["mapping"]["frontier_min_distance_m"] == 1.0
-    assert cfg["mapping"]["room_map_mode"] == "vertical_free_gap_closure_v1_vlm"
+    assert cfg["mapping"]["room_map_mode"] == "online_line_extend_roomseg_v2_vlm"
     assert cfg["mapping"]["strict_no_oracle_rooms"] is True
-    assert cfg["mapping"]["room_segmentation"]["algorithm"] == "vertical_free_gap_closure_v1"
-    assert cfg["mapping"]["room_segmentation"]["backend"] == "vertical_free_gap_closure_v1"
+    assert cfg["mapping"]["room_segmentation"]["algorithm"] == "online_line_extend_roomseg_v2"
+    assert cfg["mapping"]["room_segmentation"]["backend"] == "online_line_extend_roomseg_v2"
     assert cfg["mapping"]["room_segmentation"]["source_mode"] == "declutter_reconstruct_external"
     assert cfg["mapping"]["room_segmentation"]["legacy_watershed_allowed"] == "debug_only"
     assert cfg["mapping"]["room_segmentation"]["local_rose2_lite_allowed"] == "debug_only"
@@ -215,8 +225,8 @@ def test_config_defaults_match_benchmark_contract():
     assert cfg["mapping"]["room_segmentation"]["source_form"]["min_cell_area_m2"] == 0.35
     assert cfg["mapping"]["room_segmentation"]["open_boundary_merge"] is True
     assert cfg["mapping"]["room_segmentation"]["vertical_or_free"]["enabled"] is True
-    assert cfg["mapping"]["room_segmentation"]["vertical_or_free"]["z_min_m"] == 0.20
-    assert cfg["mapping"]["room_segmentation"]["vertical_or_free"]["z_max_m"] == 2.00
+    assert cfg["mapping"]["room_segmentation"]["vertical_or_free"]["z_min_m"] == 0.10
+    assert cfg["mapping"]["room_segmentation"]["vertical_or_free"]["z_max_m"] == 2.50
     assert cfg["mapping"]["room_segmentation"]["vertical_free_roomseg"]["enabled"] is True
     assert cfg["mapping"]["room_segmentation"]["vertical_free_roomseg"]["doorway_width_max_m"] == 1.60
     assert cfg["mapping"]["room_segmentation"]["vertical_free_gap_closure"]["enabled"] is True

@@ -34,11 +34,19 @@ class FreeSpaceExtractor:
         observed_free &= ~np.asarray(structural_map.hard_wall_mask, dtype=bool)
         min_cells = max(1, int(round(float(cfg.min_free_component_area_m2) / max(self.resolution_m * self.resolution_m, 1e-9))))
         observed_free = remove_small_components(observed_free, min_cells=min_cells, connectivity=8)
-        erosion_m = max(float(cfg.erosion_radius_m), float(cfg.robot_radius_m) + float(cfg.safety_margin_m))
-        erode_radius = radius_cells(erosion_m, self.resolution_m)
-        free_eroded = erode(observed_free, erode_radius)
+        default_nav_erosion_m = max(float(cfg.erosion_radius_m), float(cfg.robot_radius_m) + float(cfg.safety_margin_m))
+        roomseg_erosion_m = float(cfg.roomseg_erosion_radius_m) if cfg.roomseg_erosion_radius_m is not None else float(default_nav_erosion_m)
+        navigation_erosion_m = (
+            float(cfg.navigation_erosion_radius_m) if cfg.navigation_erosion_radius_m is not None else float(default_nav_erosion_m)
+        )
+        roomseg_erode_radius = radius_cells(roomseg_erosion_m, self.resolution_m)
+        navigation_erode_radius = radius_cells(navigation_erosion_m, self.resolution_m)
+        free_eroded = erode(observed_free, roomseg_erode_radius)
         if not np.any(free_eroded) and np.any(observed_free):
             free_eroded = observed_free.copy()
+        navigation_free_eroded = erode(observed_free, navigation_erode_radius)
+        if not np.any(navigation_free_eroded) and np.any(observed_free):
+            navigation_free_eroded = observed_free.copy()
         unknown_high = np.asarray(structural_map.p_unknown, dtype=np.float32) >= float(scfg.unknown_probability_threshold)
         frontier = observed_free & dilate(unknown_high, radius_cells(float(cfg.frontier_band_m), self.resolution_m))
         distance_input = free_eroded.copy()
@@ -46,6 +54,9 @@ class FreeSpaceExtractor:
         debug = {
             "distance_boundary_mask": (~distance_input).astype(np.uint8),
             "unknown_distance_boundary": (unknown_high & bool(cfg.unknown_as_boundary_for_distance)).astype(np.uint8),
+            "roomseg_erosion_radius_m": np.asarray([roomseg_erosion_m], dtype=np.float32),
+            "navigation_erosion_radius_m": np.asarray([navigation_erosion_m], dtype=np.float32),
+            "navigation_free_eroded_mask": navigation_free_eroded.astype(np.uint8),
         }
         return FreeSpaceState(
             observed_free_mask=observed_free.astype(bool),
@@ -54,4 +65,3 @@ class FreeSpaceExtractor:
             distance_transform_m=distance_m.astype(np.float32),
             debug=debug,
         )
-

@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections import deque
 from dataclasses import dataclass
 import math
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -156,6 +156,73 @@ def frontier_cells(
         exclude_mask=exclude_mask,
         unknown_source=unknown_source,
     )["frontier"]
+
+
+def wall_adjacency_mask(wall_mask: np.ndarray, clearance_radius_cells: int) -> np.ndarray:
+    """Cells treated as too close to an occupied wall/obstacle for frontier selection."""
+    return _disk_dilate(np.asarray(wall_mask).astype(bool), max(0, int(clearance_radius_cells)))
+
+
+def split_wall_adjacent_frontiers(
+    frontiers: Sequence[FrontierCluster],
+    wall_adjacent: np.ndarray,
+    *,
+    min_member_overlap_ratio: float = 1.0,
+) -> Tuple[List[FrontierCluster], List[FrontierCluster], Dict[str, object]]:
+    """Split frontier clusters into usable and wall-adjacent blacklisted groups.
+
+    A cluster is blacklisted when its selected center is already inside the
+    wall-adjacent mask, or when nearly all member cells are wall-adjacent.
+    The second condition catches thin, one-cell frontier strips that run along
+    walls while avoiding over-filtering a large mixed frontier component.
+    """
+    clusters = list(frontiers)
+    wall_adjacent_bool = np.asarray(wall_adjacent).astype(bool)
+    if not clusters or not np.any(wall_adjacent_bool):
+        return clusters, [], {
+            "frontier_wall_blacklist_filtered_count": 0,
+            "frontier_wall_blacklist_center_hits": 0,
+            "frontier_wall_blacklist_member_hits": 0,
+        }
+    h, w = wall_adjacent_bool.shape
+    min_ratio = float(np.clip(float(min_member_overlap_ratio), 0.0, 1.0))
+    kept: List[FrontierCluster] = []
+    rejected: List[FrontierCluster] = []
+    center_hits = 0
+    member_hits = 0
+    rejected_overlap_ratios: List[float] = []
+
+    for cluster in clusters:
+        center = tuple(int(v) for v in cluster.center_grid)
+        center_hit = (
+            0 <= center[0] < h
+            and 0 <= center[1] < w
+            and bool(wall_adjacent_bool[center[0], center[1]])
+        )
+        members = [tuple(int(v) for v in cell) for cell in cluster.members]
+        member_count = max(1, len(members))
+        overlap_count = 0
+        for row, col in members:
+            if 0 <= row < h and 0 <= col < w and bool(wall_adjacent_bool[row, col]):
+                overlap_count += 1
+        overlap_ratio = float(overlap_count) / float(member_count)
+        member_hit = overlap_count > 0 and overlap_ratio >= min_ratio
+        if center_hit or member_hit:
+            rejected.append(cluster)
+            center_hits += int(center_hit)
+            member_hits += int(member_hit)
+            rejected_overlap_ratios.append(overlap_ratio)
+        else:
+            kept.append(cluster)
+
+    return kept, rejected, {
+        "frontier_wall_blacklist_filtered_count": int(len(rejected)),
+        "frontier_wall_blacklist_center_hits": int(center_hits),
+        "frontier_wall_blacklist_member_hits": int(member_hits),
+        "frontier_wall_blacklist_max_member_overlap_ratio": (
+            float(max(rejected_overlap_ratios)) if rejected_overlap_ratios else 0.0
+        ),
+    }
 
 
 def _connected_components(mask: np.ndarray) -> List[List[GridCell]]:

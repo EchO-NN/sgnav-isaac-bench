@@ -6,6 +6,7 @@ def test_required_sgnav_defaults():
     cfg = load_config("isaac_bench/configs/isaac_bench.yaml")
 
     assert cfg["mapping"]["frontier_min_distance_m"] == 1.0
+    assert cfg["mapping"]["frontier_wall_blacklist_clearance_m"] == 0.05
     assert cfg["sgnav"]["frontier_distance_weight"] == 0.2
     assert cfg["sgnav"]["frontier_commit_max_steps"] == 0
     assert cfg["llm"]["enabled"] is True
@@ -16,10 +17,10 @@ def test_required_sgnav_defaults():
     assert cfg["perception"]["grounding_dino"]["checkpoint"].endswith("groundingdino_swinb_cogcoor.pth")
     assert cfg["perception"]["grounding_dino"]["config"].endswith("GroundingDINO_SwinB.cfg.py")
     assert cfg["sgnav"]["candidate_start_min_confidence"] == 0.45
-    assert cfg["mapping"]["room_map_mode"] == "vertical_free_gap_closure_v1_vlm"
+    assert cfg["mapping"]["room_map_mode"] == "online_line_extend_roomseg_v2_vlm"
     assert cfg["mapping"]["strict_no_oracle_rooms"] is True
-    assert cfg["mapping"]["room_segmentation"]["algorithm"] == "vertical_free_gap_closure_v1"
-    assert cfg["mapping"]["room_segmentation"]["backend"] == "vertical_free_gap_closure_v1"
+    assert cfg["mapping"]["room_segmentation"]["algorithm"] == "online_line_extend_roomseg_v2"
+    assert cfg["mapping"]["room_segmentation"]["backend"] == "online_line_extend_roomseg_v2"
     assert cfg["mapping"]["room_segmentation"]["source_mode"] == "declutter_reconstruct_external"
     assert cfg["mapping"]["room_segmentation"]["legacy_watershed_allowed"] == "debug_only"
     assert cfg["mapping"]["room_segmentation"]["local_rose2_lite_allowed"] == "debug_only"
@@ -40,8 +41,8 @@ def test_required_sgnav_defaults():
     assert cfg["mapping"]["room_segmentation"]["source_form"]["merge_guard_enabled"] is True
     assert cfg["mapping"]["room_segmentation"]["use_structural_obstacle_mask"] is True
     assert cfg["mapping"]["room_segmentation"]["vertical_or_free"]["enabled"] is True
-    assert cfg["mapping"]["room_segmentation"]["vertical_or_free"]["z_min_m"] == 0.20
-    assert cfg["mapping"]["room_segmentation"]["vertical_or_free"]["z_max_m"] == 2.00
+    assert cfg["mapping"]["room_segmentation"]["vertical_or_free"]["z_min_m"] == 0.10
+    assert cfg["mapping"]["room_segmentation"]["vertical_or_free"]["z_max_m"] == 2.50
     assert cfg["mapping"]["room_segmentation"]["vertical_or_free"]["min_free_rays"] == 1
     assert cfg["mapping"]["room_segmentation"]["vertical_or_free"]["min_observed_rays"] == 1
     assert cfg["mapping"]["room_segmentation"]["vertical_free_roomseg"]["enabled"] is True
@@ -62,9 +63,19 @@ def test_required_sgnav_defaults():
     assert cfg["mapping"]["room_segmentation"]["rose2"]["wall_extension_band_m"] == 0.45
     assert cfg["mapping"]["room_segmentation"]["rose2"]["wall_extension_margin_m"] == 0.15
     assert cfg["mapping"]["room_segmentation"]["online_roomseg"]["line_extension"]["passes"] == 2
+    assert cfg["mapping"]["room_segmentation"]["online_roomseg"]["line_extension"]["max_extension_m"] == 1.60
+    assert cfg["mapping"]["room_segmentation"]["online_roomseg"]["line_extension"]["max_probe_m"] == 1.80
     assert cfg["mapping"]["room_segmentation"]["online_roomseg"]["line_extension"]["unknown_ratio_max"] == 0.50
-    assert cfg["mapping"]["room_segmentation"]["online_roomseg"]["corridor_merge"]["parallel_edge_length_tolerance_ratio"] == 0.05
+    assert cfg["mapping"]["room_segmentation"]["online_roomseg"]["line_extension"]["allow_hit_virtual_door_on_pass2"] is True
+    assert cfg["visualization"]["map_base_layer"] == "vertical_free"
+    assert cfg["mapping"]["room_segmentation"]["online_roomseg"]["door_neck"]["max_width_m"] == 1.80
+    assert cfg["mapping"]["room_segmentation"]["online_roomseg"]["door_neck"]["reject_endpoint_on_other_door_middle"] is True
+    assert cfg["mapping"]["room_segmentation"]["online_roomseg"]["door_neck"]["endpoint_on_other_middle_min_ratio"] == 0.15
+    assert cfg["mapping"]["room_segmentation"]["online_roomseg"]["door_neck"]["endpoint_on_other_middle_max_ratio"] == 0.85
+    assert cfg["mapping"]["room_segmentation"]["online_roomseg"]["doorway_virtual_cut"]["max_width_m"] == 1.80
+    assert cfg["mapping"]["room_segmentation"]["online_roomseg"]["corridor_merge"]["parallel_edge_length_tolerance_ratio"] == 0.15
     assert cfg["mapping"]["room_segmentation"]["online_roomseg"]["corridor_merge"]["parallel_edge_coverage_min_ratio"] == 0.95
+    assert cfg["mapping"]["room_segmentation"]["online_roomseg"]["corridor_merge"]["shared_mask_edge_length_match_enabled"] is True
     assert cfg["mapping"]["room_segmentation"]["online_roomseg"]["corridor_merge"]["post_corridor_small_region_merge_enabled"] is True
     assert cfg["mapping"]["room_segmentation"]["online_roomseg"]["corridor_merge"]["post_corridor_small_region_max_area_m2"] == 2.50
     assert cfg["mapping"]["room_segmentation"]["online_roomseg"]["corridor_merge"]["post_corridor_small_region_max_unknown_ratio"] == 0.20
@@ -82,8 +93,9 @@ def test_required_sgnav_defaults():
     assert cfg["object_memory"]["footprint_iou_track_match_threshold"] == 0.20
     assert cfg["object_memory"]["child_containment_threshold"] == 0.70
     assert cfg["object_memory"]["child_object_area_ratio_max"] == 0.35
-    assert cfg["sgnav"]["scene_graph"]["room_nodes"]["source"] == "vertical_free_gap_closure_v1_vlm"
+    assert cfg["sgnav"]["scene_graph"]["room_nodes"]["source"] == "online_line_extend_roomseg_v2_vlm"
     assert cfg["visualization"]["show_gt_goal_cells"] is False
+    assert cfg["visualization"]["show_roomseg_debug_red_lines"] is False
     assert cfg["visualization"]["show_room_proposals"] is True
     assert cfg["isaac"]["perception_every_steps"] == 1
 
