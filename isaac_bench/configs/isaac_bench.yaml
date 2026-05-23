@@ -561,6 +561,21 @@ mapping:
       debug:
         save_layers: false
         save_json: false
+    online_visibility_bottleneck:
+      enabled: true
+      backend: online_visibility_bottleneck_roomseg_v1
+      map:
+        resolution_m: 0.05
+      depth:
+        depth_stride_px: 2
+      temporal:
+        enabled: true
+      output:
+        output_soft_masks: true
+        output_debug_layers: true
+      debug:
+        save_debug_images: false
+        debug_image_dir: debug/online_visibility_bottleneck_roomseg
     debug_layers:
       enabled: false
       output_dir: debug/roomseg_layers

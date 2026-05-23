@@ -51,6 +51,12 @@ from isaac_bench.mapping.online_watershed_roomseg import (
     OnlineWatershedRoomSegConfig,
     OnlineWatershedRoomSegmenter,
 )
+from isaac_bench.mapping.visibility_bottleneck_roomseg_adapter import (
+    ONLINE_VISIBILITY_BOTTLENECK_ROOMSEG_BACKEND,
+    ONLINE_VISIBILITY_BOTTLENECK_ROOMSEG_CONTEXT,
+    OVBRoomSegConfig,
+    OnlineVisibilityBottleneckRoomSegmenter,
+)
 from isaac_bench.mapping.upstream_rose2_pure_python_adapter import (
     UpstreamROSE2Config,
     UpstreamROSE2PurePythonSegmenter,
@@ -144,6 +150,7 @@ def _resolve_roomseg_depth_stride_px(room_segmentation_config: Mapping[str, obje
     for section in (
         "online_roomseg",
         "online_watershed_roomseg",
+        "online_visibility_bottleneck",
         "vertical_free_roomseg",
         "vertical_free_gap_closure",
     ):
@@ -1445,6 +1452,41 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
             map_info=dynamic_map_info,
         )
         room_segmenter = OnlineWatershedRoomSegmenter(watershed_cfg, map_info=dynamic_map_info)
+        room_label_client = (
+            getattr(scenegraph, "paper_llm_client", None)
+            if str(getattr(args, "room_label_backend", "vlm")).strip().lower() == "vlm"
+            else None
+        )
+        room_labeler = VLMRoomLabeler(
+            client=room_label_client,
+            allowed_categories=getattr(args, "room_label_allowed_categories", DEFAULT_ROOM_CATEGORIES),
+            min_confidence=float(getattr(args, "room_label_min_confidence", 0.60)),
+            ambiguity_margin=float(getattr(args, "room_label_ambiguity_margin", 0.15)),
+            min_reliable_objects=int(getattr(args, "room_label_min_reliable_objects", 2)),
+            unknown_category=str(getattr(args, "room_label_unknown_category", "unknown")),
+            require_backend=bool(getattr(args, "strict_benchmark", False))
+            and str(getattr(args, "room_label_backend", "vlm")).strip().lower() == "vlm",
+            max_room_objects_in_prompt=int(getattr(args, "max_room_objects_in_prompt", 25)),
+        )
+        last_room_semantics_debug["backend"] = room_labeler.backend
+    elif room_map_mode in {
+        ONLINE_VISIBILITY_BOTTLENECK_ROOMSEG_BACKEND,
+        ONLINE_VISIBILITY_BOTTLENECK_ROOMSEG_CONTEXT,
+        "online_visibility_bottleneck_roomseg",
+        "online_visibility_bottleneck_roomseg_vlm",
+    }:
+        roomseg_backend = str(
+            getattr(args, "room_segmentation_config", {}).get("backend", ONLINE_VISIBILITY_BOTTLENECK_ROOMSEG_BACKEND)
+            or ONLINE_VISIBILITY_BOTTLENECK_ROOMSEG_BACKEND
+        ).strip().lower()
+        if roomseg_backend != ONLINE_VISIBILITY_BOTTLENECK_ROOMSEG_BACKEND:
+            raise ValueError("online_visibility_bottleneck_roomseg room_map_mode requires --roomseg-backend %s" % ONLINE_VISIBILITY_BOTTLENECK_ROOMSEG_BACKEND)
+        ovb_cfg = OVBRoomSegConfig.from_mapping(
+            getattr(args, "room_segmentation_config", {}),
+            resolution_m=float(dynamic_map_info.resolution_m),
+            map_info=dynamic_map_info,
+        )
+        room_segmenter = OnlineVisibilityBottleneckRoomSegmenter(ovb_cfg, map_info=dynamic_map_info)
         room_label_client = (
             getattr(scenegraph, "paper_llm_client", None)
             if str(getattr(args, "room_label_backend", "vlm")).strip().lower() == "vlm"
@@ -3883,6 +3925,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             "legacy_rose2_style_debug",
             ONLINE_ROSE_STYLE_BACKEND,
             ONLINE_WATERSHED_ROOMSEG_BACKEND,
+            ONLINE_VISIBILITY_BOTTLENECK_ROOMSEG_BACKEND,
             VERTICAL_FREE_ROOMSEG_BACKEND,
             VERTICAL_FREE_ROOMSEG_ALGORITHM,
             VERTICAL_FREE_GAP_CLOSURE_BACKEND,
@@ -4339,6 +4382,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     roomseg_wall_gating_fix_cfg = dict(args.room_segmentation_config.get("wall_gating_fix", {}) or {})
     roomseg_online_cfg = dict(args.room_segmentation_config.get("online_roomseg", {}) or {})
     roomseg_watershed_cfg = dict(args.room_segmentation_config.get("online_watershed_roomseg", {}) or {})
+    roomseg_ovb_cfg = dict(args.room_segmentation_config.get("online_visibility_bottleneck", {}) or {})
     if args.roomseg_backend is not None:
         args.room_segmentation_config["backend"] = str(args.roomseg_backend)
     if args.debug_rose2_source is not None:
@@ -4372,6 +4416,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         watershed_depth_cfg = dict(roomseg_watershed_cfg.get("depth", {}) or {})
         watershed_depth_cfg["roomseg_depth_stride_px"] = int(args.roomseg_roomseg_depth_stride_px)
         roomseg_watershed_cfg["depth"] = watershed_depth_cfg
+        ovb_depth_cfg = dict(roomseg_ovb_cfg.get("depth", {}) or {})
+        ovb_depth_cfg["depth_stride_px"] = int(args.roomseg_roomseg_depth_stride_px)
+        roomseg_ovb_cfg["depth"] = ovb_depth_cfg
     if args.roomseg_disable_corridor_cuts:
         neck_cfg = dict(roomseg_online_cfg.get("corridor_room_neck_cut", {}) or {})
         neck_cfg["enabled"] = False
@@ -4390,6 +4437,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     args.room_segmentation_config["wall_gating_fix"] = roomseg_wall_gating_fix_cfg
     args.room_segmentation_config["online_roomseg"] = roomseg_online_cfg
     args.room_segmentation_config["online_watershed_roomseg"] = roomseg_watershed_cfg
+    args.room_segmentation_config["online_visibility_bottleneck"] = roomseg_ovb_cfg
     args.debug_roomseg_layers = bool(roomseg_debug_layers_cfg.get("enabled", False))
     args.debug_roomseg_dir = str(roomseg_debug_layers_cfg.get("output_dir", "debug/roomseg_layers"))
     args.debug_roomseg_max_saves = int(roomseg_debug_layers_cfg.get("max_saves", 50))
@@ -4397,7 +4445,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     args.roomseg_snapshot_dir = str(args.roomseg_snapshot_dir or "result/roomseg_snapshots")
     args.roomseg_snapshot_max_saves = int(args.roomseg_snapshot_max_saves if args.roomseg_snapshot_max_saves is not None else 500)
     if args.debug_roomseg_layers:
-        for nested_key in ("vertical_free_roomseg", "vertical_free_gap_closure", "online_roomseg", "online_watershed_roomseg"):
+        for nested_key in ("vertical_free_roomseg", "vertical_free_gap_closure", "online_roomseg", "online_watershed_roomseg", "online_visibility_bottleneck"):
             nested_cfg = dict(args.room_segmentation_config.get(nested_key, {}) or {})
             nested_cfg["debug_dump"] = True
             nested_cfg.setdefault("debug_dir", args.debug_roomseg_dir)
@@ -4410,6 +4458,11 @@ def main(argv: Optional[List[str]] = None) -> int:
                 debug_cfg = dict(nested_cfg.get("debug", {}) or {})
                 debug_cfg["save_layers"] = True
                 debug_cfg["save_json"] = True
+                nested_cfg["debug"] = debug_cfg
+            if nested_key == "online_visibility_bottleneck":
+                debug_cfg = dict(nested_cfg.get("debug", {}) or {})
+                debug_cfg["save_debug_images"] = True
+                debug_cfg["debug_image_dir"] = args.debug_roomseg_dir
                 nested_cfg["debug"] = debug_cfg
             args.room_segmentation_config[nested_key] = nested_cfg
     args.roomseg_backend = str(args.room_segmentation_config.get("backend", "rose2_source_external_runner"))
@@ -4634,7 +4687,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         debug_layers_cfg.setdefault("output_dir", str(getattr(args, "debug_roomseg_dir", "debug/roomseg_layers")))
         args.room_segmentation_config["debug_layers"] = debug_layers_cfg
         args.debug_roomseg_dir = str(debug_layers_cfg.get("output_dir", getattr(args, "debug_roomseg_dir", "debug/roomseg_layers")))
-        for nested_key in ("vertical_free_roomseg", "vertical_free_gap_closure", "online_roomseg", "online_watershed_roomseg"):
+        for nested_key in ("vertical_free_roomseg", "vertical_free_gap_closure", "online_roomseg", "online_watershed_roomseg", "online_visibility_bottleneck"):
             nested_cfg = dict(args.room_segmentation_config.get(nested_key, {}) or {})
             nested_cfg["debug_dump"] = True
             nested_cfg.setdefault("debug_dir", args.debug_roomseg_dir)
@@ -4647,6 +4700,11 @@ def main(argv: Optional[List[str]] = None) -> int:
                 debug_cfg = dict(nested_cfg.get("debug", {}) or {})
                 debug_cfg["save_layers"] = True
                 debug_cfg["save_json"] = True
+                nested_cfg["debug"] = debug_cfg
+            if nested_key == "online_visibility_bottleneck":
+                debug_cfg = dict(nested_cfg.get("debug", {}) or {})
+                debug_cfg["save_debug_images"] = True
+                debug_cfg["debug_image_dir"] = args.debug_roomseg_dir
                 nested_cfg["debug"] = debug_cfg
             args.room_segmentation_config[nested_key] = nested_cfg
 
