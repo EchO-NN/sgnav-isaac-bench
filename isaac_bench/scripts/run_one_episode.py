@@ -4003,6 +4003,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--show-room-proposals", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--show-room-masks", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--show-room-labels", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--sgnav-viz-map-base-layer", default=None, choices=["default", "vertical_free"])
     parser.add_argument("--show-frontier-member-cells", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--show-object-nodes", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--show-candidate-markers", action=argparse.BooleanOptionalAction, default=None)

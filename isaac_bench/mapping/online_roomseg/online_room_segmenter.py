@@ -57,12 +57,23 @@ from .wall_lines import (
 
 ONLINE_ROSE_STYLE_BACKEND = "online_rose_style_v1"
 ONLINE_ROSE_STYLE_CONTEXT = "online_rose_style_v1_vlm"
+ONLINE_LINE_EXTEND_ROOMSEG_V2_BACKEND = "online_line_extend_roomseg_v2"
+ONLINE_LINE_EXTEND_ROOMSEG_V2_CONTEXT = "online_line_extend_roomseg_v2_vlm"
+ROOMSEG_EVIDENCE_LINE_CLOSURE_V3_BACKEND = "roomseg_evidence_line_closure_v3"
+ROOMSEG_EVIDENCE_LINE_CLOSURE_V3_CONTEXT = "roomseg_evidence_line_closure_v3_vlm"
+ONLINE_LINE_EXTEND_ROOMSEG_V4_BACKEND = "online_line_extend_roomseg_v4"
+ONLINE_LINE_EXTEND_ROOMSEG_V4_CONTEXT = "online_line_extend_roomseg_v4_vlm"
+HEIGHT_PROFILE_DOOR_WALL_V6_2_BACKEND = "height_profile_door_wall_v6_2"
+HEIGHT_PROFILE_DOOR_WALL_V6_2_CONTEXT = "height_profile_door_wall_v6_2_vlm"
+HEIGHT_PROFILE_CORRIDOR_V7_BACKEND = "height_profile_corridor_v7"
+HEIGHT_PROFILE_CORRIDOR_V7_CONTEXT = "height_profile_corridor_v7_vlm"
 
 
 @dataclass
 class OnlineRoseStyleConfig:
     enabled: bool = True
     backend: str = ONLINE_ROSE_STYLE_BACKEND
+    algorithm: str = ONLINE_ROSE_STYLE_BACKEND
     resolution_m: float = 0.05
     map_info: MapInfo | None = None
     z_min_m: float = 0.20
@@ -96,7 +107,7 @@ class OnlineRoseStyleConfig:
     def from_mapping(cls, data: Mapping[str, object] | None = None, **overrides: object) -> "OnlineRoseStyleConfig":
         raw_root = dict(data or {})
         raw = dict(raw_root.get("online_roomseg", {}) or {})
-        for key in ("enabled", "backend"):
+        for key in ("enabled", "backend", "algorithm"):
             if key in raw_root and key not in raw:
                 raw[key] = raw_root[key]
         vertical_or_free = dict(raw_root.get("vertical_or_free", {}) or {})
