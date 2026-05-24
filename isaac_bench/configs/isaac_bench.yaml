@@ -168,12 +168,12 @@ mapping:
   frontier_allow_near_fallback: false
   frontier_debug_dump: false
   frontier_debug_dir: data/debug_frontier
-  room_map_mode: height_profile_door_wall_v6_2_vlm
+  room_map_mode: online_rose_style_v1_vlm
   strict_no_oracle_rooms: true
   room_segmentation:
     enabled: true
-    algorithm: height_profile_door_wall_v6_2
-    backend: height_profile_door_wall_v6_2
+    algorithm: online_rose_style_v1
+    backend: online_rose_style_v1
     source_mode: declutter_reconstruct_external
     legacy_watershed_allowed: debug_only
     local_rose2_lite_allowed: debug_only
@@ -521,8 +521,8 @@ mapping:
         show_height_profile_layers: true
     online_roomseg:
       enabled: true
-      backend: height_profile_door_wall_v6_2
-      algorithm: height_profile_door_wall_v6_2
+      backend: online_rose_style_v1
+      algorithm: online_rose_style_v1
       depth:
         roomseg_depth_stride_px: 2
         roomseg_depth_stride_debug_px: 2
@@ -995,7 +995,7 @@ sgnav:
     long_edge_geometric_pruning: true
     group_nodes: true
     room_nodes:
-      source: height_profile_door_wall_v6_2_vlm
+      source: online_rose_style_v1_vlm
       use_dataset_room_labels_in_metric: false
       strict_no_oracle_rooms: true
       room_label_backend: vlm
