@@ -529,6 +529,60 @@ class SGNavPopupVisualizer:
             crop_bounds=(r0, r1, c0, c1),
         ) if self.show_room_labels else 0
         record("room_labels", self.show_room_labels, (250, 250, 255), room_label_count, "VLM room category and reliability")
+
+        map_shape = tuple(np.asarray(occupancy).shape[:2])
+        pre_extension_door_detected = self._room_debug_array("pre_extension_door_detected_map", map_shape, bool)
+        pre_extension_door_cut = self._room_debug_array("pre_extension_door_cut_mask", map_shape, bool)
+        pre_extension_room_labels = self._room_debug_array("pre_extension_room_label_map", map_shape, np.int32)
+        pre_extension_room_boundary = self._room_label_adjacency_boundary(pre_extension_room_labels)
+        pre_door_count = self._draw_cells(
+            draw,
+            self._mask_cells_in_crop(pre_extension_door_detected, (r0, r1, c0, c1)),
+            xy,
+            (0, 210, 255),
+            radius=2,
+            max_cells=1200,
+        )
+        record(
+            "pre_extension_doors",
+            pre_door_count > 0,
+            (0, 210, 255),
+            pre_door_count,
+            "doors detected before wall-line extension by strict free/occupied/unknown pattern rules",
+        )
+        pre_door_cut_count = self._draw_cells(
+            draw,
+            self._mask_cells_in_crop(pre_extension_door_cut, (r0, r1, c0, c1)),
+            xy,
+            (255, 190, 40),
+            radius=3,
+            max_cells=1200,
+        )
+        record(
+            "pre_extension_door_cuts",
+            pre_door_cut_count > 0,
+            (255, 190, 40),
+            pre_door_cut_count,
+            "virtual free-space cuts created by pre-extension door pattern detection",
+        )
+        pre_room_boundary_count = self._draw_cells(
+            draw,
+            self._mask_cells_in_crop(pre_extension_room_boundary, (r0, r1, c0, c1)),
+            xy,
+            (120, 180, 255),
+            radius=1,
+            max_cells=2000,
+        )
+        pre_room_count = int(len([v for v in np.unique(pre_extension_room_labels) if int(v) > 0]))
+        record(
+            "pre_extension_room_labels",
+            pre_room_boundary_count > 0,
+            (120, 180, 255),
+            pre_room_count,
+            "room labels produced immediately after pre-extension door cuts and before original step1/step2",
+            boundary_cell_count=int(pre_room_boundary_count),
+        )
+
         wall_line_count, wall_extension_count = self._draw_roomseg_wall_debug_lines(draw, xy, (r0, r1, c0, c1))
         record(
             "roomseg_wall_lines_red",
@@ -678,6 +732,10 @@ class SGNavPopupVisualizer:
         pass2_line_extension_completion = self._room_debug_array("pass2_line_extension_completion", shape, bool)
         wall_target_after_line_extension = self._room_debug_array("wall_target_after_line_extension", shape, bool)
         completed_wall_after_line_extension = self._room_debug_array("completed_wall_after_line_extension", shape, bool)
+        pre_extension_door_detected = self._room_debug_array("pre_extension_door_detected_map", shape, bool)
+        pre_extension_door_cut = self._room_debug_array("pre_extension_door_cut_mask", shape, bool)
+        pre_extension_room_labels = self._room_debug_array("pre_extension_room_label_map", shape, np.int32)
+        pre_extension_room_boundary = self._room_label_adjacency_boundary(pre_extension_room_labels)
         initial_unknown_after_fusion = self._room_debug_array("initial_roomseg_unknown_after_fusion", shape, bool)
         vertical_free_room_domain = self._room_debug_array("vertical_free_room_domain", shape, bool)
         vertical_occupied_0p2_2p0 = self._room_debug_array("vertical_occupied_0p2_2p0", shape, bool)
@@ -728,6 +786,9 @@ class SGNavPopupVisualizer:
             or np.any(pass2_line_extension_completion)
             or np.any(wall_target_after_line_extension)
             or np.any(completed_wall_after_line_extension)
+            or np.any(pre_extension_door_detected)
+            or np.any(pre_extension_door_cut)
+            or np.any(pre_extension_room_labels > 0)
             or np.any(vertical_observed)
             or np.any(vertical_observed_0p2_2p0)
             or np.any(ray_valid_wall)
@@ -784,6 +845,9 @@ class SGNavPopupVisualizer:
             canvas[roomseg_terminal_wall_splat] = (255, 135, 25)
             canvas[pass2_extension_intersection_targets] = (255, 240, 0)
             canvas[pass2_line_extension_completion] = (255, 0, 0)
+            canvas[pre_extension_room_boundary] = (120, 180, 255)
+            canvas[pre_extension_door_detected] = (0, 210, 255)
+            canvas[pre_extension_door_cut] = (255, 190, 40)
             canvas[nav_obstacle_overlay_accepted] = (230, 40, 230)
             canvas[walls_rescued_from_unknown] = (255, 35, 35)
             canvas[vertical_free_over_nav_obstacle] = (45, 135, 255)
@@ -803,6 +867,9 @@ class SGNavPopupVisualizer:
             canvas[roomseg_terminal_wall_splat] = (255, 135, 25)
             canvas[pass2_extension_intersection_targets] = (255, 240, 0)
             canvas[pass2_line_extension_completion] = (255, 0, 0)
+            canvas[pre_extension_room_boundary] = (120, 180, 255)
+            canvas[pre_extension_door_detected] = (0, 210, 255)
+            canvas[pre_extension_door_cut] = (255, 190, 40)
             canvas[unknown_removed_by_ray_wall] = (255, 35, 35)
             canvas[wall_conf_hot] = (255, 105, 75)
             canvas[rose_occupied] = (0, 0, 0)
@@ -1720,6 +1787,15 @@ class SGNavPopupVisualizer:
             self._dot(draw, xy_func(cell), color, radius=radius)
             drawn += 1
         return drawn
+
+    @staticmethod
+    def _mask_cells_in_crop(mask: np.ndarray, crop_bounds: Tuple[int, int, int, int]) -> List[GridCell]:
+        r0, r1, c0, c1 = crop_bounds
+        arr = np.asarray(mask, dtype=bool)
+        if arr.ndim != 2 or r1 <= r0 or c1 <= c0:
+            return []
+        rr, cc = np.nonzero(arr[int(r0):int(r1), int(c0):int(c1)])
+        return [(int(r) + int(r0), int(c) + int(c0)) for r, c in zip(rr, cc)]
 
     def _dot(self, draw: ImageDraw.ImageDraw, xy: Tuple[int, int], color: Tuple[int, int, int], radius: int = 3) -> None:
         x, y = int(xy[0]), int(xy[1])

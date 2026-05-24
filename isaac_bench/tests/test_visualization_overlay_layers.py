@@ -209,6 +209,32 @@ def test_corridor_merge_debug_draws_bright_red_dashed_markers():
     assert int(np.count_nonzero(np.all(panel == np.asarray([255, 190, 24], dtype=np.uint8), axis=-1))) > 0
 
 
+def test_pre_extension_door_debug_layers_are_reported_and_drawn():
+    detected = np.zeros((20, 30), dtype=bool)
+    detected[8, 14:18] = True
+    cut = np.zeros_like(detected)
+    cut[9, 15:18] = True
+    labels = np.zeros((20, 30), dtype=np.int32)
+    labels[5:12, 8:15] = 1
+    labels[5:12, 15:22] = 2
+    debug = {
+        "pre_extension_door_detected_map": detected,
+        "pre_extension_door_cut_mask": cut,
+        "pre_extension_room_label_map": labels,
+    }
+
+    viz = SGNavPopupVisualizer(enabled=False, panel_size=(640, 360))
+    panel = _update(viz, room_segmentation_debug=debug)
+    layers = {layer["name"]: layer for layer in viz.overlay_layer_metadata()["layers"]}
+
+    assert layers["pre_extension_doors"]["primitive_count"] == int(np.count_nonzero(detected))
+    assert layers["pre_extension_door_cuts"]["primitive_count"] == int(np.count_nonzero(cut))
+    assert layers["pre_extension_room_labels"]["primitive_count"] == 2
+    assert layers["pre_extension_room_labels"]["boundary_cell_count"] > 0
+    assert int(np.count_nonzero(np.all(panel == np.asarray([0, 210, 255], dtype=np.uint8), axis=-1))) > 0
+    assert int(np.count_nonzero(np.all(panel == np.asarray([255, 190, 40], dtype=np.uint8), axis=-1))) > 0
+
+
 def test_roomseg_wall_lines_and_extensions_draw_red_even_without_room_split():
     debug = {
         "filtered_wall_lines_report": {

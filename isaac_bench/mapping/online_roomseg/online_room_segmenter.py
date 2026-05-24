@@ -8,6 +8,7 @@ import numpy as np
 from scipy import ndimage
 
 from isaac_bench.mapping.coordinate_transform import MapInfo
+from isaac_bench.mapping.door_pattern_detector import DoorPatternConfig, detect_pre_extension_doors
 from isaac_bench.mapping.room_segmentation import RoomMask, RoomProposalState, RoomSegmentationConfig
 from isaac_bench.mapping.room_segmentation import _proposal_masks_debug, _room_from_mask  # reuse canonical metadata/stable room shape
 from isaac_bench.mapping.vertical_profile import VerticalProfileMap
@@ -101,6 +102,8 @@ class OnlineRoseStyleConfig:
     corridor_room_neck_cut: CorridorRoomNeckCutConfig = field(default_factory=CorridorRoomNeckCutConfig)
     corridor_merge: CorridorMergeConfig = field(default_factory=CorridorMergeConfig)
     topology_test: TopologyTestConfig = field(default_factory=TopologyTestConfig)
+    pre_extension_door_detection_enabled: bool = True
+    pre_extension_door_pattern: DoorPatternConfig = field(default_factory=DoorPatternConfig)
     debug: Mapping[str, object] = field(default_factory=dict)
 
     @classmethod
@@ -144,6 +147,9 @@ class OnlineRoseStyleConfig:
             "corridor_room_neck_cut": CorridorRoomNeckCutConfig.from_mapping(raw.get("corridor_room_neck_cut")),
             "corridor_merge": CorridorMergeConfig.from_mapping(raw.get("corridor_merge")),
             "topology_test": TopologyTestConfig.from_mapping(_merge_topology_config(raw)),
+            "pre_extension_door_pattern": DoorPatternConfig.from_mapping(
+                raw.get("pre_extension_door_pattern") or raw.get("pre_extension_door_detection")
+            ),
         }
         fields = {name for name in cls.__dataclass_fields__}
         base = {key: raw[key] for key in raw if key in fields and key not in nested}
@@ -327,6 +333,30 @@ def run_online_rose_style_roomseg(
     roomseg_free_clean = evidence.free_clean & ~structural_wall_free_overlap_map
     roomseg_unknown_clean = evidence.unknown_clean & ~noise_gap_room_separator_map
     roomseg_wall_target_map = evidence.wall_candidate_clean | raw_line_map | filtered_line_map | noise_gap_fill_map
+
+    door_cfg = config.pre_extension_door_pattern
+    if not bool(config.pre_extension_door_detection_enabled):
+        door_cfg = DoorPatternConfig(enabled=False)
+    door_result = detect_pre_extension_doors(
+        free_mask=roomseg_free_clean,
+        occupied_mask=roomseg_wall_target_map,
+        unknown_mask=roomseg_unknown_clean,
+        config=door_cfg,
+        observed_mask=evidence.vertical_observed_raw,
+    )
+    pre_extension_door_detected_map = np.asarray(door_result.detected_door_mask, dtype=bool)
+    pre_extension_door_cut_mask = np.asarray(door_result.door_cut_mask, dtype=bool) & roomseg_free_clean
+    pre_extension_door_pattern_type_map = np.asarray(door_result.pattern_type_map, dtype=np.uint8)
+    pre_extension_partition_free = roomseg_free_clean & ~pre_extension_door_cut_mask
+    pre_extension_room_label_map, pre_extension_room_count_before_merge = ndimage.label(
+        pre_extension_partition_free,
+        structure=np.asarray([[0, 1, 0], [1, 1, 1], [0, 1, 0]], dtype=np.uint8),
+    )
+    pre_extension_room_label_map = relabel_compact(pre_extension_room_label_map.astype(np.int32))
+    pre_extension_room_label_map[roomseg_unknown_clean] = 0
+    pre_extension_room_label_map[~roomseg_free_clean] = 0
+    pre_extension_room_count = int(len([v for v in np.unique(pre_extension_room_label_map) if int(v) > 0]))
+
     corridor_debug = build_corridor_debug(
         roomseg_free_clean,
         resolution_m=float(config.resolution_m),
@@ -371,14 +401,14 @@ def run_online_rose_style_roomseg(
     }
     before_labels, _ = ndimage.label(roomseg_free_clean, structure=np.asarray([[0, 1, 0], [1, 1, 1], [0, 1, 0]], dtype=np.uint8))
     before_labels = relabel_compact(before_labels)
-    virtual_target_map = np.zeros_like(roomseg_free_clean, dtype=bool)
+    virtual_target_map = pre_extension_door_cut_mask.copy()
     pass2_enabled = bool(config.line_extension.enabled) and int(config.line_extension.passes) >= 2
     if pass2_enabled:
         pass2_extensions, pass2_extension_debug = extend_wall_lines_once(
             filtered_lines,
             free_clean=roomseg_free_clean,
             wall_target_mask=roomseg_wall_target_map,
-            virtual_target_mask=None,
+            virtual_target_mask=virtual_target_map if np.any(virtual_target_map) else None,
             unknown_clean=roomseg_unknown_clean,
             resolution_m=float(config.resolution_m),
             pass_id=2,
@@ -439,7 +469,9 @@ def run_online_rose_style_roomseg(
             "configured_passes": int(config.line_extension.passes),
         }
     candidates = [*pass1_accepted, *pass2_candidates]
-    pass2_virtual_target_map = (virtual_target_map | pass2_extension_intersection_targets) if pass2_enabled else np.zeros_like(virtual_target_map, dtype=bool)
+    pass2_virtual_target_map = virtual_target_map | (
+        pass2_extension_intersection_targets if pass2_enabled else np.zeros_like(virtual_target_map, dtype=bool)
+    )
     accepted, rejected, separator_map, raw_labels, topology_debug = greedily_select_separators(
         candidates,
         free_clean=roomseg_free_clean,
@@ -449,6 +481,14 @@ def run_online_rose_style_roomseg(
         resolution_m=float(config.resolution_m),
         config=config.topology_test,
     )
+    step1_step2_accepted_separator_map = separator_map.astype(bool)
+    combined_virtual_separator_map = step1_step2_accepted_separator_map | pre_extension_door_cut_mask
+    raw_labels_without_pre_extension_doors = raw_labels
+    raw_labels, _ = ndimage.label(
+        roomseg_free_clean & ~combined_virtual_separator_map,
+        structure=np.asarray([[0, 1, 0], [1, 1, 1], [0, 1, 0]], dtype=np.uint8),
+    )
+    raw_labels = relabel_compact(raw_labels)
     final_labels_raw, corridor_merge_debug = merge_false_parallel_door_corridor_regions(
         raw_labels,
         accepted_candidates=accepted,
@@ -463,7 +503,7 @@ def run_online_rose_style_roomseg(
     final_labels, virtual_separator_fill_debug = _fill_virtual_separator_label_gaps(
         final_labels_raw,
         free_clean=roomseg_free_clean,
-        virtual_separator_map=separator_map,
+        virtual_separator_map=combined_virtual_separator_map,
     )
     candidate_layers = _candidate_layers([*pass1_candidates, *pass2_candidates, *accepted, *rejected], roomseg_free_clean.shape)
     rejected_map = _rasterize_many(rejected, roomseg_free_clean.shape)
@@ -479,9 +519,13 @@ def run_online_rose_style_roomseg(
         roomseg_free_clean.shape,
     )
     wall_target_after_line_extension = roomseg_wall_target_map | pass2_extension_completion_map
-    final_separator_map = separator_map | structural_wall_free_overlap_map | pass2_extension_completion_map
+    final_separator_map = combined_virtual_separator_map | structural_wall_free_overlap_map | pass2_extension_completion_map
     accepted_before_corridor_merge = final_separator_map.copy()
-    accepted_after_corridor_merge = _rasterize_many([c for c in accepted if not bool(c.debug.get("rejected_after_corridor_merge", False))], roomseg_free_clean.shape) | structural_wall_free_overlap_map
+    accepted_after_corridor_merge = (
+        _rasterize_many([c for c in accepted if not bool(c.debug.get("rejected_after_corridor_merge", False))], roomseg_free_clean.shape)
+        | structural_wall_free_overlap_map
+        | pre_extension_door_cut_mask
+    )
     false_parallel_rejected_map = _rasterize_many([c for c in accepted if bool(c.debug.get("rejected_after_corridor_merge", False))], roomseg_free_clean.shape)
     corridor_like_regions, open_living_room_like_regions = _region_type_layers(final_labels, corridor_merge_debug)
     layers = {
@@ -496,6 +540,12 @@ def run_online_rose_style_roomseg(
         "noise_wall_gap_fill_all": noise_gap_fill_map,
         "structural_wall_free_overlap": structural_wall_free_overlap_map,
         "wall_target_after_noise_gap_fill": roomseg_wall_target_map,
+        "pre_extension_door_detected_map": pre_extension_door_detected_map,
+        "pre_extension_door_cut_mask": pre_extension_door_cut_mask,
+        "pre_extension_door_pattern_type_map": pre_extension_door_pattern_type_map,
+        "pre_extension_partition_free": pre_extension_partition_free,
+        "pre_extension_room_label_map": pre_extension_room_label_map,
+        "step1_step2_accepted_separator_map": step1_step2_accepted_separator_map,
         "pass2_line_extension_completion": pass2_extension_completion_map,
         "wall_target_after_line_extension": wall_target_after_line_extension,
         "completed_wall_after_line_extension": wall_target_after_line_extension,
@@ -531,6 +581,7 @@ def run_online_rose_style_roomseg(
         "accepted_separators": final_separator_map,
         "rejected_separators": rejected_map,
         "room_labels_before_separators": before_labels,
+        "room_labels_after_step1_step2_without_pre_extension_doors": raw_labels_without_pre_extension_doors,
         "room_labels_after_separators": raw_labels,
         "raw_room_labels_before_corridor_merge": raw_labels,
         "room_labels_after_corridor_merge_before_virtual_fill": final_labels_before_virtual_fill,
@@ -544,7 +595,12 @@ def run_online_rose_style_roomseg(
         "step": int(step),
         "backend": ONLINE_ROSE_STYLE_BACKEND,
         "algorithm": "online_line_extend_roomseg_v1",
-        "stage_order": ["short_gap_fill_prepass", "line_extension_after_short_gap_fill"],
+        "stage_order": ["pre_extension_door_detection", "pre_extension_room_split", "short_gap_fill_prepass", "line_extension_after_short_gap_fill"],
+        "pre_extension_door_detection_inserted_before_wall_extension": True,
+        "pre_extension_door_accepted_count": int(door_result.debug.get("pre_extension_door_num_accepted", 0)),
+        "pre_extension_door_cut_cells": int(np.count_nonzero(pre_extension_door_cut_mask)),
+        "pre_extension_room_count_before_small_merge": int(pre_extension_room_count_before_merge),
+        "pre_extension_room_count": int(pre_extension_room_count),
         "pass1_stage": "short_gap_fill_prepass",
         "pass2_stage": "line_extension_after_short_gap_fill",
         "wall_segment_count": int(len(segments)),
@@ -603,6 +659,25 @@ def run_online_rose_style_roomseg(
         "navigation_obstacle_written": False,
         "step": int(step),
         "resolution_m": float(config.resolution_m),
+        "pre_extension_door_detected_map": pre_extension_door_detected_map,
+        "pre_extension_door_cut_mask": pre_extension_door_cut_mask,
+        "pre_extension_door_pattern_type_map": pre_extension_door_pattern_type_map,
+        "pre_extension_partition_free": pre_extension_partition_free,
+        "pre_extension_room_label_map": pre_extension_room_label_map,
+        "pre_extension_room_count_before_small_merge": int(pre_extension_room_count_before_merge),
+        "pre_extension_room_count": int(pre_extension_room_count),
+        "pre_extension_door_detection_inserted_before_wall_extension": True,
+        "step1_step2_accepted_closure_map": step1_step2_accepted_separator_map,
+        "step1_step2_accepted_separator_map": step1_step2_accepted_separator_map,
+        "pre_extension_door_debug_summary": {
+            "enabled": bool(door_result.debug.get("pre_extension_door_detection_enabled", False)),
+            "accepted": int(door_result.debug.get("pre_extension_door_num_accepted", 0)),
+            "rule_a": int(door_result.debug.get("pre_extension_door_rule_a_count", 0)),
+            "rule_b": int(door_result.debug.get("pre_extension_door_rule_b_count", 0)),
+            "cut_cells": int(np.count_nonzero(pre_extension_door_cut_mask)),
+            "pre_room_count": int(pre_extension_room_count),
+        },
+        **door_result.debug,
         "final_room_count": int(len([v for v in np.unique(final_labels) if int(v) > 0])),
         "room_count": int(len([v for v in np.unique(final_labels) if int(v) > 0])),
         "separator_report": report,

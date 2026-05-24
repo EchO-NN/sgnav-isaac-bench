@@ -20,6 +20,10 @@ BOOL_LAYERS = [
     "noise_wall_gap_fill_all",
     "structural_wall_free_overlap",
     "wall_target_after_noise_gap_fill",
+    "pre_extension_door_detected_map",
+    "pre_extension_door_cut_mask",
+    "pre_extension_partition_free",
+    "step1_step2_accepted_separator_map",
     "pass2_line_extension_completion",
     "wall_target_after_line_extension",
     "completed_wall_after_line_extension",
@@ -81,6 +85,8 @@ def save_online_roomseg_debug(
                 paths[name] = str(path)
         for name in (
             "room_labels_before_separators",
+            "pre_extension_room_label_map",
+            "room_labels_after_step1_step2_without_pre_extension_doors",
             "room_labels_after_separators",
             "raw_room_labels_before_corridor_merge",
             "room_labels_after_corridor_merge_before_virtual_fill",
