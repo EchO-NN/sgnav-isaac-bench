@@ -934,8 +934,8 @@ def save_vertical_free_gap_closure_debug(
             _label_rgb(result.endpoint_map),
             _bool_rgb(result.candidate_closure_map, (0, 220, 255)),
             _bool_rgb(result.rejected_closure_map, (255, 0, 220)),
-            _bool_rgb(np.asarray(d.get("wall_extension_boundary_mask", result.accepted_closure_map), dtype=bool), (255, 65, 90)),
-            _bool_rgb(np.asarray(d.get("door_completion_boundary_mask", _zero_bool), dtype=bool), (255, 210, 60)),
+            _bool_rgb(np.asarray(d.get("wall_extension_boundary_mask", result.accepted_closure_map), dtype=bool), (80, 170, 255)),
+            _bool_rgb(np.asarray(d.get("door_completion_boundary_mask", _zero_bool), dtype=bool), (255, 120, 40)),
             _bool_rgb(np.asarray(d.get("partial_door_extension_cut_mask", _zero_bool), dtype=bool), (60, 250, 180)),
             _bool_rgb(np.asarray(d.get("rejected_door_extension_mask", _zero_bool), dtype=bool), (255, 60, 180)),
             _label_rgb(result.room_label_map),
@@ -1291,8 +1291,8 @@ def _vfgc_overlay_rgb(result: VerticalFreeGapClosureResult) -> np.ndarray:
     wall_extension = np.asarray(result.debug.get("wall_extension_boundary_mask", result.accepted_closure_map), dtype=bool)
     door_completion = np.asarray(result.debug.get("door_completion_boundary_mask", np.zeros_like(result.accepted_closure_map)), dtype=bool)
     partial_completion = np.asarray(result.debug.get("partial_door_extension_cut_mask", np.zeros_like(result.accepted_closure_map)), dtype=bool)
-    out[wall_extension] = (255, 65, 90)
-    out[door_completion] = (255, 210, 60)
+    out[wall_extension] = (80, 170, 255)
+    out[door_completion] = (255, 120, 40)
     out[partial_completion] = (60, 250, 180)
     out[result.wall_skeleton_map] = (255, 170, 0)
     out[result.endpoint_map > 0] = (255, 255, 0)

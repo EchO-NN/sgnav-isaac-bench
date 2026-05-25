@@ -638,14 +638,14 @@ class SGNavPopupVisualizer:
             draw,
             self._mask_cells_in_crop(wall_extension_boundary, (r0, r1, c0, c1)),
             xy,
-            (255, 65, 90),
+            (80, 170, 255),
             radius=2,
             max_cells=1600,
         )
         record(
             "wall_extension_boundaries",
             wall_extension_boundary_count > 0,
-            (255, 65, 90),
+            (80, 170, 255),
             wall_extension_boundary_count,
             "boundaries produced by the original wall-endpoint/wall-line extension closure path",
         )
@@ -653,14 +653,14 @@ class SGNavPopupVisualizer:
             draw,
             self._mask_cells_in_crop(door_completion_boundary, (r0, r1, c0, c1)),
             xy,
-            (255, 210, 60),
+            (255, 120, 40),
             radius=3,
             max_cells=1600,
         )
         record(
             "door_completion_boundaries",
             door_completion_boundary_count > 0,
-            (255, 210, 60),
+            (255, 120, 40),
             door_completion_boundary_count,
             "boundaries produced by detected strict/partial door completion, separated from wall-line extension",
         )
@@ -668,14 +668,14 @@ class SGNavPopupVisualizer:
             draw,
             self._mask_cells_in_crop(strict_pre_extension_door_cut, (r0, r1, c0, c1)),
             xy,
-            (255, 190, 40),
+            (255, 120, 40),
             radius=2,
             max_cells=1200,
         )
         record(
             "strict_pre_extension_door_cuts",
             strict_pre_cut_count > 0,
-            (255, 190, 40),
+            (255, 120, 40),
             strict_pre_cut_count,
             "door cuts from the original strict pattern rules",
         )
@@ -713,14 +713,14 @@ class SGNavPopupVisualizer:
             draw,
             self._mask_cells_in_crop(partial_door_extension_cut, (r0, r1, c0, c1)),
             xy,
-            (255, 210, 60),
+            (255, 120, 40),
             radius=3,
             max_cells=1600,
         )
         record(
             "partial_door_extension_cuts",
             partial_cut_count > 0,
-            (255, 210, 60),
+            (255, 120, 40),
             partial_cut_count,
             "accepted partial-door cut cells; these are ORed only into the final boundary",
         )
@@ -1049,9 +1049,9 @@ class SGNavPopupVisualizer:
                 color = np.asarray(label_palette[(int(label) - 1) % len(label_palette)], dtype=np.float32)
                 base = canvas[mask].astype(np.float32)
                 canvas[mask] = np.clip(base * 0.45 + color * 0.55, 0, 255).astype(np.uint8)
-            canvas[virtual_boundary] = (255, 65, 90)
-            canvas[accepted_closure | original_step_boundary | wall_extension_boundary] = (255, 65, 90)
-            canvas[door_completion_boundary] = (255, 210, 60)
+            canvas[virtual_boundary] = (245, 245, 245)
+            canvas[accepted_closure | original_step_boundary | wall_extension_boundary] = (80, 170, 255)
+            canvas[door_completion_boundary] = (255, 120, 40)
             canvas[ray_valid_wall] = (255, 80, 40)
             canvas[roomseg_terminal_wall_splat] = (255, 135, 25)
             canvas[terminal_wall_roomseg] = (255, 150, 35)
@@ -1061,12 +1061,12 @@ class SGNavPopupVisualizer:
             canvas[pass2_line_extension_completion] = (255, 0, 0)
             canvas[pre_extension_room_boundary] = (120, 180, 255)
             canvas[pre_extension_door_detected] = (0, 210, 255)
-            canvas[strict_pre_extension_door_cut] = (255, 190, 40)
+            canvas[strict_pre_extension_door_cut] = (255, 120, 40)
             canvas[partial_door_seed] = (135, 245, 255)
             canvas[partial_door_line] = (60, 250, 180)
-            canvas[partial_door_extension_cut] = (255, 210, 60)
+            canvas[partial_door_extension_cut] = (255, 120, 40)
             canvas[rejected_door_extension] = (255, 60, 180)
-            canvas[pre_extension_door_cut & ~door_completion_boundary] = (255, 190, 40)
+            canvas[pre_extension_door_cut & ~door_completion_boundary] = (255, 120, 40)
             canvas[nav_obstacle_overlay_accepted] = (230, 40, 230)
             canvas[walls_rescued_from_unknown] = (255, 35, 35)
             canvas[vertical_free_over_nav_obstacle] = (45, 135, 255)
@@ -1091,15 +1091,15 @@ class SGNavPopupVisualizer:
             canvas[pass2_line_extension_completion] = (255, 0, 0)
             canvas[pre_extension_room_boundary] = (120, 180, 255)
             canvas[pre_extension_door_detected] = (0, 210, 255)
-            canvas[virtual_boundary] = (255, 65, 90)
-            canvas[accepted_closure | original_step_boundary | wall_extension_boundary] = (255, 65, 90)
-            canvas[door_completion_boundary] = (255, 210, 60)
-            canvas[strict_pre_extension_door_cut] = (255, 190, 40)
+            canvas[virtual_boundary] = (245, 245, 245)
+            canvas[accepted_closure | original_step_boundary | wall_extension_boundary] = (80, 170, 255)
+            canvas[door_completion_boundary] = (255, 120, 40)
+            canvas[strict_pre_extension_door_cut] = (255, 120, 40)
             canvas[partial_door_seed] = (135, 245, 255)
             canvas[partial_door_line] = (60, 250, 180)
-            canvas[partial_door_extension_cut] = (255, 210, 60)
+            canvas[partial_door_extension_cut] = (255, 120, 40)
             canvas[rejected_door_extension] = (255, 60, 180)
-            canvas[pre_extension_door_cut & ~door_completion_boundary] = (255, 190, 40)
+            canvas[pre_extension_door_cut & ~door_completion_boundary] = (255, 120, 40)
             canvas[unknown_removed_by_ray_wall] = (255, 35, 35)
             canvas[wall_conf_hot] = (255, 105, 75)
             canvas[rose_occupied] = (0, 0, 0)
@@ -1257,7 +1257,7 @@ class SGNavPopupVisualizer:
             self._overlay_record(
                 "vertical_free_gap_closure_boundaries",
                 bool(np.any(virtual_boundary)),
-                (255, 65, 90),
+                (245, 245, 245),
                 int(np.count_nonzero(virtual_boundary)),
                 "final virtual boundaries after combining wall extension and detected door completion",
                 original_step1_step2_virtual_boundary_cells=int(np.count_nonzero(original_step_boundary)),
@@ -1265,14 +1265,14 @@ class SGNavPopupVisualizer:
             self._overlay_record(
                 "wall_extension_boundaries",
                 bool(np.any(wall_extension_boundary | accepted_closure)),
-                (255, 65, 90),
+                (80, 170, 255),
                 int(np.count_nonzero(wall_extension_boundary | accepted_closure)),
                 "boundaries produced by the original wall-endpoint/wall-line extension closure path",
             ),
             self._overlay_record(
                 "door_completion_boundaries",
                 bool(np.any(door_completion_boundary)),
-                (255, 210, 60),
+                (255, 120, 40),
                 int(np.count_nonzero(door_completion_boundary)),
                 "boundaries produced by detected strict/partial door completion, separated from wall-line extension",
                 strict_door_completion_cells=int(np.count_nonzero(strict_pre_extension_door_cut)),
@@ -1281,7 +1281,7 @@ class SGNavPopupVisualizer:
             self._overlay_record(
                 "strict_pre_extension_door_cuts",
                 bool(np.any(strict_pre_extension_door_cut)),
-                (255, 190, 40),
+                (255, 120, 40),
                 int(np.count_nonzero(strict_pre_extension_door_cut)),
                 "door cuts from the original strict pre-extension pattern rules",
             ),
@@ -1302,7 +1302,7 @@ class SGNavPopupVisualizer:
             self._overlay_record(
                 "partial_door_extension_cuts",
                 bool(np.any(partial_door_extension_cut)),
-                (255, 210, 60),
+                (255, 120, 40),
                 int(np.count_nonzero(partial_door_extension_cut)),
                 "accepted partial-door cut cells; these are ORed only into the final boundary",
             ),
