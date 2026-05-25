@@ -552,49 +552,66 @@ class SGNavPopupVisualizer:
             door_completion_boundary = pre_extension_door_cut
         pre_extension_room_labels = self._room_debug_array("pre_extension_room_label_map", map_shape, np.int32)
         pre_extension_room_boundary = self._room_label_adjacency_boundary(pre_extension_room_labels)
-        clipped_count = self._draw_cells(
-            draw,
-            self._mask_cells_in_crop(clipped_outside_nav, (r0, r1, c0, c1)),
-            xy,
-            (45, 135, 255),
-            radius=2,
-            max_cells=1200,
+        show_roomseg_diagnostics_on_main = bool(
+            self._room_segmentation_debug.get("show_roomseg_diagnostics_on_main", False)
         )
-        record(
+        diagnostic_note = "hidden on main map; use the ROSE roomseg debug panel or snapshot metadata"
+
+        def crop_mask_cells(mask: np.ndarray) -> List[GridCell]:
+            return self._mask_cells_in_crop(mask, (r0, r1, c0, c1))
+
+        def record_roomseg_diagnostic_mask(
+            name: str,
+            mask: np.ndarray,
+            color: Tuple[int, int, int],
+            radius: int,
+            max_cells: int,
+            note: str,
+            **extra,
+        ) -> int:
+            cells = crop_mask_cells(mask)
+            if show_roomseg_diagnostics_on_main:
+                count = self._draw_cells(draw, cells, xy, color, radius=radius, max_cells=max_cells)
+                enabled = count > 0
+                display_note = note
+            else:
+                count = 0
+                enabled = False
+                display_note = "%s; %s" % (diagnostic_note, note)
+            record(
+                name,
+                enabled,
+                color,
+                count,
+                display_note,
+                available_cell_count=int(len(cells)),
+                total_cell_count=int(np.count_nonzero(mask)),
+                **extra,
+            )
+            return count
+
+        clipped_count = record_roomseg_diagnostic_mask(
             "roomseg_vertical_free_outside_navigation",
-            clipped_count > 0,
+            clipped_outside_nav,
             (45, 135, 255),
-            clipped_count,
+            2,
+            1200,
             "vertical-free cells clipped before VFGC because they were outside navigation free",
         )
-        conflict_count = self._draw_cells(
-            draw,
-            self._mask_cells_in_crop(free_wall_conflict, (r0, r1, c0, c1)),
-            xy,
-            (255, 45, 45),
-            radius=2,
-            max_cells=1200,
-        )
-        record(
+        conflict_count = record_roomseg_diagnostic_mask(
             "roomseg_free_wall_conflict",
-            conflict_count > 0,
+            free_wall_conflict,
             (255, 45, 45),
-            conflict_count,
+            2,
+            1200,
             "free/wall overlap removed before VFGC so wall cores cannot be erased by vertical free",
         )
-        sanitized_wall_count = self._draw_cells(
-            draw,
-            self._mask_cells_in_crop(sanitized_wall, (r0, r1, c0, c1)),
-            xy,
-            (10, 10, 10),
-            radius=1,
-            max_cells=1600,
-        )
-        record(
+        sanitized_wall_count = record_roomseg_diagnostic_mask(
             "roomseg_sanitized_wall",
-            sanitized_wall_count > 0,
+            sanitized_wall,
             (10, 10, 10),
-            sanitized_wall_count,
+            1,
+            1600,
             "wall mask after input sanitizer, including terminal ray-wall evidence",
         )
         record(
@@ -605,44 +622,24 @@ class SGNavPopupVisualizer:
             "free mask after input sanitizer; it must be a subset of navigation free when available",
             subset_navigation_ok=bool(self._room_segmentation_debug.get("sanitized_free_subset_navigation_ok", False)),
         )
-        pre_door_count = self._draw_cells(
-            draw,
-            self._mask_cells_in_crop(pre_extension_door_detected, (r0, r1, c0, c1)),
-            xy,
-            (0, 210, 255),
-            radius=2,
-            max_cells=1200,
-        )
-        record(
+        pre_door_count = record_roomseg_diagnostic_mask(
             "pre_extension_doors",
-            pre_door_count > 0,
+            pre_extension_door_detected,
             (0, 210, 255),
-            pre_door_count,
+            2,
+            1200,
             "doors detected before wall-line extension by strict free/occupied/unknown pattern rules",
         )
-        pre_door_cut_count = self._draw_cells(
-            draw,
-            self._mask_cells_in_crop(pre_extension_door_cut, (r0, r1, c0, c1)),
-            xy,
-            (255, 190, 40),
-            radius=3,
-            max_cells=1200,
-        )
-        record(
+        pre_door_cut_count = record_roomseg_diagnostic_mask(
             "pre_extension_door_cuts",
-            pre_door_cut_count > 0,
+            pre_extension_door_cut,
             (255, 190, 40),
-            pre_door_cut_count,
+            3,
+            1200,
             "virtual free-space cuts created by pre-extension door pattern detection",
         )
-        wall_extension_boundary_count = self._draw_cells(
-            draw,
-            self._mask_cells_in_crop(wall_extension_boundary, (r0, r1, c0, c1)),
-            xy,
-            (80, 170, 255),
-            radius=2,
-            max_cells=1600,
-        )
+        wall_extension_cells = crop_mask_cells(wall_extension_boundary | accepted_closure)
+        wall_extension_boundary_count = int(len(wall_extension_cells))
         record(
             "wall_extension_boundaries",
             wall_extension_boundary_count > 0,
@@ -650,14 +647,8 @@ class SGNavPopupVisualizer:
             wall_extension_boundary_count,
             "boundaries produced by the original wall-endpoint/wall-line extension closure path",
         )
-        door_completion_boundary_count = self._draw_cells(
-            draw,
-            self._mask_cells_in_crop(door_completion_boundary, (r0, r1, c0, c1)),
-            xy,
-            (255, 120, 40),
-            radius=3,
-            max_cells=1600,
-        )
+        door_completion_cells = crop_mask_cells(door_completion_boundary)
+        door_completion_boundary_count = int(len(door_completion_cells))
         record(
             "door_completion_boundaries",
             door_completion_boundary_count > 0,
@@ -665,79 +656,44 @@ class SGNavPopupVisualizer:
             door_completion_boundary_count,
             "boundaries produced by detected strict/partial door completion, separated from wall-line extension",
         )
-        strict_pre_cut_count = self._draw_cells(
-            draw,
-            self._mask_cells_in_crop(strict_pre_extension_door_cut, (r0, r1, c0, c1)),
-            xy,
-            (255, 120, 40),
-            radius=2,
-            max_cells=1200,
-        )
-        record(
+        strict_pre_cut_count = record_roomseg_diagnostic_mask(
             "strict_pre_extension_door_cuts",
-            strict_pre_cut_count > 0,
+            strict_pre_extension_door_cut,
             (255, 120, 40),
-            strict_pre_cut_count,
+            2,
+            1200,
             "door cuts from the original strict pattern rules",
         )
-        partial_seed_count = self._draw_cells(
-            draw,
-            self._mask_cells_in_crop(partial_door_seed, (r0, r1, c0, c1)),
-            xy,
-            (135, 245, 255),
-            radius=2,
-            max_cells=1200,
-        )
-        record(
+        partial_seed_count = record_roomseg_diagnostic_mask(
             "partial_door_seed_points",
-            partial_seed_count > 0,
+            partial_door_seed,
             (135, 245, 255),
-            partial_seed_count,
+            2,
+            1200,
             "partial door-like occupied seed cells detected before line extension",
         )
-        partial_line_count = self._draw_cells(
-            draw,
-            self._mask_cells_in_crop(partial_door_line, (r0, r1, c0, c1)),
-            xy,
-            (60, 250, 180),
-            radius=2,
-            max_cells=1600,
-        )
-        record(
+        partial_line_count = record_roomseg_diagnostic_mask(
             "accepted_partial_door_extension_lines",
-            partial_line_count > 0,
+            partial_door_line,
             (60, 250, 180),
-            partial_line_count,
+            2,
+            1600,
             "accepted partial-door lines extended to structural wall anchors",
         )
-        partial_cut_count = self._draw_cells(
-            draw,
-            self._mask_cells_in_crop(partial_door_extension_cut, (r0, r1, c0, c1)),
-            xy,
-            (255, 120, 40),
-            radius=3,
-            max_cells=1600,
-        )
-        record(
+        partial_cut_count = record_roomseg_diagnostic_mask(
             "partial_door_extension_cuts",
-            partial_cut_count > 0,
+            partial_door_extension_cut,
             (255, 120, 40),
-            partial_cut_count,
+            3,
+            1600,
             "accepted partial-door cut cells; these are ORed only into the final boundary",
         )
-        rejected_line_count = self._draw_cells(
-            draw,
-            self._mask_cells_in_crop(rejected_door_extension, (r0, r1, c0, c1)),
-            xy,
-            (255, 60, 180),
-            radius=2,
-            max_cells=1600,
-        )
-        record(
+        rejected_line_count = record_roomseg_diagnostic_mask(
             "rejected_partial_door_extension_lines",
-            rejected_line_count > 0,
+            rejected_door_extension,
             (255, 60, 180),
-            rejected_line_count,
+            2,
+            1600,
             "partial-door extension lines rejected by width/unknown/wall/other-door guards",
             reject_reason_counts=dict(self._room_segmentation_debug.get("partial_door_line_reject_reason_counts") or {}),
         )
@@ -749,70 +705,88 @@ class SGNavPopupVisualizer:
             1 if degenerate else 0,
             "VFGC produced one large room without any virtual boundary; inspect sanitizer and terminal-wall evidence",
         )
-        pre_room_boundary_count = self._draw_cells(
-            draw,
-            self._mask_cells_in_crop(pre_extension_room_boundary, (r0, r1, c0, c1)),
-            xy,
+        pre_room_boundary_available_count = int(len(crop_mask_cells(pre_extension_room_boundary)))
+        pre_room_boundary_count = record_roomseg_diagnostic_mask(
+            "pre_extension_room_boundaries",
+            pre_extension_room_boundary,
             (120, 180, 255),
-            radius=1,
-            max_cells=2000,
+            1,
+            2000,
+            "boundaries between room labels produced immediately after pre-extension door cuts",
         )
         pre_room_count = int(len([v for v in np.unique(pre_extension_room_labels) if int(v) > 0]))
         record(
             "pre_extension_room_labels",
-            pre_room_boundary_count > 0,
+            show_roomseg_diagnostics_on_main and pre_room_boundary_count > 0,
             (120, 180, 255),
-            pre_room_count,
+            pre_room_count if show_roomseg_diagnostics_on_main else 0,
             "room labels produced immediately after pre-extension door cuts and before original step1/step2",
-            boundary_cell_count=int(pre_room_boundary_count),
+            boundary_cell_count=pre_room_boundary_available_count,
+            available_room_count=pre_room_count,
         )
 
-        wall_line_count, wall_extension_count = self._draw_roomseg_wall_debug_lines(draw, xy, (r0, r1, c0, c1))
+        if show_roomseg_diagnostics_on_main:
+            wall_line_count, wall_extension_count = self._draw_roomseg_wall_debug_lines(draw, xy, (r0, r1, c0, c1))
+        else:
+            wall_line_count, wall_extension_count = (0, 0)
         record(
             "roomseg_wall_lines_red",
-            wall_line_count > 0,
+            show_roomseg_diagnostics_on_main and wall_line_count > 0,
             (255, 35, 35),
             wall_line_count,
             "solid bright-red filtered wall lines used by the current room segmentation pass",
+            hidden_on_main=not show_roomseg_diagnostics_on_main,
         )
         record(
             "roomseg_wall_extensions_red_dashed",
-            wall_extension_count > 0,
+            show_roomseg_diagnostics_on_main and wall_extension_count > 0,
             (255, 0, 0),
             wall_extension_count,
             "pure-red dashed attempted wall-line extensions with dark outline; drawn whether or not the final split succeeds",
+            hidden_on_main=not show_roomseg_diagnostics_on_main,
         )
-        merged_count, doorway_count, merge_reasons = self._draw_room_adjacency_debug_lines(draw, xy, (r0, r1, c0, c1))
+        merge_reasons = []
+        if show_roomseg_diagnostics_on_main:
+            merged_count, doorway_count, merge_reasons = self._draw_room_adjacency_debug_lines(draw, xy, (r0, r1, c0, c1))
+        else:
+            merged_count, doorway_count = (0, 0)
         record(
             "room_merged_boundaries",
-            merged_count > 0,
+            show_roomseg_diagnostics_on_main and merged_count > 0,
             (150, 150, 155),
             merged_count,
             "dashed proposal boundaries removed by doorway-constrained merge",
             adjacency_merge_reasons=merge_reasons,
+            hidden_on_main=not show_roomseg_diagnostics_on_main,
         )
         record(
             "room_doorway_cuts",
-            doorway_count > 0,
+            show_roomseg_diagnostics_on_main and doorway_count > 0,
             (255, 170, 40),
             doorway_count,
             "bold verified doorway/gateway cuts preserved as room splits",
             adjacency_merge_reasons=[item for item in merge_reasons if item.get("verified_doorway")],
+            hidden_on_main=not show_roomseg_diagnostics_on_main,
         )
-        corridor_merge_count, small_region_merge_count = self._draw_corridor_merge_debug_lines(draw, xy, (r0, r1, c0, c1))
+        if show_roomseg_diagnostics_on_main:
+            corridor_merge_count, small_region_merge_count = self._draw_corridor_merge_debug_lines(draw, xy, (r0, r1, c0, c1))
+        else:
+            corridor_merge_count, small_region_merge_count = (0, 0)
         record(
             "corridor_merge_edges",
-            corridor_merge_count > 0,
+            show_roomseg_diagnostics_on_main and corridor_merge_count > 0,
             (255, 24, 24),
             corridor_merge_count,
             "bright red dashed shared edges that triggered strict corridor/door-neck region merge",
+            hidden_on_main=not show_roomseg_diagnostics_on_main,
         )
         record(
             "post_corridor_small_region_merges",
-            small_region_merge_count > 0,
+            show_roomseg_diagnostics_on_main and small_region_merge_count > 0,
             (255, 190, 24),
             small_region_merge_count,
             "bright amber dashed circles mark small regions merged after strict corridor merge",
+            hidden_on_main=not show_roomseg_diagnostics_on_main,
         )
 
         goal_color = (30, 220, 80)

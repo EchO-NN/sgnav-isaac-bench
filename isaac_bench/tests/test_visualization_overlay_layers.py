@@ -181,6 +181,7 @@ def test_disabling_object_nodes_removes_object_dot_primitives():
 
 def test_corridor_merge_debug_draws_bright_red_dashed_markers():
     debug = {
+        "show_roomseg_diagnostics_on_main": True,
         "corridor_merge_report": {
             "merge_events": [
                 {
@@ -209,7 +210,7 @@ def test_corridor_merge_debug_draws_bright_red_dashed_markers():
     assert int(np.count_nonzero(np.all(panel == np.asarray([255, 190, 24], dtype=np.uint8), axis=-1))) > 0
 
 
-def test_pre_extension_door_debug_layers_are_reported_and_drawn():
+def test_pre_extension_door_debug_layers_are_reported_but_hidden_on_main():
     detected = np.zeros((20, 30), dtype=bool)
     detected[8, 14:18] = True
     cut = np.zeros_like(detected)
@@ -223,15 +224,18 @@ def test_pre_extension_door_debug_layers_are_reported_and_drawn():
         "pre_extension_room_label_map": labels,
     }
 
-    viz = SGNavPopupVisualizer(enabled=False, panel_size=(640, 360))
+    viz = SGNavPopupVisualizer(enabled=False, panel_size=(640, 360), show_rose_occupancy_map=False)
     panel = _update(viz, room_segmentation_debug=debug)
     layers = {layer["name"]: layer for layer in viz.overlay_layer_metadata()["layers"]}
 
-    assert layers["pre_extension_doors"]["primitive_count"] == int(np.count_nonzero(detected))
-    assert layers["pre_extension_door_cuts"]["primitive_count"] == int(np.count_nonzero(cut))
-    assert layers["pre_extension_room_labels"]["primitive_count"] == 2
+    assert layers["pre_extension_doors"]["primitive_count"] == 0
+    assert layers["pre_extension_doors"]["available_cell_count"] == int(np.count_nonzero(detected))
+    assert layers["pre_extension_door_cuts"]["primitive_count"] == 0
+    assert layers["pre_extension_door_cuts"]["available_cell_count"] == int(np.count_nonzero(cut))
+    assert layers["pre_extension_room_labels"]["primitive_count"] == 0
+    assert layers["pre_extension_room_labels"]["available_room_count"] == 2
     assert layers["pre_extension_room_labels"]["boundary_cell_count"] > 0
-    assert int(np.count_nonzero(np.all(panel == np.asarray([0, 210, 255], dtype=np.uint8), axis=-1))) > 0
+    assert int(np.count_nonzero(np.all(panel == np.asarray([0, 210, 255], dtype=np.uint8), axis=-1))) == 0
     assert layers["door_completion_boundaries"]["primitive_count"] == int(np.count_nonzero(cut))
     assert int(np.count_nonzero(np.all(panel == np.asarray([255, 120, 40], dtype=np.uint8), axis=-1))) > 0
 
@@ -272,32 +276,40 @@ def test_roomseg_sanitizer_and_partial_door_layers_are_reported():
         "segmentation_degenerate_one_room": True,
     }
 
-    viz = SGNavPopupVisualizer(enabled=False, panel_size=(640, 360))
+    viz = SGNavPopupVisualizer(enabled=False, panel_size=(640, 360), show_rose_occupancy_map=False)
     panel = _update(viz, room_segmentation_debug=debug)
     layers = {layer["name"]: layer for layer in viz.overlay_layer_metadata()["layers"]}
 
-    assert layers["roomseg_vertical_free_outside_navigation"]["primitive_count"] == int(np.count_nonzero(clipped))
-    assert layers["roomseg_free_wall_conflict"]["primitive_count"] == int(np.count_nonzero(conflict))
+    assert layers["roomseg_vertical_free_outside_navigation"]["primitive_count"] == 0
+    assert layers["roomseg_vertical_free_outside_navigation"]["available_cell_count"] == int(np.count_nonzero(clipped))
+    assert layers["roomseg_free_wall_conflict"]["primitive_count"] == 0
+    assert layers["roomseg_free_wall_conflict"]["available_cell_count"] == int(np.count_nonzero(conflict))
     assert layers["roomseg_sanitized_free"]["primitive_count"] == int(np.count_nonzero(sanitized_free))
-    assert layers["roomseg_sanitized_wall"]["primitive_count"] == int(np.count_nonzero(sanitized_wall))
+    assert layers["roomseg_sanitized_wall"]["primitive_count"] == 0
+    assert layers["roomseg_sanitized_wall"]["available_cell_count"] == int(np.count_nonzero(sanitized_wall))
     assert layers["wall_extension_boundaries"]["primitive_count"] == int(np.count_nonzero(wall_extension))
     assert layers["door_completion_boundaries"]["primitive_count"] == int(np.count_nonzero(door_completion))
-    assert layers["partial_door_seed_points"]["primitive_count"] == int(np.count_nonzero(seed))
-    assert layers["accepted_partial_door_extension_lines"]["primitive_count"] == int(np.count_nonzero(line))
-    assert layers["partial_door_extension_cuts"]["primitive_count"] == int(np.count_nonzero(cut))
-    assert layers["rejected_partial_door_extension_lines"]["primitive_count"] == int(np.count_nonzero(rejected))
+    assert layers["partial_door_seed_points"]["primitive_count"] == 0
+    assert layers["partial_door_seed_points"]["available_cell_count"] == int(np.count_nonzero(seed))
+    assert layers["accepted_partial_door_extension_lines"]["primitive_count"] == 0
+    assert layers["accepted_partial_door_extension_lines"]["available_cell_count"] == int(np.count_nonzero(line))
+    assert layers["partial_door_extension_cuts"]["primitive_count"] == 0
+    assert layers["partial_door_extension_cuts"]["available_cell_count"] == int(np.count_nonzero(cut))
+    assert layers["rejected_partial_door_extension_lines"]["primitive_count"] == 0
+    assert layers["rejected_partial_door_extension_lines"]["available_cell_count"] == int(np.count_nonzero(rejected))
     assert layers["segmentation_degenerate_warning"]["primitive_count"] == 1
     assert layers["wall_extension_boundaries"]["color"] == [80, 170, 255]
     assert layers["door_completion_boundaries"]["color"] == [255, 120, 40]
     assert layers["wall_extension_boundaries"]["color"] != layers["door_completion_boundaries"]["color"]
     assert int(np.count_nonzero(np.all(panel == np.asarray([80, 170, 255], dtype=np.uint8), axis=-1))) > 0
     assert int(np.count_nonzero(np.all(panel == np.asarray([255, 120, 40], dtype=np.uint8), axis=-1))) > 0
-    assert int(np.count_nonzero(np.all(panel == np.asarray([60, 250, 180], dtype=np.uint8), axis=-1))) > 0
-    assert int(np.count_nonzero(np.all(panel == np.asarray([255, 60, 180], dtype=np.uint8), axis=-1))) > 0
+    assert int(np.count_nonzero(np.all(panel == np.asarray([60, 250, 180], dtype=np.uint8), axis=-1))) == 0
+    assert int(np.count_nonzero(np.all(panel == np.asarray([255, 60, 180], dtype=np.uint8), axis=-1))) == 0
 
 
 def test_roomseg_wall_lines_and_extensions_draw_red_even_without_room_split():
     debug = {
+        "show_roomseg_diagnostics_on_main": True,
         "filtered_wall_lines_report": {
             "filtered_wall_lines": [
                 {
@@ -336,6 +348,7 @@ def test_roomseg_wall_lines_and_extensions_draw_red_even_without_room_split():
 def test_roomseg_wall_endpoint_probe_draws_when_extension_report_is_missing():
     debug = {
         "resolution_m": 0.05,
+        "show_roomseg_diagnostics_on_main": True,
         "filtered_wall_lines_report": {
             "filtered_wall_lines": [
                 {
