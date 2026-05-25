@@ -543,6 +543,7 @@ class SGNavPopupVisualizer:
         partial_door_extension_cut = self._room_debug_array("partial_door_extension_cut_mask", map_shape, bool)
         rejected_door_extension = self._room_debug_array("rejected_door_extension_mask", map_shape, bool)
         original_step_boundary = self._room_debug_array("original_step1_step2_virtual_boundary_map", map_shape, bool)
+        accepted_closure = self._room_debug_array("accepted_closure_map", map_shape, bool)
         wall_extension_boundary = self._room_debug_array("wall_extension_boundary_mask", map_shape, bool)
         door_completion_boundary = self._room_debug_array("door_completion_boundary_mask", map_shape, bool)
         if not np.any(wall_extension_boundary):
@@ -870,12 +871,29 @@ class SGNavPopupVisualizer:
         record("object_nodes", self.show_object_nodes, (255, 150, 40), object_node_count)
         record("accepted_candidate", self.show_object_nodes, (40, 220, 90), accepted_candidate_count)
 
+        self._draw_cells(
+            draw,
+            self._mask_cells_in_crop(wall_extension_boundary | accepted_closure, (r0, r1, c0, c1)),
+            xy,
+            (80, 170, 255),
+            radius=3,
+            max_cells=2000,
+        )
+        self._draw_cells(
+            draw,
+            self._mask_cells_in_crop(door_completion_boundary, (r0, r1, c0, c1)),
+            xy,
+            (255, 120, 40),
+            radius=4,
+            max_cells=2000,
+        )
+
         self._draw_agent(draw, xy(current_grid), float(pose[3]) if len(pose) > 3 else 0.0, scale)
         record("agent", True, (255, 60, 60), 1)
         zoom = max(1.0, min(w / max(crop_w, 1), h / max(crop_h, 1)))
         target_count = len(nav_decision.target_cells) if nav_decision is not None else 0
         self._label(draw, (10, 8), "Map / frontiers / A* / goal candidates  zoom %.1fx target_cells=%d" % (zoom, target_count), (255, 255, 255))
-        self._legend(draw, (10, max(32, map_h_available - 120)))
+        self._legend(draw, (10, max(32, map_h_available - 148)))
         if rose_panel_enabled and rose_h > 0:
             rose_panel, rose_layers = self._render_rose_occupancy_panel(
                 occupancy=occupancy,
@@ -2167,6 +2185,8 @@ class SGNavPopupVisualizer:
         items = [
             ((255, 60, 60), "agent"),
             ((145, 110, 255), "online room"),
+            ((80, 170, 255), "wall extension"),
+            ((255, 120, 40), "door completion"),
             ((245, 245, 245), "A*"),
             ((0, 225, 255), "frontier center"),
             ((255, 225, 40), "chosen frontier"),
