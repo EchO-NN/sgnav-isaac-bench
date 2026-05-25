@@ -69,6 +69,9 @@ ROOMSEG_ARRAY_KEYS = (
     "accepted_closure_map",
     "rejected_closure_map",
     "virtual_boundary_map",
+    "wall_extension_boundary_mask",
+    "door_completion_boundary_mask",
+    "virtual_boundary_source_map",
     "representative_wall_map",
     "extended_wall_map",
     "accepted_separators",
@@ -149,6 +152,9 @@ ROOMSEG_SNAPSHOT_ARRAY_KEYS = (
     "partial_door_extension_cut_mask",
     "rejected_door_extension_mask",
     "original_step1_step2_virtual_boundary_map",
+    "wall_extension_boundary_mask",
+    "door_completion_boundary_mask",
+    "virtual_boundary_source_map",
     "pre_extension_partition_free",
     "pre_extension_room_label_map",
     "step1_step2_accepted_closure_map",
@@ -341,6 +347,9 @@ def build_roomseg_debug_arrays(
         "accepted_closure_map": "accepted_closure_map",
         "rejected_closure_map": "rejected_closure_map",
         "virtual_boundary_map": "virtual_boundary_map",
+        "wall_extension_boundary_mask": "wall_extension_boundary_mask",
+        "door_completion_boundary_mask": "door_completion_boundary_mask",
+        "virtual_boundary_source_map": "virtual_boundary_source_map",
         "accepted_separators": "accepted_separators",
         "rejected_separators": "rejected_separators",
         "virtual_separator_label_fill": "virtual_separator_label_fill",
@@ -373,6 +382,8 @@ def build_roomseg_debug_arrays(
             or out_key in {"watershed_dist_struct", "watershed_dist_free_extent", "watershed_elevation"}
         ):
             dtype = np.float32
+        elif out_key in {"virtual_boundary_source_map"}:
+            dtype = np.uint8
         elif out_key.endswith("_count"):
             dtype = np.uint16
         arrays[out_key] = _array_from_debug(room_debug, debug_key, shape, dtype)
@@ -436,6 +447,8 @@ def summarize_roomseg_arrays(arrays: Mapping[str, np.ndarray], room_debug: Mappi
     partial_door_cut = _bool_array(arrays.get("partial_door_extension_cut_mask"), _shape(arrays))
     rejected_door_extension = _bool_array(arrays.get("rejected_door_extension_mask"), _shape(arrays))
     original_step_boundary = _bool_array(arrays.get("original_step1_step2_virtual_boundary_map"), _shape(arrays))
+    wall_extension_boundary = _bool_array(arrays.get("wall_extension_boundary_mask"), _shape(arrays))
+    door_completion_boundary = _bool_array(arrays.get("door_completion_boundary_mask"), _shape(arrays))
     nav_not_vertical = nav_free & ~vertical_free
     nav_unlabeled = nav_free & (final_labels <= 0)
     vertical_unlabeled = vertical_free & (final_labels <= 0)
@@ -464,6 +477,8 @@ def summarize_roomseg_arrays(arrays: Mapping[str, np.ndarray], room_debug: Mappi
         "partial_door_extension_cut": int(np.count_nonzero(partial_door_cut)),
         "rejected_door_extension": int(np.count_nonzero(rejected_door_extension)),
         "original_step1_step2_virtual_boundary": int(np.count_nonzero(original_step_boundary)),
+        "wall_extension_boundary": int(np.count_nonzero(wall_extension_boundary)),
+        "door_completion_boundary": int(np.count_nonzero(door_completion_boundary)),
         "vertical_unknown_before_overlay": int(np.count_nonzero(vertical_unknown_before_overlay)),
         "nav_raw_obstacle": int(np.count_nonzero(nav_raw_obstacle)),
         "static_structural_occupied": int(np.count_nonzero(static_structural)),
@@ -590,8 +605,10 @@ def render_roomseg_overlay(arrays: Mapping[str, np.ndarray], summary: Mapping[st
     canvas[_bool_array(arrays.get("wall_boundary_map"), shape)] = (255, 145, 30)
     canvas[_bool_array(arrays.get("candidate_closure_map"), shape)] = (0, 220, 255)
     canvas[_bool_array(arrays.get("rejected_closure_map"), shape)] = (255, 0, 220)
-    canvas[_bool_array(arrays.get("accepted_closure_map"), shape)] = (255, 225, 40)
-    canvas[_bool_array(arrays.get("original_step1_step2_virtual_boundary_map"), shape)] = (255, 120, 95)
+    canvas[_bool_array(arrays.get("accepted_closure_map"), shape)] = (255, 65, 90)
+    canvas[_bool_array(arrays.get("original_step1_step2_virtual_boundary_map"), shape)] = (255, 65, 90)
+    canvas[_bool_array(arrays.get("wall_extension_boundary_mask"), shape)] = (255, 65, 90)
+    canvas[_bool_array(arrays.get("door_completion_boundary_mask"), shape)] = (255, 210, 60)
     canvas[_bool_array(arrays.get("pre_extension_door_detected_map"), shape)] = (0, 210, 255)
     canvas[_bool_array(arrays.get("strict_pre_extension_door_cut_mask"), shape)] = (255, 190, 40)
     canvas[_bool_array(arrays.get("partial_door_seed_mask"), shape)] = (135, 245, 255)
@@ -667,6 +684,9 @@ def render_roomseg_layers_grid(arrays: Mapping[str, np.ndarray], summary: Mappin
         ("wall_boundary", _bool_array(arrays.get("wall_boundary_map"), shape)),
         ("accepted_closure", _bool_array(arrays.get("accepted_closure_map"), shape)),
         ("candidate_closure", _bool_array(arrays.get("candidate_closure_map"), shape)),
+        ("wall_extension", _bool_array(arrays.get("wall_extension_boundary_mask"), shape)),
+        ("door_completion", _bool_array(arrays.get("door_completion_boundary_mask"), shape)),
+        ("boundary_source", np.asarray(arrays.get("virtual_boundary_source_map"), dtype=np.uint8)),
         ("pre_door_detected", _bool_array(arrays.get("pre_extension_door_detected_map"), shape)),
         ("pre_door_cut", _bool_array(arrays.get("pre_extension_door_cut_mask"), shape)),
         ("strict_pre_door_cut", _bool_array(arrays.get("strict_pre_extension_door_cut_mask"), shape)),

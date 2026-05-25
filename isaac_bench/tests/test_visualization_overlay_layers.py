@@ -232,7 +232,8 @@ def test_pre_extension_door_debug_layers_are_reported_and_drawn():
     assert layers["pre_extension_room_labels"]["primitive_count"] == 2
     assert layers["pre_extension_room_labels"]["boundary_cell_count"] > 0
     assert int(np.count_nonzero(np.all(panel == np.asarray([0, 210, 255], dtype=np.uint8), axis=-1))) > 0
-    assert int(np.count_nonzero(np.all(panel == np.asarray([255, 190, 40], dtype=np.uint8), axis=-1))) > 0
+    assert layers["door_completion_boundaries"]["primitive_count"] == int(np.count_nonzero(cut))
+    assert int(np.count_nonzero(np.all(panel == np.asarray([255, 210, 60], dtype=np.uint8), axis=-1))) > 0
 
 
 def test_roomseg_sanitizer_and_partial_door_layers_are_reported():
@@ -252,11 +253,17 @@ def test_roomseg_sanitizer_and_partial_door_layers_are_reported():
     cut[8, 13:16] = True
     rejected = np.zeros_like(clipped)
     rejected[9, 13:18] = True
+    wall_extension = np.zeros_like(clipped)
+    wall_extension[7, 10:14] = True
+    door_completion = np.zeros_like(clipped)
+    door_completion[8, 13:16] = True
     debug = {
         "vertical_free_clipped_outside_navigation_map": clipped,
         "free_wall_conflict_map_before_sanitize": conflict,
         "roomseg_sanitized_free": sanitized_free,
         "roomseg_sanitized_wall": sanitized_wall,
+        "wall_extension_boundary_mask": wall_extension,
+        "door_completion_boundary_mask": door_completion,
         "partial_door_seed_mask": seed,
         "partial_door_line_mask": line,
         "partial_door_extension_cut_mask": cut,
@@ -273,11 +280,15 @@ def test_roomseg_sanitizer_and_partial_door_layers_are_reported():
     assert layers["roomseg_free_wall_conflict"]["primitive_count"] == int(np.count_nonzero(conflict))
     assert layers["roomseg_sanitized_free"]["primitive_count"] == int(np.count_nonzero(sanitized_free))
     assert layers["roomseg_sanitized_wall"]["primitive_count"] == int(np.count_nonzero(sanitized_wall))
+    assert layers["wall_extension_boundaries"]["primitive_count"] == int(np.count_nonzero(wall_extension))
+    assert layers["door_completion_boundaries"]["primitive_count"] == int(np.count_nonzero(door_completion))
     assert layers["partial_door_seed_points"]["primitive_count"] == int(np.count_nonzero(seed))
     assert layers["accepted_partial_door_extension_lines"]["primitive_count"] == int(np.count_nonzero(line))
     assert layers["partial_door_extension_cuts"]["primitive_count"] == int(np.count_nonzero(cut))
     assert layers["rejected_partial_door_extension_lines"]["primitive_count"] == int(np.count_nonzero(rejected))
     assert layers["segmentation_degenerate_warning"]["primitive_count"] == 1
+    assert int(np.count_nonzero(np.all(panel == np.asarray([255, 65, 90], dtype=np.uint8), axis=-1))) > 0
+    assert int(np.count_nonzero(np.all(panel == np.asarray([255, 210, 60], dtype=np.uint8), axis=-1))) > 0
     assert int(np.count_nonzero(np.all(panel == np.asarray([60, 250, 180], dtype=np.uint8), axis=-1))) > 0
     assert int(np.count_nonzero(np.all(panel == np.asarray([255, 60, 180], dtype=np.uint8), axis=-1))) > 0
 

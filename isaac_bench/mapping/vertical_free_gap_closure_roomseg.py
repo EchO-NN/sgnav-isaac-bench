@@ -242,7 +242,13 @@ def run_vertical_free_gap_closure_roomseg(
     accepted, topology_rejected, topology_debug = topology_prune_closures(provisional, labels0, free, cfg)
     rejected.extend(topology_rejected)
     original_step1_step2_virtual_boundary = rasterize_closures(accepted, free.shape, cfg, include_rejected=False) & free
-    virtual_boundary = (original_step1_step2_virtual_boundary | strict_pre_extension_door_cut_mask | partial_door_extension_cut_mask) & free
+    wall_extension_boundary_mask = original_step1_step2_virtual_boundary
+    door_completion_boundary_mask = pre_extension_door_cut_mask & free
+    virtual_boundary_source_map = np.zeros(free.shape, dtype=np.uint8)
+    virtual_boundary_source_map[wall_extension_boundary_mask] = np.uint8(1)
+    virtual_boundary_source_map[strict_pre_extension_door_cut_mask] = np.uint8(2)
+    virtual_boundary_source_map[partial_door_extension_cut_mask] = np.uint8(3)
+    virtual_boundary = (wall_extension_boundary_mask | door_completion_boundary_mask) & free
     partition_free = free & ~virtual_boundary
     raw_free_labels, raw_free_component_count = ndimage.label(free, structure=_conn(8))
     _ = raw_free_labels
@@ -308,13 +314,25 @@ def run_vertical_free_gap_closure_roomseg(
         "partition_component_count_after_small_merge": int(partition_component_count_after_small_merge),
         "virtual_boundary_cells": int(virtual_boundary_cells),
         "original_step1_step2_virtual_boundary_cells": int(np.count_nonzero(original_step1_step2_virtual_boundary)),
+        "wall_extension_boundary_cells": int(np.count_nonzero(wall_extension_boundary_mask)),
+        "door_completion_boundary_cells": int(np.count_nonzero(door_completion_boundary_mask)),
         "strict_pre_door_cut_cells": int(np.count_nonzero(strict_pre_extension_door_cut_mask)),
         "partial_door_extension_cut_cells": int(np.count_nonzero(partial_door_extension_cut_mask)),
         "segmentation_degenerate_one_room": bool(segmentation_degenerate),
         "small_merge_collapsed_all_boundaries": bool(small_merge_collapsed_all_boundaries),
         "original_step1_step2_topology_prune_uses_pre_doors": False,
         "original_step1_step2_virtual_boundary_map": original_step1_step2_virtual_boundary,
+        "wall_extension_boundary_mask": wall_extension_boundary_mask,
+        "door_completion_boundary_mask": door_completion_boundary_mask,
+        "virtual_boundary_source_map": virtual_boundary_source_map,
         "final_virtual_boundary_includes_pre_doors": True,
+        "boundary_source_summary": {
+            "wall_extension_cells": int(np.count_nonzero(wall_extension_boundary_mask)),
+            "door_completion_cells": int(np.count_nonzero(door_completion_boundary_mask)),
+            "strict_door_completion_cells": int(np.count_nonzero(strict_pre_extension_door_cut_mask)),
+            "partial_door_completion_cells": int(np.count_nonzero(partial_door_extension_cut_mask)),
+            "final_virtual_boundary_cells": int(np.count_nonzero(virtual_boundary)),
+        },
         "pre_extension_door_detected_map": pre_extension_door_detected_map,
         "pre_extension_door_cut_mask": pre_extension_door_cut_mask,
         "pre_extension_door_pattern_type_map": pre_extension_door_pattern_type_map,
@@ -377,7 +395,7 @@ def run_vertical_free_gap_closure_roomseg(
         "wall_skeleton_map": wall_skeleton,
         "endpoint_map": endpoint_map,
         "candidate_closure_map": candidate_map,
-        "accepted_closure_map": virtual_boundary,
+        "accepted_closure_map": wall_extension_boundary_mask,
         "step1_step2_accepted_closure_map": original_step1_step2_virtual_boundary,
         "rejected_closure_map": rejected_map,
         "virtual_boundary_map": virtual_boundary,
@@ -397,7 +415,7 @@ def run_vertical_free_gap_closure_roomseg(
         wall_skeleton_map=wall_skeleton.astype(bool),
         endpoint_map=endpoint_map.astype(np.int32),
         candidate_closure_map=candidate_map.astype(bool),
-        accepted_closure_map=virtual_boundary.astype(bool),
+        accepted_closure_map=wall_extension_boundary_mask.astype(bool),
         rejected_closure_map=rejected_map.astype(bool),
         room_label_map_visual=visual_labels.astype(np.int32),
         room_stats=room_stats,
@@ -813,6 +831,18 @@ def save_vertical_free_gap_closure_debug(
         endpoint_map=np.asarray(result.endpoint_map, dtype=np.int32),
         candidate_closure_map=np.asarray(result.candidate_closure_map, dtype=np.uint8),
         accepted_closure_map=np.asarray(result.accepted_closure_map, dtype=np.uint8),
+        wall_extension_boundary_mask=np.asarray(
+            d.get("wall_extension_boundary_mask", d.get("original_step1_step2_virtual_boundary_map", _zero_bool)),
+            dtype=np.uint8,
+        ),
+        door_completion_boundary_mask=np.asarray(
+            d.get("door_completion_boundary_mask", d.get("pre_extension_door_cut_mask", _zero_bool)),
+            dtype=np.uint8,
+        ),
+        virtual_boundary_source_map=np.asarray(
+            d.get("virtual_boundary_source_map", _zero_bool),
+            dtype=np.uint8,
+        ),
         step1_step2_accepted_closure_map=np.asarray(
             d.get("step1_step2_accepted_closure_map", _zero_bool),
             dtype=np.uint8,
@@ -904,8 +934,9 @@ def save_vertical_free_gap_closure_debug(
             _label_rgb(result.endpoint_map),
             _bool_rgb(result.candidate_closure_map, (0, 220, 255)),
             _bool_rgb(result.rejected_closure_map, (255, 0, 220)),
-            _bool_rgb(result.accepted_closure_map, (255, 40, 40)),
-            _bool_rgb(np.asarray(d.get("partial_door_extension_cut_mask", _zero_bool), dtype=bool), (255, 210, 60)),
+            _bool_rgb(np.asarray(d.get("wall_extension_boundary_mask", result.accepted_closure_map), dtype=bool), (255, 65, 90)),
+            _bool_rgb(np.asarray(d.get("door_completion_boundary_mask", _zero_bool), dtype=bool), (255, 210, 60)),
+            _bool_rgb(np.asarray(d.get("partial_door_extension_cut_mask", _zero_bool), dtype=bool), (60, 250, 180)),
             _bool_rgb(np.asarray(d.get("rejected_door_extension_mask", _zero_bool), dtype=bool), (255, 60, 180)),
             _label_rgb(result.room_label_map),
             _vfgc_overlay_rgb(result),
@@ -951,8 +982,14 @@ def _summary_from_result(result: VerticalFreeGapClosureResult) -> dict:
         "num_rooms_final",
         "rejection_reasons",
         "labels_outside_vertical_free_cells",
+        "virtual_boundary_cells",
+        "wall_extension_boundary_cells",
+        "door_completion_boundary_cells",
+        "strict_pre_door_cut_cells",
+        "partial_door_extension_cut_cells",
     ]
     out = {key: result.debug.get(key) for key in keys}
+    out["boundary_source_summary"] = dict(result.debug.get("boundary_source_summary") or {})
     out["closure_candidates"] = list(result.closure_candidates)
     out["room_stats"] = list(result.room_stats)
     return out
@@ -1251,7 +1288,12 @@ def _vfgc_overlay_rgb(result: VerticalFreeGapClosureResult) -> np.ndarray:
     out[mask] = (0.45 * out[mask] + 0.55 * colors[mask]).astype(np.uint8)
     out[result.candidate_closure_map] = (0, 220, 255)
     out[result.rejected_closure_map] = (255, 0, 220)
-    out[result.accepted_closure_map] = (255, 40, 40)
+    wall_extension = np.asarray(result.debug.get("wall_extension_boundary_mask", result.accepted_closure_map), dtype=bool)
+    door_completion = np.asarray(result.debug.get("door_completion_boundary_mask", np.zeros_like(result.accepted_closure_map)), dtype=bool)
+    partial_completion = np.asarray(result.debug.get("partial_door_extension_cut_mask", np.zeros_like(result.accepted_closure_map)), dtype=bool)
+    out[wall_extension] = (255, 65, 90)
+    out[door_completion] = (255, 210, 60)
+    out[partial_completion] = (60, 250, 180)
     out[result.wall_skeleton_map] = (255, 170, 0)
     out[result.endpoint_map > 0] = (255, 255, 0)
     return out
