@@ -74,9 +74,20 @@ ROOMSEG_ARRAY_KEYS = (
     "accepted_separators",
     "rejected_separators",
     "virtual_separator_label_fill",
+    "vertical_free_clipped_outside_navigation_map",
+    "free_wall_conflict_map_before_sanitize",
+    "roomseg_sanitized_free",
+    "roomseg_sanitized_wall",
+    "terminal_wall_roomseg_mask",
     "pre_extension_door_detected_map",
     "pre_extension_door_cut_mask",
     "pre_extension_door_pattern_type_map",
+    "strict_pre_extension_door_cut_mask",
+    "partial_door_seed_mask",
+    "partial_door_line_mask",
+    "partial_door_extension_cut_mask",
+    "rejected_door_extension_mask",
+    "original_step1_step2_virtual_boundary_map",
     "pre_extension_partition_free",
     "pre_extension_room_label_map",
     "step1_step2_accepted_closure_map",
@@ -124,9 +135,20 @@ ROOMSEG_SNAPSHOT_ARRAY_KEYS = (
     "pass2_line_extension_completion",
     "wall_target_after_line_extension",
     "completed_wall_after_line_extension",
+    "vertical_free_clipped_outside_navigation_map",
+    "free_wall_conflict_map_before_sanitize",
+    "roomseg_sanitized_free",
+    "roomseg_sanitized_wall",
+    "terminal_wall_roomseg_mask",
     "pre_extension_door_detected_map",
     "pre_extension_door_cut_mask",
     "pre_extension_door_pattern_type_map",
+    "strict_pre_extension_door_cut_mask",
+    "partial_door_seed_mask",
+    "partial_door_line_mask",
+    "partial_door_extension_cut_mask",
+    "rejected_door_extension_mask",
+    "original_step1_step2_virtual_boundary_map",
     "pre_extension_partition_free",
     "pre_extension_room_label_map",
     "step1_step2_accepted_closure_map",
@@ -275,9 +297,20 @@ def build_roomseg_debug_arrays(
         "pass2_line_extension_completion": "pass2_line_extension_completion",
         "wall_target_after_line_extension": "wall_target_after_line_extension",
         "completed_wall_after_line_extension": "completed_wall_after_line_extension",
+        "vertical_free_clipped_outside_navigation_map": "vertical_free_clipped_outside_navigation_map",
+        "free_wall_conflict_map_before_sanitize": "free_wall_conflict_map_before_sanitize",
+        "roomseg_sanitized_free": "roomseg_sanitized_free",
+        "roomseg_sanitized_wall": "roomseg_sanitized_wall",
+        "terminal_wall_roomseg_mask": "terminal_wall_roomseg_mask",
         "pre_extension_door_detected_map": "pre_extension_door_detected_map",
         "pre_extension_door_cut_mask": "pre_extension_door_cut_mask",
         "pre_extension_door_pattern_type_map": "pre_extension_door_pattern_type_map",
+        "strict_pre_extension_door_cut_mask": "strict_pre_extension_door_cut_mask",
+        "partial_door_seed_mask": "partial_door_seed_mask",
+        "partial_door_line_mask": "partial_door_line_mask",
+        "partial_door_extension_cut_mask": "partial_door_extension_cut_mask",
+        "rejected_door_extension_mask": "rejected_door_extension_mask",
+        "original_step1_step2_virtual_boundary_map": "original_step1_step2_virtual_boundary_map",
         "pre_extension_partition_free": "pre_extension_partition_free",
         "pre_extension_room_label_map": "pre_extension_room_label_map",
         "step1_step2_accepted_closure_map": "step1_step2_accepted_closure_map",
@@ -393,6 +426,16 @@ def summarize_roomseg_arrays(arrays: Mapping[str, np.ndarray], room_debug: Mappi
     unknown_before_ray_wall = _bool_array(arrays.get("unknown_before_ray_wall"), _shape(arrays))
     unknown_after_ray_wall = _bool_array(arrays.get("unknown_after_ray_wall"), _shape(arrays))
     unknown_removed_by_ray_wall = _bool_array(arrays.get("unknown_removed_by_ray_wall"), _shape(arrays))
+    clipped_outside_nav = _bool_array(arrays.get("vertical_free_clipped_outside_navigation_map"), _shape(arrays))
+    free_wall_conflict = _bool_array(arrays.get("free_wall_conflict_map_before_sanitize"), _shape(arrays))
+    sanitized_free = _bool_array(arrays.get("roomseg_sanitized_free"), _shape(arrays))
+    sanitized_wall = _bool_array(arrays.get("roomseg_sanitized_wall"), _shape(arrays))
+    strict_pre_door_cut = _bool_array(arrays.get("strict_pre_extension_door_cut_mask"), _shape(arrays))
+    partial_door_seed = _bool_array(arrays.get("partial_door_seed_mask"), _shape(arrays))
+    partial_door_line = _bool_array(arrays.get("partial_door_line_mask"), _shape(arrays))
+    partial_door_cut = _bool_array(arrays.get("partial_door_extension_cut_mask"), _shape(arrays))
+    rejected_door_extension = _bool_array(arrays.get("rejected_door_extension_mask"), _shape(arrays))
+    original_step_boundary = _bool_array(arrays.get("original_step1_step2_virtual_boundary_map"), _shape(arrays))
     nav_not_vertical = nav_free & ~vertical_free
     nav_unlabeled = nav_free & (final_labels <= 0)
     vertical_unlabeled = vertical_free & (final_labels <= 0)
@@ -411,6 +454,16 @@ def summarize_roomseg_arrays(arrays: Mapping[str, np.ndarray], room_debug: Mappi
         "unknown_before_ray_wall": int(np.count_nonzero(unknown_before_ray_wall)),
         "unknown_after_ray_wall": int(np.count_nonzero(unknown_after_ray_wall)),
         "unknown_removed_by_ray_wall": int(np.count_nonzero(unknown_removed_by_ray_wall)),
+        "vertical_free_clipped_outside_navigation": int(np.count_nonzero(clipped_outside_nav)),
+        "free_wall_conflict_before_sanitize": int(np.count_nonzero(free_wall_conflict)),
+        "roomseg_sanitized_free": int(np.count_nonzero(sanitized_free)),
+        "roomseg_sanitized_wall": int(np.count_nonzero(sanitized_wall)),
+        "strict_pre_extension_door_cut": int(np.count_nonzero(strict_pre_door_cut)),
+        "partial_door_seed": int(np.count_nonzero(partial_door_seed)),
+        "partial_door_line": int(np.count_nonzero(partial_door_line)),
+        "partial_door_extension_cut": int(np.count_nonzero(partial_door_cut)),
+        "rejected_door_extension": int(np.count_nonzero(rejected_door_extension)),
+        "original_step1_step2_virtual_boundary": int(np.count_nonzero(original_step_boundary)),
         "vertical_unknown_before_overlay": int(np.count_nonzero(vertical_unknown_before_overlay)),
         "nav_raw_obstacle": int(np.count_nonzero(nav_raw_obstacle)),
         "static_structural_occupied": int(np.count_nonzero(static_structural)),
@@ -519,6 +572,10 @@ def render_roomseg_overlay(arrays: Mapping[str, np.ndarray], summary: Mapping[st
     canvas[_bool_array(arrays.get("initial_roomseg_occupied_after_fusion"), shape)] = (210, 85, 45)
     canvas[_bool_array(arrays.get("ray_valid_wall_inference"), shape)] = (255, 80, 40)
     canvas[_bool_array(arrays.get("roomseg_terminal_wall_splat"), shape)] = (255, 135, 25)
+    canvas[_bool_array(arrays.get("terminal_wall_roomseg_mask"), shape)] = (255, 150, 35)
+    canvas[_bool_array(arrays.get("vertical_free_clipped_outside_navigation_map"), shape)] = (45, 135, 255)
+    canvas[_bool_array(arrays.get("free_wall_conflict_map_before_sanitize"), shape)] = (255, 45, 45)
+    canvas[_bool_array(arrays.get("roomseg_sanitized_wall"), shape)] = (10, 10, 10)
     canvas[_bool_array(arrays.get("nav_obstacle_overlay_accepted"), shape)] = (230, 40, 230)
     canvas[_bool_array(arrays.get("walls_rescued_from_unknown"), shape)] = (255, 35, 35)
     canvas[_bool_array(arrays.get("vertical_free_over_nav_obstacle"), shape)] = (45, 135, 255)
@@ -534,7 +591,13 @@ def render_roomseg_overlay(arrays: Mapping[str, np.ndarray], summary: Mapping[st
     canvas[_bool_array(arrays.get("candidate_closure_map"), shape)] = (0, 220, 255)
     canvas[_bool_array(arrays.get("rejected_closure_map"), shape)] = (255, 0, 220)
     canvas[_bool_array(arrays.get("accepted_closure_map"), shape)] = (255, 225, 40)
+    canvas[_bool_array(arrays.get("original_step1_step2_virtual_boundary_map"), shape)] = (255, 120, 95)
     canvas[_bool_array(arrays.get("pre_extension_door_detected_map"), shape)] = (0, 210, 255)
+    canvas[_bool_array(arrays.get("strict_pre_extension_door_cut_mask"), shape)] = (255, 190, 40)
+    canvas[_bool_array(arrays.get("partial_door_seed_mask"), shape)] = (135, 245, 255)
+    canvas[_bool_array(arrays.get("partial_door_line_mask"), shape)] = (60, 250, 180)
+    canvas[_bool_array(arrays.get("partial_door_extension_cut_mask"), shape)] = (255, 210, 60)
+    canvas[_bool_array(arrays.get("rejected_door_extension_mask"), shape)] = (255, 60, 180)
     canvas[_bool_array(arrays.get("pre_extension_door_cut_mask"), shape)] = (255, 190, 40)
     canvas[_bool_array(arrays.get("virtual_boundary_map"), shape)] = (255, 65, 90)
     canvas[_bool_array(arrays.get("representative_wall_map"), shape)] = (255, 145, 30)
@@ -580,6 +643,11 @@ def render_roomseg_layers_grid(arrays: Mapping[str, np.ndarray], summary: Mappin
         ("unknown_before_ray", _bool_array(arrays.get("unknown_before_ray_wall"), shape)),
         ("unknown_after_ray", _bool_array(arrays.get("unknown_after_ray_wall"), shape)),
         ("unknown_removed_ray", _bool_array(arrays.get("unknown_removed_by_ray_wall"), shape)),
+        ("vfree_clipped_nav", _bool_array(arrays.get("vertical_free_clipped_outside_navigation_map"), shape)),
+        ("free_wall_conflict", _bool_array(arrays.get("free_wall_conflict_map_before_sanitize"), shape)),
+        ("sanitized_free", _bool_array(arrays.get("roomseg_sanitized_free"), shape)),
+        ("sanitized_wall", _bool_array(arrays.get("roomseg_sanitized_wall"), shape)),
+        ("terminal_wall_roomseg", _bool_array(arrays.get("terminal_wall_roomseg_mask"), shape)),
         ("vertical_unknown_pre", _bool_array(arrays.get("vertical_unknown_before_overlay"), shape)),
         ("nav_raw_obstacle", _bool_array(arrays.get("nav_raw_obstacle"), shape)),
         ("static_structural", _bool_array(arrays.get("roomseg_static_structural_occupied"), shape)),
@@ -601,6 +669,12 @@ def render_roomseg_layers_grid(arrays: Mapping[str, np.ndarray], summary: Mappin
         ("candidate_closure", _bool_array(arrays.get("candidate_closure_map"), shape)),
         ("pre_door_detected", _bool_array(arrays.get("pre_extension_door_detected_map"), shape)),
         ("pre_door_cut", _bool_array(arrays.get("pre_extension_door_cut_mask"), shape)),
+        ("strict_pre_door_cut", _bool_array(arrays.get("strict_pre_extension_door_cut_mask"), shape)),
+        ("partial_seed", _bool_array(arrays.get("partial_door_seed_mask"), shape)),
+        ("partial_line", _bool_array(arrays.get("partial_door_line_mask"), shape)),
+        ("partial_cut", _bool_array(arrays.get("partial_door_extension_cut_mask"), shape)),
+        ("partial_rejected", _bool_array(arrays.get("rejected_door_extension_mask"), shape)),
+        ("orig_step_boundary", _bool_array(arrays.get("original_step1_step2_virtual_boundary_map"), shape)),
         ("pre_room_labels", np.asarray(arrays.get("pre_extension_room_label_map"), dtype=np.int32)),
         ("virtual_boundary", _bool_array(arrays.get("virtual_boundary_map"), shape)),
         ("representative_wall", _bool_array(arrays.get("representative_wall_map"), shape)),

@@ -235,6 +235,53 @@ def test_pre_extension_door_debug_layers_are_reported_and_drawn():
     assert int(np.count_nonzero(np.all(panel == np.asarray([255, 190, 40], dtype=np.uint8), axis=-1))) > 0
 
 
+def test_roomseg_sanitizer_and_partial_door_layers_are_reported():
+    clipped = np.zeros((20, 30), dtype=bool)
+    clipped[4, 4:7] = True
+    conflict = np.zeros_like(clipped)
+    conflict[5, 6:9] = True
+    sanitized_free = np.zeros_like(clipped)
+    sanitized_free[6:10, 8:14] = True
+    sanitized_wall = np.zeros_like(clipped)
+    sanitized_wall[6:10, 15] = True
+    seed = np.zeros_like(clipped)
+    seed[8, 16:18] = True
+    line = np.zeros_like(clipped)
+    line[8, 12:21] = True
+    cut = np.zeros_like(clipped)
+    cut[8, 13:16] = True
+    rejected = np.zeros_like(clipped)
+    rejected[9, 13:18] = True
+    debug = {
+        "vertical_free_clipped_outside_navigation_map": clipped,
+        "free_wall_conflict_map_before_sanitize": conflict,
+        "roomseg_sanitized_free": sanitized_free,
+        "roomseg_sanitized_wall": sanitized_wall,
+        "partial_door_seed_mask": seed,
+        "partial_door_line_mask": line,
+        "partial_door_extension_cut_mask": cut,
+        "rejected_door_extension_mask": rejected,
+        "partial_door_line_reject_reason_counts": {"extension_endpoint_is_other_door": 1},
+        "segmentation_degenerate_one_room": True,
+    }
+
+    viz = SGNavPopupVisualizer(enabled=False, panel_size=(640, 360))
+    panel = _update(viz, room_segmentation_debug=debug)
+    layers = {layer["name"]: layer for layer in viz.overlay_layer_metadata()["layers"]}
+
+    assert layers["roomseg_vertical_free_outside_navigation"]["primitive_count"] == int(np.count_nonzero(clipped))
+    assert layers["roomseg_free_wall_conflict"]["primitive_count"] == int(np.count_nonzero(conflict))
+    assert layers["roomseg_sanitized_free"]["primitive_count"] == int(np.count_nonzero(sanitized_free))
+    assert layers["roomseg_sanitized_wall"]["primitive_count"] == int(np.count_nonzero(sanitized_wall))
+    assert layers["partial_door_seed_points"]["primitive_count"] == int(np.count_nonzero(seed))
+    assert layers["accepted_partial_door_extension_lines"]["primitive_count"] == int(np.count_nonzero(line))
+    assert layers["partial_door_extension_cuts"]["primitive_count"] == int(np.count_nonzero(cut))
+    assert layers["rejected_partial_door_extension_lines"]["primitive_count"] == int(np.count_nonzero(rejected))
+    assert layers["segmentation_degenerate_warning"]["primitive_count"] == 1
+    assert int(np.count_nonzero(np.all(panel == np.asarray([60, 250, 180], dtype=np.uint8), axis=-1))) > 0
+    assert int(np.count_nonzero(np.all(panel == np.asarray([255, 60, 180], dtype=np.uint8), axis=-1))) > 0
+
+
 def test_roomseg_wall_lines_and_extensions_draw_red_even_without_room_split():
     debug = {
         "filtered_wall_lines_report": {

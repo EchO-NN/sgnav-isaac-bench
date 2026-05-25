@@ -531,10 +531,72 @@ class SGNavPopupVisualizer:
         record("room_labels", self.show_room_labels, (250, 250, 255), room_label_count, "VLM room category and reliability")
 
         map_shape = tuple(np.asarray(occupancy).shape[:2])
+        clipped_outside_nav = self._room_debug_array("vertical_free_clipped_outside_navigation_map", map_shape, bool)
+        free_wall_conflict = self._room_debug_array("free_wall_conflict_map_before_sanitize", map_shape, bool)
+        sanitized_free = self._room_debug_array("roomseg_sanitized_free", map_shape, bool)
+        sanitized_wall = self._room_debug_array("roomseg_sanitized_wall", map_shape, bool)
         pre_extension_door_detected = self._room_debug_array("pre_extension_door_detected_map", map_shape, bool)
         pre_extension_door_cut = self._room_debug_array("pre_extension_door_cut_mask", map_shape, bool)
+        strict_pre_extension_door_cut = self._room_debug_array("strict_pre_extension_door_cut_mask", map_shape, bool)
+        partial_door_seed = self._room_debug_array("partial_door_seed_mask", map_shape, bool)
+        partial_door_line = self._room_debug_array("partial_door_line_mask", map_shape, bool)
+        partial_door_extension_cut = self._room_debug_array("partial_door_extension_cut_mask", map_shape, bool)
+        rejected_door_extension = self._room_debug_array("rejected_door_extension_mask", map_shape, bool)
         pre_extension_room_labels = self._room_debug_array("pre_extension_room_label_map", map_shape, np.int32)
         pre_extension_room_boundary = self._room_label_adjacency_boundary(pre_extension_room_labels)
+        clipped_count = self._draw_cells(
+            draw,
+            self._mask_cells_in_crop(clipped_outside_nav, (r0, r1, c0, c1)),
+            xy,
+            (45, 135, 255),
+            radius=2,
+            max_cells=1200,
+        )
+        record(
+            "roomseg_vertical_free_outside_navigation",
+            clipped_count > 0,
+            (45, 135, 255),
+            clipped_count,
+            "vertical-free cells clipped before VFGC because they were outside navigation free",
+        )
+        conflict_count = self._draw_cells(
+            draw,
+            self._mask_cells_in_crop(free_wall_conflict, (r0, r1, c0, c1)),
+            xy,
+            (255, 45, 45),
+            radius=2,
+            max_cells=1200,
+        )
+        record(
+            "roomseg_free_wall_conflict",
+            conflict_count > 0,
+            (255, 45, 45),
+            conflict_count,
+            "free/wall overlap removed before VFGC so wall cores cannot be erased by vertical free",
+        )
+        sanitized_wall_count = self._draw_cells(
+            draw,
+            self._mask_cells_in_crop(sanitized_wall, (r0, r1, c0, c1)),
+            xy,
+            (10, 10, 10),
+            radius=1,
+            max_cells=1600,
+        )
+        record(
+            "roomseg_sanitized_wall",
+            sanitized_wall_count > 0,
+            (10, 10, 10),
+            sanitized_wall_count,
+            "wall mask after input sanitizer, including terminal ray-wall evidence",
+        )
+        record(
+            "roomseg_sanitized_free",
+            bool(np.any(sanitized_free)),
+            (166, 170, 174),
+            int(np.count_nonzero(sanitized_free)),
+            "free mask after input sanitizer; it must be a subset of navigation free when available",
+            subset_navigation_ok=bool(self._room_segmentation_debug.get("sanitized_free_subset_navigation_ok", False)),
+        )
         pre_door_count = self._draw_cells(
             draw,
             self._mask_cells_in_crop(pre_extension_door_detected, (r0, r1, c0, c1)),
@@ -564,6 +626,90 @@ class SGNavPopupVisualizer:
             (255, 190, 40),
             pre_door_cut_count,
             "virtual free-space cuts created by pre-extension door pattern detection",
+        )
+        strict_pre_cut_count = self._draw_cells(
+            draw,
+            self._mask_cells_in_crop(strict_pre_extension_door_cut, (r0, r1, c0, c1)),
+            xy,
+            (255, 190, 40),
+            radius=2,
+            max_cells=1200,
+        )
+        record(
+            "strict_pre_extension_door_cuts",
+            strict_pre_cut_count > 0,
+            (255, 190, 40),
+            strict_pre_cut_count,
+            "door cuts from the original strict pattern rules",
+        )
+        partial_seed_count = self._draw_cells(
+            draw,
+            self._mask_cells_in_crop(partial_door_seed, (r0, r1, c0, c1)),
+            xy,
+            (135, 245, 255),
+            radius=2,
+            max_cells=1200,
+        )
+        record(
+            "partial_door_seed_points",
+            partial_seed_count > 0,
+            (135, 245, 255),
+            partial_seed_count,
+            "partial door-like occupied seed cells detected before line extension",
+        )
+        partial_line_count = self._draw_cells(
+            draw,
+            self._mask_cells_in_crop(partial_door_line, (r0, r1, c0, c1)),
+            xy,
+            (60, 250, 180),
+            radius=2,
+            max_cells=1600,
+        )
+        record(
+            "accepted_partial_door_extension_lines",
+            partial_line_count > 0,
+            (60, 250, 180),
+            partial_line_count,
+            "accepted partial-door lines extended to structural wall anchors",
+        )
+        partial_cut_count = self._draw_cells(
+            draw,
+            self._mask_cells_in_crop(partial_door_extension_cut, (r0, r1, c0, c1)),
+            xy,
+            (255, 210, 60),
+            radius=3,
+            max_cells=1600,
+        )
+        record(
+            "partial_door_extension_cuts",
+            partial_cut_count > 0,
+            (255, 210, 60),
+            partial_cut_count,
+            "accepted partial-door cut cells; these are ORed only into the final boundary",
+        )
+        rejected_line_count = self._draw_cells(
+            draw,
+            self._mask_cells_in_crop(rejected_door_extension, (r0, r1, c0, c1)),
+            xy,
+            (255, 60, 180),
+            radius=2,
+            max_cells=1600,
+        )
+        record(
+            "rejected_partial_door_extension_lines",
+            rejected_line_count > 0,
+            (255, 60, 180),
+            rejected_line_count,
+            "partial-door extension lines rejected by width/unknown/wall/other-door guards",
+            reject_reason_counts=dict(self._room_segmentation_debug.get("partial_door_line_reject_reason_counts") or {}),
+        )
+        degenerate = bool(self._room_segmentation_debug.get("segmentation_degenerate_one_room", False))
+        record(
+            "segmentation_degenerate_warning",
+            degenerate,
+            (255, 80, 80),
+            1 if degenerate else 0,
+            "VFGC produced one large room without any virtual boundary; inspect sanitizer and terminal-wall evidence",
         )
         pre_room_boundary_count = self._draw_cells(
             draw,
@@ -732,8 +878,19 @@ class SGNavPopupVisualizer:
         pass2_line_extension_completion = self._room_debug_array("pass2_line_extension_completion", shape, bool)
         wall_target_after_line_extension = self._room_debug_array("wall_target_after_line_extension", shape, bool)
         completed_wall_after_line_extension = self._room_debug_array("completed_wall_after_line_extension", shape, bool)
+        clipped_outside_nav = self._room_debug_array("vertical_free_clipped_outside_navigation_map", shape, bool)
+        free_wall_conflict = self._room_debug_array("free_wall_conflict_map_before_sanitize", shape, bool)
+        sanitized_free = self._room_debug_array("roomseg_sanitized_free", shape, bool)
+        sanitized_wall = self._room_debug_array("roomseg_sanitized_wall", shape, bool)
+        terminal_wall_roomseg = self._room_debug_array("terminal_wall_roomseg_mask", shape, bool)
         pre_extension_door_detected = self._room_debug_array("pre_extension_door_detected_map", shape, bool)
         pre_extension_door_cut = self._room_debug_array("pre_extension_door_cut_mask", shape, bool)
+        strict_pre_extension_door_cut = self._room_debug_array("strict_pre_extension_door_cut_mask", shape, bool)
+        partial_door_seed = self._room_debug_array("partial_door_seed_mask", shape, bool)
+        partial_door_line = self._room_debug_array("partial_door_line_mask", shape, bool)
+        partial_door_extension_cut = self._room_debug_array("partial_door_extension_cut_mask", shape, bool)
+        rejected_door_extension = self._room_debug_array("rejected_door_extension_mask", shape, bool)
+        original_step_boundary = self._room_debug_array("original_step1_step2_virtual_boundary_map", shape, bool)
         pre_extension_room_labels = self._room_debug_array("pre_extension_room_label_map", shape, np.int32)
         pre_extension_room_boundary = self._room_label_adjacency_boundary(pre_extension_room_labels)
         initial_unknown_after_fusion = self._room_debug_array("initial_roomseg_unknown_after_fusion", shape, bool)
@@ -786,8 +943,16 @@ class SGNavPopupVisualizer:
             or np.any(pass2_line_extension_completion)
             or np.any(wall_target_after_line_extension)
             or np.any(completed_wall_after_line_extension)
+            or np.any(clipped_outside_nav)
+            or np.any(free_wall_conflict)
+            or np.any(sanitized_free)
+            or np.any(sanitized_wall)
             or np.any(pre_extension_door_detected)
             or np.any(pre_extension_door_cut)
+            or np.any(partial_door_seed)
+            or np.any(partial_door_line)
+            or np.any(partial_door_extension_cut)
+            or np.any(rejected_door_extension)
             or np.any(pre_extension_room_labels > 0)
             or np.any(vertical_observed)
             or np.any(vertical_observed_0p2_2p0)
@@ -840,13 +1005,22 @@ class SGNavPopupVisualizer:
                 base = canvas[mask].astype(np.float32)
                 canvas[mask] = np.clip(base * 0.45 + color * 0.55, 0, 255).astype(np.uint8)
             canvas[accepted_closure] = (255, 205, 45)
+            canvas[original_step_boundary] = (255, 120, 95)
             canvas[virtual_boundary] = (255, 65, 90)
             canvas[ray_valid_wall] = (255, 80, 40)
             canvas[roomseg_terminal_wall_splat] = (255, 135, 25)
+            canvas[terminal_wall_roomseg] = (255, 150, 35)
+            canvas[clipped_outside_nav] = (45, 135, 255)
+            canvas[free_wall_conflict] = (255, 45, 45)
             canvas[pass2_extension_intersection_targets] = (255, 240, 0)
             canvas[pass2_line_extension_completion] = (255, 0, 0)
             canvas[pre_extension_room_boundary] = (120, 180, 255)
             canvas[pre_extension_door_detected] = (0, 210, 255)
+            canvas[strict_pre_extension_door_cut] = (255, 190, 40)
+            canvas[partial_door_seed] = (135, 245, 255)
+            canvas[partial_door_line] = (60, 250, 180)
+            canvas[partial_door_extension_cut] = (255, 210, 60)
+            canvas[rejected_door_extension] = (255, 60, 180)
             canvas[pre_extension_door_cut] = (255, 190, 40)
             canvas[nav_obstacle_overlay_accepted] = (230, 40, 230)
             canvas[walls_rescued_from_unknown] = (255, 35, 35)
@@ -865,10 +1039,18 @@ class SGNavPopupVisualizer:
             canvas[vertical_free_overridden_occupied] = (225, 132, 45)
             canvas[ray_valid_wall] = (255, 80, 40)
             canvas[roomseg_terminal_wall_splat] = (255, 135, 25)
+            canvas[terminal_wall_roomseg] = (255, 150, 35)
+            canvas[clipped_outside_nav] = (45, 135, 255)
+            canvas[free_wall_conflict] = (255, 45, 45)
             canvas[pass2_extension_intersection_targets] = (255, 240, 0)
             canvas[pass2_line_extension_completion] = (255, 0, 0)
             canvas[pre_extension_room_boundary] = (120, 180, 255)
             canvas[pre_extension_door_detected] = (0, 210, 255)
+            canvas[strict_pre_extension_door_cut] = (255, 190, 40)
+            canvas[partial_door_seed] = (135, 245, 255)
+            canvas[partial_door_line] = (60, 250, 180)
+            canvas[partial_door_extension_cut] = (255, 210, 60)
+            canvas[rejected_door_extension] = (255, 60, 180)
             canvas[pre_extension_door_cut] = (255, 190, 40)
             canvas[unknown_removed_by_ray_wall] = (255, 35, 35)
             canvas[wall_conf_hot] = (255, 105, 75)
@@ -953,6 +1135,36 @@ class SGNavPopupVisualizer:
                 unknown_removed_by_ray_wall_cells=int(np.count_nonzero(unknown_removed_by_ray_wall)),
             ),
             self._overlay_record(
+                "roomseg_vertical_free_outside_navigation",
+                bool(np.any(clipped_outside_nav)),
+                (45, 135, 255),
+                int(np.count_nonzero(clipped_outside_nav)),
+                "vertical-free cells clipped before VFGC because they were outside navigation free",
+            ),
+            self._overlay_record(
+                "roomseg_free_wall_conflict",
+                bool(np.any(free_wall_conflict)),
+                (255, 45, 45),
+                int(np.count_nonzero(free_wall_conflict)),
+                "free/wall overlap removed before VFGC so wall cores cannot be erased by vertical free",
+            ),
+            self._overlay_record(
+                "roomseg_sanitized_free",
+                bool(np.any(sanitized_free)),
+                (166, 170, 174),
+                int(np.count_nonzero(sanitized_free)),
+                "free mask after input sanitizer",
+                subset_navigation_ok=bool(self._room_segmentation_debug.get("sanitized_free_subset_navigation_ok", False)),
+            ),
+            self._overlay_record(
+                "roomseg_sanitized_wall",
+                bool(np.any(sanitized_wall)),
+                (10, 10, 10),
+                int(np.count_nonzero(sanitized_wall)),
+                "wall mask after input sanitizer, including terminal ray-wall evidence",
+                terminal_wall_roomseg_cells=int(np.count_nonzero(terminal_wall_roomseg)),
+            ),
+            self._overlay_record(
                 "roomseg_nav_obstacle_overlay_accepted",
                 True,
                 (230, 40, 230),
@@ -1000,6 +1212,50 @@ class SGNavPopupVisualizer:
                 (255, 65, 90),
                 int(np.count_nonzero(accepted_closure | virtual_boundary)),
                 "accepted or virtual gap-closure boundaries from the latest room segmentation method",
+                original_step1_step2_virtual_boundary_cells=int(np.count_nonzero(original_step_boundary)),
+            ),
+            self._overlay_record(
+                "strict_pre_extension_door_cuts",
+                bool(np.any(strict_pre_extension_door_cut)),
+                (255, 190, 40),
+                int(np.count_nonzero(strict_pre_extension_door_cut)),
+                "door cuts from the original strict pre-extension pattern rules",
+            ),
+            self._overlay_record(
+                "partial_door_seed_points",
+                bool(np.any(partial_door_seed)),
+                (135, 245, 255),
+                int(np.count_nonzero(partial_door_seed)),
+                "partial door-like occupied seed cells detected before line extension",
+            ),
+            self._overlay_record(
+                "accepted_partial_door_extension_lines",
+                bool(np.any(partial_door_line)),
+                (60, 250, 180),
+                int(np.count_nonzero(partial_door_line)),
+                "accepted partial-door lines extended to structural wall anchors",
+            ),
+            self._overlay_record(
+                "partial_door_extension_cuts",
+                bool(np.any(partial_door_extension_cut)),
+                (255, 210, 60),
+                int(np.count_nonzero(partial_door_extension_cut)),
+                "accepted partial-door cut cells; these are ORed only into the final boundary",
+            ),
+            self._overlay_record(
+                "rejected_partial_door_extension_lines",
+                bool(np.any(rejected_door_extension)),
+                (255, 60, 180),
+                int(np.count_nonzero(rejected_door_extension)),
+                "partial-door extension lines rejected by width/unknown/wall/other-door guards",
+                reject_reason_counts=dict(self._room_segmentation_debug.get("partial_door_line_reject_reason_counts") or {}),
+            ),
+            self._overlay_record(
+                "segmentation_degenerate_warning",
+                bool(self._room_segmentation_debug.get("segmentation_degenerate_one_room", False)),
+                (255, 80, 80),
+                1 if bool(self._room_segmentation_debug.get("segmentation_degenerate_one_room", False)) else 0,
+                "VFGC produced one large room without any virtual boundary; inspect sanitizer and terminal-wall evidence",
             ),
             self._overlay_record(
                 "pass2_extension_intersection_targets",

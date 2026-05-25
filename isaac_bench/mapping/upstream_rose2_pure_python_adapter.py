@@ -618,6 +618,13 @@ class UpstreamROSE2PurePythonSegmenter:
                 unknown_mask=unknown,
                 resolution_m=float(self.config.resolution_m),
                 config=vfgc_cfg,
+                navigation_free_mask=np.asarray(structural.get("navigation_free_room_domain", free), dtype=bool),
+                navigation_obstacle_mask=np.asarray(structural.get("nav_raw_obstacle", occupied), dtype=bool),
+                roomseg_ray_evidence={
+                    "terminal_wall_count": np.asarray(structural.get("roomseg_terminal_wall_count", np.zeros_like(occupied, dtype=np.uint16)), dtype=np.uint16),
+                    "terminal_wall_splat": np.asarray(structural.get("roomseg_terminal_wall_splat", np.zeros_like(occupied, dtype=bool)), dtype=bool),
+                    "ray_covered_count": np.asarray(structural.get("roomseg_ray_covered_count", np.zeros_like(occupied, dtype=np.uint16)), dtype=np.uint16),
+                },
             )
             if bool(vfgc_cfg.debug_dump):
                 dump = save_vertical_free_gap_closure_debug(

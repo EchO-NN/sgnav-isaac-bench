@@ -343,6 +343,7 @@ def run_online_rose_style_roomseg(
         unknown_mask=roomseg_unknown_clean,
         config=door_cfg,
         observed_mask=evidence.vertical_observed_raw,
+        resolution_m=float(config.resolution_m),
     )
     pre_extension_door_detected_map = np.asarray(door_result.detected_door_mask, dtype=bool)
     pre_extension_door_cut_mask = np.asarray(door_result.door_cut_mask, dtype=bool) & roomseg_free_clean

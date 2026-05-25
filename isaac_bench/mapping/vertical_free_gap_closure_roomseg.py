@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections import Counter, deque
 from dataclasses import dataclass, field
 import json
+import math
 import time
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -12,12 +13,17 @@ from scipy import ndimage
 from scipy.spatial import cKDTree
 
 from isaac_bench.mapping.door_pattern_detector import DoorPatternConfig, detect_pre_extension_doors
+from isaac_bench.mapping.roomseg_input_sanitizer import RoomsegInputSanitizerConfig, sanitize_roomseg_inputs
 from isaac_bench.mapping.rose2_source_form import ROSE2SourceResult
 
 
 VERTICAL_FREE_GAP_CLOSURE_BACKEND = "vertical_free_gap_closure_v1"
 VERTICAL_FREE_GAP_CLOSURE_ALGORITHM = "vertical_free_gap_closure_v1"
 VERTICAL_FREE_GAP_CLOSURE_CONTEXT = "vertical_free_gap_closure_v1_vlm"
+
+
+def _default_vfgc_door_pattern() -> DoorPatternConfig:
+    return DoorPatternConfig(partial_seed_enabled=True)
 
 
 @dataclass
@@ -55,8 +61,14 @@ class VFGCConfig:
     min_room_area_m2: float = 1.0
     small_component_area_m2: float = 0.6
     keep_closure_if_between_two_meaningful_rooms: bool = True
+    roomseg_input_sanitizer: RoomsegInputSanitizerConfig = field(default_factory=RoomsegInputSanitizerConfig)
     pre_extension_door_detection_enabled: bool = True
-    pre_extension_door_pattern: DoorPatternConfig = field(default_factory=DoorPatternConfig)
+    pre_extension_door_pattern: DoorPatternConfig = field(default_factory=_default_vfgc_door_pattern)
+    prevent_merge_collapse_across_strong_boundaries: bool = True
+    degenerate_large_free_min_cells: int = 200
+    use_terminal_wall_endpoints: bool = True
+    terminal_wall_endpoint_min_component_cells: int = 3
+    terminal_wall_endpoint_max_per_component: int = 32
     debug_dump: bool = False
     debug_dir: str = "debug/vertical_free_gap_closure"
 
@@ -69,10 +81,16 @@ class VFGCConfig:
         if "output_dir" in debug_layers:
             raw.setdefault("debug_dir", debug_layers.get("output_dir"))
         raw.update({key: value for key, value in overrides.items() if value is not None})
+        door_raw = raw.get("pre_extension_door_pattern") or raw.get("pre_extension_door_detection")
+        if isinstance(door_raw, DoorPatternConfig):
+            door_pattern = door_raw
+        else:
+            door_defaults = dict(_default_vfgc_door_pattern().__dict__)
+            door_defaults.update(dict(door_raw or {}))
+            door_pattern = DoorPatternConfig.from_mapping(door_defaults)
         nested = {
-            "pre_extension_door_pattern": DoorPatternConfig.from_mapping(
-                raw.get("pre_extension_door_pattern") or raw.get("pre_extension_door_detection")
-            )
+            "roomseg_input_sanitizer": RoomsegInputSanitizerConfig.from_mapping(raw.get("roomseg_input_sanitizer")),
+            "pre_extension_door_pattern": door_pattern,
         }
         fields = {name for name in cls.__dataclass_fields__}
         values = {key: raw[key] for key in raw if key in fields and key not in nested}
@@ -147,13 +165,25 @@ def run_vertical_free_gap_closure_roomseg(
     unknown_mask: np.ndarray,
     resolution_m: float,
     config: VFGCConfig | None = None,
+    navigation_free_mask: np.ndarray | None = None,
+    navigation_obstacle_mask: np.ndarray | None = None,
+    roomseg_ray_evidence: Mapping[str, np.ndarray] | None = None,
     debug_dir: str | Path | None = None,
     step_id: int = 0,
 ) -> VerticalFreeGapClosureResult:
     t0 = time.perf_counter()
     cfg = config or VFGCConfig(resolution_m=float(resolution_m))
     cfg.resolution_m = float(resolution_m)
-    free, wall, unknown, clean_debug = clean_vfgc_inputs(free_mask, wall_mask, unknown_mask, cfg)
+    san_free, san_wall, san_unknown, sanitizer_debug = sanitize_roomseg_inputs(
+        vertical_free_raw=free_mask,
+        wall_raw=wall_mask,
+        unknown_raw=unknown_mask,
+        navigation_free_mask=navigation_free_mask,
+        navigation_obstacle_mask=navigation_obstacle_mask,
+        roomseg_ray_evidence=roomseg_ray_evidence,
+        cfg=cfg.roomseg_input_sanitizer,
+    )
+    free, wall, unknown, clean_debug = clean_vfgc_inputs(san_free, san_wall, san_unknown, cfg)
     door_cfg = cfg.pre_extension_door_pattern
     if not bool(cfg.pre_extension_door_detection_enabled):
         door_cfg = DoorPatternConfig(enabled=False)
@@ -164,9 +194,12 @@ def run_vertical_free_gap_closure_roomseg(
         config=door_cfg,
         observed_mask=None,
         roi=None,
+        resolution_m=float(cfg.resolution_m),
     )
     pre_extension_door_detected_map = np.asarray(door_result.detected_door_mask, dtype=bool)
-    pre_extension_door_cut_mask = np.asarray(door_result.door_cut_mask, dtype=bool) & free
+    strict_pre_extension_door_cut_mask = np.asarray(getattr(door_result, "strict_door_cut_mask", door_result.door_cut_mask), dtype=bool) & free
+    partial_door_extension_cut_mask = np.asarray(getattr(door_result, "partial_door_extension_cut_mask", np.zeros_like(free)), dtype=bool) & free
+    pre_extension_door_cut_mask = (strict_pre_extension_door_cut_mask | partial_door_extension_cut_mask) & free
     pre_extension_door_pattern_type_map = np.asarray(door_result.pattern_type_map, dtype=np.uint8)
     pre_extension_partition_free = free & ~pre_extension_door_cut_mask
     pre_extension_room_label_map, pre_extension_room_count_before_merge = ndimage.label(
@@ -205,15 +238,25 @@ def run_vertical_free_gap_closure_roomseg(
     provisional, nms_rejected = nms_closure_candidates(provisional, cfg)
     rejected.extend(nms_rejected)
     provisional_boundary = rasterize_closures(provisional, free.shape, cfg, include_rejected=False)
-    provisional_boundary_with_pre_doors = provisional_boundary | pre_extension_door_cut_mask
-    labels0, _ = ndimage.label(free & ~provisional_boundary_with_pre_doors, structure=_conn(8))
+    labels0, _ = ndimage.label(free & ~provisional_boundary, structure=_conn(8))
     accepted, topology_rejected, topology_debug = topology_prune_closures(provisional, labels0, free, cfg)
     rejected.extend(topology_rejected)
-    original_step1_step2_virtual_boundary = rasterize_closures(accepted, free.shape, cfg, include_rejected=False)
-    virtual_boundary = (pre_extension_door_cut_mask | original_step1_step2_virtual_boundary) & free
+    original_step1_step2_virtual_boundary = rasterize_closures(accepted, free.shape, cfg, include_rejected=False) & free
+    virtual_boundary = (original_step1_step2_virtual_boundary | strict_pre_extension_door_cut_mask | partial_door_extension_cut_mask) & free
     partition_free = free & ~virtual_boundary
-    labels, num_before_small_merge = ndimage.label(partition_free, structure=_conn(8))
-    labels = merge_small_components(labels.astype(np.int32), free, virtual_boundary, cfg)
+    raw_free_labels, raw_free_component_count = ndimage.label(free, structure=_conn(8))
+    _ = raw_free_labels
+    labels_before_merge, num_before_small_merge = ndimage.label(partition_free, structure=_conn(8))
+    labels = merge_small_components(labels_before_merge.astype(np.int32), free, virtual_boundary, cfg)
+    small_merge_collapsed_all_boundaries = bool(
+        np.count_nonzero(virtual_boundary) > 0
+        and _label_count(labels_before_merge) >= 2
+        and _label_count(labels) <= 1
+    )
+    if small_merge_collapsed_all_boundaries and bool(cfg.prevent_merge_collapse_across_strong_boundaries):
+        labels = _relabel_compact(labels_before_merge.astype(np.int32))
+        labels[~free] = 0
+        labels[virtual_boundary] = 0
     labels = _relabel_compact(labels)
     labels[unknown] = 0
     labels[~free] = 0
@@ -227,8 +270,15 @@ def run_vertical_free_gap_closure_roomseg(
         endpoint_map[int(ep.rc[0]), int(ep.rc[1])] = int(ep.id)
     accepted_count = int(len(accepted))
     rejected_reason_counts = dict(Counter(str(c.reject_reason or "accepted") for c in rejected))
-    labels_outside_free = int(np.count_nonzero((labels > 0) & ~np.asarray(free_mask, dtype=bool)))
-    labels_in_unknown = int(np.count_nonzero((labels > 0) & np.asarray(unknown_mask, dtype=bool)))
+    partition_component_count_after_small_merge = int(_label_count(labels))
+    virtual_boundary_cells = int(np.count_nonzero(virtual_boundary))
+    segmentation_degenerate = bool(
+        int(partition_component_count_after_small_merge) <= 1
+        and int(np.count_nonzero(free)) >= int(cfg.degenerate_large_free_min_cells)
+        and virtual_boundary_cells == 0
+    )
+    labels_outside_free = int(np.count_nonzero((labels > 0) & ~free))
+    labels_in_unknown = int(np.count_nonzero((labels > 0) & unknown))
     debug = {
         "backend": VERTICAL_FREE_GAP_CLOSURE_BACKEND,
         "actual_backend": VERTICAL_FREE_GAP_CLOSURE_BACKEND,
@@ -253,9 +303,26 @@ def run_vertical_free_gap_closure_roomseg(
         "free_cells": int(np.count_nonzero(free)),
         "wall_cells": int(np.count_nonzero(wall)),
         "unknown_cells": int(np.count_nonzero(unknown)),
+        "raw_free_component_count": int(raw_free_component_count),
+        "partition_component_count_before_small_merge": int(num_before_small_merge),
+        "partition_component_count_after_small_merge": int(partition_component_count_after_small_merge),
+        "virtual_boundary_cells": int(virtual_boundary_cells),
+        "original_step1_step2_virtual_boundary_cells": int(np.count_nonzero(original_step1_step2_virtual_boundary)),
+        "strict_pre_door_cut_cells": int(np.count_nonzero(strict_pre_extension_door_cut_mask)),
+        "partial_door_extension_cut_cells": int(np.count_nonzero(partial_door_extension_cut_mask)),
+        "segmentation_degenerate_one_room": bool(segmentation_degenerate),
+        "small_merge_collapsed_all_boundaries": bool(small_merge_collapsed_all_boundaries),
+        "original_step1_step2_topology_prune_uses_pre_doors": False,
+        "original_step1_step2_virtual_boundary_map": original_step1_step2_virtual_boundary,
+        "final_virtual_boundary_includes_pre_doors": True,
         "pre_extension_door_detected_map": pre_extension_door_detected_map,
         "pre_extension_door_cut_mask": pre_extension_door_cut_mask,
         "pre_extension_door_pattern_type_map": pre_extension_door_pattern_type_map,
+        "strict_pre_extension_door_cut_mask": strict_pre_extension_door_cut_mask,
+        "partial_door_seed_mask": np.asarray(getattr(door_result, "partial_door_seed_mask", np.zeros_like(free)), dtype=bool),
+        "partial_door_line_mask": np.asarray(getattr(door_result, "partial_door_line_mask", np.zeros_like(free)), dtype=bool),
+        "partial_door_extension_cut_mask": partial_door_extension_cut_mask,
+        "rejected_door_extension_mask": np.asarray(getattr(door_result, "rejected_door_extension_mask", np.zeros_like(free)), dtype=bool),
         "pre_extension_partition_free": pre_extension_partition_free,
         "pre_extension_room_label_map": pre_extension_room_label_map,
         "pre_extension_room_count_before_small_merge": int(pre_extension_room_count_before_merge),
@@ -282,6 +349,17 @@ def run_vertical_free_gap_closure_roomseg(
         "final_room_count": int(_label_count(labels)),
         "accepted_closure_count": accepted_count,
         "rejection_reasons": rejected_reason_counts,
+        "corridor_diagnostics": {
+            "wall_cells_after_sanitizer": int(np.count_nonzero(wall)),
+            "terminal_wall_splat_cells": int(sanitizer_debug.get("terminal_wall_splat_cells", 0)),
+            "wall_boundary_cells": int(np.count_nonzero(wall_boundary)),
+            "wall_skeleton_cells": int(np.count_nonzero(wall_skeleton)),
+            "endpoint_count": int(len(endpoints)),
+            "raw_candidate_count": int(len(raw_candidates)),
+            "provisional_candidate_count": int(len(provisional)),
+            "accepted_original_step1_step2_count": int(len(accepted)),
+            "rejected_reason_counts": rejected_reason_counts,
+        },
         "labels_outside_vertical_free_cells": labels_outside_free,
         "labels_in_unknown_cells": labels_in_unknown,
         "room_stats": room_stats,
@@ -290,6 +368,9 @@ def run_vertical_free_gap_closure_roomseg(
         "input_free": np.asarray(free_mask, dtype=bool),
         "input_wall": np.asarray(wall_mask, dtype=bool),
         "input_unknown": np.asarray(unknown_mask, dtype=bool),
+        "sanitized_free": san_free,
+        "sanitized_wall": san_wall,
+        "sanitized_unknown": san_unknown,
         "clean_free": free,
         "clean_wall": wall,
         "wall_boundary_map": wall_boundary,
@@ -304,6 +385,7 @@ def run_vertical_free_gap_closure_roomseg(
         "final_room_label_map": labels,
         "room_label_map_visual": visual_labels,
     }
+    debug.update(sanitizer_debug)
     debug.update(clean_debug)
     debug.update(endpoint_debug)
     debug.update(gen_debug)
@@ -737,6 +819,26 @@ def save_vertical_free_gap_closure_debug(
         ),
         rejected_closure_map=np.asarray(result.rejected_closure_map, dtype=np.uint8),
         virtual_boundary_map=np.asarray(result.virtual_boundary_map, dtype=np.uint8),
+        vertical_free_clipped_outside_navigation_map=np.asarray(
+            d.get("vertical_free_clipped_outside_navigation_map", _zero_bool),
+            dtype=np.uint8,
+        ),
+        free_wall_conflict_map_before_sanitize=np.asarray(
+            d.get("free_wall_conflict_map_before_sanitize", _zero_bool),
+            dtype=np.uint8,
+        ),
+        roomseg_sanitized_free=np.asarray(
+            d.get("roomseg_sanitized_free", d.get("sanitized_free", _zero_bool)),
+            dtype=np.uint8,
+        ),
+        roomseg_sanitized_wall=np.asarray(
+            d.get("roomseg_sanitized_wall", d.get("sanitized_wall", _zero_bool)),
+            dtype=np.uint8,
+        ),
+        terminal_wall_roomseg_mask=np.asarray(
+            d.get("terminal_wall_roomseg_mask", _zero_bool),
+            dtype=np.uint8,
+        ),
         pre_extension_door_detected_map=np.asarray(
             d.get("pre_extension_door_detected_map", _zero_bool),
             dtype=np.uint8,
@@ -747,6 +849,30 @@ def save_vertical_free_gap_closure_debug(
         ),
         pre_extension_door_pattern_type_map=np.asarray(
             d.get("pre_extension_door_pattern_type_map", _zero_bool),
+            dtype=np.uint8,
+        ),
+        strict_pre_extension_door_cut_mask=np.asarray(
+            d.get("strict_pre_extension_door_cut_mask", _zero_bool),
+            dtype=np.uint8,
+        ),
+        partial_door_seed_mask=np.asarray(
+            d.get("partial_door_seed_mask", _zero_bool),
+            dtype=np.uint8,
+        ),
+        partial_door_line_mask=np.asarray(
+            d.get("partial_door_line_mask", _zero_bool),
+            dtype=np.uint8,
+        ),
+        partial_door_extension_cut_mask=np.asarray(
+            d.get("partial_door_extension_cut_mask", _zero_bool),
+            dtype=np.uint8,
+        ),
+        rejected_door_extension_mask=np.asarray(
+            d.get("rejected_door_extension_mask", _zero_bool),
+            dtype=np.uint8,
+        ),
+        original_step1_step2_virtual_boundary_map=np.asarray(
+            d.get("original_step1_step2_virtual_boundary_map", _zero_bool),
             dtype=np.uint8,
         ),
         pre_extension_partition_free=np.asarray(
@@ -779,13 +905,17 @@ def save_vertical_free_gap_closure_debug(
             _bool_rgb(result.candidate_closure_map, (0, 220, 255)),
             _bool_rgb(result.rejected_closure_map, (255, 0, 220)),
             _bool_rgb(result.accepted_closure_map, (255, 40, 40)),
+            _bool_rgb(np.asarray(d.get("partial_door_extension_cut_mask", _zero_bool), dtype=bool), (255, 210, 60)),
+            _bool_rgb(np.asarray(d.get("rejected_door_extension_mask", _zero_bool), dtype=bool), (255, 60, 180)),
             _label_rgb(result.room_label_map),
             _vfgc_overlay_rgb(result),
         ]
         h, w = panels[0].shape[:2]
-        canvas = Image.new("RGB", (w * 5, h * 2), (0, 0, 0))
+        cols = 5
+        rows = int(math.ceil(len(panels) / float(cols)))
+        canvas = Image.new("RGB", (w * cols, h * rows), (0, 0, 0))
         for idx, panel in enumerate(panels):
-            canvas.paste(Image.fromarray(panel, mode="RGB"), ((idx % 5) * w, (idx // 5) * h))
+            canvas.paste(Image.fromarray(panel, mode="RGB"), ((idx % cols) * w, (idx // cols) * h))
         draw = ImageDraw.Draw(canvas)
         draw.text((4, 4), "VFGC RoomSeg layers", fill=(255, 255, 255))
         canvas.save(layers_path)
