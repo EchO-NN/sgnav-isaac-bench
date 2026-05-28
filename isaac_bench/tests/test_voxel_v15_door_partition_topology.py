@@ -32,7 +32,7 @@ def _seed_result(shape: tuple[int, int], cells: list[tuple[int, int]]) -> VoxelD
 
 def test_door_visual_line_does_not_become_partition_without_topology_gain() -> None:
     shape = (20, 28)
-    seed = _seed_result(shape, [(10, 13), (10, 14)])
+    seed = _seed_result(shape, [(10, 13), (10, 14), (10, 15)])
     visual_free = np.zeros(shape, dtype=bool)
     visual_free[10, 6:22] = True
     partition_free = np.zeros(shape, dtype=bool)
@@ -60,7 +60,7 @@ def test_door_visual_line_does_not_become_partition_without_topology_gain() -> N
 
 def test_valid_door_cut_must_split_partition_free() -> None:
     shape = (18, 26)
-    seed = _seed_result(shape, [(8, 12), (9, 12)])
+    seed = _seed_result(shape, [(8, 12), (9, 12), (10, 12)])
     free = np.zeros(shape, dtype=bool)
     free[4:14, 5:21] = True
     anchors = np.zeros(shape, dtype=bool)

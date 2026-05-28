@@ -50,6 +50,9 @@ def test_one_seed_one_wall_completion_generates_partition_cut() -> None:
             wall_anchor_radius_cells=0,
             seed_cluster_morph_close_radius_cells=0,
             partition_topology_enabled=False,
+            one_seed_one_wall_partition_enabled=True,
+            min_seed_cells_for_partition_completion=1,
+            min_seed_overlap_cells_for_partition=1,
         ),
         real_wall_barrier_map=anchors,
     )
@@ -90,7 +93,7 @@ def test_seed_pair_bridge_supports_two_offset_seed_blobs_without_wall_anchor() -
 
 def test_topology_no_gain_is_warning_by_default_for_geometry_valid_door_cut() -> None:
     shape = (20, 28)
-    seed = _seed_result(shape, [[(10, 13), (10, 14)]])
+    seed = _seed_result(shape, [[(10, 13), (10, 14), (10, 15)]])
     visual_free = np.zeros(shape, dtype=bool)
     visual_free[10, 6:22] = True
     anchors = np.zeros(shape, dtype=bool)

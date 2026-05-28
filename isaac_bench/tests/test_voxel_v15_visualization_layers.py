@@ -51,7 +51,7 @@ def test_v15_voxel_overlay_colors_for_seed_door_and_step2() -> None:
     layers = _render_layers(debug, shape)
 
     assert layers["voxel_door_seed"]["color"] == [0, 80, 255]
-    assert layers["voxel_door_centerline"]["color"] == [0, 255, 70]
+    assert layers["voxel_door_centerline"]["color"] == [80, 255, 80]
     assert layers["voxel_step2_extension"]["color"] == [220, 60, 255]
 
 
@@ -66,6 +66,7 @@ def test_v15_visual_only_door_is_diagnostic_not_fake_cut() -> None:
     assert layers["voxel_door_cut"]["primitive_count"] == 0
 
     debug["voxel_show_wall_diagnostics"] = True
+    debug["voxel_show_door_visual_only_candidates"] = True
     debug["voxel_door_visual_only_mask"][1, 2] = True
     layers = _render_layers(debug, shape)
     assert layers["voxel_door_visual_only"]["enabled"] is True

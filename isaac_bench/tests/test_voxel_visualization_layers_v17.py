@@ -24,6 +24,8 @@ def test_v17_voxel_visualization_exposes_unknown_gate_stable_and_warning_layers(
     debug: dict[str, object] = {
         "backend": "voxel_occupancy_door_wall_v9",
         "voxel_show_wall_diagnostics": True,
+        "voxel_show_wall_support_rejected_unknown": True,
+        "voxel_show_door_visual_only_candidates": True,
         "voxel_vertical_free_xy": np.ones(shape, dtype=bool),
         "voxel_wall_xy": zero.copy(),
         "voxel_display_wall_xy": zero.copy(),

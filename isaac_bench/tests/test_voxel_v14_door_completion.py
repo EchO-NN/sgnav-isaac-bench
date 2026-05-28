@@ -52,7 +52,7 @@ def test_same_physical_door_seed_fragments_merge_before_completion() -> None:
 
 def test_door_visual_line_drawn_even_when_partition_cut_empty() -> None:
     shape = (20, 28)
-    seed = _seed_result(shape, [[(10, 13), (10, 14)]])
+    seed = _seed_result(shape, [[(10, 13), (10, 14), (10, 15)]])
     visual_free = np.zeros(shape, dtype=bool)
     visual_free[10, 6:22] = True
     partition_free = np.zeros(shape, dtype=bool)
@@ -82,7 +82,7 @@ def test_door_visual_line_drawn_even_when_partition_cut_empty() -> None:
 
 def test_door_unknown_ratio_does_not_count_real_wall_as_unknown() -> None:
     shape = (20, 28)
-    seed = _seed_result(shape, [[(10, 13), (10, 14)]])
+    seed = _seed_result(shape, [[(10, 13), (10, 14), (10, 15)]])
     free = np.zeros(shape, dtype=bool)
     free[10, 7:21] = True
     anchors = np.zeros(shape, dtype=bool)

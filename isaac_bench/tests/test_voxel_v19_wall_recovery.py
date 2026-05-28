@@ -8,6 +8,7 @@ from isaac_bench.mapping.voxel_occupancy_door_wall_roomseg import (
     run_voxel_occupancy_door_wall_roomseg,
 )
 from isaac_bench.mapping.voxel_occupancy_grid import (
+    VOXEL_CONFLICT,
     VOXEL_FREE,
     VOXEL_OCCUPIED,
     VoxelOccupancyGrid3D,
@@ -46,6 +47,7 @@ def test_sparse_occupied_support_recovers_projected_display_wall() -> None:
     grid = _grid()
     shape = grid.shape
     grid.state[4:10, 12, 6:26] = int(VOXEL_OCCUPIED)
+    grid.state[10:15, 12, 6:26] = int(VOXEL_CONFLICT)
     grid.state[1:4, 7:12, 6:26] = int(VOXEL_FREE)
 
     nav_free = np.zeros(shape, dtype=bool)
@@ -64,10 +66,10 @@ def test_sparse_occupied_support_recovers_projected_display_wall() -> None:
         occupancy_map=np.zeros(shape, dtype=bool),
         observed_free_mask=nav_free,
         obstacle_mask=np.zeros(shape, dtype=bool),
-        unknown_mask=~nav_free,
+        unknown_mask=np.zeros(shape, dtype=bool),
         voxel_grid=grid,
         navigation_free_mask=nav_free,
-        navigation_obstacle_mask=~nav_free,
+        navigation_obstacle_mask=np.zeros(shape, dtype=bool),
         resolution_m=0.10,
         config=cfg,
     )

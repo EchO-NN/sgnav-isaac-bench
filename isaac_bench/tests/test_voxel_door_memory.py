@@ -31,7 +31,7 @@ def _seed_result(shape: tuple[int, int], cells: list[tuple[int, int]]) -> VoxelD
 
 def test_stable_door_memory_keeps_last_valid_cut_after_candidate_disappears() -> None:
     shape = (18, 26)
-    seed = _seed_result(shape, [(8, 12), (9, 12)])
+    seed = _seed_result(shape, [(8, 12), (9, 12), (10, 12)])
     free = np.zeros(shape, dtype=bool)
     free[4:14, 5:21] = True
     anchors = np.zeros(shape, dtype=bool)

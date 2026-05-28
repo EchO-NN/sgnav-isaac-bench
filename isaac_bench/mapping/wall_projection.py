@@ -21,8 +21,12 @@ class WallProjectionConfig:
     min_projected_support_ratio: float = 0.25
     anchor_min_projected_line_length_m: float = 0.15
     anchor_min_projected_support_ratio: float = 0.15
-    step2_source_min_projected_line_length_m: float = 0.20
-    step2_source_min_projected_support_ratio: float = 0.18
+    step2_source_min_projected_line_length_m: float = 0.60
+    step2_source_min_projected_support_ratio: float = 0.32
+    step2_source_min_support_cells: int = 6
+    step2_source_max_unknown_ratio_on_line: float = 0.35
+    step2_source_forbid_frontier_unknown_band: bool = True
+    step2_source_forbid_door_seed_band: bool = True
     max_fill_gap_m: float = 0.25
     max_free_gap_ratio: float = 0.20
     separate_parallel_wall_min_cells: int = 4
@@ -38,6 +42,8 @@ class WallProjectionConfig:
     side_band_cells: int = 3
     side_min_free_ratio: float = 0.15
     side_min_nonfree_ratio: float = 0.15
+    side_min_structural_ratio: float = 0.08
+    side_unknown_ratio_max_for_structural: float = 0.65
     reject_if_both_sides_free_ratio_gt: float = 0.55
     reject_if_both_sides_unknown_ratio_gt: float = 0.85
     reject_if_no_free_side: bool = True
@@ -227,6 +233,10 @@ def project_wall_evidence_to_axis_accumulator_lines(
     support_weight: np.ndarray | None = None,
     vertical_free_map: np.ndarray,
     unknown_map: np.ndarray,
+    unknown_ratio_map: np.ndarray | None = None,
+    navigation_unknown_map: np.ndarray | None = None,
+    frontier_unknown_band: np.ndarray | None = None,
+    structural_side_support_map: np.ndarray | None = None,
     door_forbidden_mask: np.ndarray | None,
     resolution_m: float,
     config: WallProjectionConfig | Mapping[str, object] | None = None,
@@ -238,6 +248,17 @@ def project_wall_evidence_to_axis_accumulator_lines(
     unknown = np.asarray(unknown_map, dtype=bool)
     if support.shape != free.shape or support.shape != unknown.shape:
         raise ValueError("support_map, vertical_free_map, and unknown_map must share HxW shape")
+    if unknown_ratio_map is None:
+        unknown_ratio = unknown.astype(np.float32)
+    else:
+        unknown_ratio = np.asarray(unknown_ratio_map, dtype=np.float32)
+        if unknown_ratio.shape != support.shape:
+            raise ValueError("unknown_ratio_map must match support_map shape")
+    nav_unknown = np.zeros(support.shape, dtype=bool) if navigation_unknown_map is None else np.asarray(navigation_unknown_map, dtype=bool)
+    frontier_band = np.zeros(support.shape, dtype=bool) if frontier_unknown_band is None else np.asarray(frontier_unknown_band, dtype=bool)
+    structural_side = support.copy() if structural_side_support_map is None else np.asarray(structural_side_support_map, dtype=bool)
+    if nav_unknown.shape != support.shape or frontier_band.shape != support.shape or structural_side.shape != support.shape:
+        raise ValueError("navigation_unknown_map, frontier_unknown_band, and structural_side_support_map must match support_map shape")
     if support_weight is None:
         weight = support.astype(np.float32)
     else:
@@ -263,7 +284,9 @@ def project_wall_evidence_to_axis_accumulator_lines(
     accepted_support = np.zeros_like(support, dtype=bool)
     rejected_support = np.zeros_like(support, dtype=bool)
     reject_reason_map = np.zeros(support.shape, dtype=np.uint8)
+    step2_reject_reason_map = np.zeros(support.shape, dtype=np.uint8)
     reject_counts: Counter[str] = Counter()
+    step2_reject_counts: Counter[str] = Counter()
     display_lines: list[ProjectedWallLine] = []
     anchor_lines: list[ProjectedWallLine] = []
     step2_lines: list[ProjectedWallLine] = []
@@ -291,13 +314,13 @@ def project_wall_evidence_to_axis_accumulator_lines(
                 projected_cells = int(np.count_nonzero(line_mask))
                 support_ratio = float(support_weight_sum / float(max(1, projected_cells)))
                 length_m = float(projected_cells) * float(resolution_m)
-                side_metrics = _validate_projected_wall_sides(line_mask, axis, free, unknown, cfg)
+                side_metrics = _validate_projected_wall_sides(line_mask, axis, free, unknown, cfg, structural_side_support_map=structural_side)
                 reject_reason = _axis_line_reject_reason(
                     length_m=length_m,
                     support_ratio=support_ratio,
                     side_metrics=side_metrics,
-                    min_length_m=float(cfg.step2_source_min_projected_line_length_m),
-                    min_support_ratio=float(cfg.step2_source_min_projected_support_ratio),
+                    min_length_m=float(cfg.anchor_min_projected_line_length_m),
+                    min_support_ratio=float(cfg.anchor_min_projected_support_ratio),
                 )
                 line = ProjectedWallLine(
                     line_id=int(line_id),
@@ -328,9 +351,24 @@ def project_wall_evidence_to_axis_accumulator_lines(
                     line_id += 1
                     continue
                 accepted_support |= line_support
-                if length_m + 1e-9 >= float(cfg.step2_source_min_projected_line_length_m) and support_ratio + 1e-9 >= float(cfg.step2_source_min_projected_support_ratio):
+                step2_ok, step2_reject_reason, step2_debug = validate_projected_line_for_step2_source(
+                    line,
+                    support_map=support,
+                    unknown_ratio=unknown_ratio,
+                    navigation_unknown_mask=nav_unknown,
+                    frontier_unknown_band=frontier_band,
+                    door_seed_mask=door_forbidden,
+                    resolution_m=float(resolution_m),
+                    cfg=cfg,
+                    line_mask=line_mask,
+                )
+                line.debug["step2_source_validation"] = step2_debug
+                if step2_ok:
                     step2_source |= line_mask
                     step2_lines.append(line)
+                elif step2_reject_reason is not None:
+                    step2_reject_counts[str(step2_reject_reason)] += 1
+                    step2_reject_reason_map[line_mask] = _projection_reject_code(str(step2_reject_reason))
                 if length_m + 1e-9 >= float(cfg.anchor_min_projected_line_length_m) and support_ratio + 1e-9 >= float(cfg.anchor_min_projected_support_ratio):
                     anchor |= line_mask
                     anchor_lines.append(line)
@@ -362,6 +400,8 @@ def project_wall_evidence_to_axis_accumulator_lines(
             "voxel_wall_projection_accumulator_h_votes": h_votes.astype(np.float32),
             "voxel_wall_projection_accumulator_v_votes": v_votes.astype(np.float32),
             "voxel_wall_projection_reject_reason_map": reject_reason_map.astype(np.uint8),
+            "voxel_wall_projection_step2_source_reject_reason_map": step2_reject_reason_map.astype(np.uint8),
+            "voxel_wall_projection_step2_source_reject_reason_counts": dict(step2_reject_counts),
         }
     )
     return ProjectedWallResult(
@@ -479,8 +519,74 @@ def _projection_reject_code(reason: str) -> int:
         "projected_wall_both_sides_unknown_frontier_like": 6,
         "projected_wall_no_free_side": 7,
         "projected_wall_no_nonfree_side": 8,
+        "projected_wall_side_is_unknown_frontier": 9,
+        "projected_wall_unknown_boundary_not_structural": 10,
+        "reject_step2_source_too_short": 21,
+        "reject_step2_source_support_ratio_low": 22,
+        "reject_step2_source_support_cells_low": 23,
+        "reject_step2_source_unknown_ratio_high": 24,
+        "reject_step2_source_frontier_unknown_edge": 25,
+        "reject_step2_source_door_frame_duplicate": 26,
     }
     return int(codes.get(str(reason), 255))
+
+
+def validate_projected_line_for_step2_source(
+    line: ProjectedWallLine,
+    *,
+    support_map: np.ndarray,
+    unknown_ratio: np.ndarray,
+    navigation_unknown_mask: np.ndarray,
+    frontier_unknown_band: np.ndarray,
+    door_seed_mask: np.ndarray,
+    resolution_m: float,
+    cfg: WallProjectionConfig,
+    line_mask: np.ndarray | None = None,
+) -> tuple[bool, str | None, dict[str, Any]]:
+    support = np.asarray(support_map, dtype=bool)
+    unknown_ratio_map = np.asarray(unknown_ratio, dtype=np.float32)
+    nav_unknown = np.asarray(navigation_unknown_mask, dtype=bool)
+    frontier_band = np.asarray(frontier_unknown_band, dtype=bool)
+    door_seed = np.asarray(door_seed_mask, dtype=bool)
+    if line_mask is None:
+        mask = _projected_line_mask(line, support.shape)
+    else:
+        mask = np.asarray(line_mask, dtype=bool)
+    if mask.shape != support.shape or unknown_ratio_map.shape != support.shape or nav_unknown.shape != support.shape or frontier_band.shape != support.shape or door_seed.shape != support.shape:
+        raise ValueError("projected line validation masks must share HxW shape")
+    projected_cells = int(np.count_nonzero(mask))
+    support_cells = int(np.count_nonzero(mask & support))
+    length_m = float(projected_cells) * float(resolution_m)
+    unknown_ratio_on_line = float(np.mean(unknown_ratio_map[mask])) if projected_cells > 0 else 1.0
+    overlaps_frontier = bool(np.any(mask & (frontier_band | nav_unknown)))
+    overlaps_door = bool(np.any(mask & door_seed))
+    debug = {
+        "step2_source_length_m": float(length_m),
+        "step2_source_projected_cells": int(projected_cells),
+        "step2_source_support_cells": int(support_cells),
+        "step2_source_support_ratio": float(line.support_ratio),
+        "step2_source_unknown_ratio_on_line": float(unknown_ratio_on_line),
+        "step2_source_overlaps_frontier_unknown_band": bool(overlaps_frontier),
+        "step2_source_overlaps_door_seed_band": bool(overlaps_door),
+    }
+    if length_m + 1e-9 < float(cfg.step2_source_min_projected_line_length_m) or projected_cells < 8:
+        return False, "reject_step2_source_too_short", debug
+    if float(line.support_ratio) + 1e-9 < float(cfg.step2_source_min_projected_support_ratio):
+        return False, "reject_step2_source_support_ratio_low", debug
+    if support_cells < max(1, int(getattr(cfg, "step2_source_min_support_cells", 6))):
+        return False, "reject_step2_source_support_cells_low", debug
+    if unknown_ratio_on_line > float(getattr(cfg, "step2_source_max_unknown_ratio_on_line", 0.35)) + 1e-9:
+        return False, "reject_step2_source_unknown_ratio_high", debug
+    if bool(getattr(cfg, "step2_source_forbid_frontier_unknown_band", True)) and overlaps_frontier:
+        return False, "reject_step2_source_frontier_unknown_edge", debug
+    if bool(getattr(cfg, "step2_source_forbid_door_seed_band", True)) and overlaps_door:
+        return False, "reject_step2_source_door_frame_duplicate", debug
+    return True, None, debug
+
+
+def _projected_line_mask(line: ProjectedWallLine, shape: tuple[int, int]) -> np.ndarray:
+    coords = np.arange(int(line.start), int(line.end) + 1, dtype=np.int32)
+    return _axis_line_mask(str(line.axis), int(line.line), coords, shape)
 
 
 def _axis_accumulator_debug(
@@ -770,6 +876,7 @@ def _validate_projected_wall_sides(
     free: np.ndarray,
     unknown: np.ndarray,
     cfg: WallProjectionConfig,
+    structural_side_support_map: np.ndarray | None = None,
 ) -> dict[str, Any]:
     if not bool(cfg.side_validation_enabled):
         return {"structural_side_score": 1.0, "reject_reason": None}
@@ -777,30 +884,40 @@ def _validate_projected_wall_sides(
     if int(np.count_nonzero(line)) < int(cfg.min_line_observed_support_cells):
         return {"structural_side_score": 0.0, "reject_reason": "projected_wall_side_support_too_weak"}
     side_a, side_b = _line_side_bands(line, str(axis), int(cfg.side_band_cells))
+    structural = np.zeros_like(line, dtype=bool) if structural_side_support_map is None else np.asarray(structural_side_support_map, dtype=bool)
+    if structural.shape != line.shape:
+        raise ValueError("structural_side_support_map must match projected wall mask shape")
+    structural = ndimage.binary_dilation(structural | line, structure=conn(8)).astype(bool)
 
-    def ratios(side: np.ndarray) -> tuple[float, float, float]:
+    def ratios(side: np.ndarray) -> tuple[float, float, float, float]:
         count = int(np.count_nonzero(side))
         if count <= 0:
-            return 0.0, 1.0, 1.0
+            return 0.0, 1.0, 0.0, 0.0
         free_ratio = float(np.count_nonzero(side & free)) / float(count)
         unknown_ratio = float(np.count_nonzero(side & unknown)) / float(count)
-        nonfree_ratio = float(np.count_nonzero(side & ~free)) / float(count)
-        return free_ratio, unknown_ratio, nonfree_ratio
+        nonfree_ratio = float(np.count_nonzero(side & ~free & ~unknown)) / float(count)
+        structural_ratio = float(np.count_nonzero(side & structural)) / float(count)
+        return free_ratio, unknown_ratio, nonfree_ratio, structural_ratio
 
-    free_a, unknown_a, nonfree_a = ratios(side_a)
-    free_b, unknown_b, nonfree_b = ratios(side_b)
+    free_a, unknown_a, nonfree_a, structural_a = ratios(side_a)
+    free_b, unknown_b, nonfree_b, structural_b = ratios(side_b)
     has_free_side = max(free_a, free_b) >= float(cfg.side_min_free_ratio)
     has_nonfree_side = max(nonfree_a, nonfree_b) >= float(cfg.side_min_nonfree_ratio)
+    has_structural_side = max(structural_a, structural_b) >= float(getattr(cfg, "side_min_structural_ratio", 0.08))
     reject_reason = None
     if free_a > float(cfg.reject_if_both_sides_free_ratio_gt) and free_b > float(cfg.reject_if_both_sides_free_ratio_gt):
         reject_reason = "projected_wall_both_sides_free_furniture_like"
     elif unknown_a > float(cfg.reject_if_both_sides_unknown_ratio_gt) and unknown_b > float(cfg.reject_if_both_sides_unknown_ratio_gt):
         reject_reason = "projected_wall_both_sides_unknown_frontier_like"
+    elif max(unknown_a, unknown_b) > float(getattr(cfg, "side_unknown_ratio_max_for_structural", 0.65)) and not has_structural_side:
+        reject_reason = "projected_wall_unknown_boundary_not_structural"
+    elif max(unknown_a, unknown_b) > float(getattr(cfg, "side_unknown_ratio_max_for_structural", 0.65)) and min(unknown_a, unknown_b) > 0.20:
+        reject_reason = "projected_wall_side_is_unknown_frontier"
     elif bool(cfg.reject_if_no_free_side) and not has_free_side:
         reject_reason = "projected_wall_no_free_side"
-    elif bool(cfg.reject_if_no_nonfree_side) and not has_nonfree_side:
+    elif bool(cfg.reject_if_no_nonfree_side) and not (has_nonfree_side or has_structural_side):
         reject_reason = "projected_wall_no_nonfree_side"
-    structural_score = max(free_a, free_b) * max(nonfree_a, nonfree_b) * (1.0 - min(unknown_a, unknown_b))
+    structural_score = max(free_a, free_b) * max(nonfree_a, nonfree_b, structural_a, structural_b) * (1.0 - min(unknown_a, unknown_b))
     return {
         "side_free_ratio_a": float(free_a),
         "side_free_ratio_b": float(free_b),
@@ -808,6 +925,8 @@ def _validate_projected_wall_sides(
         "side_unknown_ratio_b": float(unknown_b),
         "side_nonfree_ratio_a": float(nonfree_a),
         "side_nonfree_ratio_b": float(nonfree_b),
+        "side_structural_ratio_a": float(structural_a),
+        "side_structural_ratio_b": float(structural_b),
         "structural_side_score": float(structural_score),
         "reject_reason": reject_reason,
     }

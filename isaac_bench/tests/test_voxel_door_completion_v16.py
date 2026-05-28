@@ -48,7 +48,7 @@ def test_v16_seed_cluster_without_wall_still_outputs_extension_attempts() -> Non
 
 def test_v16_two_wall_seed_has_visual_and_partition_cut_maps() -> None:
     shape = (18, 26)
-    seed = _seed_result(shape, [[(8, 12), (9, 12)]])
+    seed = _seed_result(shape, [[(8, 12), (9, 12), (10, 12)]])
     free = np.zeros(shape, dtype=bool)
     free[4:14, 5:21] = True
     anchors = np.zeros(shape, dtype=bool)
@@ -76,7 +76,7 @@ def test_v16_two_wall_seed_has_visual_and_partition_cut_maps() -> None:
 
 def test_v16_visual_only_door_keeps_partition_reject_auditable() -> None:
     shape = (20, 28)
-    seed = _seed_result(shape, [[(10, 13), (10, 14)]])
+    seed = _seed_result(shape, [[(10, 13), (10, 14), (10, 15)]])
     visual_free = np.zeros(shape, dtype=bool)
     visual_free[10, 6:22] = True
     anchors = np.zeros(shape, dtype=bool)
@@ -122,7 +122,12 @@ def test_v16_split_seed_clusters_do_not_hard_reject_visual_crossing_other_seed()
         anchor_wall_map=anchors,
         unknown_map=np.zeros(shape, dtype=bool),
         resolution_m=0.10,
-        config=VoxelDoorDetectorConfig(wall_anchor_radius_cells=0, seed_cluster_merge_distance_cells=0, partition_topology_enabled=False),
+        config=VoxelDoorDetectorConfig(
+            wall_anchor_radius_cells=0,
+            seed_cluster_merge_distance_cells=0,
+            partition_topology_enabled=False,
+            min_seed_cells_for_partition_completion=2,
+        ),
         real_wall_barrier_map=anchors,
     )
 

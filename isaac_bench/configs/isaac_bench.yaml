@@ -338,9 +338,13 @@ mapping:
       wall_line_support_enabled: true
       wall_line_support_min_occupied_z_cells: 1
       wall_line_support_free_exclusion_z_cells: 3
-      wall_line_support_unknown_ratio_max: 0.75
-      wall_line_support_unknown_ratio_hard_max: 0.90
-      wall_line_support_min_observed_z_cells: 1
+      wall_line_support_unknown_ratio_max: 0.50
+      wall_line_support_unknown_ratio_hard_max: 0.65
+      wall_line_support_min_observed_z_cells: 3
+      wall_line_support_min_observed_ratio: 0.15
+      wall_line_support_reject_navigation_unknown: true
+      frontier_unknown_band_dilation_cells: 2
+      frontier_free_band_dilation_cells: 3
       wall_line_support_use_nav_edge_gate: true
       wall_line_support_nav_edge_radius_cells: 3
       wall_line_support_free_boundary_radius_cells: 3
@@ -356,8 +360,12 @@ mapping:
       min_projected_support_ratio: 0.25
       anchor_min_projected_line_length_m: 0.15
       anchor_min_projected_support_ratio: 0.15
-      step2_source_min_projected_line_length_m: 0.20
-      step2_source_min_projected_support_ratio: 0.18
+      step2_source_min_projected_line_length_m: 0.60
+      step2_source_min_projected_support_ratio: 0.32
+      step2_source_min_support_cells: 6
+      step2_source_max_unknown_ratio_on_line: 0.35
+      step2_source_forbid_frontier_unknown_band: true
+      step2_source_forbid_door_seed_band: true
       max_fill_gap_m: 0.25
       max_free_gap_ratio: 0.20
       separate_parallel_wall_min_cells: 4
@@ -377,6 +385,8 @@ mapping:
       reject_if_both_sides_unknown_ratio_gt: 0.85
       reject_if_no_free_side: true
       reject_if_no_nonfree_side: true
+      side_unknown_ratio_max_for_structural: 0.65
+      side_min_structural_ratio: 0.08
       min_line_observed_support_cells: 3
       keep_accepted_line_cells_even_if_unknown_dominant: true
     voxel_door:
@@ -457,6 +467,12 @@ mapping:
       partition_topology_min_side_area_cells: 3
       partition_topology_min_side_width_cells: 1
       enable_one_seed_one_wall_completion: true
+      min_seed_cells_for_partition_completion: 3
+      min_seed_cells_for_visual_only_completion: 1
+      one_seed_one_wall_partition_enabled: false
+      one_seed_one_wall_visual_only_enabled: true
+      min_seed_overlap_cells_for_partition: 2
+      min_seed_coverage_ratio_for_partition: 0.50
       enable_seed_pair_bridge_completion: true
       seed_pair_max_center_distance_m: 1.40
       seed_pair_max_perpendicular_gap_cells: 2
@@ -476,7 +492,11 @@ mapping:
       door_memory_decay_per_update: 0.05
       door_memory_confirm_increment: 0.35
       door_memory_min_confidence_to_keep: 0.20
-      door_memory_ttl_updates: 20
+      door_memory_ttl_updates: 40
+      door_memory_hard_contradiction_requires_strict_wall: true
+      door_memory_hard_contradiction_min_updates: 3
+      door_memory_unknown_never_contradicts: true
+      door_memory_decay_only_on_target_updates: true
       show_candidate_lines_in_debug: true
     voxel_roomseg:
       use_real_wall_as_partition_barrier: true
@@ -484,6 +504,12 @@ mapping:
       door_seed_wall_carve_radius_cells: 2
     voxel_visualization:
       voxel_show_wall_diagnostics: false
+      show_raw_wall_support: false
+      show_wall_support_rejected_unknown: false
+      show_frontier_unknown_band: false
+      show_step2_source_candidates: false
+      show_step2_rejected_candidates: false
+      show_door_visual_only_candidates: false
       door_seed_color: [0, 80, 255]
       door_extension_color: [0, 255, 70]
       step2_extension_color: [220, 60, 255]
@@ -509,8 +535,22 @@ mapping:
       reject_if_intersects_door: true
       reject_if_intersects_door_visual: false
       reject_if_intersects_door_seed: false
+      reject_if_intersects_existing_extension: true
+      reject_if_hits_extension_not_wall: true
       door_intersection_dilation_cells: 1
       reject_if_tiny_side_width_cells_leq: 2
+      source_min_line_length_m: 0.60
+      source_min_support_ratio: 0.30
+      source_min_support_cells: 6
+      source_forbid_frontier_unknown_band: true
+      source_forbid_door_band: true
+      extension_intersection_policy: reject
+      enable_extension_intersection_fallback: false
+      separator_memory_enabled: true
+      separator_memory_ttl_updates: 40
+      separator_memory_decay_per_update: 0.05
+      separator_memory_min_confidence_to_keep: 0.20
+      separator_memory_hard_contradiction_min_updates: 3
     voxel_step2_topology:
       corridor_min_split_area_m2: 0.05
       corridor_min_new_component_width_m: 0.10

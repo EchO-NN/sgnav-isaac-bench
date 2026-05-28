@@ -54,7 +54,7 @@ def _cell_pixel(arr: np.ndarray, row: int, col: int, shape: tuple[int, int] = (4
     return tuple(int(v) for v in arr[y, x].tolist())
 
 
-def test_voxel_panel_uses_blue_seed_and_green_door_extension() -> None:
+def test_voxel_panel_uses_blue_seed_and_green_only_for_door_cut() -> None:
     shape = (4, 4)
     debug = _base_debug(shape)
     debug["voxel_door_seed_mask"][1, 1] = True
@@ -65,7 +65,7 @@ def test_voxel_panel_uses_blue_seed_and_green_door_extension() -> None:
     arr = _render(debug, shape)
 
     assert _cell_pixel(arr, 1, 1, shape) == (0, 80, 255)
-    assert _cell_pixel(arr, 1, 2, shape) == (0, 255, 70)
+    assert _cell_pixel(arr, 1, 2, shape) != (0, 255, 70)
     assert _cell_pixel(arr, 2, 2, shape) == (80, 255, 80)
 
 
@@ -101,6 +101,7 @@ def test_voxel_panel_hides_orange_diagnostics_by_default_and_shows_when_enabled(
     assert _cell_pixel(arr, 1, 2, shape) != (255, 142, 45)
 
     debug["voxel_show_wall_diagnostics"] = True
+    debug["voxel_show_wall_support_rejected_unknown"] = True
     arr = _render(debug, shape)
     assert _cell_pixel(arr, 1, 1, shape) == (255, 126, 45)
     assert _cell_pixel(arr, 1, 2, shape) == (255, 142, 45)

@@ -23,6 +23,8 @@ def test_v16_voxel_visualization_exposes_door_and_step2_partition_layers() -> No
     debug: dict[str, object] = {
         "backend": "voxel_occupancy_door_wall_v9",
         "voxel_show_wall_diagnostics": True,
+        "voxel_show_door_visual_only_candidates": True,
+        "voxel_show_step2_source_candidates": True,
         "voxel_vertical_free_xy": np.ones(shape, dtype=bool),
         "voxel_wall_xy": np.zeros(shape, dtype=bool),
         "voxel_display_wall_xy": np.zeros(shape, dtype=bool),
@@ -68,7 +70,7 @@ def test_v16_voxel_visualization_exposes_door_and_step2_partition_layers() -> No
     assert layers["voxel_vertical_free"]["color"] == [170, 220, 245]
     assert layers["voxel_door_seed"]["color"] == [0, 80, 255]
     assert layers["voxel_door_extension_attempt"]["color"] == [0, 120, 40]
-    assert layers["voxel_door_centerline"]["color"] == [0, 255, 70]
+    assert layers["voxel_door_centerline"]["color"] == [80, 255, 80]
     assert layers["voxel_door_cut"]["color"] == [80, 255, 80]
     assert layers["voxel_door_partition_cut_candidate"]["enabled"] is True
     assert layers["voxel_door_partition_cut_rejected"]["enabled"] is True

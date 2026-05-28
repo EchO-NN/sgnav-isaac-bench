@@ -74,7 +74,12 @@ def test_different_door_clusters_that_cross_are_still_rejected() -> None:
         anchor_wall_map=anchor_wall,
         unknown_map=np.zeros(shape, dtype=bool),
         resolution_m=0.10,
-        config=VoxelDoorDetectorConfig(wall_anchor_radius_cells=0, seed_cluster_merge_distance_cells=0, partition_topology_enabled=False),
+        config=VoxelDoorDetectorConfig(
+            wall_anchor_radius_cells=0,
+            seed_cluster_merge_distance_cells=0,
+            partition_topology_enabled=False,
+            min_seed_cells_for_partition_completion=2,
+        ),
         real_wall_barrier_map=anchor_wall,
     )
 

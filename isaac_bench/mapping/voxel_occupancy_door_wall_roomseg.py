@@ -87,6 +87,182 @@ class Step2LinePool:
 
 
 @dataclass
+class StableSeparatorTrack:
+    track_id: int
+    kind: str
+    first_seen_step: int
+    last_seen_step: int
+    first_seen_update_index: int
+    last_seen_update_index: int
+    confidence: float
+    center_rc: tuple[float, float]
+    major_dir_rc: tuple[float, float]
+    cut_cells: list[tuple[int, int]]
+    visual_cells: list[tuple[int, int]]
+    hard_contradiction_count: int = 0
+    missed_update_count: int = 0
+
+    def mask(self, shape: tuple[int, int]) -> np.ndarray:
+        out = np.zeros(shape, dtype=bool)
+        for r, c in self.cut_cells:
+            if 0 <= int(r) < shape[0] and 0 <= int(c) < shape[1]:
+                out[int(r), int(c)] = True
+        return out
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "track_id": int(self.track_id),
+            "kind": str(self.kind),
+            "first_seen_step": int(self.first_seen_step),
+            "last_seen_step": int(self.last_seen_step),
+            "first_seen_update_index": int(self.first_seen_update_index),
+            "last_seen_update_index": int(self.last_seen_update_index),
+            "confidence": float(self.confidence),
+            "center_rc": [float(self.center_rc[0]), float(self.center_rc[1])],
+            "major_dir_rc": [float(self.major_dir_rc[0]), float(self.major_dir_rc[1])],
+            "cut_cells": [[int(r), int(c)] for r, c in self.cut_cells],
+            "visual_cells": [[int(r), int(c)] for r, c in self.visual_cells],
+            "hard_contradiction_count": int(self.hard_contradiction_count),
+            "missed_update_count": int(self.missed_update_count),
+        }
+
+
+@dataclass
+class StableSeparatorMemoryResult:
+    stable_separator_mask: np.ndarray
+    stable_separator_visual_mask: np.ndarray
+    tracks: list[StableSeparatorTrack]
+    debug: dict[str, object]
+
+
+class VoxelSeparatorMemory:
+    def __init__(self, ttl_updates: int = 40, decay_per_update: float = 0.05, min_confidence: float = 0.20, hard_contradiction_min_updates: int = 3):
+        self.ttl_updates = int(ttl_updates)
+        self.decay_per_update = float(decay_per_update)
+        self.min_confidence = float(min_confidence)
+        self.hard_contradiction_min_updates = int(hard_contradiction_min_updates)
+        self._tracks: list[StableSeparatorTrack] = []
+        self._next_track_id = 1
+
+    def stable_mask(self, shape: tuple[int, int]) -> np.ndarray:
+        out = np.zeros(shape, dtype=bool)
+        for track in self._tracks:
+            out |= track.mask(shape)
+        return out.astype(bool)
+
+    def update(
+        self,
+        accepted_mask: np.ndarray,
+        *,
+        step: int,
+        update_index: int,
+        shape: tuple[int, int],
+        contradiction_wall_map: np.ndarray | None = None,
+    ) -> StableSeparatorMemoryResult:
+        accepted = np.asarray(accepted_mask, dtype=bool)
+        if accepted.shape != shape:
+            raise ValueError("accepted separator mask must match shape")
+        strict_wall = np.zeros(shape, dtype=bool) if contradiction_wall_map is None else np.asarray(contradiction_wall_map, dtype=bool)
+        labels, count = ndimage.label(accepted, structure=conn(8))
+        current_tracks: list[StableSeparatorTrack] = []
+        for label in range(1, int(count) + 1):
+            comp = labels == int(label)
+            cells = [tuple((int(r), int(c))) for r, c in zip(*np.nonzero(comp))]
+            if not cells:
+                continue
+            rows, cols = np.nonzero(comp)
+            center = (float(np.mean(rows)), float(np.mean(cols)))
+            major = _mask_major_dir(comp)
+            current_tracks.append(
+                StableSeparatorTrack(
+                    track_id=-1,
+                    kind="step2_corridor",
+                    first_seen_step=int(step),
+                    last_seen_step=int(step),
+                    first_seen_update_index=int(update_index),
+                    last_seen_update_index=int(update_index),
+                    confidence=1.0,
+                    center_rc=center,
+                    major_dir_rc=major,
+                    cut_cells=cells,
+                    visual_cells=cells,
+                    hard_contradiction_count=0,
+                    missed_update_count=0,
+                )
+            )
+        matched_existing: set[int] = set()
+        new_tracks: list[StableSeparatorTrack] = []
+        for current in current_tracks:
+            best_idx = None
+            best_score = 0.0
+            current_mask = current.mask(shape)
+            for idx, track in enumerate(self._tracks):
+                if idx in matched_existing:
+                    continue
+                old_mask = track.mask(shape)
+                union = int(np.count_nonzero(current_mask | old_mask))
+                iou = float(np.count_nonzero(current_mask & old_mask)) / float(max(1, union))
+                dist = float(np.linalg.norm(np.asarray(current.center_rc) - np.asarray(track.center_rc)))
+                score = iou - 0.02 * dist
+                if score > best_score:
+                    best_score = score
+                    best_idx = idx
+            if best_idx is not None and best_score >= 0.05:
+                track = self._tracks[int(best_idx)]
+                matched_existing.add(int(best_idx))
+                track.last_seen_step = int(step)
+                track.last_seen_update_index = int(update_index)
+                track.confidence = min(1.0, float(track.confidence) + 0.35)
+                track.center_rc = current.center_rc
+                track.major_dir_rc = current.major_dir_rc
+                track.cut_cells = list(current.cut_cells)
+                track.visual_cells = list(current.visual_cells)
+                track.hard_contradiction_count = 0
+                track.missed_update_count = 0
+                new_tracks.append(track)
+            else:
+                current.track_id = int(self._next_track_id)
+                self._next_track_id += 1
+                new_tracks.append(current)
+        prune_counts: Counter[str] = Counter()
+        for idx, track in enumerate(self._tracks):
+            if idx in matched_existing:
+                continue
+            missed = max(0, int(update_index) - int(track.last_seen_update_index))
+            track.missed_update_count = int(missed)
+            track.confidence = max(0.0, float(track.confidence) - float(self.decay_per_update) * float(max(1, missed)))
+            track_mask = track.mask(shape)
+            if np.any(track_mask):
+                strict_overlap = float(np.count_nonzero(track_mask & strict_wall)) / float(max(1, int(np.count_nonzero(track_mask))))
+                if strict_overlap >= 0.70:
+                    track.hard_contradiction_count += 1
+            if missed > int(self.ttl_updates):
+                prune_counts["ttl_updates_exceeded"] += 1
+                continue
+            if track.confidence < float(self.min_confidence):
+                prune_counts["confidence_below_min"] += 1
+                continue
+            if track.hard_contradiction_count >= int(self.hard_contradiction_min_updates):
+                prune_counts["strict_wall_contradiction"] += 1
+                continue
+            new_tracks.append(track)
+        self._tracks = list(new_tracks)
+        stable = np.zeros(shape, dtype=bool)
+        visual = np.zeros(shape, dtype=bool)
+        for track in self._tracks:
+            stable |= track.mask(shape)
+            visual |= _cells_to_mask(track.visual_cells, shape)
+        debug = {
+            "voxel_separator_memory_track_count": int(len(self._tracks)),
+            "voxel_separator_memory_update_index": int(update_index),
+            "voxel_separator_memory_prune_reason_counts": dict(prune_counts),
+            "voxel_separator_memory_tracks": [track.to_dict() for track in self._tracks],
+            "voxel_stable_step2_separator_cells": int(np.count_nonzero(stable)),
+        }
+        return StableSeparatorMemoryResult(stable.astype(bool), visual.astype(bool), list(self._tracks), debug)
+
+
+@dataclass
 class PartitionMapBundle:
     wall_anchor_support_map: np.ndarray
     door_anchor_wall_map: np.ndarray
@@ -140,7 +316,21 @@ class VoxelOccupancyDoorWallRoomSegConfig:
     reject_step2_if_intersects_door: bool = True
     reject_step2_if_intersects_door_visual: bool = False
     reject_step2_if_intersects_door_seed: bool = False
+    reject_step2_if_intersects_existing_extension: bool = True
+    reject_step2_if_hits_extension_not_wall: bool = True
     door_intersection_dilation_cells: int = 1
+    step2_source_min_line_length_m: float = 0.60
+    step2_source_min_support_ratio: float = 0.30
+    step2_source_min_support_cells: int = 6
+    step2_source_forbid_frontier_unknown_band: bool = True
+    step2_source_forbid_door_band: bool = True
+    extension_intersection_policy: str = "reject"
+    enable_extension_intersection_fallback: bool = False
+    separator_memory_enabled: bool = True
+    separator_memory_ttl_updates: int = 40
+    separator_memory_decay_per_update: float = 0.05
+    separator_memory_min_confidence_to_keep: float = 0.20
+    separator_memory_hard_contradiction_min_updates: int = 3
     reject_step2_if_tiny_side_width_cells_leq: int = 3
     final_connectivity: int = 4
     merge_small_components_enabled: bool = False
@@ -151,6 +341,12 @@ class VoxelOccupancyDoorWallRoomSegConfig:
     door_seed_wall_carve_radius_cells: int = 2
     voxel_step2_topology: VoxelStep2TopologyConfig = field(default_factory=VoxelStep2TopologyConfig)
     voxel_show_wall_diagnostics: bool = False
+    voxel_show_raw_wall_support: bool = False
+    voxel_show_wall_support_rejected_unknown: bool = False
+    voxel_show_frontier_unknown_band: bool = False
+    voxel_show_step2_source_candidates: bool = False
+    voxel_show_step2_rejected_candidates: bool = False
+    voxel_show_door_visual_only_candidates: bool = False
     debug_dump: bool = False
     debug_dir: str = "debug/voxel_occupancy_door_wall_roomseg"
 
@@ -213,7 +409,21 @@ class VoxelOccupancyDoorWallRoomSegConfig:
             "reject_if_intersects_door": "reject_step2_if_intersects_door",
             "reject_if_intersects_door_visual": "reject_step2_if_intersects_door_visual",
             "reject_if_intersects_door_seed": "reject_step2_if_intersects_door_seed",
+            "reject_if_intersects_existing_extension": "reject_step2_if_intersects_existing_extension",
+            "reject_if_hits_extension_not_wall": "reject_step2_if_hits_extension_not_wall",
             "door_intersection_dilation_cells": "door_intersection_dilation_cells",
+            "source_min_line_length_m": "step2_source_min_line_length_m",
+            "source_min_support_ratio": "step2_source_min_support_ratio",
+            "source_min_support_cells": "step2_source_min_support_cells",
+            "source_forbid_frontier_unknown_band": "step2_source_forbid_frontier_unknown_band",
+            "source_forbid_door_band": "step2_source_forbid_door_band",
+            "extension_intersection_policy": "extension_intersection_policy",
+            "enable_extension_intersection_fallback": "enable_extension_intersection_fallback",
+            "separator_memory_enabled": "separator_memory_enabled",
+            "separator_memory_ttl_updates": "separator_memory_ttl_updates",
+            "separator_memory_decay_per_update": "separator_memory_decay_per_update",
+            "separator_memory_min_confidence_to_keep": "separator_memory_min_confidence_to_keep",
+            "separator_memory_hard_contradiction_min_updates": "separator_memory_hard_contradiction_min_updates",
             "reject_if_tiny_side_width_cells_leq": "reject_step2_if_tiny_side_width_cells_leq",
         }
         for src, dst in step2_key_map.items():
@@ -224,6 +434,16 @@ class VoxelOccupancyDoorWallRoomSegConfig:
                 raw[key] = voxel_roomseg[key]
         if "voxel_show_wall_diagnostics" in voxel_visualization:
             raw["voxel_show_wall_diagnostics"] = voxel_visualization["voxel_show_wall_diagnostics"]
+        for src, dst in {
+            "show_raw_wall_support": "voxel_show_raw_wall_support",
+            "show_wall_support_rejected_unknown": "voxel_show_wall_support_rejected_unknown",
+            "show_frontier_unknown_band": "voxel_show_frontier_unknown_band",
+            "show_step2_source_candidates": "voxel_show_step2_source_candidates",
+            "show_step2_rejected_candidates": "voxel_show_step2_rejected_candidates",
+            "show_door_visual_only_candidates": "voxel_show_door_visual_only_candidates",
+        }.items():
+            if src in voxel_visualization:
+                raw[dst] = voxel_visualization[src]
         for key, value in overrides.items():
             if value is not None:
                 raw[key] = value
@@ -270,6 +490,12 @@ class VoxelOccupancyDoorWallRoomSegmenter:
         self.last_debug: dict[str, object] = {}
         self.last_result: VoxelOccupancyDoorWallRoomSegResult | None = None
         self.door_memory = VoxelDoorMemory(self.config.door)
+        self.separator_memory = VoxelSeparatorMemory(
+            ttl_updates=int(self.config.separator_memory_ttl_updates),
+            decay_per_update=float(self.config.separator_memory_decay_per_update),
+            min_confidence=float(self.config.separator_memory_min_confidence_to_keep),
+            hard_contradiction_min_updates=int(self.config.separator_memory_hard_contradiction_min_updates),
+        )
         self._roomseg_update_index = 0
 
     def update(
@@ -311,6 +537,7 @@ class VoxelOccupancyDoorWallRoomSegmenter:
             step=int(step),
             door_memory_update_index=int(self._roomseg_update_index),
             door_memory=self.door_memory,
+            separator_memory=self.separator_memory if bool(self.config.separator_memory_enabled) else None,
         )
         self.last_result = result
         self.last_debug = dict(result.debug)
@@ -331,6 +558,7 @@ def run_voxel_occupancy_door_wall_roomseg(
     step: int = 0,
     door_memory_update_index: int = 0,
     door_memory: VoxelDoorMemory | None = None,
+    separator_memory: VoxelSeparatorMemory | None = None,
 ) -> VoxelOccupancyDoorWallRoomSegResult:
     cfg = config if isinstance(config, VoxelOccupancyDoorWallRoomSegConfig) else VoxelOccupancyDoorWallRoomSegConfig.from_mapping(config, resolution_m=resolution_m)
     shape = np.asarray(observed_free_mask, dtype=bool).shape
@@ -357,13 +585,19 @@ def run_voxel_occupancy_door_wall_roomseg(
     door_seed_result = classify_voxel_door_seeds(voxel_grid=voxel_grid, config=cfg.door)
     door_seed_mask = np.asarray(door_seed_result.door_seed_mask, dtype=bool)
 
-    projection_input = np.asarray(evidence.wall_line_support_xy, dtype=bool)
+    projection_input = np.asarray(evidence.wall_support_for_projection_xy if evidence.wall_support_for_projection_xy is not None else evidence.wall_line_support_xy, dtype=bool)
+    projection_weight = np.asarray(evidence.wall_support_weight_xy if evidence.wall_support_weight_xy is not None else evidence.wall_line_support_weight_xy, dtype=np.float32)
+    frontier_unknown_band = np.asarray(evidence.frontier_unknown_band_xy if evidence.frontier_unknown_band_xy is not None else np.zeros(shape, dtype=bool), dtype=bool)
     wall_projection = project_wall_evidence_to_axis_accumulator_lines(
         support_map=projection_input,
-        support_weight=np.asarray(evidence.wall_line_support_weight_xy, dtype=np.float32),
+        support_weight=projection_weight,
         door_forbidden_mask=door_seed_mask,
         vertical_free_map=evidence.vertical_free_xy,
         unknown_map=evidence.unknown_xy,
+        unknown_ratio_map=evidence.unknown_ratio_active_xy,
+        navigation_unknown_map=np.asarray(unknown_mask, dtype=bool),
+        frontier_unknown_band=frontier_unknown_band,
+        structural_side_support_map=np.asarray(evidence.wall_xy, dtype=bool) | projection_input,
         resolution_m=float(resolution_m),
         config=cfg.wall_projection,
     )
@@ -372,7 +606,7 @@ def run_voxel_occupancy_door_wall_roomseg(
     anchor_projected_wall_map = np.asarray(wall_projection.projected_wall_anchor_map if wall_projection.projected_wall_anchor_map is not None else projected_wall_map, dtype=bool)
     step2_source_projected_wall_map = np.asarray(wall_projection.projected_wall_step2_source_map if wall_projection.projected_wall_step2_source_map is not None else projected_wall_map, dtype=bool)
     projected_display_lines = list(wall_projection.projected_display_lines or wall_projection.projected_lines)
-    projected_step2_source_lines = list(wall_projection.projected_step2_source_lines or projected_display_lines)
+    projected_step2_source_lines = list(wall_projection.projected_step2_source_lines or [])
     wall_for_line_extraction = np.asarray(evidence.wall_xy, dtype=bool) | projected_wall_map
     segments, wall_debug = extract_line_supported_walls(
         wall_for_line_extraction,
@@ -486,8 +720,8 @@ def run_voxel_occupancy_door_wall_roomseg(
             step=int(step),
             update_index=int(door_memory_update_index),
             shape=shape,
-            contradiction_wall_map=real_wall_barrier_for_partition,
-            contradiction_unknown_map=unknown_after_step1,
+            contradiction_wall_map=np.asarray(evidence.wall_xy, dtype=bool),
+            contradiction_unknown_map=None,
         )
         stable_door_cut_mask = np.asarray(door_memory_result.stable_door_cut_mask, dtype=bool)
         stable_door_visual_mask = np.asarray(door_memory_result.stable_door_visual_mask, dtype=bool)
@@ -503,12 +737,21 @@ def run_voxel_occupancy_door_wall_roomseg(
     door_cut_mask = current_door_cut_mask | stable_door_cut_mask
     door_visual_mask = current_door_visual_mask | stable_door_visual_mask
     accepted_door_visual_mask = np.asarray(door_completion.debug.get("voxel_accepted_door_centerline_mask", current_door_cut_mask), dtype=bool) | stable_door_visual_mask
+    door_suppression_band = dilate(door_cut_mask | stable_door_cut_mask | door_seed_mask | accepted_door_visual_mask, 2)
     step1_wall_mask = step1_completed_wall_map
     step2_line_pool = build_step2_line_pool(
         filtered_lines=filtered_lines,
         extension_seed_lines=extension_seed_lines,
         projected_display_lines=projected_display_lines,
         projected_source_lines=projected_step2_source_lines,
+        source_support_map=projection_input | np.asarray(evidence.wall_xy, dtype=bool) | projected_wall_map,
+        frontier_unknown_band=frontier_unknown_band,
+        door_suppression_band=door_suppression_band,
+        source_min_line_length_m=float(cfg.step2_source_min_line_length_m),
+        source_min_support_ratio=float(cfg.step2_source_min_support_ratio),
+        source_min_support_cells=int(cfg.step2_source_min_support_cells),
+        source_forbid_frontier_unknown_band=bool(cfg.step2_source_forbid_frontier_unknown_band),
+        source_forbid_door_band=bool(cfg.step2_source_forbid_door_band),
         strict_raw_wall=np.asarray(evidence.wall_xy, dtype=bool),
         projected_wall_map=projected_wall_map,
         anchor_projected_wall_map=anchor_projected_wall_map,
@@ -562,25 +805,58 @@ def run_voxel_occupancy_door_wall_roomseg(
         config=cfg.door_neck,
         start_id=1,
     )
-    intersection_candidates, intersection_target_map, intersection_debug = build_door_neck_candidates_from_extension_intersections(
-        step2_extensions,
-        free_clean=free_after_step1,
-        unknown_clean=unknown_after_step1,
-        resolution_m=float(resolution_m),
-        line_config=line_cfg,
-        door_config=cfg.door_neck,
-        start_id=int(len(step2_candidates) + 1),
-    )
-    for candidate in intersection_candidates:
-        candidate.kind = "line_extension_corridor_separator"
-        candidate.debug["kind_detail"] = "corridor_separator"
-        candidate.debug["candidate_source"] = "step2_extension_intersection"
-    intersection_candidates, intersection_pre_rejected = _reject_step2_candidates_intersecting_doors(
-        intersection_candidates,
-        door_block_mask=step2_door_reject_mask,
-        shape=shape,
+    intersection_policy = str(getattr(cfg, "extension_intersection_policy", "reject") or "reject").strip().lower()
+    debug_intersection_candidates: list[SeparatorCandidate] = []
+    intersection_debug: dict[str, object] = {
+        "voxel_step2_extension_intersection_policy": str(intersection_policy),
+        "voxel_step2_extension_intersection_fallback_enabled": bool(getattr(cfg, "enable_extension_intersection_fallback", False)),
+    }
+    if intersection_policy in {"candidate", "debug_only"} or bool(getattr(cfg, "enable_extension_intersection_fallback", False)):
+        debug_intersection_candidates, debug_intersection_target_map, intersection_debug_raw = build_door_neck_candidates_from_extension_intersections(
+            step2_extensions,
+            free_clean=free_after_step1,
+            unknown_clean=unknown_after_step1,
+            resolution_m=float(resolution_m),
+            line_config=line_cfg,
+            door_config=cfg.door_neck,
+            start_id=int(len(step2_candidates) + 1),
+        )
+        intersection_debug.update(dict(intersection_debug_raw))
+        intersection_debug["voxel_step2_debug_intersection_candidate_count"] = int(len(debug_intersection_candidates))
+    else:
+        debug_intersection_target_map = np.zeros(shape, dtype=bool)
+    if intersection_policy == "candidate" and bool(getattr(cfg, "enable_extension_intersection_fallback", False)):
+        intersection_candidates = list(debug_intersection_candidates)
+        intersection_target_map = np.asarray(debug_intersection_target_map, dtype=bool)
+        for candidate in intersection_candidates:
+            candidate.kind = "line_extension_corridor_separator"
+            candidate.debug["kind_detail"] = "corridor_separator"
+            candidate.debug["candidate_source"] = "step2_extension_intersection"
+        intersection_candidates, intersection_pre_rejected = _reject_step2_candidates_intersecting_doors(
+            intersection_candidates,
+            door_block_mask=step2_door_reject_mask,
+            shape=shape,
+        )
+    else:
+        intersection_candidates = []
+        intersection_pre_rejected = []
+        intersection_target_map = np.zeros(shape, dtype=bool)
+        intersection_debug["voxel_step2_extension_intersection_candidates_suppressed"] = int(len(debug_intersection_candidates))
+    previous_stable_step2_separator_map = (
+        separator_memory.stable_mask(shape)
+        if separator_memory is not None
+        else np.zeros(shape, dtype=bool)
     )
     all_step2_candidates = [*step2_candidates, *intersection_candidates]
+    all_step2_candidates, conflict_rejected_step2, conflict_debug = reject_step2_candidate_conflicts_v22(
+        all_step2_candidates,
+        accepted_door_mask=door_cut_mask,
+        stable_door_mask=stable_door_cut_mask,
+        accepted_step2_memory_mask=previous_stable_step2_separator_map,
+        real_wall_map=step2_line_pool.target_wall_map,
+        shape=shape,
+        cfg=cfg,
+    )
     topology_cfg = replace(
         cfg.topology_test,
         reject_if_side_width_cells_leq=int(cfg.reject_step2_if_tiny_side_width_cells_leq),
@@ -601,7 +877,7 @@ def run_voxel_occupancy_door_wall_roomseg(
         resolution_m=float(resolution_m),
         config=topology_cfg,
     )
-    rejected_step2 = [*intersection_pre_rejected, *rejected_step2]
+    rejected_step2 = [*intersection_pre_rejected, *conflict_rejected_step2, *rejected_step2]
     step2_candidate_map = _rasterize_candidates(all_step2_candidates, shape)
     step2_partition_cut_accepted_map, step2_partition_cut_candidate_from_accepted_map, step2_partition_cut_debug = build_step2_partition_cut_v16(
         accepted_step2,
@@ -615,20 +891,38 @@ def run_voxel_occupancy_door_wall_roomseg(
     )
     step2_partition_cut_candidate_map = step2_candidate_map.astype(bool)
     step2_extension_separator_map = step2_partition_cut_accepted_map & base_partition_free
-    final_virtual_separator_map = door_cut_mask | step2_extension_separator_map
+    if separator_memory is not None:
+        separator_memory_result = separator_memory.update(
+            step2_extension_separator_map,
+            step=int(step),
+            update_index=int(door_memory_update_index),
+            shape=shape,
+            contradiction_wall_map=np.asarray(evidence.wall_xy, dtype=bool),
+        )
+        stable_step2_separator_map = np.asarray(separator_memory_result.stable_separator_mask, dtype=bool)
+        separator_memory_debug = dict(separator_memory_result.debug)
+    else:
+        stable_step2_separator_map = np.zeros(shape, dtype=bool)
+        separator_memory_debug = {
+            "voxel_separator_memory_track_count": 0,
+            "voxel_separator_memory_update_index": int(door_memory_update_index),
+            "voxel_stable_step2_separator_cells": 0,
+        }
+    final_step2_separator_map = step2_extension_separator_map | stable_step2_separator_map
+    final_virtual_separator_map = door_cut_mask | final_step2_separator_map
     partition_free_for_label = (base_partition_free | accepted_seed_for_partition) & ~final_virtual_separator_map
     partition_free = partition_free_for_label.copy()
     labels, _count = ndimage.label(partition_free, structure=conn(int(cfg.final_connectivity)))
     labels = relabel_compact(labels.astype(np.int32))
     labels[unknown_after_step1] = 0
     labels[~partition_free_for_label] = 0
-    final_separator_map = real_wall_barrier_for_partition | door_cut_mask | step2_extension_separator_map
+    final_separator_map = real_wall_barrier_for_partition | door_cut_mask | final_step2_separator_map
 
     boundary_source = np.zeros(shape, dtype=np.uint8)
     boundary_source[real_wall_barrier_for_partition] = 1
     boundary_source[step1_gap_fill_map] = 4
     boundary_source[door_cut_mask] = 2
-    boundary_source[step2_extension_separator_map] = 3
+    boundary_source[final_step2_separator_map] = 3
     step2_layers = _extension_layers(step2_extensions, shape)
     step2_topology_rejected_map = _rasterize_candidates(rejected_step2, shape)
     step2_reject_reason_map = _step2_reject_reason_map(step2_extensions, rejected_step2, shape)
@@ -639,7 +933,7 @@ def run_voxel_occupancy_door_wall_roomseg(
         separator_candidates_pre_topology_map=step2_candidate_map.astype(bool),
         topology_rejected_separator_map=step2_topology_rejected_map.astype(bool),
         accepted_separator_map=accepted_step2_map.astype(bool),
-        accepted_partition_cut_map=step2_extension_separator_map.astype(bool),
+        accepted_partition_cut_map=final_step2_separator_map.astype(bool),
     )
     step2_partition_cut_empty_count = int(len(accepted_step2)) if np.any(accepted_step2_map) and not np.any(step2_extension_separator_map) else 0
     display_wall_map = (
@@ -680,6 +974,14 @@ def run_voxel_occupancy_door_wall_roomseg(
         "voxel_wall_line_support_rejected_by_observed_xy": np.asarray(evidence.wall_line_support_rejected_by_observed_xy, dtype=bool),
         "voxel_wall_line_support_rejected_by_nav_edge_xy": np.asarray(evidence.wall_line_support_rejected_by_nav_edge_xy, dtype=bool),
         "voxel_wall_projection_support_input_xy": projection_input,
+        "voxel_wall_support_raw_occupied_xy": np.asarray(evidence.wall_support_raw_occupied_xy, dtype=bool),
+        "voxel_wall_support_known_xy": np.asarray(evidence.wall_support_known_xy, dtype=bool),
+        "voxel_wall_support_for_projection_xy": np.asarray(evidence.wall_support_for_projection_xy, dtype=bool),
+        "voxel_wall_support_rejected_by_unknown_ratio_xy": np.asarray(evidence.wall_support_unknown_rejected_xy, dtype=bool),
+        "voxel_wall_support_rejected_by_nav_unknown_xy": np.asarray(evidence.wall_support_nav_unknown_rejected_xy, dtype=bool),
+        "voxel_wall_support_rejected_by_frontier_band_xy": np.asarray(evidence.wall_support_frontier_band_rejected_xy, dtype=bool),
+        "voxel_wall_support_free_conflict_xy": np.asarray(evidence.wall_support_free_conflict_xy, dtype=bool),
+        "voxel_frontier_unknown_band_xy": np.asarray(evidence.frontier_unknown_band_xy, dtype=bool),
         "voxel_wall_rejected_by_free_xy": np.asarray(evidence.wall_rejected_by_free_xy, dtype=bool),
         "voxel_wall_rejected_by_unknown_xy": np.asarray(evidence.wall_rejected_by_unknown_xy, dtype=bool),
         "voxel_nonstructural_occupied_xy": np.asarray(evidence.nonstructural_occupied_xy, dtype=bool),
@@ -756,11 +1058,16 @@ def run_voxel_occupancy_door_wall_roomseg(
         "voxel_step2_separator_candidates_pre_topology_map": step2_stage_maps.separator_candidates_pre_topology_map,
         "voxel_step2_partition_cut_candidate_map": step2_partition_cut_candidate_map,
         "voxel_step2_partition_cut_candidate_from_accepted_map": step2_partition_cut_candidate_from_accepted_map,
-        "voxel_step2_partition_cut_accepted_map": step2_extension_separator_map,
+        "voxel_step2_partition_cut_accepted_map": final_step2_separator_map,
+        "voxel_step2_current_partition_cut_accepted_map": step2_extension_separator_map,
+        "voxel_stable_step2_separator_map": stable_step2_separator_map,
+        "voxel_final_step2_separator_map": final_step2_separator_map,
+        "voxel_previous_stable_step2_separator_map": previous_stable_step2_separator_map,
         "voxel_step2_topology_rejected_separator_map": step2_stage_maps.topology_rejected_separator_map,
         "voxel_step2_reject_reason_map": step2_reject_reason_map,
         "voxel_step2_accepted_separator_map": step2_stage_maps.accepted_separator_map,
-        "voxel_step2_extension_separator_map": step2_extension_separator_map,
+        "voxel_step2_extension_separator_map": final_step2_separator_map,
+        "voxel_step2_current_extension_separator_map": step2_extension_separator_map,
         "voxel_step2_intersection_candidate_map": step2_intersection_candidate_map,
         "voxel_step2_intersection_target_map": intersection_target_map,
         "voxel_step2_rejected_extension_map": step2_layers["rejected"] | step2_topology_rejected_map,
@@ -799,6 +1106,11 @@ def run_voxel_occupancy_door_wall_roomseg(
         "voxel_wall_line_support_raw_cells": int(np.count_nonzero(evidence.wall_line_support_raw_xy)),
         "voxel_wall_line_support_strong_cells": int(np.count_nonzero(evidence.wall_line_support_strong_xy)),
         "voxel_wall_line_support_conflict_cells": int(np.count_nonzero(evidence.wall_line_support_conflict_xy)),
+        "voxel_wall_support_for_projection_cells": int(np.count_nonzero(np.asarray(evidence.wall_support_for_projection_xy, dtype=bool))),
+        "voxel_wall_support_rejected_by_unknown_ratio_cells": int(np.count_nonzero(np.asarray(evidence.wall_support_unknown_rejected_xy, dtype=bool))),
+        "voxel_wall_support_rejected_by_nav_unknown_cells": int(np.count_nonzero(np.asarray(evidence.wall_support_nav_unknown_rejected_xy, dtype=bool))),
+        "voxel_wall_support_rejected_by_frontier_band_cells": int(np.count_nonzero(np.asarray(evidence.wall_support_frontier_band_rejected_xy, dtype=bool))),
+        "voxel_frontier_unknown_band_cells": int(np.count_nonzero(np.asarray(evidence.frontier_unknown_band_xy, dtype=bool))),
         "voxel_strict_raw_wall_cells": int(np.count_nonzero(evidence.strict_raw_wall_xy)),
         "voxel_wall_projected_cells": int(np.count_nonzero(projected_wall_map)),
         "voxel_projected_structural_wall_cells": int(np.count_nonzero(projected_wall_map)),
@@ -830,8 +1142,12 @@ def run_voxel_occupancy_door_wall_roomseg(
         "voxel_step2_partition_cut_empty_count": int(step2_partition_cut_empty_count),
         "voxel_step2_partition_cut_candidate_cells": int(np.count_nonzero(step2_partition_cut_candidate_map)),
         "voxel_step2_partition_cut_accepted_cells": int(np.count_nonzero(step2_extension_separator_map)),
+        "voxel_stable_step2_separator_cells": int(np.count_nonzero(stable_step2_separator_map)),
+        "voxel_final_step2_separator_cells": int(np.count_nonzero(final_step2_separator_map)),
         "voxel_step2_partition_cut_debug": dict(step2_partition_cut_debug),
         "voxel_step2_reject_reason_counts": _extension_and_candidate_reasons(step2_extensions, rejected_step2),
+        **separator_memory_debug,
+        **conflict_debug,
         "voxel_step2_candidate_debug_list": [candidate.to_dict() for candidate in [*accepted_step2, *rejected_step2]],
         "voxel_step2_corridor_topology_debug_per_candidate": [
             candidate.to_dict()
@@ -867,9 +1183,16 @@ def run_voxel_occupancy_door_wall_roomseg(
         "room_count": _room_count(labels),
         "merge_small_components_enabled": bool(cfg.merge_small_components_enabled),
         "voxel_show_wall_diagnostics": bool(cfg.voxel_show_wall_diagnostics),
+        "voxel_show_raw_wall_support": bool(cfg.voxel_show_raw_wall_support),
+        "voxel_show_wall_support_rejected_unknown": bool(cfg.voxel_show_wall_support_rejected_unknown),
+        "voxel_show_frontier_unknown_band": bool(cfg.voxel_show_frontier_unknown_band),
+        "voxel_show_step2_source_candidates": bool(cfg.voxel_show_step2_source_candidates),
+        "voxel_show_step2_rejected_candidates": bool(cfg.voxel_show_step2_rejected_candidates),
+        "voxel_show_door_visual_only_candidates": bool(cfg.voxel_show_door_visual_only_candidates),
         "voxel_step2_reject_reason_counts": report["voxel_step2_reject_reason_counts"],
         "voxel_step2_extension_reject_reason_counts": report["voxel_step2_extension_reject_reason_counts"],
         "voxel_step2_topology_reject_reason_counts": report["voxel_step2_topology_reject_reason_counts"],
+        "voxel_step2_conflict_reject_reason_counts": report.get("voxel_step2_conflict_reject_reason_counts", {}),
         "voxel_step2_partition_cut_empty_count": int(step2_partition_cut_empty_count),
         "voxel_step2_partition_cut_debug": dict(step2_partition_cut_debug),
         "voxel_step2_corridor_topology_debug_per_candidate": report["voxel_step2_corridor_topology_debug_per_candidate"],
@@ -888,6 +1211,8 @@ def run_voxel_occupancy_door_wall_roomseg(
         "voxel_wall_run_report": wall_run_debug,
         "topology_report": {"final": topology_debug, "step2_candidates": step2_candidate_debug},
         "voxel_step2_intersection_debug": intersection_debug,
+        **conflict_debug,
+        **separator_memory_debug,
         "accepted_separators": [candidate.to_dict() for candidate in accepted_step2],
         "rejected_separators": [candidate.to_dict() for candidate in rejected_step2],
         "proposal_room_masks": _proposal_masks_debug(labels),
@@ -929,7 +1254,7 @@ def run_voxel_occupancy_door_wall_roomseg(
         wall_map=step1_wall_mask.astype(bool),
         door_cut_map=door_cut_mask.astype(bool),
         step1_wall_gap_fill_map=step1_gap_fill_map.astype(bool),
-        step2_extension_separator_map=step2_extension_separator_map.astype(bool),
+        step2_extension_separator_map=final_step2_separator_map.astype(bool),
         layers=layers,
         debug=debug,
     )
@@ -1197,6 +1522,14 @@ def build_step2_line_pool(
     extension_seed_lines: Sequence[FilteredWallLine],
     projected_display_lines: Sequence[ProjectedWallLine] | None = None,
     projected_source_lines: Sequence[ProjectedWallLine] | None = None,
+    source_support_map: np.ndarray | None = None,
+    frontier_unknown_band: np.ndarray | None = None,
+    door_suppression_band: np.ndarray | None = None,
+    source_min_line_length_m: float = 0.60,
+    source_min_support_ratio: float = 0.30,
+    source_min_support_cells: int = 6,
+    source_forbid_frontier_unknown_band: bool = True,
+    source_forbid_door_band: bool = True,
     strict_raw_wall: np.ndarray,
     projected_wall_map: np.ndarray,
     anchor_projected_wall_map: np.ndarray,
@@ -1208,24 +1541,52 @@ def build_step2_line_pool(
     resolution_m: float,
     target_wall_override: np.ndarray | None = None,
 ) -> Step2LinePool:
-    projected_display_filtered = projected_wall_lines_to_filtered_lines(
-        list(projected_display_lines or []),
-        shape=shape,
-        resolution_m=float(resolution_m),
-        source_name="projected_display_wall",
-    )
+    support = np.ones(shape, dtype=bool) if source_support_map is None else np.asarray(source_support_map, dtype=bool)
+    frontier_band = np.zeros(shape, dtype=bool) if frontier_unknown_band is None else np.asarray(frontier_unknown_band, dtype=bool)
+    door_band = np.zeros(shape, dtype=bool) if door_suppression_band is None else np.asarray(door_suppression_band, dtype=bool)
+    if support.shape != shape or frontier_band.shape != shape or door_band.shape != shape:
+        raise ValueError("Step2 source validation masks must match shape")
     projected_source_filtered = projected_wall_lines_to_filtered_lines(
         list(projected_source_lines or []),
         shape=shape,
         resolution_m=float(resolution_m),
         source_name="projected_step2_source_wall",
     )
+    source_debug: list[dict[str, object]] = []
+    rejected_source_debug: list[dict[str, object]] = []
+
+    def validate(line: FilteredWallLine, role: str) -> bool:
+        accepted, reason, debug = validate_step2_source_line_v22(
+            line,
+            shape=shape,
+            resolution_m=float(resolution_m),
+            support_map=support,
+            frontier_unknown_band=frontier_band,
+            door_suppression_band=door_band,
+            min_line_length_m=float(source_min_line_length_m),
+            min_support_ratio=float(source_min_support_ratio),
+            min_support_cells=int(source_min_support_cells),
+            forbid_frontier_unknown_band=bool(source_forbid_frontier_unknown_band),
+            forbid_door_band=bool(source_forbid_door_band),
+        )
+        line.debug = dict(line.debug)
+        line.debug["step2_source_role"] = str(role)
+        line.debug["step2_source_validation"] = dict(debug)
+        record = {"role": str(role), "accepted": bool(accepted), "reject_reason": reason, **dict(debug)}
+        if accepted:
+            source_debug.append(record)
+        else:
+            rejected_source_debug.append(record)
+        return bool(accepted)
+
+    filtered_valid = [line for line in filtered_lines if validate(line, "filtered_wall_line")]
+    extension_valid = [line for line in extension_seed_lines if validate(line, "extension_seed_line")]
+    projected_source_valid = [line for line in projected_source_filtered if validate(line, "projected_step2_source_wall")]
     source_lines, dedup_count = _dedup_step2_lines(
         [
-            *list(filtered_lines),
-            *list(extension_seed_lines),
-            *projected_display_filtered,
-            *projected_source_filtered,
+            *filtered_valid,
+            *extension_valid,
+            *projected_source_valid,
         ]
     )
     source_line_map = filtered_wall_line_mask(source_lines, shape)
@@ -1257,10 +1618,14 @@ def build_step2_line_pool(
     }
     debug = {
         "voxel_step2_source_line_count": int(len(source_lines)),
-        "voxel_step2_filtered_line_count": int(len(filtered_lines)),
-        "voxel_step2_extension_seed_line_count": int(len(extension_seed_lines)),
-        "voxel_step2_projected_display_line_count": int(len(projected_display_filtered)),
-        "voxel_step2_projected_source_line_count": int(len(projected_source_filtered)),
+        "voxel_step2_filtered_line_count": int(len(filtered_valid)),
+        "voxel_step2_extension_seed_line_count": int(len(extension_valid)),
+        "voxel_step2_projected_display_line_count": 0,
+        "voxel_step2_projected_source_line_count": int(len(projected_source_valid)),
+        "voxel_step2_rejected_source_line_count": int(len(rejected_source_debug)),
+        "voxel_step2_source_line_validation": source_debug[:1024],
+        "voxel_step2_rejected_source_line_validation": rejected_source_debug[:1024],
+        "voxel_step2_source_reject_reason_counts": dict(Counter(str(item.get("reject_reason")) for item in rejected_source_debug)),
         "voxel_step2_source_line_dedup_count": int(dedup_count),
         "voxel_step2_target_wall_cells": int(np.count_nonzero(target_wall)),
         "voxel_step2_target_source_counts": source_counts,
@@ -1301,6 +1666,61 @@ def build_step2_door_reject_mask(
     if bool(reject_if_intersects_door_seed):
         reject |= seed
     return reject.astype(bool)
+
+
+def validate_step2_source_line_v22(
+    line: FilteredWallLine,
+    *,
+    shape: tuple[int, int],
+    resolution_m: float,
+    support_map: np.ndarray,
+    frontier_unknown_band: np.ndarray,
+    door_suppression_band: np.ndarray,
+    min_line_length_m: float,
+    min_support_ratio: float,
+    min_support_cells: int,
+    forbid_frontier_unknown_band: bool = True,
+    forbid_door_band: bool = True,
+) -> tuple[bool, str | None, dict[str, object]]:
+    mask = _filtered_line_mask(line, shape)
+    support = np.asarray(support_map, dtype=bool)
+    frontier = np.asarray(frontier_unknown_band, dtype=bool)
+    door_band = np.asarray(door_suppression_band, dtype=bool)
+    if support.shape != shape or frontier.shape != shape or door_band.shape != shape:
+        raise ValueError("Step2 source validation masks must match shape")
+    support_cells = int(np.count_nonzero(mask & support))
+    projected_cells = int(np.count_nonzero(mask))
+    support_ratio = float(getattr(line, "support_ratio", 0.0) or 0.0)
+    if projected_cells > 0:
+        support_ratio = max(support_ratio, float(support_cells) / float(projected_cells))
+    length_m = float(getattr(line, "length_m", 0.0) or 0.0)
+    if length_m <= 0.0:
+        length_m = float(projected_cells) * float(resolution_m)
+    overlaps_frontier = bool(np.any(mask & frontier))
+    overlaps_door = bool(np.any(mask & door_band))
+    debug = {
+        "length_m": float(length_m),
+        "projected_cells": int(projected_cells),
+        "support_cells": int(support_cells),
+        "support_ratio": float(support_ratio),
+        "overlaps_frontier_unknown_band": bool(overlaps_frontier),
+        "overlaps_door_band": bool(overlaps_door),
+    }
+    if length_m + 1e-9 < float(min_line_length_m) or projected_cells < 8:
+        return False, "reject_step2_source_too_short", debug
+    if support_ratio + 1e-9 < float(min_support_ratio):
+        return False, "reject_step2_source_support_ratio_low", debug
+    if support_cells < max(1, int(min_support_cells)):
+        return False, "reject_step2_source_support_cells_low", debug
+    if bool(forbid_frontier_unknown_band) and overlaps_frontier:
+        return False, "reject_step2_source_frontier_unknown_edge", debug
+    if bool(forbid_door_band) and overlaps_door:
+        return False, "reject_step2_source_door_frame_duplicate", debug
+    return True, None, debug
+
+
+def _filtered_line_mask(line: FilteredWallLine, shape: tuple[int, int]) -> np.ndarray:
+    return rasterize_line(np.asarray(line.p0_rc, dtype=np.float32), np.asarray(line.p1_rc, dtype=np.float32), shape)
 
 
 def projected_wall_lines_to_filtered_lines(
@@ -1376,6 +1796,110 @@ def _reject_step2_candidates_intersecting_doors(
     return kept, rejected
 
 
+def reject_step2_candidate_conflicts_v22(
+    candidates: Sequence[SeparatorCandidate],
+    *,
+    accepted_door_mask: np.ndarray,
+    stable_door_mask: np.ndarray,
+    accepted_step2_memory_mask: np.ndarray,
+    real_wall_map: np.ndarray,
+    shape: tuple[int, int],
+    cfg: VoxelOccupancyDoorWallRoomSegConfig,
+) -> tuple[list[SeparatorCandidate], list[SeparatorCandidate], dict[str, object]]:
+    door = np.asarray(accepted_door_mask, dtype=bool) | np.asarray(stable_door_mask, dtype=bool)
+    existing = np.asarray(accepted_step2_memory_mask, dtype=bool)
+    real_wall = np.asarray(real_wall_map, dtype=bool)
+    kept: list[SeparatorCandidate] = []
+    rejected: list[SeparatorCandidate] = []
+    conflicts: list[dict[str, object]] = []
+    for candidate in candidates:
+        mask = candidate.mask(shape)
+        if bool(getattr(cfg, "reject_step2_if_intersects_door", True)) and np.any(mask & door):
+            candidate.accepted = False
+            candidate.reject_reason = "reject_step2_intersects_door"
+            candidate.debug["pre_topology_reject_reason"] = candidate.reject_reason
+            rejected.append(candidate)
+            conflicts.append({"candidate_id": int(candidate.candidate_id), "conflict_type": candidate.reject_reason})
+            continue
+        if bool(getattr(cfg, "reject_step2_if_intersects_existing_extension", True)) and np.any(mask & existing & ~real_wall):
+            candidate.accepted = False
+            candidate.reject_reason = "reject_step2_intersects_existing_extension"
+            candidate.debug["pre_topology_reject_reason"] = candidate.reject_reason
+            rejected.append(candidate)
+            conflicts.append({"candidate_id": int(candidate.candidate_id), "conflict_type": candidate.reject_reason})
+            continue
+        kept.append(candidate)
+
+    final_kept: list[SeparatorCandidate] = []
+    rejected_ids: set[int] = set()
+    masks = [candidate.mask(shape) for candidate in kept]
+    for i, cand_a in enumerate(kept):
+        if int(cand_a.candidate_id) in rejected_ids:
+            continue
+        for j in range(i + 1, len(kept)):
+            cand_b = kept[j]
+            if int(cand_b.candidate_id) in rejected_ids:
+                continue
+            overlap = masks[i] & masks[j] & ~real_wall
+            if not np.any(overlap):
+                continue
+            score_a = _step2_candidate_pre_score(cand_a, masks[i])
+            score_b = _step2_candidate_pre_score(cand_b, masks[j])
+            cells = [[int(r), int(c)] for r, c in zip(*np.nonzero(overlap))]
+            if abs(score_a - score_b) <= 0.05:
+                for cand in (cand_a, cand_b):
+                    cand.accepted = False
+                    cand.reject_reason = "reject_step2_pairwise_crossing_ambiguous"
+                    cand.debug["pre_topology_reject_reason"] = cand.reject_reason
+                    rejected_ids.add(int(cand.candidate_id))
+                conflicts.append(
+                    {
+                        "candidate_id_a": int(cand_a.candidate_id),
+                        "candidate_id_b": int(cand_b.candidate_id),
+                        "conflict_type": "reject_step2_pairwise_crossing_ambiguous",
+                        "intersection_cells": cells[:64],
+                        "resolved_winner": None,
+                        "rejected_candidate_ids": [int(cand_a.candidate_id), int(cand_b.candidate_id)],
+                    }
+                )
+            else:
+                loser = cand_a if score_a < score_b else cand_b
+                winner = cand_b if score_a < score_b else cand_a
+                loser.accepted = False
+                loser.reject_reason = "reject_step2_pairwise_crossing_loser"
+                loser.debug["pre_topology_reject_reason"] = loser.reject_reason
+                rejected_ids.add(int(loser.candidate_id))
+                conflicts.append(
+                    {
+                        "candidate_id_a": int(cand_a.candidate_id),
+                        "candidate_id_b": int(cand_b.candidate_id),
+                        "conflict_type": "reject_step2_pairwise_crossing_loser",
+                        "intersection_cells": cells[:64],
+                        "resolved_winner": int(winner.candidate_id),
+                        "rejected_candidate_ids": [int(loser.candidate_id)],
+                    }
+                )
+    for candidate in kept:
+        if int(candidate.candidate_id) in rejected_ids:
+            rejected.append(candidate)
+        else:
+            final_kept.append(candidate)
+    debug = {
+        "voxel_step2_conflict_rejected_count": int(len(rejected)),
+        "voxel_step2_conflict_graph": conflicts,
+        "voxel_step2_conflict_reject_reason_counts": dict(Counter(str(c.reject_reason) for c in rejected if c.reject_reason)),
+    }
+    return final_kept, rejected, debug
+
+
+def _step2_candidate_pre_score(candidate: SeparatorCandidate, mask: np.ndarray) -> float:
+    source_conf = float(candidate.debug.get("source_line_confidence", candidate.debug.get("confidence", 0.5)) or 0.5)
+    topology = float(candidate.debug.get("topology_gain_score", 0.5) or 0.5)
+    length_score = min(1.0, float(np.count_nonzero(mask)) / 16.0)
+    unknown_ratio = float(candidate.debug.get("unknown_ratio", 0.0) or 0.0)
+    return float(0.35 * source_conf + 0.20 * topology + 0.20 * length_score - 0.30 * unknown_ratio)
+
+
 def _dedup_step2_lines(lines: Sequence[FilteredWallLine]) -> tuple[list[FilteredWallLine], int]:
     kept: list[FilteredWallLine] = []
     dropped = 0
@@ -1418,6 +1942,32 @@ def _step2_lines_equivalent(a: FilteredWallLine, b: FilteredWallLine) -> bool:
 
 def _cheb(a: np.ndarray, b: np.ndarray) -> int:
     return int(np.max(np.abs(np.asarray(a, dtype=np.int32) - np.asarray(b, dtype=np.int32))))
+
+
+def _cells_to_mask(cells: Sequence[tuple[int, int]], shape: tuple[int, int]) -> np.ndarray:
+    out = np.zeros(shape, dtype=bool)
+    for r, c in cells:
+        if 0 <= int(r) < shape[0] and 0 <= int(c) < shape[1]:
+            out[int(r), int(c)] = True
+    return out
+
+
+def _mask_major_dir(mask: np.ndarray) -> tuple[float, float]:
+    rows, cols = np.nonzero(np.asarray(mask, dtype=bool))
+    if rows.size < 2:
+        return (0.0, 1.0)
+    pts = np.stack([rows.astype(np.float32), cols.astype(np.float32)], axis=1)
+    pts = pts - np.mean(pts, axis=0, keepdims=True)
+    try:
+        _u, _s, vt = np.linalg.svd(pts, full_matrices=False)
+        vec = vt[0].astype(np.float32)
+    except np.linalg.LinAlgError:
+        vec = np.asarray([0.0, 1.0], dtype=np.float32)
+    norm = float(np.linalg.norm(vec))
+    if norm <= 1e-6:
+        return (0.0, 1.0)
+    vec = vec / norm
+    return (float(vec[0]), float(vec[1]))
 
 
 def _extension_layers(extensions: Sequence[LineExtensionHit], shape: tuple[int, int]) -> dict[str, np.ndarray]:
@@ -1473,6 +2023,16 @@ def _step2_reject_code(reason: str) -> int:
         "no_hit": 6,
         "hit_too_close": 7,
         "hit_not_wall": 8,
+        "reject_step2_intersects_door": 9,
+        "reject_step2_intersects_existing_extension": 10,
+        "reject_step2_hits_extension_not_wall": 11,
+        "reject_step2_pairwise_crossing_ambiguous": 12,
+        "reject_step2_pairwise_crossing_loser": 13,
+        "reject_step2_source_too_short": 21,
+        "reject_step2_source_support_ratio_low": 22,
+        "reject_step2_source_support_cells_low": 23,
+        "reject_step2_source_frontier_unknown_edge": 24,
+        "reject_step2_source_door_frame_duplicate": 25,
         "step2_candidate_rejected": 255,
     }
     return int(values.get(str(reason), 254))

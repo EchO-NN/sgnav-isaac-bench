@@ -28,8 +28,8 @@ def _line(line_id: int, p0: tuple[int, int], p1: tuple[int, int], *, confidence:
 
 def test_step2_line_pool_uses_filtered_and_extension_seed_lines() -> None:
     shape = (20, 20)
-    filtered = [_line(1, (5, 2), (5, 8))]
-    relaxed = [_line(2, (12, 2), (12, 7))]
+    filtered = [_line(1, (5, 2), (5, 9))]
+    relaxed = [_line(2, (12, 2), (12, 9))]
 
     pool = build_step2_line_pool(
         filtered_lines=filtered,

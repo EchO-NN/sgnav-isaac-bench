@@ -120,6 +120,12 @@ class VoxelDoorDetectorConfig:
     partition_topology_min_side_area_cells: int = 3
     partition_topology_min_side_width_cells: int = 1
     enable_one_seed_one_wall_completion: bool = True
+    min_seed_cells_for_partition_completion: int = 3
+    min_seed_cells_for_visual_only_completion: int = 1
+    one_seed_one_wall_partition_enabled: bool = False
+    one_seed_one_wall_visual_only_enabled: bool = True
+    min_seed_overlap_cells_for_partition: int = 2
+    min_seed_coverage_ratio_for_partition: float = 0.50
     enable_seed_pair_bridge_completion: bool = True
     seed_pair_max_center_distance_m: float = 1.40
     seed_pair_max_perpendicular_gap_cells: int = 2
@@ -139,7 +145,11 @@ class VoxelDoorDetectorConfig:
     door_memory_decay_per_update: float = 0.05
     door_memory_confirm_increment: float = 0.35
     door_memory_min_confidence_to_keep: float = 0.20
-    door_memory_ttl_updates: int = 20
+    door_memory_ttl_updates: int = 40
+    door_memory_hard_contradiction_requires_strict_wall: bool = True
+    door_memory_hard_contradiction_min_updates: int = 3
+    door_memory_unknown_never_contradicts: bool = True
+    door_memory_decay_only_on_target_updates: bool = True
     show_candidate_lines_in_debug: bool = True
 
     @classmethod
@@ -569,6 +579,8 @@ class StableDoorTrack:
     update_count: int = 1
     last_refresh_reason: str = "created"
     missed_update_count: int = 0
+    hard_contradiction_count: int = 0
+    last_contradiction_reason: str = ""
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -586,6 +598,8 @@ class StableDoorTrack:
             "update_count": int(self.update_count),
             "last_refresh_reason": str(self.last_refresh_reason),
             "missed_update_count": int(self.missed_update_count),
+            "hard_contradiction_count": int(self.hard_contradiction_count),
+            "last_contradiction_reason": str(self.last_contradiction_reason),
         }
 
 
@@ -679,6 +693,8 @@ class VoxelDoorMemory:
                         update_count=1,
                         last_refresh_reason="created",
                         missed_update_count=0,
+                        hard_contradiction_count=0,
+                        last_contradiction_reason="",
                     )
                 )
                 matched_ids.add(int(self._next_track_id))
@@ -701,6 +717,8 @@ class VoxelDoorMemory:
             best_track.update_count += 1
             best_track.last_refresh_reason = "strong_partition"
             best_track.missed_update_count = 0
+            best_track.hard_contradiction_count = 0
+            best_track.last_contradiction_reason = ""
             matched_ids.add(int(best_track.track_id))
             refresh_reasons["strong_partition"] += 1
             updated += 1
@@ -747,6 +765,8 @@ class VoxelDoorMemory:
             best_track.update_count += 1
             best_track.last_refresh_reason = "weak_visual_%s" % partition_reason
             best_track.missed_update_count = 0
+            best_track.hard_contradiction_count = 0
+            best_track.last_contradiction_reason = ""
             matched_ids.add(int(best_track.track_id))
             refresh_reasons[best_track.last_refresh_reason] += 1
             weak_refreshed += 1
@@ -754,11 +774,13 @@ class VoxelDoorMemory:
         ttl = int(getattr(cfg, "door_memory_ttl_updates", 20))
         min_conf = float(getattr(cfg, "door_memory_min_confidence_to_keep", 0.20))
         wall_contradiction = np.zeros(shape, dtype=bool) if contradiction_wall_map is None else np.asarray(contradiction_wall_map, dtype=bool)
-        _ = contradiction_unknown_map
+        unknown_contradiction = np.zeros(shape, dtype=bool) if contradiction_unknown_map is None else np.asarray(contradiction_unknown_map, dtype=bool)
+        hard_contradiction_min_updates = max(1, int(getattr(cfg, "door_memory_hard_contradiction_min_updates", 3)))
         before_prune = len(self._tracks)
         prune_reasons: Counter[str] = Counter()
         kept_tracks: list[StableDoorTrack] = []
         prune_reason_map = np.zeros(shape, dtype=np.uint8)
+        contradiction_reasons: Counter[str] = Counter()
         for track in self._tracks:
             track_mask = _cells_to_mask(track.cut_cells, shape)
             if float(track.confidence) < min_conf:
@@ -772,7 +794,19 @@ class VoxelDoorMemory:
                 continue
             if np.any(track_mask):
                 wall_ratio = float(np.count_nonzero(track_mask & wall_contradiction)) / float(max(1, np.count_nonzero(track_mask)))
+                unknown_ratio = float(np.count_nonzero(track_mask & unknown_contradiction)) / float(max(1, np.count_nonzero(track_mask)))
                 if wall_ratio >= 0.70:
+                    track.hard_contradiction_count += 1
+                    track.last_contradiction_reason = "strict_wall_overlap_%.2f" % float(wall_ratio)
+                    contradiction_reasons["strict_wall_overlap"] += 1
+                elif bool(getattr(cfg, "door_memory_unknown_never_contradicts", True)) and unknown_ratio >= 0.70:
+                    track.hard_contradiction_count = 0
+                    track.last_contradiction_reason = "unknown_ignored_%.2f" % float(unknown_ratio)
+                    contradiction_reasons["unknown_ignored"] += 1
+                else:
+                    track.hard_contradiction_count = 0
+                    track.last_contradiction_reason = ""
+                if track.hard_contradiction_count >= hard_contradiction_min_updates:
                     prune_reasons["hard_wall_contradiction"] += 1
                     prune_reason_map[track_mask] = 3
                     continue
@@ -801,6 +835,9 @@ class VoxelDoorMemory:
             "voxel_door_memory_missed_update_counts": [int(track.missed_update_count) for track in self._tracks],
             "voxel_door_memory_refresh_reason_counts": dict(refresh_reasons),
             "voxel_door_memory_prune_reason_counts": dict(prune_reasons),
+            "voxel_door_memory_contradiction_reason_counts": dict(contradiction_reasons),
+            "voxel_door_memory_hard_contradiction_min_updates": int(hard_contradiction_min_updates),
+            "voxel_door_memory_unknown_never_contradicts": bool(getattr(cfg, "door_memory_unknown_never_contradicts", True)),
             "voxel_door_memory_prune_reason_map": prune_reason_map.astype(np.uint8),
             "voxel_stable_door_kept_without_current_match_cells": int(np.count_nonzero(kept_without_current)),
             "voxel_stable_door_kept_without_current_match_mask": kept_without_current.astype(bool),
@@ -2562,6 +2599,8 @@ def _candidate_from_seed_component(
     width_m = float(len(full_cells) * resolution_m)
     own_seed = _cells_to_mask(seed_cells, free_clean.shape)
     visual_mask = _cells_to_mask(full_cells, free_clean.shape)
+    seed_line_mask = dilate(visual_mask, 1)
+    seed_coverage_score = _ratio(seed_cells, seed_line_mask)
     cut_result = build_door_partition_cut(
         full_line_cells=full_cells,
         seed_mask=own_seed,
@@ -2581,7 +2620,9 @@ def _candidate_from_seed_component(
     inner_wall_ratio = _ratio(inner, real_wall & ~own_seed)
     inner_free_or_seed_ratio = _ratio(inner, free_clean | own_seed)
     visual_reject_reason = None
-    if bool(cfg.enforce_seed_door_width_limits) and (width_m < float(cfg.door_width_min_m) or width_m > float(cfg.door_width_max_m)):
+    if len(seed_cells) < max(1, int(getattr(cfg, "min_seed_cells_for_visual_only_completion", 1))):
+        visual_reject_reason = "door_seed_support_too_weak_for_visual"
+    elif bool(cfg.enforce_seed_door_width_limits) and (width_m < float(cfg.door_width_min_m) or width_m > float(cfg.door_width_max_m)):
         visual_reject_reason = "door_width_out_of_range"
     elif width_m < float(cfg.visual_width_min_m):
         visual_reject_reason = "door_visual_width_out_of_range"
@@ -2610,11 +2651,39 @@ def _candidate_from_seed_component(
     else:
         neck_debug = {"door_line_local_neck_checked": False, "door_line_local_neck_skip_reason": str(visual_reject_reason)}
     partition_reject_reason = None
+    seed_overlap_cells_for_partition = int(np.count_nonzero(partition_mask & same_seed_mask))
+    seed_pair_like_for_partition = bool(
+        completion_mode == DOOR_COMPLETION_SEED_PAIR_BRIDGE
+        or seed_group_kind_debug == "seed_pair_bridge"
+        or len(component_debug_ids) >= 2
+    )
     if visual_reject_reason is not None:
         partition_reject_reason = "visual_rejected"
         partition_cells = []
     elif not partition_cells:
         partition_reject_reason = "door_partition_cut_empty"
+    elif (
+        completion_mode == DOOR_COMPLETION_ONE_SEED_ONE_WALL
+        and not bool(getattr(cfg, "one_seed_one_wall_partition_enabled", False))
+    ):
+        partition_reject_reason = "door_partition_one_seed_one_wall_visual_only"
+        partition_cells = []
+        partition_mask = np.zeros_like(partition_mask, dtype=bool)
+    elif (
+        len(seed_cells) < max(1, int(getattr(cfg, "min_seed_cells_for_partition_completion", 3)))
+        and not seed_pair_like_for_partition
+    ):
+        partition_reject_reason = "door_partition_seed_support_too_weak"
+        partition_cells = []
+        partition_mask = np.zeros_like(partition_mask, dtype=bool)
+    elif seed_overlap_cells_for_partition < max(0, int(getattr(cfg, "min_seed_overlap_cells_for_partition", 2))):
+        partition_reject_reason = "door_partition_seed_overlap_too_low"
+        partition_cells = []
+        partition_mask = np.zeros_like(partition_mask, dtype=bool)
+    elif seed_coverage_score < float(getattr(cfg, "min_seed_coverage_ratio_for_partition", 0.50)) and not seed_pair_like_for_partition:
+        partition_reject_reason = "door_partition_seed_coverage_too_low"
+        partition_cells = []
+        partition_mask = np.zeros_like(partition_mask, dtype=bool)
     elif inner_unknown_ratio > float(getattr(cfg, "partition_inner_unknown_ratio_max", cfg.inner_unknown_ratio_max)):
         partition_reject_reason = "door_inner_unknown_ratio_too_high"
         partition_cells = []
@@ -2674,8 +2743,6 @@ def _candidate_from_seed_component(
     topology_warning = bool(partition_reject_reason is None and not bool(topology.topology_accepted))
     topology_warning_reason = None if not topology_warning else str(topology.reject_reason or "door_cut_no_topology_gain")
     anchor_score = 1.0 if anchor_a is not None and anchor_b is not None else (0.80 if anchor_a is not None or anchor_b is not None else 0.65)
-    seed_line_mask = dilate(visual_mask, 1)
-    seed_coverage_score = _ratio(seed_cells, seed_line_mask)
     source_values = [value for value in (source_a, source_b) if int(value) != DOOR_ANCHOR_NONE]
     source_priority = float(np.mean([_door_anchor_source_priority(value) for value in source_values])) if source_values else 0.50
     length_score = min(1.0, width_m / max(float(cfg.visual_width_min_m), 1e-6))
@@ -2719,6 +2786,11 @@ def _candidate_from_seed_component(
             "inner_unknown_ratio": float(inner_unknown_ratio),
             "inner_wall_ratio": float(inner_wall_ratio),
             "inner_free_or_seed_ratio": float(inner_free_or_seed_ratio),
+            "seed_cells_for_completion": int(len(seed_cells)),
+            "seed_overlap_cells_for_partition": int(seed_overlap_cells_for_partition),
+            "seed_coverage_ratio_for_partition": float(seed_coverage_score),
+            "seed_pair_like_for_partition": bool(seed_pair_like_for_partition),
+            "one_seed_one_wall_partition_enabled": bool(getattr(cfg, "one_seed_one_wall_partition_enabled", False)),
             "anchor_a_source": _anchor_source_name(source_a),
             "anchor_b_source": _anchor_source_name(source_b),
             "anchor_a_source_code": int(source_a),
