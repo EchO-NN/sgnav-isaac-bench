@@ -124,6 +124,10 @@ def should_update_roomseg_frontiers(
     target_invalidated: bool = False,
     no_progress: bool = False,
     debug_force: bool = False,
+    update_on_target_invalidated: bool = False,
+    update_on_no_active_path: bool = False,
+    update_on_no_progress: bool = False,
+    update_on_replan: bool = False,
 ) -> tuple[bool, str]:
     _ = step
     normalized_policy = str(policy or "always").strip().lower()
@@ -135,11 +139,13 @@ def should_update_roomseg_frontiers(
         return True, "initial"
     if bool(target_reached):
         return True, "target_reached"
-    if bool(target_invalidated):
+    if bool(update_on_replan) and normalized_policy in {"at_replan", "replan"}:
+        return True, "replan"
+    if bool(target_invalidated) and bool(update_on_target_invalidated):
         return True, "target_invalidated"
-    if bool(no_progress):
+    if bool(no_progress) and bool(update_on_no_progress):
         return True, "no_progress"
-    if not bool(has_current_path):
+    if not bool(has_current_path) and bool(update_on_no_active_path):
         return True, "no_active_path"
     return False, "cached_during_navigation"
 
@@ -1843,7 +1849,14 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
     detection_category_counts = Counter()
     goal_detection_history = []
     last_frontiers = []
+    last_frontier_free = None
+    last_frontier_observed = None
+    last_frontier_occupancy = None
+    last_frontier_layers = None
+    last_frontier_source_metadata = {}
+    last_distance_traversible = None
     roomseg_frontier_update_gate = FrontierRoomsegUpdateGateState()
+    roomseg_frontier_target_reached_pending = False
     last_nav_decision = None
     last_frontier_commitment_metadata = {}
     last_frontier_commitment_reason = ""
@@ -2791,8 +2804,14 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
                 gate_state=roomseg_frontier_update_gate,
                 policy=str(getattr(args, "roomseg_frontier_update_policy", "at_frontier_arrival")),
                 freeze_during_navigation=bool(getattr(args, "freeze_roomseg_and_frontiers_during_navigation", True)),
+                target_reached=bool(roomseg_frontier_target_reached_pending),
                 target_invalidated=bool(needs_replan and not current_path and roomseg_frontier_update_gate.initialized),
+                no_progress=bool(nav_execution_no_progress_steps >= int(args.frontier_commit_no_progress_steps)),
                 debug_force=bool(getattr(args, "force_roomseg_frontier_update", False)),
+                update_on_target_invalidated=bool(getattr(args, "roomseg_frontier_update_on_target_invalidated", False)),
+                update_on_no_active_path=bool(getattr(args, "roomseg_frontier_update_on_no_active_path", False)),
+                update_on_no_progress=bool(getattr(args, "roomseg_frontier_update_on_no_progress", False)),
+                update_on_replan=bool(getattr(args, "roomseg_frontier_update_on_replan", False)),
             )
             if needs_replan and not update_roomseg_frontiers and current_path:
                 needs_replan = False
@@ -2808,7 +2827,11 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
                 }
 
             if needs_replan:
-                mark_roomseg_frontier_gate_update(roomseg_frontier_update_gate, step=int(step), reason=roomseg_frontier_update_reason)
+                if update_roomseg_frontiers:
+                    mark_roomseg_frontier_gate_update(roomseg_frontier_update_gate, step=int(step), reason=roomseg_frontier_update_reason)
+                    roomseg_frontier_target_reached_pending = False
+                else:
+                    mark_roomseg_frontier_gate_skip(roomseg_frontier_update_gate, reason=roomseg_frontier_update_reason)
                 planning_started_at = time.perf_counter()
                 llm_requests_before = total_llm_requests()
                 astar_traversible = np.asarray(map_state.get("astar_navigable", navigable), dtype=bool)
@@ -2827,48 +2850,66 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
                         not paper_mode
                         or str(getattr(args, "frontier_selection_mode", "sgnav")).strip().lower() in {"nearest", "random"}
                     )
+                    and bool(update_roomseg_frontiers)
                 )
                 if roomseg_context_needed:
                     room_context_result = update_room_context_for_frontier_scoring(step, map_state)
-                frontier_free, frontier_observed, frontier_occupancy, frontier_source_metadata = resolve_frontier_source_layers(
-                    room_debug=last_room_segmentation_debug,
-                    mapper=mapper,
-                    navigation_free=free,
-                    navigation_observed=observed,
-                    navigation_occupancy=occupancy,
-                    frontier_traversible=frontier_traversible,
-                    source=str(getattr(args, "frontier_source", "navigation")),
-                    require_navigation_reachable=bool(getattr(args, "frontier_vertical_free_require_navigation_reachable", True)),
-                )
+                recompute_frontiers = bool(update_roomseg_frontiers) or last_frontier_layers is None
+                if recompute_frontiers:
+                    frontier_free, frontier_observed, frontier_occupancy, frontier_source_metadata = resolve_frontier_source_layers(
+                        room_debug=last_room_segmentation_debug,
+                        mapper=mapper,
+                        navigation_free=free,
+                        navigation_observed=observed,
+                        navigation_occupancy=occupancy,
+                        frontier_traversible=frontier_traversible,
+                        source=str(getattr(args, "frontier_source", "navigation")),
+                        require_navigation_reachable=bool(getattr(args, "frontier_vertical_free_require_navigation_reachable", True)),
+                    )
+                else:
+                    frontier_free = np.asarray(last_frontier_free, dtype=bool)
+                    frontier_observed = np.asarray(last_frontier_observed, dtype=bool)
+                    frontier_occupancy = np.asarray(last_frontier_occupancy, dtype=bool)
+                    frontier_source_metadata = dict(last_frontier_source_metadata)
                 last_room_segmentation_debug = {
                     **dict(last_room_segmentation_debug),
                     **dict(frontier_source_metadata),
-                    "roomseg_frontier_update_due": True,
+                    "roomseg_frontier_update_due": bool(update_roomseg_frontiers),
                     "roomseg_frontier_update_reason": roomseg_frontier_update_reason,
                     "roomseg_frontier_update_policy": str(getattr(args, "roomseg_frontier_update_policy", "at_frontier_arrival")),
                     "roomseg_frontier_last_update_step": int(roomseg_frontier_update_gate.last_update_step),
                     "roomseg_frontier_last_update_reason": roomseg_frontier_update_gate.last_update_reason,
-                    "frontiers_frozen_during_navigation": False,
+                    "frontiers_frozen_during_navigation": not bool(update_roomseg_frontiers),
                 }
-                distance_traversible = frontier_traversible.copy()
-                rr, cc = int(current_grid[0]), int(current_grid[1])
-                if 0 <= rr < distance_traversible.shape[0] and 0 <= cc < distance_traversible.shape[1]:
-                    distance_traversible[rr, cc] = True
-                static_only_nearfield = getattr(mapper, "static_nearfield_mask", None)
-                depth_free_mask = getattr(mapper, "depth_free_mask", None)
-                if bool(getattr(args, "static_nearfield_map", False)) and static_only_nearfield is not None and depth_free_mask is not None:
-                    static_only_nearfield = np.asarray(static_only_nearfield).astype(bool) & ~np.asarray(depth_free_mask).astype(bool)
+                if recompute_frontiers:
+                    distance_traversible = frontier_traversible.copy()
+                    rr, cc = int(current_grid[0]), int(current_grid[1])
+                    if 0 <= rr < distance_traversible.shape[0] and 0 <= cc < distance_traversible.shape[1]:
+                        distance_traversible[rr, cc] = True
+                    static_only_nearfield = getattr(mapper, "static_nearfield_mask", None)
+                    depth_free_mask = getattr(mapper, "depth_free_mask", None)
+                    if bool(getattr(args, "static_nearfield_map", False)) and static_only_nearfield is not None and depth_free_mask is not None:
+                        static_only_nearfield = np.asarray(static_only_nearfield).astype(bool) & ~np.asarray(depth_free_mask).astype(bool)
+                    else:
+                        static_only_nearfield = None
+                    frontier_layers = frontier_debug_layers(
+                        frontier_free,
+                        observed=frontier_observed,
+                        occupancy=frontier_occupancy,
+                        obstacle_dilation_radius_cells=int(args.frontier_obstacle_dilation_radius_cells),
+                        unknown_dilation_radius_cells=int(args.frontier_unknown_dilation_radius_cells),
+                        exclude_mask=static_only_nearfield,
+                        unknown_source="observed" if str(frontier_source_metadata.get("frontier_source")) in {"vertical_free", "voxel_vertical_free"} else str(args.frontier_unknown_source),
+                    )
+                    last_frontier_free = np.asarray(frontier_free, dtype=bool).copy()
+                    last_frontier_observed = np.asarray(frontier_observed, dtype=bool).copy()
+                    last_frontier_occupancy = np.asarray(frontier_occupancy, dtype=bool).copy()
+                    last_frontier_layers = {key: np.asarray(value).copy() for key, value in frontier_layers.items()}
+                    last_frontier_source_metadata = dict(frontier_source_metadata)
+                    last_distance_traversible = np.asarray(distance_traversible, dtype=bool).copy()
                 else:
-                    static_only_nearfield = None
-                frontier_layers = frontier_debug_layers(
-                    frontier_free,
-                    observed=frontier_observed,
-                    occupancy=frontier_occupancy,
-                    obstacle_dilation_radius_cells=int(args.frontier_obstacle_dilation_radius_cells),
-                    unknown_dilation_radius_cells=int(args.frontier_unknown_dilation_radius_cells),
-                    exclude_mask=static_only_nearfield,
-                    unknown_source="observed" if str(frontier_source_metadata.get("frontier_source")) in {"vertical_free", "voxel_vertical_free"} else str(args.frontier_unknown_source),
-                )
+                    frontier_layers = {key: np.asarray(value).copy() for key, value in dict(last_frontier_layers or {}).items()}
+                    distance_traversible = np.asarray(last_distance_traversible if last_distance_traversible is not None else frontier_traversible, dtype=bool).copy()
                 if bool(getattr(args, "frontier_debug_dump", False)):
                     assert frontier_free.shape == frontier_observed.shape == frontier_occupancy.shape == distance_traversible.shape
                     assert int(np.count_nonzero(frontier_layers["frontier"] & ~frontier_free)) == 0
@@ -2900,7 +2941,7 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
                             "long_term_goal_locked": True,
                             "long_term_goal_selected_step": int(long_term_goal.selected_step),
                         }
-                else:
+                elif recompute_frontiers:
                     if candidate_override is not None:
                         long_term_goal.clear("candidate_override")
                     last_frontier_raw_cells = int(np.count_nonzero(frontier_layers["frontier"]))
@@ -2924,6 +2965,37 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
                     )
                     last_frontier_clusters = len(frontiers)
                     last_frontiers = list(frontiers)
+                else:
+                    last_frontier_raw_cells = int(np.count_nonzero(frontier_layers.get("frontier", np.zeros_like(frontier_free, dtype=bool))))
+                    frontiers = list(last_frontiers)
+                    last_frontier_clusters = len(frontiers)
+                    if candidate_override is not None:
+                        long_term_goal.clear("candidate_override")
+                    candidate_preview = None
+                    nav_decision = candidate_override or decision_policy.choose_navigation_target(
+                        object_memory,
+                        episode["goal_category"],
+                        current_grid,
+                        frontiers,
+                        base_nav_planner if bool(frontier_mask_probe or explore_until_no_frontiers) else nav_planner,
+                        dynamic_map_info,
+                        pose,
+                        allow_frontier=True,
+                        current_step=step,
+                    )
+                    nav_decision.metadata = {
+                        **dict(nav_decision.metadata or {}),
+                        **dict(frontier_source_metadata),
+                    }
+                    locked_goal_used = False
+                    last_frontier_commitment_reason = "cached_roomseg_frontiers"
+                    last_frontier_commitment_metadata = {
+                        **dict(last_frontier_commitment_metadata),
+                        "frontier_commitment_reason": "cached_roomseg_frontiers",
+                    }
+                if not recompute_frontiers:
+                    candidate_preview = None
+                if recompute_frontiers:
                     candidate_preview = None
                     if paper_mode and frontiers and candidate_override is None and not frontier_mask_probe:
                         candidate_preview = decision_policy.select_goal_candidate(
@@ -3481,6 +3553,7 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
                 if paper_mode:
                     long_term_goal.clear("reached")
                 current_path = []
+                roomseg_frontier_target_reached_pending = True
                 force_perception_step = True
                 full_path.append(tuple(int(v) for v in current_grid))
                 last_decision_reason = reason
@@ -4811,6 +4884,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     args.roomseg_frontier_update_policy = str(roomseg_frontier_update_cfg.get("policy", "at_frontier_arrival"))
     args.freeze_roomseg_and_frontiers_during_navigation = bool(roomseg_frontier_update_cfg.get("freeze_during_navigation", True))
     args.force_roomseg_frontier_update = bool(roomseg_frontier_update_cfg.get("debug_force_update", False))
+    args.roomseg_frontier_update_on_target_invalidated = bool(roomseg_frontier_update_cfg.get("update_on_target_invalidated", False))
+    args.roomseg_frontier_update_on_no_active_path = bool(roomseg_frontier_update_cfg.get("update_on_no_active_path", False))
+    args.roomseg_frontier_update_on_no_progress = bool(roomseg_frontier_update_cfg.get("update_on_no_progress", False))
+    args.roomseg_frontier_update_on_replan = bool(roomseg_frontier_update_cfg.get("update_on_replan", False))
     room_semantics_cfg = dict(get_nested(cfg, "room_semantics", {}) or {})
     for key in (
         "use_premerge_labels_for_open_plan_merge",

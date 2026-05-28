@@ -123,6 +123,9 @@ def test_required_sgnav_defaults():
     assert cfg["mapping"]["room_segmentation"]["voxel_door"]["allow_diagonal_orientation_candidates"] is False
     assert cfg["mapping"]["room_segmentation"]["voxel_door"]["infer_orientation_from_wall_pairs"] is True
     assert cfg["mapping"]["room_segmentation"]["voxel_door"]["infer_orientation_from_local_free_neck"] is True
+    assert cfg["mapping"]["room_segmentation"]["voxel_door"]["infer_orientation_from_local_free_neck_for_accept"] is False
+    assert cfg["mapping"]["room_segmentation"]["voxel_door"]["allow_axis_candidate_without_seed_support"] is False
+    assert cfg["mapping"]["room_segmentation"]["voxel_door"]["min_seed_cells_for_axis_fallback"] == 3
     assert cfg["mapping"]["room_segmentation"]["voxel_door"]["visual_walk_ignore_other_seed_clusters"] is True
     assert cfg["mapping"]["room_segmentation"]["voxel_door"]["visual_walk_unknown_bridge_max_cells"] == 2
     assert cfg["mapping"]["room_segmentation"]["voxel_door"]["visual_width_min_m"] == 0.15

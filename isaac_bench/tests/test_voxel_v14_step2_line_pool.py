@@ -51,7 +51,7 @@ def test_step2_line_pool_uses_filtered_and_extension_seed_lines() -> None:
     assert np.any(pool.source_line_map[12, 2:8])
 
 
-def test_step2_target_wall_includes_extension_seed_line_map() -> None:
+def test_step2_target_wall_excludes_extension_seed_line_map_by_default() -> None:
     shape = (20, 20)
     extension_seed_map = np.zeros(shape, dtype=bool)
     extension_seed_map[10, 4:12] = True
@@ -69,6 +69,6 @@ def test_step2_target_wall_includes_extension_seed_line_map() -> None:
         resolution_m=0.10,
     )
 
-    assert np.all(pool.target_wall_map[10, 4:12])
-    assert np.all(pool.target_source_map[10, 4:12] == 6)
-    assert pool.debug["voxel_step2_target_source_counts"]["extension_seed_line"] == 8
+    assert not np.any(pool.target_wall_map[10, 4:12])
+    assert not np.any(pool.target_source_map[10, 4:12])
+    assert pool.debug["voxel_step2_target_source_counts"]["extension_seed_line"] == 0

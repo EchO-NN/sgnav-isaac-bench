@@ -95,6 +95,9 @@ class VoxelDoorDetectorConfig:
     allow_diagonal_orientation_candidates: bool = False
     infer_orientation_from_wall_pairs: bool = True
     infer_orientation_from_local_free_neck: bool = True
+    infer_orientation_from_local_free_neck_for_accept: bool = False
+    allow_axis_candidate_without_seed_support: bool = False
+    min_seed_cells_for_axis_fallback: int = 3
     visual_walk_ignore_other_seed_clusters: bool = True
     visual_walk_continue_through_unknown: bool = True
     visual_walk_unknown_bridge_max_cells: int = 2
@@ -133,10 +136,10 @@ class VoxelDoorDetectorConfig:
     door_memory_match_iou_min: float = 0.20
     door_memory_match_distance_cells: int = 3
     door_memory_match_angle_deg: float = 20.0
-    door_memory_decay_per_update: float = 0.10
+    door_memory_decay_per_update: float = 0.05
     door_memory_confirm_increment: float = 0.35
-    door_memory_min_confidence_to_keep: float = 0.25
-    door_memory_ttl_updates: int = 8
+    door_memory_min_confidence_to_keep: float = 0.20
+    door_memory_ttl_updates: int = 20
     show_candidate_lines_in_debug: bool = True
 
     @classmethod
@@ -555,6 +558,8 @@ class StableDoorTrack:
     track_id: int
     first_seen_step: int
     last_seen_step: int
+    first_seen_update_index: int
+    last_seen_update_index: int
     confidence: float
     center_rc: tuple[float, float]
     major_dir_rc: tuple[float, float]
@@ -562,12 +567,16 @@ class StableDoorTrack:
     visual_cells: list[tuple[int, int]]
     source_candidate_ids: list[int] = field(default_factory=list)
     update_count: int = 1
+    last_refresh_reason: str = "created"
+    missed_update_count: int = 0
 
     def to_dict(self) -> dict[str, object]:
         return {
             "track_id": int(self.track_id),
             "first_seen_step": int(self.first_seen_step),
             "last_seen_step": int(self.last_seen_step),
+            "first_seen_update_index": int(self.first_seen_update_index),
+            "last_seen_update_index": int(self.last_seen_update_index),
             "confidence": float(self.confidence),
             "center_rc": [float(self.center_rc[0]), float(self.center_rc[1])],
             "major_dir_rc": [float(self.major_dir_rc[0]), float(self.major_dir_rc[1])],
@@ -575,6 +584,8 @@ class StableDoorTrack:
             "visual_cells": [[int(r), int(c)] for r, c in self.visual_cells],
             "source_candidate_ids": [int(v) for v in self.source_candidate_ids],
             "update_count": int(self.update_count),
+            "last_refresh_reason": str(self.last_refresh_reason),
+            "missed_update_count": int(self.missed_update_count),
         }
 
 
@@ -602,10 +613,14 @@ class VoxelDoorMemory:
         candidates: Sequence[VoxelDoorLineCandidate],
         *,
         step: int,
+        update_index: int = 0,
         shape: tuple[int, int],
+        contradiction_wall_map: np.ndarray | None = None,
+        contradiction_unknown_map: np.ndarray | None = None,
     ) -> StableDoorMemoryResult:
         cfg = self.config
         stable_empty = np.zeros(shape, dtype=bool)
+        update_idx = int(update_index)
         if not bool(getattr(cfg, "door_memory_enabled", True)):
             return StableDoorMemoryResult(
                 stable_door_cut_mask=stable_empty.copy(),
@@ -616,8 +631,11 @@ class VoxelDoorMemory:
             )
 
         for track in self._tracks:
-            if int(track.last_seen_step) != int(step):
-                track.confidence = max(0.0, float(track.confidence) - float(getattr(cfg, "door_memory_decay_per_update", 0.10)))
+            missed = max(0, int(update_idx) - int(track.last_seen_update_index))
+            if missed > 0:
+                track.missed_update_count = int(missed)
+                track.confidence = max(0.0, float(track.confidence) - float(getattr(cfg, "door_memory_decay_per_update", 0.05)) * float(missed))
+                track.last_refresh_reason = "kept_without_current_match"
 
         current = [
             candidate
@@ -636,6 +654,8 @@ class VoxelDoorMemory:
         matched_current_mask = np.zeros(shape, dtype=bool)
         created = 0
         updated = 0
+        weak_refreshed = 0
+        refresh_reasons: Counter[str] = Counter()
         for candidate in current:
             cut_cells = [tuple(v) for v in candidate.door_cut_cells]
             visual_cells = [tuple(v) for v in (candidate.extended_centerline_cells or candidate.door_cut_cells)]
@@ -648,6 +668,8 @@ class VoxelDoorMemory:
                         track_id=int(self._next_track_id),
                         first_seen_step=int(step),
                         last_seen_step=int(step),
+                        first_seen_update_index=int(update_idx),
+                        last_seen_update_index=int(update_idx),
                         confidence=float(getattr(cfg, "door_memory_initial_confidence", 1.0)),
                         center_rc=(float(candidate.center_rc[0]), float(candidate.center_rc[1])),
                         major_dir_rc=(float(candidate.major_dir_rc[0]), float(candidate.major_dir_rc[1])),
@@ -655,13 +677,17 @@ class VoxelDoorMemory:
                         visual_cells=visual_cells,
                         source_candidate_ids=[int(candidate.candidate_id)],
                         update_count=1,
+                        last_refresh_reason="created",
+                        missed_update_count=0,
                     )
                 )
                 matched_ids.add(int(self._next_track_id))
+                refresh_reasons["created"] += 1
                 self._next_track_id += 1
                 created += 1
                 continue
             best_track.last_seen_step = int(step)
+            best_track.last_seen_update_index = int(update_idx)
             best_track.confidence = min(
                 1.0,
                 float(best_track.confidence) + float(getattr(cfg, "door_memory_confirm_increment", 0.35)),
@@ -673,31 +699,111 @@ class VoxelDoorMemory:
             best_track.source_candidate_ids.append(int(candidate.candidate_id))
             best_track.source_candidate_ids = best_track.source_candidate_ids[-16:]
             best_track.update_count += 1
+            best_track.last_refresh_reason = "strong_partition"
+            best_track.missed_update_count = 0
             matched_ids.add(int(best_track.track_id))
+            refresh_reasons["strong_partition"] += 1
             updated += 1
 
-        ttl = int(getattr(cfg, "door_memory_ttl_updates", 8))
-        min_conf = float(getattr(cfg, "door_memory_min_confidence_to_keep", 0.25))
-        before_prune = len(self._tracks)
-        self._tracks = [
-            track
-            for track in self._tracks
-            if float(track.confidence) >= min_conf and int(step) - int(track.last_seen_step) <= ttl
+        weak_refresh_partition_reasons = {
+            "door_cut_no_topology_gain",
+            "door_cut_no_global_gain",
+            "door_cut_local_gain_only",
+            "door_cut_no_two_sides",
+            "door_cut_tiny_side",
+        }
+        visual_current = [
+            candidate
+            for candidate in candidates
+            if bool(candidate.accepted)
+            and bool(candidate.extended_centerline_cells)
+            and int(candidate.candidate_id) not in {int(v) for track in self._tracks for v in track.source_candidate_ids[-1:]}
         ]
+        for candidate in visual_current:
+            partition_reason = str(
+                candidate.debug.get("reject_reason_partition")
+                or candidate.debug.get("reject_reason_topology")
+                or candidate.reject_reason
+                or ""
+            )
+            if partition_reason not in weak_refresh_partition_reasons:
+                continue
+            visual_cells = [tuple(v) for v in candidate.extended_centerline_cells]
+            visual_mask = _cells_to_mask(visual_cells, shape)
+            best_track = self._best_matching_track(candidate, visual_mask, shape, matched_ids)
+            if best_track is None:
+                continue
+            best_track.last_seen_step = int(step)
+            best_track.last_seen_update_index = int(update_idx)
+            best_track.confidence = min(
+                1.0,
+                float(best_track.confidence) + 0.5 * float(getattr(cfg, "door_memory_confirm_increment", 0.35)),
+            )
+            best_track.center_rc = (float(candidate.center_rc[0]), float(candidate.center_rc[1]))
+            best_track.major_dir_rc = (float(candidate.major_dir_rc[0]), float(candidate.major_dir_rc[1]))
+            best_track.visual_cells = visual_cells
+            best_track.source_candidate_ids.append(int(candidate.candidate_id))
+            best_track.source_candidate_ids = best_track.source_candidate_ids[-16:]
+            best_track.update_count += 1
+            best_track.last_refresh_reason = "weak_visual_%s" % partition_reason
+            best_track.missed_update_count = 0
+            matched_ids.add(int(best_track.track_id))
+            refresh_reasons[best_track.last_refresh_reason] += 1
+            weak_refreshed += 1
+
+        ttl = int(getattr(cfg, "door_memory_ttl_updates", 20))
+        min_conf = float(getattr(cfg, "door_memory_min_confidence_to_keep", 0.20))
+        wall_contradiction = np.zeros(shape, dtype=bool) if contradiction_wall_map is None else np.asarray(contradiction_wall_map, dtype=bool)
+        _ = contradiction_unknown_map
+        before_prune = len(self._tracks)
+        prune_reasons: Counter[str] = Counter()
+        kept_tracks: list[StableDoorTrack] = []
+        prune_reason_map = np.zeros(shape, dtype=np.uint8)
+        for track in self._tracks:
+            track_mask = _cells_to_mask(track.cut_cells, shape)
+            if float(track.confidence) < min_conf:
+                prune_reasons["confidence_below_min"] += 1
+                prune_reason_map[track_mask] = 1
+                continue
+            missed_updates = max(0, int(update_idx) - int(track.last_seen_update_index))
+            if missed_updates > ttl:
+                prune_reasons["ttl_updates_exceeded"] += 1
+                prune_reason_map[track_mask] = 2
+                continue
+            if np.any(track_mask):
+                wall_ratio = float(np.count_nonzero(track_mask & wall_contradiction)) / float(max(1, np.count_nonzero(track_mask)))
+                if wall_ratio >= 0.70:
+                    prune_reasons["hard_wall_contradiction"] += 1
+                    prune_reason_map[track_mask] = 3
+                    continue
+            kept_tracks.append(track)
+        self._tracks = kept_tracks
         stable_cut = np.zeros(shape, dtype=bool)
         stable_visual = np.zeros(shape, dtype=bool)
+        kept_without_current = np.zeros(shape, dtype=bool)
         for track in self._tracks:
-            stable_cut |= _cells_to_mask(track.cut_cells, shape)
+            track_cut = _cells_to_mask(track.cut_cells, shape)
+            stable_cut |= track_cut
             stable_visual |= _cells_to_mask(track.visual_cells, shape)
+            if int(track.track_id) not in matched_ids:
+                kept_without_current |= track_cut
         debug = {
             "voxel_door_memory_enabled": True,
+            "voxel_door_memory_update_index": int(update_idx),
             "voxel_door_memory_track_count": int(len(self._tracks)),
             "voxel_door_memory_current_candidate_count": int(len(current)),
             "voxel_door_memory_rejected_visual_only_count": int(rejected_visual_only),
             "voxel_door_memory_rejected_partition_false_count": int(rejected_partition_false),
             "voxel_door_memory_created_count": int(created),
             "voxel_door_memory_updated_count": int(updated),
-            "voxel_door_memory_pruned_count": int(before_prune + created - len(self._tracks)),
+            "voxel_door_memory_weak_refreshed_count": int(weak_refreshed),
+            "voxel_door_memory_pruned_count": int(before_prune - len(self._tracks)),
+            "voxel_door_memory_missed_update_counts": [int(track.missed_update_count) for track in self._tracks],
+            "voxel_door_memory_refresh_reason_counts": dict(refresh_reasons),
+            "voxel_door_memory_prune_reason_counts": dict(prune_reasons),
+            "voxel_door_memory_prune_reason_map": prune_reason_map.astype(np.uint8),
+            "voxel_stable_door_kept_without_current_match_cells": int(np.count_nonzero(kept_without_current)),
+            "voxel_stable_door_kept_without_current_match_mask": kept_without_current.astype(bool),
             "voxel_door_memory_stable_cut_cells": int(np.count_nonzero(stable_cut)),
             "voxel_door_memory_stable_visual_cells": int(np.count_nonzero(stable_visual)),
             "voxel_door_memory_tracks": [track.to_dict() for track in self._tracks],
@@ -2098,7 +2204,17 @@ def _door_orientation_candidates(
     mode = str(cfg.completion_orientation_mode or "pca_plus_axis").strip().lower()
     if "pca" in mode and len(cluster.seed_cells) >= 2:
         candidates.append(("pca", np.asarray(cluster.major_dir_rc, dtype=np.float32)))
-    if "axis" in mode or not candidates:
+    allow_axis = "axis" in mode or not candidates
+    if len(cluster.seed_cells) < max(1, int(getattr(cfg, "min_seed_cells_for_axis_fallback", 3))):
+        allow_axis = allow_axis and (
+            bool(getattr(cfg, "allow_axis_candidate_without_seed_support", False))
+            or (
+                wall_clean is not None
+                and bool(getattr(cfg, "single_seed_infer_from_wall_enabled", True))
+                and _cluster_has_nearby_wall_support(cluster, np.asarray(wall_clean, dtype=bool), cfg)
+            )
+        )
+    if allow_axis:
         candidates.extend(
             [
                 ("axis_h", np.asarray([0.0, 1.0], dtype=np.float32)),
@@ -2115,7 +2231,11 @@ def _door_orientation_candidates(
         )
     if bool(getattr(cfg, "infer_orientation_from_wall_pairs", True)) and wall_clean is not None:
         candidates.extend(_infer_directions_from_nearby_wall_pairs(cluster, np.asarray(wall_clean, dtype=bool)))
-    if bool(getattr(cfg, "infer_orientation_from_local_free_neck", True)) and free_clean is not None:
+    if (
+        bool(getattr(cfg, "infer_orientation_from_local_free_neck", True))
+        and bool(getattr(cfg, "infer_orientation_from_local_free_neck_for_accept", False))
+        and free_clean is not None
+    ):
         candidates.extend(_infer_directions_from_local_free_neck(cluster, np.asarray(free_clean, dtype=bool)))
     out: list[tuple[str, np.ndarray]] = []
     seen: list[np.ndarray] = []
@@ -2129,6 +2249,21 @@ def _door_orientation_candidates(
         seen.append(unit)
         out.append((source, unit.astype(np.float32)))
     return out
+
+
+def _cluster_has_nearby_wall_support(cluster: DoorSeedCluster, wall_clean: np.ndarray, cfg: VoxelDoorDetectorConfig) -> bool:
+    wall = np.asarray(wall_clean, dtype=bool)
+    center = np.asarray(cluster.center_rc, dtype=np.float32)
+    radius = max(
+        3,
+        int(np.ceil(max(float(cluster.length_m), float(cluster.thickness_m)) / 0.05)),
+        int(np.ceil(float(getattr(cfg, "single_seed_wall_search_radius_m", 1.20)) / 0.10)),
+    )
+    r0 = max(0, int(round(float(center[0]))) - radius)
+    r1 = min(wall.shape[0], int(round(float(center[0]))) + radius + 1)
+    c0 = max(0, int(round(float(center[1]))) - radius)
+    c1 = min(wall.shape[1], int(round(float(center[1]))) + radius + 1)
+    return bool(np.any(wall[r0:r1, c0:c1]))
 
 
 def _infer_directions_from_nearby_wall_pairs(cluster: DoorSeedCluster, wall_clean: np.ndarray) -> list[tuple[str, np.ndarray]]:
@@ -2210,11 +2345,26 @@ def _select_best_cluster_candidate(candidates: Sequence[VoxelDoorLineCandidate])
             -1 if "diag" in source else 0,
             -float(long_penalty),
             -float(width_penalty),
-            float(candidate.debug.get("score", 0.0)),
+            float(candidate.debug.get("score", 0.0)) + 0.05 * float(candidate.debug.get("orientation_score", 0.0)),
             -int(candidate.debug.get("visual_line_cells", 0)),
         )
 
     return max(candidates, key=key)
+
+
+def _door_orientation_source_score(source: str) -> float:
+    src = str(source)
+    if src == "pca":
+        return 1.0
+    if src == "nearby_wall_pair_axis":
+        return 0.90
+    if src.startswith("axis_"):
+        return 0.65
+    if src == "local_free_neck_axis":
+        return 0.35
+    if src.startswith("diag"):
+        return 0.20
+    return 0.50
 
 
 def _door_anchor_source_priority(source: int) -> float:
@@ -2391,6 +2541,7 @@ def _candidate_from_seed_component(
                 "component_ids": component_debug_ids,
                 "completion_mode": DOOR_COMPLETION_REJECTED,
                 "orientation_source": str(orientation_source),
+                "orientation_score": float(_door_orientation_source_score(str(orientation_source))),
                 "walk_a_cells": [[int(r), int(c)] for r, c in extension_a],
                 "walk_b_cells": [[int(r), int(c)] for r, c in extension_b],
                 "walk_a_status": walk_a.status,
@@ -2528,13 +2679,15 @@ def _candidate_from_seed_component(
     source_values = [value for value in (source_a, source_b) if int(value) != DOOR_ANCHOR_NONE]
     source_priority = float(np.mean([_door_anchor_source_priority(value) for value in source_values])) if source_values else 0.50
     length_score = min(1.0, width_m / max(float(cfg.visual_width_min_m), 1e-6))
+    orientation_score = float(_door_orientation_source_score(str(orientation_source)))
     score = float(
-        0.30 * anchor_score
+        0.28 * anchor_score
         + 0.20 * min(1.0, seed_coverage_score)
         + 0.20 * min(1.0, inner_free_or_seed_ratio)
         + 0.15 * (1.0 - min(1.0, inner_unknown_ratio))
         + 0.10 * source_priority
-        + 0.05 * length_score
+        + 0.04 * length_score
+        + 0.03 * orientation_score
     )
     return VoxelDoorLineCandidate(
         candidate_id=candidate_id,
@@ -2560,6 +2713,7 @@ def _candidate_from_seed_component(
             "component_ids": component_debug_ids,
             "completion_mode": str(completion_mode),
             "orientation_source": str(orientation_source),
+            "orientation_score": float(orientation_score),
             "component_thickness_m": float(thickness_m),
             "residual_max_cells": float(residual_max),
             "inner_unknown_ratio": float(inner_unknown_ratio),

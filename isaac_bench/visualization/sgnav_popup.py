@@ -1567,6 +1567,9 @@ class SGNavPopupVisualizer:
         unknown_dominant = self._room_debug_array("voxel_unknown_dominant_xy", shape, bool)
         unknown_rejected_wall = self._room_debug_array("voxel_wall_support_rejected_unknown_xy", shape, bool)
         unknown_gated_wall = self._room_debug_array("voxel_wall_support_unknown_gated_xy", shape, bool)
+        wall_line_support_strong = self._room_debug_array("voxel_wall_line_support_strong_xy", shape, bool)
+        wall_line_support_conflict = self._room_debug_array("voxel_wall_line_support_conflict_xy", shape, bool)
+        wall_line_support_rejected_furniture = self._room_debug_array("voxel_wall_line_support_rejected_furniture_xy", shape, bool)
         unknown = self._room_debug_array("voxel_unknown_xy", shape, bool)
         conflict = self._room_debug_array("voxel_free_wall_conflict_xy", shape, bool)
         line_wall = self._room_debug_array("voxel_filtered_wall_line_mask", shape, bool)
@@ -1715,7 +1718,9 @@ class SGNavPopupVisualizer:
         else:
             raw_wall_count = int(np.count_nonzero(raw_wall))
             wall_line_support_count = int(np.count_nonzero(wall_line_support))
+            wall_line_support_conflict_count = int(np.count_nonzero(wall_line_support_conflict))
             projected_wall_count = int(np.count_nonzero(projected_wall))
+            anchor_projected_wall_count = int(np.count_nonzero(anchor_projected_wall))
             rejected_wall_support_count = int(np.count_nonzero(rejected_wall_support))
             display_wall_count = int(np.count_nonzero(wall_visual))
             door_seed_count = int(np.count_nonzero(door_seed))
@@ -1738,43 +1743,49 @@ class SGNavPopupVisualizer:
             stable_count = int(np.count_nonzero(stable_door_cut))
             warning_count = int(np.count_nonzero(door_topology_warning))
             update_reason = str(self._room_segmentation_debug.get("roomseg_frontier_update_reason", "NA"))
-            title_a = "voxel v19 | wall_support=%d proj=%d proj_rej=%d red=%d step2_src=%d hit=%d acc=%d" % (
-                wall_line_support_count,
-                projected_wall_count,
-                rejected_wall_support_count,
-                display_wall_count,
-                step2_source_count,
-                step2_hit_count,
-                step2_accepted_count,
-            )
-            title_b = "door_seed=%d door_green=%d free=%d unknown=%d raw_occ=%d ratio_wall=%d unkdom=%d update=%s" % (
-                door_seed_count,
-                door_green_count,
+            roomseg_update_index = int(self._room_segmentation_debug.get("voxel_door_memory_update_index", self._room_segmentation_debug.get("roomseg_update_index", 0)) or 0)
+            proj_reject_text = _top_reason_text(self._room_segmentation_debug.get("voxel_wall_projection_reject_reason_counts", {}))
+            step2_reject_counts = self._room_segmentation_debug.get("voxel_step2_topology_reject_reason_counts", self._room_segmentation_debug.get("voxel_step2_reject_reason_counts", {}))
+            step2_reject_text = _top_reason_text(step2_reject_counts)
+            prune_text = _top_reason_text(self._room_segmentation_debug.get("voxel_door_memory_prune_reason_counts", {}))
+            title_a = "voxel v21 | free=%d wall=%d raw_occ=%d ratio_wall=%d unkdom=%d wall_sup=%d conf=%d" % (
                 int(np.count_nonzero(vertical_free)),
-                int(np.count_nonzero(unknown)),
-                int(np.count_nonzero(raw_wall)),
+                display_wall_count,
+                raw_wall_count,
                 int(np.count_nonzero(ratio_wall_debug)),
                 int(np.count_nonzero(unknown_dominant)),
+                wall_line_support_count,
+                wall_line_support_conflict_count,
+            )
+            title_b = "proj=%d anchor=%d proj_rej=%s door seed=%d cur=%d stable=%d mem=%d prune=%s update=%s idx=%d" % (
+                projected_wall_count,
+                anchor_projected_wall_count,
+                proj_reject_text,
+                door_seed_count,
+                door_cut_count,
+                stable_count,
+                int(self._room_segmentation_debug.get("voxel_door_memory_track_count", 0) or 0),
+                prune_text,
                 update_reason,
+                roomseg_update_index,
             )
             door_reject_counts = self._room_segmentation_debug.get("voxel_door_reject_reason_counts", {})
             door_partition_reject_counts = self._room_segmentation_debug.get("voxel_door_partition_reject_reason_counts", {})
             door_topology_reject_counts = self._room_segmentation_debug.get("voxel_door_topology_reject_reason_counts", {})
-            step2_reject_counts = self._room_segmentation_debug.get("voxel_step2_topology_reject_reason_counts", self._room_segmentation_debug.get("voxel_step2_reject_reason_counts", {}))
             door_counts = door_topology_reject_counts if isinstance(door_topology_reject_counts, dict) and door_topology_reject_counts else door_partition_reject_counts
             if not isinstance(door_counts, dict) or not door_counts:
                 door_counts = door_reject_counts
             door_reject_text = _top_reason_text(door_counts)
-            step2_reject_text = _top_reason_text(step2_reject_counts)
             if show_diag:
-                title_b = "%s | vis=%d visual_only=%d cut=%d rooms=%d reject=%s step2_reject=%s" % (
+                title_b = "%s | step2 src=%d hit=%d cand=%d acc=%d top_rej=%s rooms=%d door_rej=%s" % (
                     title_b,
-                    door_visual_count,
-                    door_visual_only_count,
-                    door_cut_count,
+                    step2_source_count,
+                    step2_hit_count,
+                    step2_candidate_count,
+                    step2_accepted_count,
+                    step2_reject_text,
                     int(len([v for v in np.unique(labels) if int(v) > 0])),
                     door_reject_text,
-                    step2_reject_text,
                 )
         title_color = (255, 70, 70) if missing or backend == "python_debug" else (255, 255, 255)
         self._label(draw, (8, 5), title_a[:96], title_color)
@@ -1843,9 +1854,12 @@ class SGNavPopupVisualizer:
             ),
             self._overlay_record("vertical_free", True, (170, 220, 245), int(np.count_nonzero(vertical_free)), "voxel vertical free cells used by roomseg"),
             self._overlay_record("voxel_vertical_free", True, (170, 220, 245), int(np.count_nonzero(vertical_free)), "voxel vertical free cells used by roomseg"),
-            self._overlay_record("voxel_display_wall", True, (255, 30, 30), int(np.count_nonzero(wall_visual)), "clean v19 display wall from voxel_display_wall_xy only"),
+            self._overlay_record("voxel_display_wall", True, (255, 30, 30), int(np.count_nonzero(wall_visual)), "clean v21 display wall from voxel_display_wall_xy only"),
             self._overlay_record("voxel_raw_occupied_wall_support", bool(show_diag and np.any(raw_wall)), (92, 78, 64), int(np.count_nonzero(raw_wall)), "diagnostic raw occupied-any support, not default red wall"),
             self._overlay_record("voxel_wall_line_support", bool(show_diag and np.any(wall_line_support)), (255, 170, 64), int(np.count_nonzero(wall_line_support)), "diagnostic structural wall-line support candidate before projection validation"),
+            self._overlay_record("voxel_wall_line_support_strong", bool(show_diag and np.any(wall_line_support_strong)), (255, 190, 76), int(np.count_nonzero(wall_line_support_strong)), "diagnostic strong wall-line support before projection validation"),
+            self._overlay_record("voxel_wall_line_support_conflict", bool(show_diag and np.any(wall_line_support_conflict)), (255, 126, 45), int(np.count_nonzero(wall_line_support_conflict)), "diagnostic free-conflict wall-line support used at lower projection weight"),
+            self._overlay_record("voxel_wall_line_support_rejected_furniture", bool(show_diag and np.any(wall_line_support_rejected_furniture)), (120, 98, 72), int(np.count_nonzero(wall_line_support_rejected_furniture)), "diagnostic occupied support rejected away from free/nonfree boundary"),
             self._overlay_record("voxel_wall_raw", bool(show_diag and np.any(ratio_wall_debug)), (112, 64, 180), int(np.count_nonzero(ratio_wall_debug)), "diagnostic ratio wall candidates before priority filtering"),
             self._overlay_record("voxel_strict_raw_wall", bool(np.any(strict_raw_wall)), (255, 30, 30), strict_wall_count, "clean structural voxel wall after free and unknown priority"),
             self._overlay_record("voxel_wall_suppressed_by_free", bool(show_diag and np.any(wall_suppressed_by_free)), (72, 150, 92), int(np.count_nonzero(wall_suppressed_by_free)), "diagnostic occupied support suppressed by free voxel threshold"),

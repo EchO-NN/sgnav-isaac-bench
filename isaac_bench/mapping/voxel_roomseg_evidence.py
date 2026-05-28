@@ -39,9 +39,14 @@ class VoxelRoomsegEvidenceConfig:
     wall_line_support_min_occupied_z_cells: int = 1
     wall_line_support_free_exclusion_z_cells: int = 3
     wall_line_support_unknown_ratio_max: float = 0.75
+    wall_line_support_unknown_ratio_hard_max: float = 0.90
     wall_line_support_min_observed_z_cells: int = 1
     wall_line_support_use_nav_edge_gate: bool = True
     wall_line_support_nav_edge_radius_cells: int = 3
+    wall_line_support_free_boundary_radius_cells: int = 3
+    wall_line_support_allow_free_conflict_for_projection: bool = True
+    wall_line_support_conflict_weight: float = 0.35
+    wall_line_support_strong_weight: float = 1.0
     wall_line_support_remove_small_area_cells: int = 3
     # Legacy/debug knobs retained for older configs; they no longer define final wall.
     wall_min_occupied_z_cells: int = 1
@@ -120,6 +125,12 @@ class VoxelRoomsegEvidence:
     small_unknown_hole_filled_xy: np.ndarray
     wall_line_support_xy: np.ndarray
     wall_line_support_raw_xy: np.ndarray
+    wall_line_support_strong_xy: np.ndarray
+    wall_line_support_conflict_xy: np.ndarray
+    wall_line_support_near_free_boundary_xy: np.ndarray
+    wall_line_support_rejected_furniture_xy: np.ndarray
+    wall_line_support_rejected_unknown_xy: np.ndarray
+    wall_line_support_weight_xy: np.ndarray
     wall_line_support_rejected_by_free_xy: np.ndarray
     wall_line_support_rejected_by_unknown_xy: np.ndarray
     wall_line_support_rejected_by_observed_xy: np.ndarray
@@ -209,29 +220,41 @@ def classify_voxel_columns_for_roomseg(
         occupied_ratio >= float(cfg.wall_occupied_ratio_debug_threshold)
     ) if bool(cfg.wall_ratio_debug_enabled) else np.zeros(shape, dtype=bool)
     wall_line_support_raw = occupied_count >= max(1, int(cfg.wall_line_support_min_occupied_z_cells))
-    wall_line_support_free_block = free_count >= max(1, int(cfg.wall_line_support_free_exclusion_z_cells))
-    wall_line_support_unknown_block = unknown_ratio >= float(cfg.wall_line_support_unknown_ratio_max)
+    wall_line_support_free_block = free_count >= max(1, int(cfg.min_free_z_cells_for_xy_free))
+    wall_line_support_unknown_block = unknown_ratio >= float(cfg.wall_line_support_unknown_ratio_hard_max)
     wall_line_support_observed_block = observed_count < max(1, int(cfg.wall_line_support_min_observed_z_cells))
-    wall_line_support_nav_edge_block = np.zeros(shape, dtype=bool)
-    wall_line_support = wall_line_support_raw & ~wall_line_support_free_block & ~wall_line_support_unknown_block & ~wall_line_support_observed_block
-    if bool(cfg.wall_line_support_use_nav_edge_gate) and np.any(nav_free) and np.any(~nav_free):
-        radius = max(0, int(cfg.wall_line_support_nav_edge_radius_cells))
-        structure = _disk(radius) if radius > 0 else conn(8)
-        free_dilated = ndimage.binary_dilation(nav_free, structure=structure).astype(bool)
-        free_eroded = ndimage.binary_erosion(nav_free, structure=structure, border_value=0).astype(bool)
-        free_edge = free_dilated & ~free_eroded
-        unknown_or_nonfree_near = ndimage.binary_dilation(~nav_free, structure=structure).astype(bool)
-        edge_gate = ndimage.binary_dilation(free_edge | unknown_or_nonfree_near, structure=structure).astype(bool)
-        wall_line_support_nav_edge_block = wall_line_support & ~edge_gate
-        wall_line_support &= edge_gate
+    free_boundary = vertical_free & ndimage.binary_dilation(~vertical_free, structure=conn(8)).astype(bool)
+    boundary_radius = max(0, int(getattr(cfg, "wall_line_support_free_boundary_radius_cells", 3)))
+    boundary_structure = _disk(boundary_radius) if boundary_radius > 0 else conn(8)
+    near_free_boundary = ndimage.binary_dilation(free_boundary, structure=boundary_structure).astype(bool)
+    structural_boundary_seed = wall_ratio_raw | wall_rejected_by_free | wall_rejected_by_unknown
+    if np.any(structural_boundary_seed):
+        near_free_boundary |= ndimage.binary_dilation(structural_boundary_seed, structure=boundary_structure).astype(bool)
+    support_raw_known = wall_line_support_raw & ~wall_line_support_unknown_block & ~wall_line_support_observed_block
+    wall_line_support_near_free_boundary = support_raw_known & near_free_boundary
+    wall_line_support_conflict = wall_line_support_near_free_boundary & wall_line_support_free_block
+    if not bool(getattr(cfg, "wall_line_support_allow_free_conflict_for_projection", True)):
+        wall_line_support_conflict = np.zeros(shape, dtype=bool)
+    wall_line_support_strong = wall_line_support_near_free_boundary & ~wall_line_support_free_block
+    wall_line_support_rejected_furniture = support_raw_known & ~near_free_boundary
+    wall_line_support_rejected_unknown = wall_line_support_raw & wall_line_support_unknown_block
+    wall_line_support_nav_edge_block = wall_line_support_rejected_furniture.copy()
+    wall_line_support = wall_line_support_strong | wall_line_support_conflict
     if not bool(cfg.wall_line_support_enabled):
         wall_line_support = np.zeros(shape, dtype=bool)
+        wall_line_support_strong = np.zeros(shape, dtype=bool)
+        wall_line_support_conflict = np.zeros(shape, dtype=bool)
     wall_line_support = _remove_small_true_components(
         wall_line_support,
         max_area_cells=int(cfg.wall_line_support_remove_small_area_cells),
         connectivity=8,
         remove_leq=True,
     )
+    wall_line_support_strong &= wall_line_support
+    wall_line_support_conflict &= wall_line_support
+    wall_line_support_weight = np.zeros(shape, dtype=np.float32)
+    wall_line_support_weight[wall_line_support_strong] = float(getattr(cfg, "wall_line_support_strong_weight", 1.0))
+    wall_line_support_weight[wall_line_support_conflict] = float(getattr(cfg, "wall_line_support_conflict_weight", 0.35))
 
     small_hole_filled = np.zeros(shape, dtype=bool)
     if bool(cfg.fill_small_unknown_holes_inside_vertical_free):
@@ -281,8 +304,14 @@ def classify_voxel_columns_for_roomseg(
         "small_unknown_hole_filled": small_hole_filled.astype(bool),
         "wall_line_support": wall_line_support.astype(bool),
         "wall_line_support_raw": wall_line_support_raw.astype(bool),
-        "wall_line_support_rejected_by_free": (wall_line_support_raw & wall_line_support_free_block).astype(bool),
-        "wall_line_support_rejected_by_unknown": (wall_line_support_raw & ~wall_line_support_free_block & wall_line_support_unknown_block).astype(bool),
+        "wall_line_support_strong": wall_line_support_strong.astype(bool),
+        "wall_line_support_conflict": wall_line_support_conflict.astype(bool),
+        "wall_line_support_near_free_boundary": wall_line_support_near_free_boundary.astype(bool),
+        "wall_line_support_rejected_furniture": wall_line_support_rejected_furniture.astype(bool),
+        "wall_line_support_rejected_unknown": wall_line_support_rejected_unknown.astype(bool),
+        "wall_line_support_weight": wall_line_support_weight.astype(np.float32),
+        "wall_line_support_rejected_by_free": wall_line_support_conflict.astype(bool),
+        "wall_line_support_rejected_by_unknown": wall_line_support_rejected_unknown.astype(bool),
         "wall_line_support_rejected_by_observed": (wall_line_support_raw & ~wall_line_support_free_block & ~wall_line_support_unknown_block & wall_line_support_observed_block).astype(bool),
         "wall_line_support_rejected_by_nav_edge": wall_line_support_nav_edge_block.astype(bool),
         "promoted_nav_obstacle": promoted_nav_obstacle.astype(bool),
@@ -386,6 +415,12 @@ def build_voxel_roomseg_evidence(
                 "voxel_structural_wall_ratio_xy": empty,
                 "voxel_wall_line_support_xy": empty,
                 "voxel_wall_line_support_raw_xy": empty,
+                "voxel_wall_line_support_strong_xy": empty,
+                "voxel_wall_line_support_conflict_xy": empty,
+                "voxel_wall_line_support_near_free_boundary_xy": empty,
+                "voxel_wall_line_support_rejected_furniture_xy": empty,
+                "voxel_wall_line_support_rejected_unknown_xy": empty,
+                "voxel_wall_line_support_weight_xy": zero_f32,
                 "voxel_wall_line_support_rejected_by_free_xy": empty,
                 "voxel_wall_line_support_rejected_by_unknown_xy": empty,
                 "voxel_wall_line_support_rejected_by_observed_xy": empty,
@@ -416,6 +451,11 @@ def build_voxel_roomseg_evidence(
                 "voxel_wall_min_occupied_z_cells_for_xy_wall": int(cfg.wall_min_occupied_z_cells_for_xy_wall),
                 "voxel_wall_line_support_cells": 0,
                 "voxel_wall_line_support_raw_cells": 0,
+                "voxel_wall_line_support_strong_cells": 0,
+                "voxel_wall_line_support_conflict_cells": 0,
+                "voxel_wall_line_support_near_free_boundary_cells": 0,
+                "voxel_wall_line_support_rejected_furniture_cells": 0,
+                "voxel_wall_line_support_rejected_unknown_cells": 0,
                 "voxel_wall_line_support_rejected_by_free_cells": 0,
                 "voxel_wall_line_support_rejected_by_unknown_cells": 0,
                 "voxel_wall_line_support_rejected_by_observed_cells": 0,
@@ -455,6 +495,12 @@ def build_voxel_roomseg_evidence(
             small_unknown_hole_filled_xy=empty,
             wall_line_support_xy=empty,
             wall_line_support_raw_xy=empty,
+            wall_line_support_strong_xy=empty,
+            wall_line_support_conflict_xy=empty,
+            wall_line_support_near_free_boundary_xy=empty,
+            wall_line_support_rejected_furniture_xy=empty,
+            wall_line_support_rejected_unknown_xy=empty,
+            wall_line_support_weight_xy=zero_f32,
             wall_line_support_rejected_by_free_xy=empty,
             wall_line_support_rejected_by_unknown_xy=empty,
             wall_line_support_rejected_by_observed_xy=empty,
@@ -503,6 +549,12 @@ def build_voxel_roomseg_evidence(
     small_unknown_hole_filled = np.asarray(classified["small_unknown_hole_filled"], dtype=bool)
     wall_line_support = np.asarray(classified["wall_line_support"], dtype=bool)
     wall_line_support_raw = np.asarray(classified["wall_line_support_raw"], dtype=bool)
+    wall_line_support_strong = np.asarray(classified["wall_line_support_strong"], dtype=bool)
+    wall_line_support_conflict = np.asarray(classified["wall_line_support_conflict"], dtype=bool)
+    wall_line_support_near_free_boundary = np.asarray(classified["wall_line_support_near_free_boundary"], dtype=bool)
+    wall_line_support_rejected_furniture = np.asarray(classified["wall_line_support_rejected_furniture"], dtype=bool)
+    wall_line_support_rejected_unknown = np.asarray(classified["wall_line_support_rejected_unknown"], dtype=bool)
+    wall_line_support_weight = np.asarray(classified["wall_line_support_weight"], dtype=np.float32)
     wall_line_support_rejected_by_free = np.asarray(classified["wall_line_support_rejected_by_free"], dtype=bool)
     wall_line_support_rejected_by_unknown = np.asarray(classified["wall_line_support_rejected_by_unknown"], dtype=bool)
     wall_line_support_rejected_by_observed = np.asarray(classified["wall_line_support_rejected_by_observed"], dtype=bool)
@@ -526,6 +578,11 @@ def build_voxel_roomseg_evidence(
         "voxel_nonstructural_occupied_cells": int(np.count_nonzero(nonstructural_occupied)),
         "voxel_wall_line_support_cells": int(np.count_nonzero(wall_line_support)),
         "voxel_wall_line_support_raw_cells": int(np.count_nonzero(wall_line_support_raw)),
+        "voxel_wall_line_support_strong_cells": int(np.count_nonzero(wall_line_support_strong)),
+        "voxel_wall_line_support_conflict_cells": int(np.count_nonzero(wall_line_support_conflict)),
+        "voxel_wall_line_support_near_free_boundary_cells": int(np.count_nonzero(wall_line_support_near_free_boundary)),
+        "voxel_wall_line_support_rejected_furniture_cells": int(np.count_nonzero(wall_line_support_rejected_furniture)),
+        "voxel_wall_line_support_rejected_unknown_cells": int(np.count_nonzero(wall_line_support_rejected_unknown)),
         "voxel_wall_line_support_rejected_by_free_cells": int(np.count_nonzero(wall_line_support_rejected_by_free)),
         "voxel_wall_line_support_rejected_by_unknown_cells": int(np.count_nonzero(wall_line_support_rejected_by_unknown)),
         "voxel_wall_line_support_rejected_by_observed_cells": int(np.count_nonzero(wall_line_support_rejected_by_observed)),
@@ -583,6 +640,12 @@ def build_voxel_roomseg_evidence(
         "voxel_structural_wall_ratio_xy": wall_ratio_raw.astype(bool),
         "voxel_wall_line_support_xy": wall_line_support.astype(bool),
         "voxel_wall_line_support_raw_xy": wall_line_support_raw.astype(bool),
+        "voxel_wall_line_support_strong_xy": wall_line_support_strong.astype(bool),
+        "voxel_wall_line_support_conflict_xy": wall_line_support_conflict.astype(bool),
+        "voxel_wall_line_support_near_free_boundary_xy": wall_line_support_near_free_boundary.astype(bool),
+        "voxel_wall_line_support_rejected_furniture_xy": wall_line_support_rejected_furniture.astype(bool),
+        "voxel_wall_line_support_rejected_unknown_xy": wall_line_support_rejected_unknown.astype(bool),
+        "voxel_wall_line_support_weight_xy": wall_line_support_weight.astype(np.float32),
         "voxel_wall_line_support_rejected_by_free_xy": wall_line_support_rejected_by_free.astype(bool),
         "voxel_wall_line_support_rejected_by_unknown_xy": wall_line_support_rejected_by_unknown.astype(bool),
         "voxel_wall_line_support_rejected_by_observed_xy": wall_line_support_rejected_by_observed.astype(bool),
@@ -627,6 +690,11 @@ def build_voxel_roomseg_evidence(
         "voxel_nonstructural_occupied_cells": int(np.count_nonzero(nonstructural_occupied)),
         "voxel_wall_line_support_cells": int(np.count_nonzero(wall_line_support)),
         "voxel_wall_line_support_raw_cells": int(np.count_nonzero(wall_line_support_raw)),
+        "voxel_wall_line_support_strong_cells": int(np.count_nonzero(wall_line_support_strong)),
+        "voxel_wall_line_support_conflict_cells": int(np.count_nonzero(wall_line_support_conflict)),
+        "voxel_wall_line_support_near_free_boundary_cells": int(np.count_nonzero(wall_line_support_near_free_boundary)),
+        "voxel_wall_line_support_rejected_furniture_cells": int(np.count_nonzero(wall_line_support_rejected_furniture)),
+        "voxel_wall_line_support_rejected_unknown_cells": int(np.count_nonzero(wall_line_support_rejected_unknown)),
         "voxel_wall_line_support_rejected_by_free_cells": int(np.count_nonzero(wall_line_support_rejected_by_free)),
         "voxel_wall_line_support_rejected_by_unknown_cells": int(np.count_nonzero(wall_line_support_rejected_by_unknown)),
         "voxel_wall_line_support_rejected_by_observed_cells": int(np.count_nonzero(wall_line_support_rejected_by_observed)),
@@ -688,6 +756,12 @@ def build_voxel_roomseg_evidence(
         small_unknown_hole_filled_xy=small_unknown_hole_filled.astype(bool),
         wall_line_support_xy=wall_line_support.astype(bool),
         wall_line_support_raw_xy=wall_line_support_raw.astype(bool),
+        wall_line_support_strong_xy=wall_line_support_strong.astype(bool),
+        wall_line_support_conflict_xy=wall_line_support_conflict.astype(bool),
+        wall_line_support_near_free_boundary_xy=wall_line_support_near_free_boundary.astype(bool),
+        wall_line_support_rejected_furniture_xy=wall_line_support_rejected_furniture.astype(bool),
+        wall_line_support_rejected_unknown_xy=wall_line_support_rejected_unknown.astype(bool),
+        wall_line_support_weight_xy=wall_line_support_weight.astype(np.float32),
         wall_line_support_rejected_by_free_xy=wall_line_support_rejected_by_free.astype(bool),
         wall_line_support_rejected_by_unknown_xy=wall_line_support_rejected_by_unknown.astype(bool),
         wall_line_support_rejected_by_observed_xy=wall_line_support_rejected_by_observed.astype(bool),

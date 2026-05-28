@@ -21,6 +21,8 @@ class WallProjectionConfig:
     min_projected_support_ratio: float = 0.25
     anchor_min_projected_line_length_m: float = 0.15
     anchor_min_projected_support_ratio: float = 0.15
+    step2_source_min_projected_line_length_m: float = 0.20
+    step2_source_min_projected_support_ratio: float = 0.18
     max_fill_gap_m: float = 0.25
     max_free_gap_ratio: float = 0.20
     separate_parallel_wall_min_cells: int = 4
@@ -106,6 +108,12 @@ class ProjectedWallResult:
     rejected_support_map: np.ndarray
     projected_lines: list[ProjectedWallLine]
     debug: dict[str, Any]
+    projected_wall_display_map: np.ndarray | None = None
+    projected_wall_anchor_map: np.ndarray | None = None
+    projected_wall_step2_source_map: np.ndarray | None = None
+    projected_display_lines: list[ProjectedWallLine] = field(default_factory=list)
+    projected_anchor_lines: list[ProjectedWallLine] = field(default_factory=list)
+    projected_step2_source_lines: list[ProjectedWallLine] = field(default_factory=list)
 
 
 def project_wall_evidence_to_lines(
@@ -211,6 +219,315 @@ def project_wall_evidence_to_lines(
     rejected_support |= support & ~accepted_support
     debug = _debug_dict(started_at, cfg, raw, projected, accepted_support, rejected_support, unknown_forbidden, lines, reject_counts)
     return ProjectedWallResult(projected, raw.copy(), accepted_support, rejected_support, lines, debug)
+
+
+def project_wall_evidence_to_axis_accumulator_lines(
+    *,
+    support_map: np.ndarray,
+    support_weight: np.ndarray | None = None,
+    vertical_free_map: np.ndarray,
+    unknown_map: np.ndarray,
+    door_forbidden_mask: np.ndarray | None,
+    resolution_m: float,
+    config: WallProjectionConfig | Mapping[str, object] | None = None,
+) -> ProjectedWallResult:
+    started_at = time.perf_counter()
+    cfg = config if isinstance(config, WallProjectionConfig) else WallProjectionConfig.from_mapping(config)
+    support = np.asarray(support_map, dtype=bool)
+    free = np.asarray(vertical_free_map, dtype=bool)
+    unknown = np.asarray(unknown_map, dtype=bool)
+    if support.shape != free.shape or support.shape != unknown.shape:
+        raise ValueError("support_map, vertical_free_map, and unknown_map must share HxW shape")
+    if support_weight is None:
+        weight = support.astype(np.float32)
+    else:
+        weight = np.asarray(support_weight, dtype=np.float32)
+        if weight.shape != support.shape:
+            raise ValueError("support_weight must match support_map shape")
+        weight = np.where(support, np.maximum(weight, 0.0), 0.0).astype(np.float32)
+    door_forbidden = np.zeros(support.shape, dtype=bool) if door_forbidden_mask is None else np.asarray(door_forbidden_mask, dtype=bool)
+    if door_forbidden.shape != support.shape:
+        raise ValueError("door_forbidden_mask must match support_map shape")
+    if np.any(door_forbidden):
+        support = support & ~door_forbidden
+        weight = np.where(support, weight, 0.0).astype(np.float32)
+    if not bool(cfg.enabled):
+        zero = np.zeros_like(support, dtype=bool)
+        debug = _axis_accumulator_debug(started_at, cfg, support, weight, zero, zero, zero, zero, zero, [], [], [], Counter({"disabled": 1}))
+        return ProjectedWallResult(zero.copy(), support.copy(), zero.copy(), support.copy(), [], debug, zero.copy(), zero.copy(), zero.copy(), [], [], [])
+
+    h_votes, v_votes = _axis_accumulator_votes(support, weight, int(cfg.projection_band_cells))
+    display = np.zeros_like(support, dtype=bool)
+    anchor = np.zeros_like(support, dtype=bool)
+    step2_source = np.zeros_like(support, dtype=bool)
+    accepted_support = np.zeros_like(support, dtype=bool)
+    rejected_support = np.zeros_like(support, dtype=bool)
+    reject_reason_map = np.zeros(support.shape, dtype=np.uint8)
+    reject_counts: Counter[str] = Counter()
+    display_lines: list[ProjectedWallLine] = []
+    anchor_lines: list[ProjectedWallLine] = []
+    step2_lines: list[ProjectedWallLine] = []
+    line_id = 1
+
+    def consume_axis(axis: str, votes: np.ndarray) -> None:
+        nonlocal line_id, display, anchor, step2_source, accepted_support, rejected_support
+        fixed_count = votes.shape[0] if axis == "h" else votes.shape[1]
+        for fixed in range(int(fixed_count)):
+            if axis == "h" and not np.any(support[int(fixed), :]):
+                continue
+            if axis == "v" and not np.any(support[:, int(fixed)]):
+                continue
+            values = votes[int(fixed), :] if axis == "h" else votes[:, int(fixed)]
+            coords = np.flatnonzero(values > 0.0).astype(np.int32)
+            for run in _axis_vote_runs(coords, fixed=int(fixed), axis=axis, free=free, door_forbidden=door_forbidden, resolution_m=float(resolution_m), cfg=cfg):
+                if run.size <= 0:
+                    continue
+                line_mask = _axis_line_mask(axis, int(fixed), run, support.shape)
+                if np.any(line_mask & door_forbidden):
+                    reject_counts["projected_wall_crosses_door_seed"] += 1
+                    reject_reason_map[line_mask] = 4
+                    continue
+                support_weight_sum = float(np.sum(values[run]))
+                projected_cells = int(np.count_nonzero(line_mask))
+                support_ratio = float(support_weight_sum / float(max(1, projected_cells)))
+                length_m = float(projected_cells) * float(resolution_m)
+                side_metrics = _validate_projected_wall_sides(line_mask, axis, free, unknown, cfg)
+                reject_reason = _axis_line_reject_reason(
+                    length_m=length_m,
+                    support_ratio=support_ratio,
+                    side_metrics=side_metrics,
+                    min_length_m=float(cfg.step2_source_min_projected_line_length_m),
+                    min_support_ratio=float(cfg.step2_source_min_projected_support_ratio),
+                )
+                line = ProjectedWallLine(
+                    line_id=int(line_id),
+                    axis=str(axis),
+                    line=int(fixed),
+                    start=int(run.min()),
+                    end=int(run.max()),
+                    support_cell_count=int(np.count_nonzero(line_mask & support)),
+                    projected_cell_count=int(projected_cells),
+                    support_ratio=float(support_ratio),
+                    lateral_std_cells=0.0,
+                    source="axis_accumulator",
+                    reject_reason=reject_reason,
+                    side_free_ratio_a=float(side_metrics.get("side_free_ratio_a", 0.0)),
+                    side_free_ratio_b=float(side_metrics.get("side_free_ratio_b", 0.0)),
+                    side_unknown_ratio_a=float(side_metrics.get("side_unknown_ratio_a", 0.0)),
+                    side_unknown_ratio_b=float(side_metrics.get("side_unknown_ratio_b", 0.0)),
+                    side_nonfree_ratio_a=float(side_metrics.get("side_nonfree_ratio_a", 0.0)),
+                    side_nonfree_ratio_b=float(side_metrics.get("side_nonfree_ratio_b", 0.0)),
+                    structural_side_score=float(side_metrics.get("structural_side_score", 0.0)),
+                    debug={"support_weight_sum": float(support_weight_sum), **side_metrics},
+                )
+                line_support = line_mask & support
+                if reject_reason is not None:
+                    rejected_support |= line_support
+                    reject_counts[str(reject_reason)] += 1
+                    reject_reason_map[line_mask] = _projection_reject_code(str(reject_reason))
+                    line_id += 1
+                    continue
+                accepted_support |= line_support
+                if length_m + 1e-9 >= float(cfg.step2_source_min_projected_line_length_m) and support_ratio + 1e-9 >= float(cfg.step2_source_min_projected_support_ratio):
+                    step2_source |= line_mask
+                    step2_lines.append(line)
+                if length_m + 1e-9 >= float(cfg.anchor_min_projected_line_length_m) and support_ratio + 1e-9 >= float(cfg.anchor_min_projected_support_ratio):
+                    anchor |= line_mask
+                    anchor_lines.append(line)
+                if length_m + 1e-9 >= float(cfg.min_projected_line_length_m) and support_ratio + 1e-9 >= float(cfg.min_projected_support_ratio):
+                    display |= line_mask
+                    display_lines.append(line)
+                line_id += 1
+
+    consume_axis("h", h_votes)
+    consume_axis("v", v_votes)
+    rejected_support |= support & ~accepted_support
+    debug = _axis_accumulator_debug(
+        started_at,
+        cfg,
+        support,
+        weight,
+        display,
+        anchor,
+        step2_source,
+        accepted_support,
+        rejected_support,
+        display_lines,
+        anchor_lines,
+        step2_lines,
+        reject_counts,
+    )
+    debug.update(
+        {
+            "voxel_wall_projection_accumulator_h_votes": h_votes.astype(np.float32),
+            "voxel_wall_projection_accumulator_v_votes": v_votes.astype(np.float32),
+            "voxel_wall_projection_reject_reason_map": reject_reason_map.astype(np.uint8),
+        }
+    )
+    return ProjectedWallResult(
+        projected_wall_map=display.astype(bool),
+        raw_wall_map=support.astype(bool),
+        support_map=accepted_support.astype(bool),
+        rejected_support_map=rejected_support.astype(bool),
+        projected_lines=list(display_lines),
+        debug=debug,
+        projected_wall_display_map=display.astype(bool),
+        projected_wall_anchor_map=anchor.astype(bool),
+        projected_wall_step2_source_map=step2_source.astype(bool),
+        projected_display_lines=list(display_lines),
+        projected_anchor_lines=list(anchor_lines),
+        projected_step2_source_lines=list(step2_lines),
+    )
+
+
+def _axis_accumulator_votes(support: np.ndarray, weight: np.ndarray, projection_band_cells: int) -> tuple[np.ndarray, np.ndarray]:
+    rows, cols = np.nonzero(np.asarray(support, dtype=bool))
+    h_votes = np.zeros(support.shape, dtype=np.float32)
+    v_votes = np.zeros(support.shape, dtype=np.float32)
+    band = max(0, int(projection_band_cells))
+    for r, c in zip(rows, cols):
+        w = float(weight[int(r), int(c)])
+        if w <= 0.0:
+            continue
+        r0 = max(0, int(r) - band)
+        r1 = min(support.shape[0], int(r) + band + 1)
+        c0 = max(0, int(c) - band)
+        c1 = min(support.shape[1], int(c) + band + 1)
+        h_votes[r0:r1, int(c)] += float(w)
+        v_votes[int(r), c0:c1] += float(w)
+    return h_votes, v_votes
+
+
+def _axis_vote_runs(
+    coords: np.ndarray,
+    *,
+    fixed: int,
+    axis: str,
+    free: np.ndarray,
+    door_forbidden: np.ndarray,
+    resolution_m: float,
+    cfg: WallProjectionConfig,
+) -> list[np.ndarray]:
+    values = np.asarray(coords, dtype=np.int32)
+    if values.size == 0:
+        return []
+    max_gap_cells = max(0, int(round(float(cfg.max_fill_gap_m) / max(float(resolution_m), 1e-9))))
+    runs: list[list[int]] = [[int(values[0])]]
+    for left, right in zip(values[:-1], values[1:]):
+        gap = int(right - left - 1)
+        fill = np.arange(int(left) + 1, int(right), dtype=np.int32)
+        can_fill = False
+        if gap > 0 and gap <= max_gap_cells:
+            if axis == "h":
+                rr = np.full(fill.shape, int(fixed), dtype=np.int32)
+                cc = fill
+            else:
+                rr = fill
+                cc = np.full(fill.shape, int(fixed), dtype=np.int32)
+            valid = (rr >= 0) & (rr < free.shape[0]) & (cc >= 0) & (cc < free.shape[1])
+            if np.any(valid):
+                blocked = bool(np.any(door_forbidden[rr[valid], cc[valid]]))
+                free_ratio = float(np.count_nonzero(free[rr[valid], cc[valid]])) / float(max(1, int(np.count_nonzero(valid))))
+                can_fill = (not blocked) and free_ratio <= max(float(cfg.max_free_gap_ratio), 0.35)
+        if gap <= 0:
+            pass
+        elif can_fill:
+            runs[-1].extend(int(v) for v in fill.tolist())
+        else:
+            runs.append([])
+        runs[-1].append(int(right))
+    return [np.asarray(run, dtype=np.int32) for run in runs if run]
+
+
+def _axis_line_mask(axis: str, fixed: int, coords: np.ndarray, shape: tuple[int, int]) -> np.ndarray:
+    mask = np.zeros(shape, dtype=bool)
+    values = np.asarray(coords, dtype=np.int32)
+    if str(axis) == "h":
+        valid = (values >= 0) & (values < int(shape[1])) & (0 <= int(fixed) < int(shape[0]))
+        if np.any(valid):
+            mask[int(fixed), values[valid]] = True
+    else:
+        valid = (values >= 0) & (values < int(shape[0])) & (0 <= int(fixed) < int(shape[1]))
+        if np.any(valid):
+            mask[values[valid], int(fixed)] = True
+    return mask
+
+
+def _axis_line_reject_reason(
+    *,
+    length_m: float,
+    support_ratio: float,
+    side_metrics: Mapping[str, object],
+    min_length_m: float,
+    min_support_ratio: float,
+) -> str | None:
+    if float(length_m) + 1e-9 < float(min_length_m):
+        return "projected_wall_too_short"
+    if float(support_ratio) + 1e-9 < float(min_support_ratio):
+        return "projected_support_ratio_too_low"
+    reason = side_metrics.get("reject_reason")
+    return None if reason is None else str(reason)
+
+
+def _projection_reject_code(reason: str) -> int:
+    codes = {
+        "projected_wall_too_short": 1,
+        "projected_support_ratio_too_low": 2,
+        "projected_wall_side_support_too_weak": 3,
+        "projected_wall_crosses_door_seed": 4,
+        "projected_wall_both_sides_free_furniture_like": 5,
+        "projected_wall_both_sides_unknown_frontier_like": 6,
+        "projected_wall_no_free_side": 7,
+        "projected_wall_no_nonfree_side": 8,
+    }
+    return int(codes.get(str(reason), 255))
+
+
+def _axis_accumulator_debug(
+    started_at: float,
+    cfg: WallProjectionConfig,
+    support: np.ndarray,
+    weight: np.ndarray,
+    display: np.ndarray,
+    anchor: np.ndarray,
+    step2_source: np.ndarray,
+    accepted_support: np.ndarray,
+    rejected_support: np.ndarray,
+    display_lines: list[ProjectedWallLine],
+    anchor_lines: list[ProjectedWallLine],
+    step2_lines: list[ProjectedWallLine],
+    reject_counts: Counter[str],
+) -> dict[str, Any]:
+    return {
+        "voxel_wall_projection_enabled": bool(cfg.enabled),
+        "voxel_wall_projection_mode": "axis_accumulator",
+        "voxel_wall_projection_ms": float((time.perf_counter() - started_at) * 1000.0),
+        "voxel_wall_raw_xy": np.asarray(support, dtype=bool),
+        "voxel_wall_projected_xy": np.asarray(display, dtype=bool),
+        "voxel_projected_wall_display_map": np.asarray(display, dtype=bool),
+        "voxel_projected_wall_anchor_map": np.asarray(anchor, dtype=bool),
+        "voxel_projected_wall_step2_source_map": np.asarray(step2_source, dtype=bool),
+        "voxel_wall_projection_support_map": np.asarray(accepted_support, dtype=bool),
+        "voxel_wall_projection_rejected_support_map": np.asarray(rejected_support, dtype=bool),
+        "voxel_wall_projection_support_weight_xy": np.asarray(weight, dtype=np.float32),
+        "voxel_wall_projection_raw_cells": int(np.count_nonzero(support)),
+        "voxel_wall_projected_cells": int(np.count_nonzero(display)),
+        "voxel_projected_wall_display_cells": int(np.count_nonzero(display)),
+        "voxel_projected_wall_anchor_cells": int(np.count_nonzero(anchor)),
+        "voxel_projected_wall_step2_source_cells": int(np.count_nonzero(step2_source)),
+        "voxel_wall_projection_support_cells": int(np.count_nonzero(accepted_support)),
+        "voxel_wall_projection_rejected_support_cells": int(np.count_nonzero(rejected_support)),
+        "voxel_wall_projection_line_count": int(len(display_lines)),
+        "voxel_wall_projection_anchor_line_count": int(len(anchor_lines)),
+        "voxel_wall_projection_step2_source_line_count": int(len(step2_lines)),
+        "voxel_wall_projection_lines": [line.to_dict() for line in display_lines[:1024]],
+        "voxel_wall_projection_anchor_lines": [line.to_dict() for line in anchor_lines[:1024]],
+        "voxel_wall_projection_step2_source_lines": [line.to_dict() for line in step2_lines[:1024]],
+        "voxel_wall_projection_reject_reason_counts": dict(reject_counts),
+        "voxel_wall_projection_side_reject_reason_counts": {
+            key: value for key, value in reject_counts.items() if str(key).startswith("projected_wall_")
+        },
+    }
 
 
 def _project_component_axis_aligned(

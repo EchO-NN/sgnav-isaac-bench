@@ -201,6 +201,10 @@ mapping:
     frontier_update_gate:
       policy: at_frontier_arrival
       freeze_during_navigation: true
+      update_on_target_invalidated: false
+      update_on_no_active_path: false
+      update_on_no_progress: false
+      update_on_replan: false
       debug_force_update: false
     source_grid: online_depth_observed
     proposal_mode: vertical_free_gap_closure
@@ -335,9 +339,14 @@ mapping:
       wall_line_support_min_occupied_z_cells: 1
       wall_line_support_free_exclusion_z_cells: 3
       wall_line_support_unknown_ratio_max: 0.75
+      wall_line_support_unknown_ratio_hard_max: 0.90
       wall_line_support_min_observed_z_cells: 1
       wall_line_support_use_nav_edge_gate: true
       wall_line_support_nav_edge_radius_cells: 3
+      wall_line_support_free_boundary_radius_cells: 3
+      wall_line_support_allow_free_conflict_for_projection: true
+      wall_line_support_conflict_weight: 0.35
+      wall_line_support_strong_weight: 1.0
       wall_line_support_remove_small_area_cells: 3
     voxel_wall_projection:
       enabled: true
@@ -347,6 +356,8 @@ mapping:
       min_projected_support_ratio: 0.25
       anchor_min_projected_line_length_m: 0.15
       anchor_min_projected_support_ratio: 0.15
+      step2_source_min_projected_line_length_m: 0.20
+      step2_source_min_projected_support_ratio: 0.18
       max_fill_gap_m: 0.25
       max_free_gap_ratio: 0.20
       separate_parallel_wall_min_cells: 4
@@ -421,6 +432,9 @@ mapping:
       allow_diagonal_orientation_candidates: false
       infer_orientation_from_wall_pairs: true
       infer_orientation_from_local_free_neck: true
+      infer_orientation_from_local_free_neck_for_accept: false
+      allow_axis_candidate_without_seed_support: false
+      min_seed_cells_for_axis_fallback: 3
       visual_walk_ignore_other_seed_clusters: true
       visual_walk_continue_through_unknown: true
       visual_walk_unknown_bridge_max_cells: 2
@@ -459,10 +473,10 @@ mapping:
       door_memory_match_iou_min: 0.20
       door_memory_match_distance_cells: 3
       door_memory_match_angle_deg: 20.0
-      door_memory_decay_per_update: 0.10
+      door_memory_decay_per_update: 0.05
       door_memory_confirm_increment: 0.35
-      door_memory_min_confidence_to_keep: 0.25
-      door_memory_ttl_updates: 8
+      door_memory_min_confidence_to_keep: 0.20
+      door_memory_ttl_updates: 20
       show_candidate_lines_in_debug: true
     voxel_roomseg:
       use_real_wall_as_partition_barrier: true
@@ -493,6 +507,8 @@ mapping:
       min_free_cells_between_start_and_hit: 2
       allow_hit_virtual_door_on_pass2: false
       reject_if_intersects_door: true
+      reject_if_intersects_door_visual: false
+      reject_if_intersects_door_seed: false
       door_intersection_dilation_cells: 1
       reject_if_tiny_side_width_cells_leq: 2
     voxel_step2_topology:

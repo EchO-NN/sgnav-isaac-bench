@@ -51,8 +51,8 @@ def test_stable_door_memory_keeps_last_valid_cut_after_candidate_disappears() ->
     assert np.any(completion.door_cut_mask_for_partition)
 
     memory = VoxelDoorMemory(cfg)
-    first = memory.update(completion.candidates, step=1, shape=shape)
-    second = memory.update([], step=2, shape=shape)
+    first = memory.update(completion.candidates, step=1, update_index=1, shape=shape)
+    second = memory.update([], step=2, update_index=2, shape=shape)
 
     assert np.any(first.stable_door_cut_mask)
     assert np.array_equal(first.stable_door_cut_mask, second.stable_door_cut_mask)

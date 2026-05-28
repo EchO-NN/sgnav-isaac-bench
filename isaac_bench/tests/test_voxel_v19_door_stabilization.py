@@ -32,7 +32,13 @@ def test_v19_default_orientation_does_not_add_unconditional_diagonals() -> None:
         reject_reason=None,
     )
 
-    sources = [source for source, _vec in _door_orientation_candidates(cluster, VoxelDoorDetectorConfig())]
+    sources = [
+        source
+        for source, _vec in _door_orientation_candidates(
+            cluster,
+            VoxelDoorDetectorConfig(allow_axis_candidate_without_seed_support=True),
+        )
+    ]
 
     assert "axis_h" in sources
     assert "axis_v" in sources
@@ -102,7 +108,7 @@ def test_v19_door_memory_keeps_only_partition_accepted_cuts() -> None:
         debug={"partition_accepted": True},
     )
 
-    result = VoxelDoorMemory().update([visual_only, accepted], step=1, shape=shape)
+    result = VoxelDoorMemory().update([visual_only, accepted], step=1, update_index=1, shape=shape)
 
     assert result.debug["voxel_door_memory_current_candidate_count"] == 1
     assert result.debug["voxel_door_memory_rejected_visual_only_count"] == 1
