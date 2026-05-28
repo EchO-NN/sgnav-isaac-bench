@@ -80,7 +80,7 @@ class IsaacSimServer:
         forward_offset_m: float = 0.0,
         camera_pitch_deg: float = 0.0,
         camera_near_m: float = 0.02,
-        camera_far_m: float = 5.0,
+        camera_far_m: float = 10.0,
         enable_depth: bool = False,
         camera_annotator_device: str = "cuda",
         enable_nearfield_depth: bool = False,
@@ -804,7 +804,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--camera-forward-offset-m", type=float, default=0.0)
     parser.add_argument("--camera-pitch-deg", type=float, default=0.0)
     parser.add_argument("--camera-near-m", type=float, default=0.02)
-    parser.add_argument("--camera-far-m", type=float, default=5.0)
+    parser.add_argument("--camera-far-m", type=float, default=10.0)
     parser.add_argument("--camera-annotator-device", choices=["cpu", "cuda"], default="cuda")
     parser.add_argument("--read-depth", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--nearfield-depth", action=argparse.BooleanOptionalAction, default=False)

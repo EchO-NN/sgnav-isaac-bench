@@ -7,8 +7,15 @@ from typing import List, Tuple
 
 import numpy as np
 
+from isaac_bench.mapping.ceiling_height_estimator import CeilingHeightEstimator, CeilingHeightEstimatorConfig
 from isaac_bench.mapping.coordinate_transform import MapInfo, grid_to_world_xy, is_inside_grid, world_xy_to_grid
 from isaac_bench.mapping.grid_map import OnlineGridMap
+from isaac_bench.mapping.height_column_profile import HeightColumnProfileConfig, HeightColumnProfileMap
+from isaac_bench.mapping.voxel_occupancy_grid import (
+    NavigationProjection,
+    VoxelOccupancyGrid3D,
+    VoxelOccupancyGridConfig,
+)
 from isaac_bench.mapping.vertical_profile import VerticalProfileMap
 from isaac_bench.sensors.camera_geometry import CameraIntrinsics
 from isaac_bench.sensors.depth_backproject import backproject_pixels, transform_points
@@ -19,7 +26,7 @@ class OnlineMapper:
         self,
         size_m: float,
         resolution_m: float,
-        depth_max_m: float = 6.0,
+        depth_max_m: float = 5.0,
         depth_min_m: float = 0.20,
         depth_stride_px: int = 8,
         ray_step_m: float | None = None,
@@ -33,6 +40,24 @@ class OnlineMapper:
         free_splat_point_threshold: int | None = None,
         robot_radius_m: float = 0.14,
         inflation_radius_m: float = 0.0,
+        height_profile_enabled: bool = True,
+        height_profile_z_min_m: float = 0.10,
+        height_profile_z_max_m: float = 2.00,
+        height_profile_storage_z_max_m: float | None = 3.20,
+        height_profile_active_z_max_fallback_m: float = 2.00,
+        height_profile_active_z_max_ceiling_ratio: float = 0.90,
+        height_profile_z_bin_size_m: float = 0.05,
+        ceiling_height_estimator_config: CeilingHeightEstimatorConfig | dict | None = None,
+        voxel_grid_enabled: bool = True,
+        voxel_grid_z_min_m: float = 0.00,
+        voxel_grid_z_max_m: float = 3.20,
+        voxel_grid_z_resolution_m: float = 0.05,
+        voxel_grid_active_z_min_m: float = 0.10,
+        voxel_grid_active_z_max_fallback_m: float = 2.00,
+        voxel_grid_active_z_max_ceiling_ratio: float = 0.90,
+        voxel_grid_config: VoxelOccupancyGridConfig | dict | None = None,
+        voxel_navigation_projection_config: dict | None = None,
+        voxel_navigation_blind_zone_config: dict | None = None,
     ):
         self.size_m = float(size_m)
         self.resolution_m = float(resolution_m)
@@ -71,6 +96,63 @@ class OnlineMapper:
         self._free_ray_obstacle_endpoint_decay = 1
         self.last_inflated_occupied = np.zeros_like(self.grid.free, dtype=bool)
         self.vertical_profile = VerticalProfileMap.zeros(self.grid.free.shape)
+        voxel_cfg_raw = dict(voxel_grid_config or {}) if not isinstance(voxel_grid_config, VoxelOccupancyGridConfig) else dict(voxel_grid_config.__dict__)
+        voxel_cfg_raw.setdefault("enabled", bool(voxel_grid_enabled))
+        voxel_cfg_raw.setdefault("z_min_m", float(voxel_grid_z_min_m))
+        voxel_cfg_raw.setdefault("z_max_m", float(voxel_grid_z_max_m))
+        voxel_cfg_raw.setdefault("z_resolution_m", float(voxel_grid_z_resolution_m))
+        voxel_cfg_raw.setdefault("active_z_min_m", float(voxel_grid_active_z_min_m))
+        voxel_cfg_raw.setdefault("active_z_max_fallback_m", float(voxel_grid_active_z_max_fallback_m))
+        voxel_cfg_raw.setdefault("active_z_max_ceiling_ratio", float(voxel_grid_active_z_max_ceiling_ratio))
+        self.voxel_grid_config = VoxelOccupancyGridConfig.from_mapping(voxel_cfg_raw)
+        nav_cfg = dict(voxel_navigation_projection_config or {})
+        self.voxel_navigation_projection_config = {
+            "obstacle_z_min_m": float(nav_cfg.get("obstacle_z_min_m", self.obstacle_min_height_m)),
+            "obstacle_z_max_m": float(nav_cfg.get("obstacle_z_max_m", self.obstacle_max_height_m)),
+            "free_z_min_m": float(nav_cfg.get("free_z_min_m", 0.10)),
+            "free_z_max_m": float(nav_cfg.get("free_z_max_m", self.obstacle_max_height_m)),
+            "min_free_voxels": int(nav_cfg.get("min_free_voxels", 1)),
+        }
+        self.voxel_grid_drives_navigation = bool(self.voxel_grid_config.voxel_grid_drives_navigation)
+        self.voxel_grid = VoxelOccupancyGrid3D.zeros(self.grid.free.shape, self.grid.map_info, self.voxel_grid_config)
+        self.last_voxel_navigation_projection: NavigationProjection | None = None
+        blind_cfg = dict(voxel_navigation_blind_zone_config or {})
+        self.voxel_navigation_blind_zone_config = {
+            "enabled": bool(blind_cfg.get("enabled", True)),
+            "force_initial_blind_zone_free": bool(blind_cfg.get("force_initial_blind_zone_free", True)),
+            "initial_blind_zone_radius_m": float(blind_cfg.get("initial_blind_zone_radius_m", 0.80)),
+            "initial_blind_zone_steps": int(blind_cfg.get("initial_blind_zone_steps", 60)),
+            "force_current_footprint_free": bool(blind_cfg.get("force_current_footprint_free", True)),
+            "current_footprint_radius_m": float(blind_cfg.get("current_footprint_radius_m", 0.35)),
+            "write_to_voxel_grid": bool(blind_cfg.get("write_to_voxel_grid", True)),
+            "free_z_min_m": float(blind_cfg.get("free_z_min_m", 0.10)),
+            "free_z_max_m": float(blind_cfg.get("free_z_max_m", 0.90)),
+            "free_all_bins_in_range": bool(blind_cfg.get("free_all_bins_in_range", True)),
+        }
+        self._initial_blind_zone_center_world_xy: tuple[float, float] | None = None
+        self._update_step_index = 0
+        self.last_voxel_blind_zone_debug: dict[str, object] = {}
+        storage_z_max = float(height_profile_storage_z_max_m if height_profile_storage_z_max_m is not None else height_profile_z_max_m)
+        self.height_profile_config = HeightColumnProfileConfig(
+            enabled=bool(height_profile_enabled),
+            z_min_m=float(height_profile_z_min_m),
+            z_max_m=float(storage_z_max),
+            storage_z_max_m=float(storage_z_max),
+            active_z_min_m=float(height_profile_z_min_m),
+            active_z_max_m=float(height_profile_active_z_max_fallback_m),
+            active_z_max_fallback_m=float(height_profile_active_z_max_fallback_m),
+            active_z_max_ceiling_ratio=float(height_profile_active_z_max_ceiling_ratio),
+            z_bin_size_m=float(height_profile_z_bin_size_m),
+        )
+        self.ceiling_height_estimator = CeilingHeightEstimator(
+            ceiling_height_estimator_config,
+            active_z_min_m=float(height_profile_z_min_m),
+            storage_z_max_m=float(storage_z_max),
+            active_z_max_fallback_m=float(height_profile_active_z_max_fallback_m),
+            active_z_max_ceiling_ratio=float(height_profile_active_z_max_ceiling_ratio),
+        )
+        self.last_ceiling_height_estimate = self.ceiling_height_estimator.last_estimate
+        self.height_profile = HeightColumnProfileMap.zeros(self.grid.free.shape, self.height_profile_config)
         self._reset_roomseg_ray_evidence()
 
     def reset(self, start_xy: Tuple[float, float]) -> None:
@@ -85,6 +167,14 @@ class OnlineMapper:
         self.depth_obstacle_endpoint_count = np.zeros_like(self.grid.free, dtype=np.uint16)
         self.last_inflated_occupied = np.zeros_like(self.grid.free, dtype=bool)
         self.vertical_profile = VerticalProfileMap.zeros(self.grid.free.shape)
+        self.voxel_grid = VoxelOccupancyGrid3D.zeros(self.grid.free.shape, self.grid.map_info, self.voxel_grid_config)
+        self.last_voxel_navigation_projection = None
+        self._initial_blind_zone_center_world_xy = (float(start_xy[0]), float(start_xy[1]))
+        self._update_step_index = 0
+        self.last_voxel_blind_zone_debug = {}
+        self.height_profile.reset_shape(self.grid.free.shape)
+        self.ceiling_height_estimator.reset()
+        self.last_ceiling_height_estimate = self.ceiling_height_estimator.last_estimate
         self._reset_roomseg_ray_evidence()
 
     def update_simple_radius(self, base_pose_world: Tuple[float, float, float, float], radius_m: float = 1.5) -> OnlineGridMap:
@@ -149,6 +239,8 @@ class OnlineMapper:
         points_cam = backproject_pixels(depth_arr, valid_pixels, intr)
         points_world = transform_points(points_cam, camera_pose_world)
         floor_z = float(base_pose_world[2])
+        if self._initial_blind_zone_center_world_xy is None:
+            self._initial_blind_zone_center_world_xy = (float(base_pose_world[0]), float(base_pose_world[1]))
 
         rel_z = points_world[:, 2].astype(np.float32) - floor_z
         rows_cols = _world_points_to_grid(points_world, self.grid.map_info)
@@ -184,12 +276,59 @@ class OnlineMapper:
             self._finish_timing_stats(timings, total_started_at, reason="ray_origin_out_of_bounds")
             return self.grid
 
+        in_bounds_points_world = points_world[in_bounds]
         in_bounds_pixels = valid_pixels[in_bounds]
         in_bounds_depth = valid_depth[in_bounds]
         rows_cols = rows_cols[in_bounds]
         rel_z = rel_z[in_bounds]
+        if bool(self.height_profile_config.enabled) or bool(self.voxel_grid_config.enabled):
+            self.last_ceiling_height_estimate = self.ceiling_height_estimator.update(rel_z, rows_cols)
+        if bool(self.height_profile_config.enabled):
+            self.height_profile_config.active_z_max_m = float(self.last_ceiling_height_estimate.active_z_max_m)
+            self.height_profile.active_z_min_m = float(self.height_profile_config.active_z_min_m)
+            self.height_profile.active_z_max_m = float(self.height_profile_config.active_z_max_m)
+        voxel_nav_projection = None
+        if bool(self.voxel_grid_config.enabled):
+            status = "locked" if bool(self.last_ceiling_height_estimate.locked) else ("stable" if bool(self.last_ceiling_height_estimate.stable) else "fallback")
+            self.voxel_grid.set_active_z_from_ceiling(self.last_ceiling_height_estimate.height_m, status=status)
+            voxel_stats = self.voxel_grid.integrate_depth_points(
+                camera_origin_world=np.asarray(camera_pose_world[:3], dtype=np.float32),
+                points_world=in_bounds_points_world,
+                depths_m=in_bounds_depth,
+                floor_z=floor_z,
+            )
+            if bool(voxel_stats.python_debug_backend_used):
+                raise RuntimeError("python_debug voxel backend must not be used in runtime")
+            floor_endpoint_mask = rel_z <= float(self.free_max_height_m)
+            if np.any(floor_endpoint_mask):
+                free_z_idx = self.voxel_grid.z_index_for_height(
+                    max(float(self.voxel_navigation_projection_config.get("free_z_min_m", 0.10)), float(self.voxel_grid.active_z_min_m))
+                )
+                if free_z_idx is not None:
+                    rc = np.asarray(rows_cols[floor_endpoint_mask], dtype=np.int32)
+                    if rc.size:
+                        floor_cells = np.empty((int(rc.shape[0]), 3), dtype=np.int32)
+                        floor_cells[:, 0] = int(free_z_idx)
+                        floor_cells[:, 1] = rc[:, 0]
+                        floor_cells[:, 2] = rc[:, 1]
+                        _count, changed = self.voxel_grid.mark_free_voxels_array(floor_cells)
+                        self.voxel_grid.refresh_state_indices(changed)
+            blind_started_at = time.perf_counter()
+            self.last_voxel_blind_zone_debug = self._apply_voxel_navigation_blind_zone(
+                base_pose_world,
+                write_to_voxel=bool(self.voxel_navigation_blind_zone_config.get("write_to_voxel_grid", True)),
+                write_to_grid=False,
+            )
+            timings["voxel_blind_zone_voxel_ms"] = _elapsed_ms(blind_started_at)
+            voxel_nav_projection = self.voxel_grid.project_navigation(**self.voxel_navigation_projection_config)
+            self.last_voxel_navigation_projection = voxel_nav_projection
+        else:
+            self.last_voxel_navigation_projection = None
+            self.last_voxel_blind_zone_debug = {}
         stage_started_at = time.perf_counter()
         self.vertical_profile.mark_occupied_points(rows_cols, rel_z)
+        if bool(self.height_profile_config.enabled):
+            self.height_profile.mark_occupied_points(rows_cols, rel_z)
         timings["vertical_profile_occupied_ms"] = _elapsed_ms(stage_started_at)
         obstacle_mask = (rel_z >= self.obstacle_min_height_m) & (rel_z <= self.obstacle_max_height_m)
         free_mask = (rel_z >= self.free_min_height_m) & (rel_z <= self.free_max_height_m)
@@ -216,6 +355,27 @@ class OnlineMapper:
             ray_result.free_flat_by_band,
             ray_result.free_weight_by_band,
         )
+        height_ray_result = None
+        if bool(self.height_profile_config.enabled):
+            height_ray_result = _collect_ray_cast_evidence(
+                origin_cell=(int(origin_cell[0]), int(origin_cell[1])),
+                endpoints=rows_cols,
+                endpoint_rel_z=rel_z,
+                endpoint_depth_m=in_bounds_depth,
+                endpoint_is_obstacle=obstacle_mask,
+                ray_can_clear=ray_clear_mask,
+                map_width=map_width,
+                depth_min_m=float(self.depth_min_m),
+                depth_max_m=float(self.depth_max_m),
+                camera_rel_z_m=float(camera_rel_z),
+                z_min_m=float(self.height_profile_config.z_min_m),
+                z_max_m=float(self.height_profile_config.z_max_m),
+                band_ranges_m=self.height_profile.bin_ranges_m,
+            )
+            self.height_profile.mark_free_ray_cells_by_bin(
+                height_ray_result.free_flat_by_band,
+                height_ray_result.free_weight_by_band,
+            )
         self._mark_roomseg_ray_covered_weighted_flat(
             ray_result.roomseg_ray_covered_flat,
             ray_result.roomseg_ray_covered_weight,
@@ -266,6 +426,37 @@ class OnlineMapper:
             self.grid.free[rows, cols] = 0
             self.grid.occupied[rows, cols] = 1
             self.grid.observed[rows, cols] = 1
+        if bool(self.voxel_grid_config.enabled) and bool(self.voxel_grid_drives_navigation) and voxel_nav_projection is not None:
+            self.grid.free[:, :] = np.asarray(voxel_nav_projection.free, dtype=np.uint8)
+            self.grid.occupied[:, :] = np.asarray(voxel_nav_projection.occupied, dtype=np.uint8)
+            self.grid.observed[:, :] = np.asarray(voxel_nav_projection.observed, dtype=np.uint8)
+            self.depth_free_mask[:, :] = np.asarray(voxel_nav_projection.free, dtype=np.uint8)
+        blind_2d_started_at = time.perf_counter()
+        blind_2d_debug = self._apply_voxel_navigation_blind_zone(
+            base_pose_world,
+            write_to_voxel=False,
+            write_to_grid=True,
+        )
+        if blind_2d_debug:
+            merged = dict(self.last_voxel_blind_zone_debug)
+            additive_keys = {
+                "voxel_blind_zone_written_voxels",
+            }
+            for key, value in blind_2d_debug.items():
+                if key in additive_keys and isinstance(value, (int, np.integer)) and not isinstance(value, bool) and key in merged:
+                    merged[key] = int(merged.get(key, 0) or 0) + int(value)
+                else:
+                    merged[key] = value
+            merged["voxel_blind_zone_write_to_voxel"] = bool(
+                self.last_voxel_blind_zone_debug.get("voxel_blind_zone_write_to_voxel", False)
+                or blind_2d_debug.get("voxel_blind_zone_write_to_voxel", False)
+            )
+            merged["voxel_blind_zone_write_to_grid"] = bool(
+                self.last_voxel_blind_zone_debug.get("voxel_blind_zone_write_to_grid", False)
+                or blind_2d_debug.get("voxel_blind_zone_write_to_grid", False)
+            )
+            self.last_voxel_blind_zone_debug = merged
+        timings["voxel_blind_zone_2d_ms"] = _elapsed_ms(blind_2d_started_at)
         timings["grid_write_ms"] = _elapsed_ms(stage_started_at)
         stage_started_at = time.perf_counter()
         self._mark_robot_footprint_free(base_pose_world)
@@ -286,6 +477,8 @@ class OnlineMapper:
             skipped_height_rays=int(ray_result.nav_skipped_height_rays),
             vertical_profile_ray_count=int(ray_result.vertical_profile_ray_count),
             vertical_profile_skipped_height_rays=int(ray_result.vertical_profile_skipped_height_rays),
+            height_profile_ray_count=0 if height_ray_result is None else int(height_ray_result.vertical_profile_ray_count),
+            height_profile_skipped_height_rays=0 if height_ray_result is None else int(height_ray_result.vertical_profile_skipped_height_rays),
             ray_cast_backend=str(ray_result.backend),
             ray_unique_endpoint_cells=int(ray_result.unique_endpoint_cells),
             base_pose_world=base_pose_world,
@@ -294,6 +487,7 @@ class OnlineMapper:
         )
         timings["debug_stats_ms"] = _elapsed_ms(stage_started_at)
         self._finish_timing_stats(timings, total_started_at, reason="ok")
+        self._update_step_index += 1
         return self.grid
 
     def update_nearfield_topdown(
@@ -560,6 +754,124 @@ class OnlineMapper:
         radius_cells = self._robot_footprint_radius_cells()
         return _dilate_binary(self.grid.occupied.astype(bool), radius_cells)
 
+    def _apply_voxel_navigation_blind_zone(
+        self,
+        base_pose_world: Tuple[float, float, float, float],
+        *,
+        write_to_voxel: bool,
+        write_to_grid: bool,
+    ) -> dict[str, object]:
+        cfg = self.voxel_navigation_blind_zone_config
+        out: dict[str, object] = {
+            "voxel_blind_zone_enabled": bool(cfg.get("enabled", True)),
+            "voxel_blind_zone_step_index": int(self._update_step_index),
+            "voxel_initial_blind_zone_free_cells": 0,
+            "voxel_current_footprint_forced_free_cells": 0,
+            "voxel_blind_zone_written_voxels": 0,
+            "voxel_blind_zone_grid_cells": 0,
+            "voxel_blind_zone_write_to_voxel": bool(write_to_voxel),
+            "voxel_blind_zone_write_to_grid": bool(write_to_grid),
+            "voxel_blind_zone_free_z_min_m": float(cfg.get("free_z_min_m", 0.10)),
+            "voxel_blind_zone_free_z_max_m": float(cfg.get("free_z_max_m", 0.90)),
+            "voxel_blind_zone_active_this_frame": False,
+            "voxel_blind_zone_changed_voxels": 0,
+        }
+        if not bool(cfg.get("enabled", True)):
+            return out
+        if self._initial_blind_zone_center_world_xy is None:
+            self._initial_blind_zone_center_world_xy = (float(base_pose_world[0]), float(base_pose_world[1]))
+
+        requests: list[tuple[str, tuple[float, float], float]] = []
+        if (
+            bool(cfg.get("force_initial_blind_zone_free", True))
+            and int(self._update_step_index) < max(0, int(cfg.get("initial_blind_zone_steps", 20)))
+            and self._initial_blind_zone_center_world_xy is not None
+        ):
+            requests.append(
+                (
+                    "initial",
+                    self._initial_blind_zone_center_world_xy,
+                    max(0.0, float(cfg.get("initial_blind_zone_radius_m", 0.60))),
+                )
+            )
+        if bool(cfg.get("force_current_footprint_free", True)):
+            requests.append(
+                (
+                    "current",
+                    (float(base_pose_world[0]), float(base_pose_world[1])),
+                    max(0.0, float(cfg.get("current_footprint_radius_m", 0.25))),
+                )
+            )
+
+        total_grid_cells = 0
+        total_voxels = 0
+        changed_chunks: list[np.ndarray] = []
+        initial_cells = 0
+        current_cells = 0
+        for reason, center_xy, radius_m in requests:
+            rows, cols = self._disk_cells_for_world_xy(center_xy, radius_m)
+            if rows.size == 0:
+                continue
+            if write_to_grid:
+                self.grid.free[rows, cols] = 1
+                self.grid.occupied[rows, cols] = 0
+                self.grid.observed[rows, cols] = 1
+                self.depth_free_mask[rows, cols] = 1
+            total_grid_cells += int(rows.size)
+            if reason == "initial":
+                initial_cells += int(rows.size)
+            else:
+                current_cells += int(rows.size)
+            if write_to_voxel and bool(cfg.get("write_to_voxel_grid", True)) and bool(self.voxel_grid_config.enabled):
+                z_idx = self.voxel_grid.active_z_indices(
+                    z_min_m=float(cfg.get("free_z_min_m", 0.10)),
+                    z_max_m=float(cfg.get("free_z_max_m", 0.35)),
+                )
+                if not bool(cfg.get("free_all_bins_in_range", True)) and z_idx.size:
+                    z_idx = z_idx[:1]
+                if z_idx.size:
+                    voxels = np.empty((int(z_idx.size) * int(rows.size), 3), dtype=np.int32)
+                    voxels[:, 0] = np.repeat(z_idx.astype(np.int32), int(rows.size))
+                    voxels[:, 1] = np.tile(rows.astype(np.int32), int(z_idx.size))
+                    voxels[:, 2] = np.tile(cols.astype(np.int32), int(z_idx.size))
+                    count, changed = self.voxel_grid.force_free_voxels(voxels)
+                    total_voxels += int(count)
+                    if changed.size:
+                        changed_chunks.append(np.asarray(changed, dtype=np.int64))
+        if changed_chunks:
+            changed_all = np.unique(np.concatenate(changed_chunks).astype(np.int64, copy=False))
+            self.voxel_grid.refresh_state_indices(changed_all)
+        else:
+            changed_all = np.zeros(0, dtype=np.int64)
+        out.update(
+            {
+                "voxel_initial_blind_zone_free_cells": int(initial_cells),
+                "voxel_current_footprint_forced_free_cells": int(current_cells),
+                "voxel_blind_zone_grid_cells": int(total_grid_cells),
+                "voxel_blind_zone_written_voxels": int(total_voxels),
+                "voxel_blind_zone_changed_voxels": int(changed_all.size),
+                "voxel_blind_zone_active_this_frame": bool(total_grid_cells > 0 or total_voxels > 0),
+                "voxel_initial_blind_zone_radius_m": float(cfg.get("initial_blind_zone_radius_m", 0.80)),
+                "voxel_current_footprint_radius_m": float(cfg.get("current_footprint_radius_m", 0.35)),
+                "voxel_initial_blind_zone_steps": int(cfg.get("initial_blind_zone_steps", 60)),
+            }
+        )
+        return out
+
+    def _disk_cells_for_world_xy(self, center_world_xy: tuple[float, float], radius_m: float) -> tuple[np.ndarray, np.ndarray]:
+        center = self.grid.world_to_grid(float(center_world_xy[0]), float(center_world_xy[1]))
+        radius_cells = max(0, int(math.ceil(max(0.0, float(radius_m)) / max(float(self.grid.map_info.resolution_m), 1e-6))))
+        rows: list[int] = []
+        cols: list[int] = []
+        for dr, dc in _disk_offsets(radius_cells):
+            row, col = int(center[0] + dr), int(center[1] + dc)
+            if 0 <= row < self.grid.map_info.height and 0 <= col < self.grid.map_info.width:
+                rows.append(row)
+                cols.append(col)
+        if not rows:
+            return np.zeros(0, dtype=np.int32), np.zeros(0, dtype=np.int32)
+        return np.asarray(rows, dtype=np.int32), np.asarray(cols, dtype=np.int32)
+
     def _mark_robot_footprint_free(self, base_pose_world: Tuple[float, float, float, float]) -> None:
         radius_cells = max(1, self._robot_footprint_radius_cells())
         center = self.grid.world_to_grid(float(base_pose_world[0]), float(base_pose_world[1]))
@@ -615,6 +927,39 @@ class OnlineMapper:
             "terminal_wall_height_max": np.asarray(self.roomseg_terminal_wall_height_max, dtype=np.float32),
             "terminal_wall_depth_min": np.asarray(self.roomseg_terminal_wall_depth_min, dtype=np.float32),
             "terminal_wall_splat": np.asarray(self.roomseg_terminal_wall_splat, dtype=np.uint8),
+        }
+
+    def roomseg_height_profile_evidence(self) -> dict[str, np.ndarray | float]:
+        return {
+            "free_ray_count": np.asarray(self.height_profile.free_ray_count, dtype=np.uint16).copy(),
+            "occupied_count": np.asarray(self.height_profile.occupied_count, dtype=np.uint16).copy(),
+            "observed_count": np.asarray(self.height_profile.observed_count, dtype=np.uint16).copy(),
+            "z_min_m": float(self.height_profile.z_min_m),
+            "z_max_m": float(self.height_profile.z_max_m),
+            "z_bin_size_m": float(self.height_profile.z_bin_size_m),
+            "active_z_min_m": float(self.height_profile_config.active_z_min_m),
+            "active_z_max_m": float(self.height_profile_config.active_z_max_m or self.height_profile_config.active_z_max_fallback_m),
+            "ceiling_height_estimate_m": (
+                np.nan
+                if self.last_ceiling_height_estimate.height_m is None
+                else float(self.last_ceiling_height_estimate.height_m)
+            ),
+        }
+
+    def roomseg_voxel_evidence(self) -> dict[str, np.ndarray | float | None]:
+        return {
+            "state": np.asarray(self.voxel_grid.state, dtype=np.uint8).copy(),
+            "log_odds": np.asarray(self.voxel_grid.log_odds, dtype=np.int16).copy(),
+            "z_min_m": float(self.voxel_grid.z_min_m),
+            "z_max_m": float(self.voxel_grid.z_max_m),
+            "z_resolution_m": float(self.voxel_grid.z_resolution_m),
+            "active_z_min_m": float(self.voxel_grid.active_z_min_m),
+            "active_z_max_m": None if self.voxel_grid.active_z_max_m is None else float(self.voxel_grid.active_z_max_m),
+            "ceiling_height_estimate_m": (
+                None
+                if self.last_ceiling_height_estimate.height_m is None
+                else float(self.last_ceiling_height_estimate.height_m)
+            ),
         }
 
     def _mark_roomseg_ray_covered_flat(self, flat_values: List[int]) -> None:
@@ -807,6 +1152,8 @@ class OnlineMapper:
         skipped_height_rays: int,
         vertical_profile_ray_count: int,
         vertical_profile_skipped_height_rays: int,
+        height_profile_ray_count: int,
+        height_profile_skipped_height_rays: int,
         ray_cast_backend: str,
         ray_unique_endpoint_cells: int,
         base_pose_world: Tuple[float, float, float, float],
@@ -836,6 +1183,11 @@ class OnlineMapper:
             "skipped_height_rays": int(skipped_height_rays),
             "vertical_profile_ray_count": int(vertical_profile_ray_count),
             "vertical_profile_skipped_height_rays": int(vertical_profile_skipped_height_rays),
+            "height_profile_enabled": bool(self.height_profile_config.enabled),
+            "height_profile_ray_count": int(height_profile_ray_count),
+            "height_profile_skipped_height_rays": int(height_profile_skipped_height_rays),
+            "height_profile_z_bin_count": int(self.height_profile.z_bin_count),
+            **dict(self.last_ceiling_height_estimate.debug),
             "free_band_points": int(np.count_nonzero(free_mask)),
             "obstacle_band_points": int(np.count_nonzero(obstacle_mask)),
             "below_free_min_points": int(np.count_nonzero(rel_z < self.free_min_height_m)),
@@ -869,6 +1221,35 @@ class OnlineMapper:
                 "vertical_profile_free_max": float(self.vertical_profile_free_max_height_m),
             },
             "vertical_profile": self.vertical_profile.to_debug_dict(),
+            "voxel_grid": self.voxel_grid.to_debug_dict(),
+            "voxel_navigation_projection": dict(self.voxel_grid.last_navigation_debug),
+            "voxel_navigation_blind_zone": dict(self.last_voxel_blind_zone_debug),
+            **dict(self.last_voxel_blind_zone_debug),
+            "voxel_grid_drives_navigation": bool(self.voxel_grid_drives_navigation),
+            "height_profile": {
+                "z_min_m": float(self.height_profile.z_min_m),
+                "z_max_m": float(self.height_profile.z_max_m),
+                "z_bin_size_m": float(self.height_profile.z_bin_size_m),
+                "z_bin_count": int(self.height_profile.z_bin_count),
+                "active_z_min_m": float(self.height_profile_config.active_z_min_m),
+                "active_z_max_m": float(self.height_profile_config.active_z_max_m or self.height_profile_config.active_z_max_fallback_m),
+                "active_z_bin_count": int(np.count_nonzero(
+                    (self.height_profile.bin_centers_m >= float(self.height_profile_config.active_z_min_m))
+                    & (self.height_profile.bin_centers_m <= float(self.height_profile_config.active_z_max_m or self.height_profile_config.active_z_max_fallback_m))
+                )),
+                "ceiling_height_estimate_m": (
+                    None
+                    if self.last_ceiling_height_estimate.height_m is None
+                    else float(self.last_ceiling_height_estimate.height_m)
+                ),
+                "ceiling_height_stable": bool(self.last_ceiling_height_estimate.stable),
+                "ceiling_height_locked": bool(self.last_ceiling_height_estimate.locked),
+                "free_ray_cells": int(np.count_nonzero(self.height_profile.free_ray_count)),
+                "occupied_cells": int(np.count_nonzero(self.height_profile.occupied_count)),
+                "observed_cells": int(np.count_nonzero(self.height_profile.observed_count)),
+                "free_ray_count_sum": int(np.sum(self.height_profile.free_ray_count, dtype=np.uint64)),
+                "occupied_count_sum": int(np.sum(self.height_profile.occupied_count, dtype=np.uint64)),
+            },
             "roomseg_ray_evidence": {
                 "ray_covered_cells": int(np.count_nonzero(self.roomseg_ray_covered_count)),
                 "ray_covered_count_sum": int(np.sum(self.roomseg_ray_covered_count, dtype=np.uint64)),
@@ -1002,11 +1383,13 @@ def _collect_ray_cast_evidence(
     lo = np.maximum(float(z_min_m), np.minimum(float(camera_rel_z_m), rel_z.astype(np.float32)))
     hi = np.minimum(float(z_max_m), np.maximum(float(camera_rel_z_m), rel_z.astype(np.float32)))
     valid_interval = hi >= lo
-    band_bits = np.zeros((n,), dtype=np.uint8)
+    band_membership = np.zeros((band_count, n), dtype=bool)
+    has_band_evidence = np.zeros((n,), dtype=bool)
     for band_idx, (band_lo, band_hi) in enumerate(band_ranges_m):
         band_mask = valid_interval & (float(band_hi) > lo) & (float(band_lo) < hi)
         if np.any(band_mask):
-            band_bits[band_mask] |= np.uint8(1 << int(band_idx))
+            band_membership[int(band_idx), band_mask] = True
+            has_band_evidence[band_mask] = True
 
     roomseg_ray_valid = np.isfinite(depth) & (depth > float(depth_min_m)) & (depth < float(depth_max_m))
     terminal_valid = roomseg_ray_valid & np.isfinite(rel_z) & (rel_z >= float(z_min_m)) & (rel_z <= float(z_max_m))
@@ -1038,22 +1421,19 @@ def _collect_ray_cast_evidence(
         profile_line_flat = line_flat[:-1]
         if profile_line_flat.size == 0:
             continue
-        valid_group = group_indices[roomseg_ray_valid[group_indices] & (band_bits[group_indices] > 0)]
+        valid_group = group_indices[roomseg_ray_valid[group_indices] & has_band_evidence[group_indices]]
         if valid_group.size == 0:
             continue
-        group_bits = band_bits[valid_group]
-        unique_bits, bit_counts = np.unique(group_bits, return_counts=True)
-        for bits, bits_count in zip(unique_bits, bit_counts):
-            count_int = int(bits_count)
-            if count_int <= 0:
+        valid_count = int(valid_group.size)
+        vertical_profile_ray_count += valid_count
+        covered_chunks.append(profile_line_flat)
+        covered_weight_chunks.append(np.full(profile_line_flat.shape, valid_count, dtype=np.int64))
+        for band_idx in range(band_count):
+            band_count_for_group = int(np.count_nonzero(band_membership[int(band_idx), valid_group]))
+            if band_count_for_group <= 0:
                 continue
-            vertical_profile_ray_count += count_int
-            covered_chunks.append(profile_line_flat)
-            covered_weight_chunks.append(np.full(profile_line_flat.shape, count_int, dtype=np.int64))
-            for band_idx in range(band_count):
-                if int(bits) & (1 << int(band_idx)):
-                    band_flat_chunks[band_idx].append(profile_line_flat)
-                    band_weight_chunks[band_idx].append(np.full(profile_line_flat.shape, count_int, dtype=np.int64))
+            band_flat_chunks[band_idx].append(profile_line_flat)
+            band_weight_chunks[band_idx].append(np.full(profile_line_flat.shape, band_count_for_group, dtype=np.int64))
 
     occupied_flat = endpoint_flat[obstacle]
     terminal_flat = endpoint_flat[terminal_valid]

@@ -168,6 +168,7 @@ def test_room_visualization_proposal_vs_final_layers(tmp_path):
     debug = {
         "proposal_room_count": 2,
         "final_room_count": 1,
+        "show_roomseg_diagnostics_on_main": True,
         "proposal_room_masks": [
             {"label_id": 1, "mask": proposal_a.astype(np.uint8).tolist()},
             {"label_id": 2, "mask": proposal_b.astype(np.uint8).tolist()},

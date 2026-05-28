@@ -518,6 +518,38 @@ def build_door_neck_candidates_from_extensions(
     return candidates, debug
 
 
+def build_step2_separator_candidates_from_extensions(
+    extensions: Sequence[LineExtensionHit],
+    *,
+    accepted_virtual_targets: Sequence[SeparatorCandidate] | None,
+    resolution_m: float,
+    config: DoorNeckConfig | Mapping[str, object] | None = None,
+    start_id: int = 1,
+) -> tuple[list[SeparatorCandidate], dict]:
+    """Build Step2 corridor separators from accepted wall-extension hits.
+
+    The older helper names these candidates as door necks.  Voxel room
+    segmentation uses the same geometric evidence for corridor partitioning,
+    but keeping a distinct kind makes topology reports and per-kind thresholds
+    auditable.
+    """
+    candidates, debug = build_door_neck_candidates_from_extensions(
+        extensions,
+        accepted_virtual_targets=accepted_virtual_targets,
+        resolution_m=float(resolution_m),
+        config=config,
+        start_id=int(start_id),
+    )
+    for candidate in candidates:
+        candidate.kind = "line_extension_corridor_separator"
+        candidate.debug["kind_detail"] = "corridor_separator"
+        candidate.debug["candidate_source"] = "step2_line_extension"
+    debug = dict(debug)
+    debug["candidate_kind"] = "line_extension_corridor_separator"
+    debug["candidates"] = [candidate.to_dict() for candidate in candidates[:1024]]
+    return candidates, debug
+
+
 def build_door_neck_candidates_from_extension_intersections(
     extensions: Sequence[LineExtensionHit],
     *,

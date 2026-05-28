@@ -89,7 +89,7 @@ class FusedInstanceRegistry:
         intr: CameraIntrinsics,
         camera_pose_world: Tuple[float, float, float, float],
         step_id: int,
-        depth_max_m: float = 6.0,
+        depth_max_m: float = 5.0,
         min_points: int = 20,
         stride: int = 4,
     ) -> List[FusedInstance]:

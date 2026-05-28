@@ -133,8 +133,18 @@ def prepare_room_context_for_frontier_scoring(
         unknown_arr = np.asarray(unknown_mask, dtype=bool)
     static_structural_arr = _resolve_optional_mapper_array("roomseg_static_structural_occupied", mapper, obstacle_arr.shape)
     roomseg_ray_evidence = _resolve_roomseg_ray_evidence(mapper, obstacle_arr.shape)
+    height_profile = _resolve_height_profile(mapper, obstacle_arr.shape)
+    voxel_grid = _resolve_voxel_grid(mapper, obstacle_arr.shape)
 
-    map_hash = _hash_arrays(free_arr, obstacle_arr, unknown_arr, static_structural_arr, *roomseg_ray_evidence.values())
+    map_hash = _hash_arrays(
+        free_arr,
+        obstacle_arr,
+        unknown_arr,
+        static_structural_arr,
+        *roomseg_ray_evidence.values(),
+        *_height_profile_hash_arrays(height_profile),
+        *_voxel_grid_hash_arrays(voxel_grid),
+    )
     object_hash = _hash_object_memory(object_memory)
     if (
         cache.last_result is not None
@@ -184,6 +194,10 @@ def prepare_room_context_for_frontier_scoring(
                 build_params = {}
             if "vertical_profile" in build_params:
                 build_kwargs["vertical_profile"] = getattr(mapper, "vertical_profile", None)
+            if "height_profile" in build_params:
+                build_kwargs["height_profile"] = height_profile
+            if "voxel_grid" in build_params:
+                build_kwargs["voxel_grid"] = voxel_grid
             if "roomseg_static_structural_occupied" in build_params:
                 build_kwargs["roomseg_static_structural_occupied"] = static_structural_arr
             if "roomseg_ray_evidence" in build_params:
@@ -225,6 +239,10 @@ def prepare_room_context_for_frontier_scoring(
                 update_kwargs["object_memory"] = getattr(object_memory, "nodes", [])
             if "vertical_profile" in update_params:
                 update_kwargs["vertical_profile"] = getattr(mapper, "vertical_profile", None)
+            if "height_profile" in update_params:
+                update_kwargs["height_profile"] = height_profile
+            if "voxel_grid" in update_params:
+                update_kwargs["voxel_grid"] = voxel_grid
             if "roomseg_static_structural_occupied" in update_params:
                 update_kwargs["roomseg_static_structural_occupied"] = static_structural_arr
             if "roomseg_ray_evidence" in update_params:
@@ -246,6 +264,10 @@ def prepare_room_context_for_frontier_scoring(
             update_kwargs["object_memory"] = getattr(object_memory, "nodes", [])
         if "vertical_profile" in update_params:
             update_kwargs["vertical_profile"] = getattr(mapper, "vertical_profile", None)
+        if "height_profile" in update_params:
+            update_kwargs["height_profile"] = height_profile
+        if "voxel_grid" in update_params:
+            update_kwargs["voxel_grid"] = voxel_grid
         if "roomseg_static_structural_occupied" in update_params:
             update_kwargs["roomseg_static_structural_occupied"] = static_structural_arr
         if "roomseg_ray_evidence" in update_params:
@@ -388,11 +410,64 @@ def _resolve_roomseg_ray_evidence(mapper: object | None, shape: tuple[int, ...])
     return out
 
 
+def _resolve_height_profile(mapper: object | None, shape: tuple[int, ...]) -> object | None:
+    if mapper is None or not hasattr(mapper, "height_profile"):
+        return None
+    height_profile = getattr(mapper, "height_profile")
+    if callable(height_profile):
+        height_profile = height_profile()
+    if height_profile is None:
+        return None
+    profile_shape = getattr(height_profile, "shape", None)
+    if tuple(profile_shape or ()) != tuple(shape):
+        return None
+    for name in ("free_ray_count", "occupied_count", "observed_count"):
+        if not hasattr(height_profile, name):
+            return None
+    return height_profile
+
+
+def _height_profile_hash_arrays(height_profile: object | None) -> tuple[np.ndarray, ...]:
+    if height_profile is None:
+        return ()
+    return (
+        np.asarray(getattr(height_profile, "free_ray_count")),
+        np.asarray(getattr(height_profile, "occupied_count")),
+        np.asarray(getattr(height_profile, "observed_count")),
+    )
+
+
+def _resolve_voxel_grid(mapper: object | None, shape: tuple[int, ...]) -> object | None:
+    if mapper is None or not hasattr(mapper, "voxel_grid"):
+        return None
+    voxel_grid = getattr(mapper, "voxel_grid")
+    if callable(voxel_grid):
+        voxel_grid = voxel_grid()
+    if voxel_grid is None:
+        return None
+    grid_shape = getattr(voxel_grid, "shape", None)
+    if tuple(grid_shape or ()) != tuple(shape):
+        return None
+    if not hasattr(voxel_grid, "state") or not hasattr(voxel_grid, "log_odds"):
+        return None
+    return voxel_grid
+
+
+def _voxel_grid_hash_arrays(voxel_grid: object | None) -> tuple[np.ndarray, ...]:
+    if voxel_grid is None:
+        return ()
+    return (
+        np.asarray(getattr(voxel_grid, "state")),
+        np.asarray(getattr(voxel_grid, "log_odds")),
+    )
+
+
 def _hash_arrays(*arrays: np.ndarray) -> str:
     digest = hashlib.blake2b(digest_size=16)
     for array in arrays:
-        arr = np.asarray(array, dtype=bool)
+        arr = np.asarray(array)
         digest.update(str(arr.shape).encode("utf-8"))
+        digest.update(str(arr.dtype).encode("utf-8"))
         digest.update(np.ascontiguousarray(arr).view(np.uint8))
     return digest.hexdigest()
 

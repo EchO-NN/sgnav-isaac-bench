@@ -42,6 +42,37 @@ class CountingSegmenter:
         return [room]
 
 
+class HeightProfileRequiredSegmenter:
+    context_source = "height_profile_door_wall_v8_vlm"
+
+    def __init__(self):
+        self.update_count = 0
+        self.last_debug = {}
+
+    def update(self, occupancy_map, observed_free_mask, obstacle_mask, unknown_mask, step, height_profile):
+        assert height_profile is not None
+        self.update_count += 1
+        mask = np.zeros_like(observed_free_mask, dtype=bool)
+        mask[1:4, 1:4] = True
+        room = RoomMask(
+            room_id="room_0001",
+            mask=mask,
+            centroid_xy=(2.5, 2.5),
+            area_m2=9.0,
+            boundary_unknown_fraction=0.0,
+            doorway_edges=[],
+            confidence=0.9,
+            observed_free_cells=9,
+            mask_confidence=0.9,
+        )
+        self.last_debug = {
+            "source": "height_profile_door_wall_v8",
+            "algorithm": "height_profile_door_wall_v8",
+            "room_count": 1,
+        }
+        return [room]
+
+
 class CountingLabeler:
     backend = "vlm"
 
@@ -93,6 +124,20 @@ def _masks():
     observed = np.ones((5, 5), dtype=bool)
     unknown = ~observed
     return free, occ, unknown
+
+
+class _FakeHeightProfile:
+    shape = (5, 5)
+
+    def __init__(self):
+        self.free_ray_count = np.zeros((2, 5, 5), dtype=np.uint16)
+        self.occupied_count = np.zeros((2, 5, 5), dtype=np.uint16)
+        self.observed_count = np.zeros((2, 5, 5), dtype=np.uint16)
+
+
+class _FakeMapper:
+    def __init__(self):
+        self.height_profile = _FakeHeightProfile()
 
 
 def test_room_context_not_called_by_mapper_or_perception_only_updates():
@@ -152,6 +197,30 @@ def test_room_context_called_immediately_before_frontier_scoring_order():
     assert result.labeling_ran is True
     assert trace == SCORING_ROOM_CALL_ORDER_FULL
     assert result.metadata(full_order=True)["room_call_order_trace"] == SCORING_ROOM_CALL_ORDER_FULL
+
+
+def test_room_context_passes_height_profile_to_height_profile_segmenter():
+    segmenter = HeightProfileRequiredSegmenter()
+    free, occ, unknown = _masks()
+
+    result = prepare_room_context_for_frontier_scoring(
+        step_idx=0,
+        mapper=_FakeMapper(),
+        object_memory=ObjectMemory(),
+        room_segmenter=segmenter,
+        room_labeler=None,
+        map_info=_map_info(),
+        previous_room_context=RoomContextCache(),
+        strict_benchmark=False,
+        occupancy=occ,
+        observed_free_mask=free,
+        obstacle_mask=occ,
+        unknown_mask=unknown,
+    )
+
+    assert segmenter.update_count == 1
+    assert result.segmentation_ran is True
+    assert result.room_segmentation_debug["algorithm"] == "height_profile_door_wall_v8"
 
 
 def test_committed_frontier_replan_does_not_trigger_room_context():

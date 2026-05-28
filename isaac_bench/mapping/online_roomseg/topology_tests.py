@@ -19,11 +19,26 @@ class TopologyTestConfig:
     min_new_component_area_cells: int = 4
     allow_partial_room_split: bool = True
     max_tiny_fragment_count: int = 3
+    tiny_fragment_count_mode: str = "local_delta"
+    local_fragment_radius_cells: int = 12
+    centered_extension_allow_small_gaps: bool = True
+    centered_extension_max_bridge_gap_cells: int = 2
+    centered_extension_bridge_unknown: bool = True
+    centered_extension_bridge_nonfree_if_between_free: bool = False
+    require_cut_adjacent_to_wall_or_barrier: bool = True
     reject_corridor_split: bool = True
     open_room_width_min_m: float = 1.80
     open_room_min_side_area_m2: float = 2.00
     narrow_neck_width_max_m: float = 1.60
     reject_open_living_room_internal_split: bool = True
+    reject_if_side_width_cells_leq: int = 0
+    corridor_min_split_area_m2: float = 0.05
+    corridor_min_new_component_width_m: float = 0.10
+    corridor_reject_tiny_side_width_cells_leq: int = 2
+    corridor_tiny_side_min_area_m2: float = 0.03
+    corridor_tiny_side_min_length_m: float = 0.35
+    corridor_accept_long_narrow_side: bool = True
+    corridor_local_topology_radius_cells: int = 20
     separator: SeparatorAnchorConfig | None = None
 
     @classmethod
@@ -49,7 +64,37 @@ class TopologyTestConfig:
             return int(sep.corridor_neck_thickness_cells)
         if str(kind) == "line_extension_door_neck":
             return int(sep.doorway_thickness_cells)
+        if str(kind) == "line_extension_corridor_separator":
+            return int(sep.doorway_thickness_cells)
         return int(sep.thickness_cells)
+
+
+@dataclass
+class TopologyFragmentStats:
+    before_component_count: int
+    after_component_count: int
+    before_tiny_count: int
+    after_tiny_count: int
+    new_tiny_count: int
+    local_before_tiny_count: int
+    local_after_tiny_count: int
+    local_new_tiny_count: int
+    touched_labels: list[int]
+    component_info: list[dict]
+
+    def to_dict(self) -> dict:
+        return {
+            "before_component_count": int(self.before_component_count),
+            "after_component_count": int(self.after_component_count),
+            "before_tiny_count": int(self.before_tiny_count),
+            "after_tiny_count": int(self.after_tiny_count),
+            "new_tiny_count": int(self.new_tiny_count),
+            "local_before_tiny_count": int(self.local_before_tiny_count),
+            "local_after_tiny_count": int(self.local_after_tiny_count),
+            "local_new_tiny_count": int(self.local_new_tiny_count),
+            "touched_labels": [int(v) for v in self.touched_labels],
+            "component_info": list(self.component_info),
+        }
 
 
 def greedily_select_separators(
@@ -93,10 +138,18 @@ def greedily_select_separators(
     final_labels = relabel_compact(final_labels)
     debug = {
         "topology_test_enabled": bool(cfg.enabled),
+        "tiny_fragment_count_mode": str(cfg.tiny_fragment_count_mode),
+        "local_fragment_radius_cells": int(cfg.local_fragment_radius_cells),
         "accepted_separator_count": int(len(accepted)),
         "rejected_separator_count": int(len(rejected)),
         "accepted_separator_kinds": _kind_counts(accepted),
         "rejected_separator_reasons": _reason_counts(rejected),
+        "topology_fragment_stats_per_candidate": [
+            item.debug.get("topology_fragment_stats", {}) for item in [*accepted, *rejected]
+        ],
+        "candidate_cut_not_adjacent_to_barrier_count": int(
+            sum(1 for item in [*accepted, *rejected] if not bool(item.debug.get("candidate_cut_touch_wall_a", True)) or not bool(item.debug.get("candidate_cut_touch_wall_b", True)))
+        ),
         "corridor_to_corridor_rejected_count": int(sum(1 for item in rejected if item.reject_reason in {"reject_split_main_corridor_axis", "reject_corridor_to_corridor_split"})),
         "corridor_to_room_accepted_count": int(sum(1 for item in accepted if (item.debug.get("corridor_side_classification") or {}).get("one_corridor_one_room"))),
     }
@@ -136,9 +189,12 @@ def evaluate_candidate(
     candidate_map, cut_debug = _candidate_separator_map_for_topology(
         candidate,
         free_clean=free,
+        unknown_clean=unknown,
+        wall_candidate_clean=wall,
         current_separator_map=current,
         resolution_m=float(resolution_m),
         thickness_cells=thickness,
+        config=config,
     )
     anchor_debug = {**anchor_debug, **cut_debug}
     if int(np.count_nonzero(candidate_map)) <= 0:
@@ -146,6 +202,17 @@ def evaluate_candidate(
     if not bool(config.enabled):
         candidate.topology_gain_score = 1.0
         return True, "", candidate_map, {**anchor_debug, "topology_test_skipped": True}
+    if str(candidate.kind) == "line_extension_corridor_separator":
+        return evaluate_corridor_separator_candidate_v16(
+            candidate,
+            free_clean=free,
+            current_separator_map=current,
+            candidate_map=candidate_map,
+            corridor_skeleton=skeleton,
+            resolution_m=float(resolution_m),
+            config=config,
+            anchor_debug=anchor_debug,
+        )
     before = free & ~current
     after = before & ~candidate_map
     before_labels, before_count = label_components(before, 4)
@@ -157,7 +224,10 @@ def evaluate_candidate(
     if len(touched) < 2:
         return False, "reject_no_two_sides", candidate_map, {**anchor_debug, "candidate_mask_cell_count": int(np.count_nonzero(candidate_map)), "touched_components": touched}
     component_info = []
-    min_area_m2 = float(config.min_area_for_kind(str(candidate.kind)))
+    is_corridor_extension = str(candidate.kind) == "line_extension_corridor_separator"
+    min_area_m2 = float(config.corridor_min_split_area_m2) if is_corridor_extension else float(config.min_area_for_kind(str(candidate.kind)))
+    min_new_width_m = float(config.corridor_min_new_component_width_m) if is_corridor_extension else float(config.min_new_component_width_m)
+    reject_width_cells = int(config.corridor_reject_tiny_side_width_cells_leq) if is_corridor_extension else int(config.reject_if_side_width_cells_leq)
     min_cells = max(int(config.min_new_component_area_cells), int(round(min_area_m2 / max(float(resolution_m) ** 2, 1e-9))))
     distance_cells = ndimage.distance_transform_edt(before)
     for label in touched:
@@ -168,18 +238,69 @@ def evaluate_candidate(
     component_info.sort(key=lambda item: int(item["area_cells"]), reverse=True)
     main = component_info[:2]
     min_width = min(float(item.get("thickness_m", 0.0)) for item in main) if len(main) >= 2 else 0.0
-    if len(main) < 2 or min(int(item["area_cells"]) for item in main) < min_cells or min_width < float(config.min_new_component_width_m):
+    min_side_width_cells = int(round(float(min_width) / max(float(resolution_m), 1e-9))) if len(main) >= 2 else 0
+    if int(reject_width_cells) > 0 and min_side_width_cells <= int(reject_width_cells) and (
+        not is_corridor_extension
+        or _is_true_sliver_split(
+            main,
+            candidate_map=candidate_map,
+            after_labels=after_labels,
+            touched_labels=[int(item.get("label", 0)) for item in main],
+            resolution_m=float(resolution_m),
+            width_threshold_cells=int(reject_width_cells),
+            area_threshold_m2=float(config.corridor_tiny_side_min_area_m2),
+            long_axis_threshold_m=float(config.corridor_tiny_side_min_length_m),
+            contact_length_threshold_cells=3,
+        )
+    ):
+        return False, "reject_split_tiny_side_width_1_to_3_cells", candidate_map, {
+            **anchor_debug,
+            "candidate_mask_cell_count": int(np.count_nonzero(candidate_map)),
+            "components": component_info[:8],
+            "min_side_width_cells": int(min_side_width_cells),
+            "reject_if_side_width_cells_leq": int(reject_width_cells),
+            "topology_touched_labels": touched,
+        }
+    width_reject = (not is_corridor_extension) and min_width < float(min_new_width_m)
+    if len(main) < 2 or min(int(item["area_cells"]) for item in main) < min_cells or width_reject:
         return False, "reject_tiny_split", candidate_map, {
             **anchor_debug,
             "candidate_mask_cell_count": int(np.count_nonzero(candidate_map)),
             "components": component_info[:8],
             "min_split_cells": int(min_cells),
             "topology_min_area_m2": float(min_area_m2),
+            "topology_min_new_component_width_m": float(min_new_width_m),
+            "topology_touched_labels": touched,
+            "topology_min_side_width_cells": int(min_side_width_cells),
+            "topology_min_side_area_cells": int(min(int(item["area_cells"]) for item in main)) if main else 0,
         }
-    tiny_count = int(sum(1 for label in range(1, int(after_count) + 1) if int(np.count_nonzero(after_labels == label)) < min_cells))
+    fragment_stats = _fragment_stats(
+        before_labels=before_labels,
+        after_labels=after_labels,
+        before_count=int(before_count),
+        after_count=int(after_count),
+        candidate_map=candidate_map,
+        min_cells=int(min_cells),
+        local_radius_cells=int(config.local_fragment_radius_cells),
+        touched_labels=touched,
+        component_info=component_info[:8],
+    )
+    tiny_count = _tiny_fragment_reject_count(fragment_stats, str(config.tiny_fragment_count_mode))
     if tiny_count > int(config.max_tiny_fragment_count):
         candidate.fragmentation_penalty = float(tiny_count)
-        return False, "reject_too_many_tiny_fragments", candidate_map, {**anchor_debug, "tiny_fragment_count": tiny_count, "components": component_info[:8]}
+        return False, "reject_too_many_tiny_fragments", candidate_map, {
+            **anchor_debug,
+            "tiny_fragment_count": int(tiny_count),
+            "tiny_fragment_count_mode": str(config.tiny_fragment_count_mode),
+            "before_tiny_count": int(fragment_stats.before_tiny_count),
+            "after_tiny_count": int(fragment_stats.after_tiny_count),
+            "new_tiny_count": int(fragment_stats.new_tiny_count),
+            "local_before_tiny_count": int(fragment_stats.local_before_tiny_count),
+            "local_after_tiny_count": int(fragment_stats.local_after_tiny_count),
+            "local_new_tiny_count": int(fragment_stats.local_new_tiny_count),
+            "topology_fragment_stats": fragment_stats.to_dict(),
+            "components": component_info[:8],
+        }
     side_class = classify_cut_sides_local(
         candidate_map,
         free_clean=before,
@@ -208,7 +329,18 @@ def evaluate_candidate(
         "after_components": int(after_count),
         "candidate_mask_cell_count": int(np.count_nonzero(candidate_map)),
         "touched_components": touched,
+        "topology_touched_labels": touched,
+        "topology_min_side_width_cells": int(min_side_width_cells),
+        "topology_min_side_area_cells": int(min(int(item["area_cells"]) for item in main)) if main else 0,
         "components": main,
+        "tiny_fragment_count_mode": str(config.tiny_fragment_count_mode),
+        "before_tiny_count": int(fragment_stats.before_tiny_count),
+        "after_tiny_count": int(fragment_stats.after_tiny_count),
+        "new_tiny_count": int(fragment_stats.new_tiny_count),
+        "local_before_tiny_count": int(fragment_stats.local_before_tiny_count),
+        "local_after_tiny_count": int(fragment_stats.local_after_tiny_count),
+        "local_new_tiny_count": int(fragment_stats.local_new_tiny_count),
+        "topology_fragment_stats": fragment_stats.to_dict(),
         "corridor_side_classification": side_class,
         "topology_min_area_m2": float(min_area_m2),
         "topology_gain_score": float(candidate.topology_gain_score),
@@ -253,25 +385,223 @@ def classify_cut_sides_local(
     }
 
 
-def _candidate_separator_map_for_topology(
+def evaluate_corridor_separator_candidate_v16(
     candidate: SeparatorCandidate,
     *,
     free_clean: np.ndarray,
     current_separator_map: np.ndarray,
+    candidate_map: np.ndarray,
+    corridor_skeleton: np.ndarray,
     resolution_m: float,
-    thickness_cells: int,
-) -> tuple[np.ndarray, dict]:
+    config: TopologyTestConfig,
+    anchor_debug: Mapping[str, object] | None = None,
+) -> tuple[bool, str, np.ndarray, dict]:
+    anchor = dict(anchor_debug or {})
     free = np.asarray(free_clean, dtype=bool)
     current = np.asarray(current_separator_map, dtype=bool)
-    if str(candidate.kind) != "line_extension_door_neck":
+    cut = np.asarray(candidate_map, dtype=bool) & free & ~current
+    before = free & ~current
+    after = before & ~cut
+    before_labels, before_count = label_components(before, 4)
+    after_labels, after_count = label_components(after, 4)
+    distance_cells = ndimage.distance_transform_edt(before)
+    global_gain = int(after_count) > int(before_count)
+
+    local_radius = int(max(1, int(config.corridor_local_topology_radius_cells)))
+    local_region = dilate(cut, local_radius) & before
+    if not np.any(local_region):
+        local_region = dilate(cut, max(1, int(config.local_fragment_radius_cells))) & before
+    local_before_labels, local_before_count = label_components(before & local_region, 4)
+    local_after_labels, local_after_count = label_components(after & local_region, 4)
+    local_gain = int(local_after_count) > int(local_before_count)
+
+    adjacent = dilate(cut, 1) & after
+    global_touched = sorted({int(v) for v in np.unique(after_labels[adjacent]) if int(v) > 0})
+    local_adjacent = dilate(cut, 1) & (after & local_region)
+    local_touched = sorted({int(v) for v in np.unique(local_after_labels[local_adjacent]) if int(v) > 0})
+    use_local_sides = len(global_touched) < 2 and len(local_touched) >= 2
+    side_labels = local_touched if use_local_sides else global_touched
+    labels_for_sides = local_after_labels if use_local_sides else after_labels
+
+    if not (global_gain or local_gain):
+        return False, "reject_no_topology_gain", cut, {
+            **anchor,
+            "corridor_topology_v16": True,
+            "candidate_mask_cell_count": int(np.count_nonzero(cut)),
+            "before_components": int(before_count),
+            "after_components": int(after_count),
+            "local_before_components": int(local_before_count),
+            "local_after_components": int(local_after_count),
+            "topology_touched_labels": [int(v) for v in side_labels],
+        }
+    if len(side_labels) < 2:
+        return False, "reject_no_two_sides", cut, {
+            **anchor,
+            "corridor_topology_v16": True,
+            "candidate_mask_cell_count": int(np.count_nonzero(cut)),
+            "before_components": int(before_count),
+            "after_components": int(after_count),
+            "local_before_components": int(local_before_count),
+            "local_after_components": int(local_after_count),
+            "touched_components": [int(v) for v in side_labels],
+        }
+
+    component_info = _component_info_for_labels(
+        labels_for_sides,
+        side_labels,
+        resolution_m=float(resolution_m),
+        distance_cells=distance_cells,
+    )
+    component_info.sort(key=lambda item: int(item["area_cells"]), reverse=True)
+    main = component_info[:2]
+    min_area_m2 = float(config.corridor_min_split_area_m2)
+    min_cells = max(int(config.min_new_component_area_cells), int(round(min_area_m2 / max(float(resolution_m) ** 2, 1e-9))))
+    min_width = min(float(item.get("thickness_m", 0.0)) for item in main) if len(main) >= 2 else 0.0
+    min_side_width_cells = int(round(float(min_width) / max(float(resolution_m), 1e-9))) if len(main) >= 2 else 0
+    min_side_area_cells = int(min(int(item.get("area_cells", 0)) for item in main)) if main else 0
+    reject_width_cells = int(config.corridor_reject_tiny_side_width_cells_leq)
+    true_sliver = False
+    if reject_width_cells > 0 and min_side_width_cells <= reject_width_cells:
+        true_sliver = _corridor_true_sliver_v16(
+            main,
+            candidate_map=cut,
+            after_labels=labels_for_sides,
+            touched_labels=[int(item.get("label", 0)) for item in main],
+            resolution_m=float(resolution_m),
+            width_threshold_cells=reject_width_cells,
+            area_threshold_m2=float(config.corridor_tiny_side_min_area_m2),
+            long_axis_threshold_m=float(config.corridor_tiny_side_min_length_m),
+            contact_length_threshold_cells=3,
+            accept_long_narrow_side=bool(config.corridor_accept_long_narrow_side),
+        )
+    if true_sliver:
+        return False, "reject_split_tiny_side_width_1_to_3_cells", cut, {
+            **anchor,
+            "corridor_topology_v16": True,
+            "candidate_mask_cell_count": int(np.count_nonzero(cut)),
+            "components": component_info[:8],
+            "min_side_width_cells": int(min_side_width_cells),
+            "topology_min_side_width_cells": int(min_side_width_cells),
+            "topology_min_side_area_cells": int(min_side_area_cells),
+            "reject_if_side_width_cells_leq": int(reject_width_cells),
+            "topology_touched_labels": [int(v) for v in side_labels],
+            "corridor_long_narrow_side_accepted": False,
+        }
+    if len(main) < 2 or min_side_area_cells < min_cells:
+        return False, "reject_tiny_split", cut, {
+            **anchor,
+            "corridor_topology_v16": True,
+            "candidate_mask_cell_count": int(np.count_nonzero(cut)),
+            "components": component_info[:8],
+            "min_split_cells": int(min_cells),
+            "topology_min_area_m2": float(min_area_m2),
+            "topology_min_side_width_cells": int(min_side_width_cells),
+            "topology_min_side_area_cells": int(min_side_area_cells),
+            "topology_touched_labels": [int(v) for v in side_labels],
+        }
+
+    fragment_stats = _fragment_stats(
+        before_labels=before_labels,
+        after_labels=after_labels,
+        before_count=int(before_count),
+        after_count=int(after_count),
+        candidate_map=cut,
+        min_cells=int(min_cells),
+        local_radius_cells=int(config.local_fragment_radius_cells),
+        touched_labels=global_touched,
+        component_info=component_info[:8],
+    )
+    tiny_count = _tiny_fragment_reject_count(fragment_stats, str(config.tiny_fragment_count_mode))
+    if tiny_count > int(config.max_tiny_fragment_count):
+        candidate.fragmentation_penalty = float(tiny_count)
+        return False, "reject_too_many_tiny_fragments", cut, {
+            **anchor,
+            "corridor_topology_v16": True,
+            "tiny_fragment_count": int(tiny_count),
+            "tiny_fragment_count_mode": str(config.tiny_fragment_count_mode),
+            "topology_fragment_stats": fragment_stats.to_dict(),
+            "components": component_info[:8],
+        }
+
+    side_class = classify_cut_sides_local(
+        cut,
+        free_clean=before,
+        after_labels=labels_for_sides,
+        touched_labels=side_labels,
+        component_info=main,
+        distance_transform=distance_cells,
+        corridor_skeleton=corridor_skeleton,
+        resolution_m=float(resolution_m),
+    )
+    both_corridor = bool(side_class.get("side_a_corridor_like") and side_class.get("side_b_corridor_like"))
+    if bool(config.reject_corridor_split) and both_corridor:
+        candidate.corridor_split_penalty = 1.0
+        return False, "reject_split_main_corridor_axis", cut, {
+            **anchor,
+            "corridor_topology_v16": True,
+            "components": main,
+            "corridor_side_classification": side_class,
+            "both_sides_corridor_like": True,
+        }
+
+    candidate.topology_gain_score = float(max(0, int(after_count) - int(before_count), int(local_after_count) - int(local_before_count)))
+    candidate.corridor_preservation_score = 1.0 if not both_corridor else 0.0
+    long_narrow_accepted = bool(
+        reject_width_cells > 0
+        and min_side_width_cells <= reject_width_cells
+        and not true_sliver
+        and bool(config.corridor_accept_long_narrow_side)
+    )
+    return True, "", cut, {
+        **anchor,
+        "corridor_topology_v16": True,
+        "before_components": int(before_count),
+        "after_components": int(after_count),
+        "local_before_components": int(local_before_count),
+        "local_after_components": int(local_after_count),
+        "candidate_mask_cell_count": int(np.count_nonzero(cut)),
+        "touched_components": [int(v) for v in side_labels],
+        "topology_touched_labels": [int(v) for v in side_labels],
+        "topology_min_side_width_cells": int(min_side_width_cells),
+        "topology_min_side_area_cells": int(min_side_area_cells),
+        "components": main,
+        "tiny_fragment_count_mode": str(config.tiny_fragment_count_mode),
+        "topology_fragment_stats": fragment_stats.to_dict(),
+        "corridor_side_classification": side_class,
+        "topology_min_area_m2": float(min_area_m2),
+        "topology_gain_score": float(candidate.topology_gain_score),
+        "corridor_preservation_score": float(candidate.corridor_preservation_score),
+        "corridor_long_narrow_side_accepted": bool(long_narrow_accepted),
+        "corridor_local_topology_radius_cells": int(local_radius),
+    }
+
+
+def _candidate_separator_map_for_topology(
+    candidate: SeparatorCandidate,
+    *,
+    free_clean: np.ndarray,
+    unknown_clean: np.ndarray,
+    wall_candidate_clean: np.ndarray,
+    current_separator_map: np.ndarray,
+    resolution_m: float,
+    thickness_cells: int,
+    config: TopologyTestConfig,
+) -> tuple[np.ndarray, dict]:
+    free = np.asarray(free_clean, dtype=bool)
+    wall = np.asarray(wall_candidate_clean, dtype=bool)
+    current = np.asarray(current_separator_map, dtype=bool)
+    if str(candidate.kind) not in {"line_extension_door_neck", "line_extension_corridor_separator"}:
         mask = separator_mask_for_candidate(candidate, free.shape, thickness_cells) & free & ~current
         return mask.astype(bool), {"centered_extension_cut_enabled": False}
     mask, debug = _centered_line_extension_free_run_mask(
         candidate,
         free_clean=free,
+        unknown_clean=unknown_clean,
+        wall_candidate_clean=wall,
         current_separator_map=current,
         resolution_m=float(resolution_m),
         thickness_cells=int(thickness_cells),
+        config=config,
     )
     return mask.astype(bool), debug
 
@@ -280,14 +610,41 @@ def _centered_line_extension_free_run_mask(
     candidate: SeparatorCandidate,
     *,
     free_clean: np.ndarray,
+    unknown_clean: np.ndarray,
+    wall_candidate_clean: np.ndarray,
     current_separator_map: np.ndarray,
     resolution_m: float,
     thickness_cells: int,
+    config: TopologyTestConfig,
 ) -> tuple[np.ndarray, dict]:
     free = np.asarray(free_clean, dtype=bool)
+    unknown = np.asarray(unknown_clean, dtype=bool)
+    wall = np.asarray(wall_candidate_clean, dtype=bool)
     current = np.asarray(current_separator_map, dtype=bool)
     cells = _ordered_line_cells(candidate.p0_rc, candidate.p1_rc, free.shape)
     valid = np.asarray([bool(free[int(r), int(c)] and not current[int(r), int(c)]) for r, c in cells], dtype=bool)
+    bridgeable = np.asarray(
+        [
+            bool(
+                not current[int(r), int(c)]
+                and not wall[int(r), int(c)]
+                and (
+                    (bool(config.centered_extension_bridge_unknown) and unknown[int(r), int(c)])
+                    or (bool(config.centered_extension_bridge_nonfree_if_between_free) and not free[int(r), int(c)])
+                )
+            )
+            for r, c in cells
+        ],
+        dtype=bool,
+    )
+    bridged_gap_count = 0
+    bridged_indices: list[int] = []
+    if bool(config.centered_extension_allow_small_gaps):
+        valid, bridged_gap_count, bridged_indices = _bridge_small_line_gaps(
+            valid,
+            bridgeable,
+            int(config.centered_extension_max_bridge_gap_cells),
+        )
     if not np.any(valid):
         mask = separator_mask_for_candidate(candidate, free.shape, thickness_cells) & free & ~current
         return mask.astype(bool), {
@@ -313,6 +670,9 @@ def _centered_line_extension_free_run_mask(
     base[cut_cells[:, 0], cut_cells[:, 1]] = True
     mask = dilate(base, int(thickness_cells)) if int(thickness_cells) > 0 else base
     mask = mask & free & ~current
+    wall_dilated = dilate(wall, 1)
+    p0_touch = bool(np.any(dilate(_single_cell_mask(tuple(int(v) for v in cut_cells[0]), free.shape), 1) & wall_dilated))
+    p1_touch = bool(np.any(dilate(_single_cell_mask(tuple(int(v) for v in cut_cells[-1]), free.shape), 1) & wall_dilated))
     p0_cut = cut_cells[0].astype(np.float32)
     p1_cut = cut_cells[-1].astype(np.float32)
     original_p0 = np.asarray(candidate.p0_rc, dtype=np.float32).copy()
@@ -324,6 +684,9 @@ def _centered_line_extension_free_run_mask(
         "centered_extension_cut_enabled": True,
         "centered_extension_cut_applied": True,
         "centered_extension_cut_mode": "middle_contiguous_free_run",
+        "centered_extension_allow_small_gaps": bool(config.centered_extension_allow_small_gaps),
+        "centered_extension_bridge_gap_count": int(bridged_gap_count),
+        "centered_extension_bridge_cells": [[int(cells[idx][0]), int(cells[idx][1])] for idx in bridged_indices[:64]],
         "centered_extension_cut_original_p0": [int(round(float(v))) for v in original_p0.tolist()],
         "centered_extension_cut_original_p1": [int(round(float(v))) for v in original_p1.tolist()],
         "centered_extension_cut_p0": [int(v) for v in p0_cut.astype(np.int32).tolist()],
@@ -331,6 +694,9 @@ def _centered_line_extension_free_run_mask(
         "centered_extension_cut_cell_count": int(len(cut_cells)),
         "centered_extension_cut_mask_cell_count": int(np.count_nonzero(mask)),
         "candidate_mask_cell_count": int(np.count_nonzero(mask)),
+        "candidate_cut_touch_wall_a": bool(p0_touch),
+        "candidate_cut_touch_wall_b": bool(p1_touch),
+        "candidate_cut_not_adjacent_to_barrier": bool(not (p0_touch and p1_touch)),
         "centered_extension_cut_trimmed": bool(
             not np.array_equal(np.rint(original_p0).astype(np.int32), p0_cut.astype(np.int32))
             or not np.array_equal(np.rint(original_p1).astype(np.int32), p1_cut.astype(np.int32))
@@ -361,6 +727,210 @@ def _ordered_line_cells(p0_rc: np.ndarray, p1_rc: np.ndarray, shape: tuple[int, 
     return coords[keep].astype(np.int32)
 
 
+def _single_cell_mask(cell: tuple[int, int], shape: tuple[int, int]) -> np.ndarray:
+    out = np.zeros(shape, dtype=bool)
+    r, c = int(cell[0]), int(cell[1])
+    if 0 <= r < shape[0] and 0 <= c < shape[1]:
+        out[r, c] = True
+    return out
+
+
+def _bridge_small_false_gaps(values: np.ndarray, max_gap_cells: int) -> tuple[np.ndarray, int]:
+    src = np.asarray(values, dtype=bool).copy()
+    if int(max_gap_cells) <= 0 or src.size <= 2:
+        return src, 0
+    count = 0
+    idx = 0
+    while idx < src.size:
+        if bool(src[idx]):
+            idx += 1
+            continue
+        start = idx
+        while idx < src.size and not bool(src[idx]):
+            idx += 1
+        end = idx
+        if start == 0 or end >= src.size:
+            continue
+        if bool(src[start - 1]) and bool(src[end]) and (end - start) <= int(max_gap_cells):
+            src[start:end] = True
+            count += 1
+    return src, int(count)
+
+
+def _bridge_small_line_gaps(values: np.ndarray, bridgeable: np.ndarray, max_gap_cells: int) -> tuple[np.ndarray, int, list[int]]:
+    src = np.asarray(values, dtype=bool).copy()
+    bridge = np.asarray(bridgeable, dtype=bool)
+    if src.shape != bridge.shape:
+        raise ValueError("line bridge arrays must have the same shape")
+    bridged: list[int] = []
+    if int(max_gap_cells) <= 0 or src.size <= 2:
+        return src, 0, bridged
+    count = 0
+    idx = 0
+    while idx < src.size:
+        if bool(src[idx]):
+            idx += 1
+            continue
+        start = idx
+        while idx < src.size and not bool(src[idx]):
+            idx += 1
+        end = idx
+        if start == 0 or end >= src.size:
+            continue
+        if bool(src[start - 1]) and bool(src[end]) and (end - start) <= int(max_gap_cells) and bool(np.all(bridge[start:end])):
+            src[start:end] = True
+            bridged.extend(range(start, end))
+            count += 1
+    return src, int(count), bridged
+
+
+def _component_info_for_labels(labels: np.ndarray, touched_labels: Sequence[int], *, resolution_m: float, distance_cells: np.ndarray) -> list[dict]:
+    arr = np.asarray(labels, dtype=np.int32)
+    out: list[dict] = []
+    for label in touched_labels:
+        mask = arr == int(label)
+        if not np.any(mask):
+            continue
+        info = component_metrics(mask, float(resolution_m), distance_cells)
+        info["label"] = int(label)
+        out.append(info)
+    return out
+
+
+def _corridor_true_sliver_v16(
+    component_info: Sequence[dict],
+    *,
+    candidate_map: np.ndarray,
+    after_labels: np.ndarray,
+    touched_labels: Sequence[int],
+    resolution_m: float,
+    width_threshold_cells: int,
+    area_threshold_m2: float,
+    long_axis_threshold_m: float,
+    contact_length_threshold_cells: int,
+    accept_long_narrow_side: bool,
+) -> bool:
+    if len(component_info) < 2:
+        return True
+    by_label = {int(item.get("label", 0)): item for item in component_info if int(item.get("label", 0)) > 0}
+    contact = _candidate_contact_lengths(candidate_map, after_labels, touched_labels)
+    for label in touched_labels[:2]:
+        info = by_label.get(int(label))
+        if not info:
+            continue
+        width_cells = int(round(float(info.get("thickness_m", 0.0)) / max(float(resolution_m), 1e-9)))
+        if width_cells > int(width_threshold_cells):
+            continue
+        area_m2 = float(info.get("area_m2", 0.0))
+        long_axis_m = float(info.get("length_m", 0.0))
+        contact_cells = int(contact.get(int(label), 0))
+        if bool(accept_long_narrow_side) and area_m2 >= float(area_threshold_m2) and long_axis_m >= float(long_axis_threshold_m):
+            continue
+        if area_m2 < float(area_threshold_m2) and long_axis_m < float(long_axis_threshold_m) and contact_cells <= int(contact_length_threshold_cells):
+            return True
+    return False
+
+
+def _is_true_sliver_split(
+    component_info: Sequence[dict],
+    *,
+    candidate_map: np.ndarray,
+    after_labels: np.ndarray,
+    touched_labels: Sequence[int],
+    resolution_m: float,
+    width_threshold_cells: int,
+    area_threshold_m2: float,
+    long_axis_threshold_m: float,
+    contact_length_threshold_cells: int,
+) -> bool:
+    if len(component_info) < 2:
+        return True
+    by_label = {int(item.get("label", 0)): item for item in component_info if int(item.get("label", 0)) > 0}
+    contact = _candidate_contact_lengths(candidate_map, after_labels, touched_labels)
+    for label in touched_labels[:2]:
+        info = by_label.get(int(label))
+        if not info:
+            continue
+        width_cells = int(round(float(info.get("thickness_m", 0.0)) / max(float(resolution_m), 1e-9)))
+        area_m2 = float(info.get("area_m2", 0.0))
+        long_axis_m = float(info.get("length_m", 0.0))
+        contact_cells = int(contact.get(int(label), 0))
+        if (
+            width_cells <= int(width_threshold_cells)
+            and area_m2 < float(area_threshold_m2)
+            and long_axis_m < float(long_axis_threshold_m)
+            and contact_cells <= int(contact_length_threshold_cells)
+        ):
+            return True
+    return False
+
+
+def _candidate_contact_lengths(candidate_map: np.ndarray, labels: np.ndarray, touched_labels: Sequence[int]) -> dict[int, int]:
+    contact_region = dilate(np.asarray(candidate_map, dtype=bool), 1) & ~np.asarray(candidate_map, dtype=bool)
+    label_arr = np.asarray(labels, dtype=np.int32)
+    out: dict[int, int] = {}
+    for label in touched_labels:
+        out[int(label)] = int(np.count_nonzero(contact_region & (label_arr == int(label))))
+    return out
+
+
+def _fragment_stats(
+    *,
+    before_labels: np.ndarray,
+    after_labels: np.ndarray,
+    before_count: int,
+    after_count: int,
+    candidate_map: np.ndarray,
+    min_cells: int,
+    local_radius_cells: int,
+    touched_labels: Sequence[int],
+    component_info: Sequence[dict],
+) -> TopologyFragmentStats:
+    before_tiny = _tiny_labels(before_labels, int(before_count), int(min_cells))
+    after_tiny = _tiny_labels(after_labels, int(after_count), int(min_cells))
+    local_region = dilate(np.asarray(candidate_map, dtype=bool), int(local_radius_cells))
+    local_before = _labels_touching_region(before_labels, before_tiny, local_region)
+    local_after = _labels_touching_region(after_labels, after_tiny, local_region)
+    return TopologyFragmentStats(
+        before_component_count=int(before_count),
+        after_component_count=int(after_count),
+        before_tiny_count=int(len(before_tiny)),
+        after_tiny_count=int(len(after_tiny)),
+        new_tiny_count=max(0, int(len(after_tiny)) - int(len(before_tiny))),
+        local_before_tiny_count=int(len(local_before)),
+        local_after_tiny_count=int(len(local_after)),
+        local_new_tiny_count=max(0, int(len(local_after)) - int(len(local_before))),
+        touched_labels=[int(v) for v in touched_labels],
+        component_info=list(component_info),
+    )
+
+
+def _tiny_labels(labels: np.ndarray, count: int, min_cells: int) -> set[int]:
+    out: set[int] = set()
+    arr = np.asarray(labels, dtype=np.int32)
+    for label in range(1, int(count) + 1):
+        if int(np.count_nonzero(arr == int(label))) < int(min_cells):
+            out.add(int(label))
+    return out
+
+
+def _labels_touching_region(labels: np.ndarray, label_set: set[int], region: np.ndarray) -> set[int]:
+    if not label_set:
+        return set()
+    arr = np.asarray(labels, dtype=np.int32)
+    values = {int(v) for v in np.unique(arr[np.asarray(region, dtype=bool)]) if int(v) > 0}
+    return {int(v) for v in values if int(v) in label_set}
+
+
+def _tiny_fragment_reject_count(stats: TopologyFragmentStats, mode: str) -> int:
+    mode = str(mode or "local_delta").strip().lower()
+    if mode == "absolute":
+        return int(stats.after_tiny_count)
+    if mode == "global_delta":
+        return int(stats.new_tiny_count)
+    return int(stats.local_new_tiny_count)
+
+
 def _kind_order(kind: str) -> int:
     return {
         "physical_wall_completion": 0,
@@ -370,6 +940,7 @@ def _kind_order(kind: str) -> int:
         "line_extension_door_neck": 3,
         "single_sided_wall_extension": 4,
         "corridor_room_neck_cut": 5,
+        "line_extension_corridor_separator": 6,
     }.get(str(kind), 99)
 
 

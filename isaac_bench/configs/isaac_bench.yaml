@@ -116,7 +116,7 @@ camera:
   forward_offset_m: 0.0
   pitch_deg: 0.0
   near_m: 0.02
-  far_m: 5.0
+  far_m: 10.0
   publish_hz: 5
 
 nearfield_depth:
@@ -143,7 +143,7 @@ nearfield_static_map:
 mapping:
   online_resolution_m: 0.05
   map_size_m: 40.0
-  depth_max_m: 3.0
+  depth_max_m: 5.0
   depth_min_m: 0.20
   depth_stride_px: 8
   obstacle_min_height_m: 0.20
@@ -160,16 +160,18 @@ mapping:
   frontier_obstacle_dilation_radius_cells: 4
   frontier_unknown_dilation_radius_cells: 1
   frontier_unknown_source: observed
+  frontier_source: voxel_vertical_free
+  frontier_vertical_free_require_navigation_reachable: true
   frontier_cluster_distance_mode: mean
   frontier_allow_near_fallback: false
   frontier_debug_dump: false
   frontier_debug_dir: data/debug_frontier
-  room_map_mode: vertical_free_gap_closure_v1_vlm
+  room_map_mode: voxel_occupancy_door_wall_v9_vlm
   strict_no_oracle_rooms: true
   room_segmentation:
     enabled: true
-    algorithm: vertical_free_gap_closure_v1
-    backend: vertical_free_gap_closure_v1
+    algorithm: voxel_occupancy_door_wall_v9
+    backend: voxel_occupancy_door_wall_v9
     source_mode: declutter_reconstruct_external
     legacy_watershed_allowed: debug_only
     local_rose2_lite_allowed: debug_only
@@ -196,6 +198,10 @@ mapping:
         th1: 0.1
         distance_extended_segment: 20
     run_only_before_frontier_scoring: true
+    frontier_update_gate:
+      policy: at_frontier_arrival
+      freeze_during_navigation: true
+      debug_force_update: false
     source_grid: online_depth_observed
     proposal_mode: vertical_free_gap_closure
     depth:
@@ -243,6 +249,360 @@ mapping:
       upper_band_m: [1.30, 2.00]
       min_free_rays: 1
       min_observed_rays: 1
+    voxel_grid:
+      enabled: true
+      z_min_m: 0.00
+      z_max_m: 3.20
+      z_resolution_m: 0.05
+      active_z_min_m: 0.10
+      active_z_max_mode: ceiling_90pct
+      active_z_max_ceiling_ratio: 0.90
+      active_z_max_fallback_m: 2.00
+      integration_backend: cpu_vectorized
+      cuda_device: cuda:0
+      cuda_chunk_rays: 8192
+      cuda_ray_step_voxels: 1.00
+      cuda_max_samples_per_ray: 320
+      cuda_keep_logodds_on_device: false
+      python_debug_backend_allowed: false
+      depth_stride_px: 2
+      depth_min_m: 0.20
+      depth_max_m: 5.00
+      free_logodds_delta: -1
+      occupied_logodds_delta: 3
+      free_logodds_threshold: -1
+      occupied_logodds_threshold: 1
+      logodds_min: -20
+      logodds_max: 20
+      mark_endpoint_occupied: true
+      free_excludes_endpoint: true
+      free_excludes_last_n_voxels_before_endpoint: 0
+      endpoint_splat_xy_radius_cells: 0
+      endpoint_splat_z_radius_cells: 0
+      conflict_enabled: false
+      conflict_margin: 0
+      voxel_grid_drives_navigation: true
+    voxel_navigation_projection:
+      obstacle_z_min_m: 0.20
+      obstacle_z_max_m: 0.90
+      free_z_min_m: 0.10
+      free_z_max_m: 0.90
+      min_free_voxels: 1
+    voxel_navigation_blind_zone:
+      enabled: true
+      force_initial_blind_zone_free: true
+      initial_blind_zone_radius_m: 0.80
+      initial_blind_zone_steps: 60
+      force_current_footprint_free: true
+      current_footprint_radius_m: 0.35
+      write_to_voxel_grid: true
+      free_z_min_m: 0.10
+      free_z_max_m: 0.90
+      free_all_bins_in_range: true
+    voxel_roomseg_evidence:
+      enabled: true
+      active_z_min_m: 0.10
+      active_z_max_mode: ceiling_90pct
+      active_z_max_ceiling_ratio: 0.90
+      active_z_max_fallback_m: 2.00
+      min_free_z_cells_for_xy_free: 3
+      wall_mode: free_unknown_then_ratio_wall
+      wall_occupied_ratio_min_for_xy_wall: 0.90
+      wall_min_occupied_z_cells_for_xy_wall: 3
+      unknown_ratio_min_for_xy_unknown: 0.50
+      min_observed_z_cells_for_known_column: 3
+      free_priority_over_wall: true
+      unknown_priority_over_wall: true
+      nav_assisted_free_enabled: true
+      nav_assisted_free_requires_observed: false
+      nav_assisted_free_forbidden_on_ratio_wall: true
+      wall_ratio_debug_enabled: true
+      wall_occupied_ratio_debug_threshold: 0.90
+      show_unknown_rejected_wall_support: false
+      projection_priority: free_unknown_then_ratio_wall
+      preserve_unknown: true
+      fill_unknown_as_wall: false
+      fill_unknown_as_free: false
+      suppress_free_on_navigation_obstacle: false
+      promote_navigation_obstacle_to_wall: false
+      fill_small_unknown_holes_inside_vertical_free: true
+      small_unknown_hole_max_area_cells: 16
+      small_unknown_hole_min_free_neighbor_ratio: 0.75
+      free_remove_island_max_area_cells: 0
+      wall_remove_island_max_area_cells: 0
+      wall_micro_close_radius_cells: 0
+      wall_line_support_enabled: true
+      wall_line_support_min_occupied_z_cells: 1
+      wall_line_support_free_exclusion_z_cells: 3
+      wall_line_support_unknown_ratio_max: 0.75
+      wall_line_support_min_observed_z_cells: 1
+      wall_line_support_use_nav_edge_gate: true
+      wall_line_support_nav_edge_radius_cells: 3
+      wall_line_support_remove_small_area_cells: 3
+    voxel_wall_projection:
+      enabled: true
+      projection_band_cells: 2
+      max_projection_band_cells: 3
+      min_projected_line_length_m: 0.35
+      min_projected_support_ratio: 0.25
+      anchor_min_projected_line_length_m: 0.15
+      anchor_min_projected_support_ratio: 0.15
+      max_fill_gap_m: 0.25
+      max_free_gap_ratio: 0.20
+      separate_parallel_wall_min_cells: 4
+      parallel_peak_min_support_cells: 3
+      max_lateral_std_cells: 1.75
+      use_axis_aligned_first: true
+      allow_diagonal_pca_projection: true
+      max_pca_angle_to_axis_deg: 20.0
+      forbid_projection_across_free: true
+      forbid_projection_across_door_seed: true
+      forbid_merge_across_unknown_gap: false
+      side_validation_enabled: true
+      side_band_cells: 3
+      side_min_free_ratio: 0.15
+      side_min_nonfree_ratio: 0.15
+      reject_if_both_sides_free_ratio_gt: 0.55
+      reject_if_both_sides_unknown_ratio_gt: 0.85
+      reject_if_no_free_side: true
+      reject_if_no_nonfree_side: true
+      min_line_observed_support_cells: 3
+      keep_accepted_line_cells_even_if_unknown_dominant: true
+    voxel_door:
+      enabled: true
+      seed_method: centroid_ratio
+      z_scan_min_m: 0.10
+      z_scan_max_mode: active_z_max
+      top_occupied_min_z_m: 1.80
+      centroid_turn_extent_scale: 0.50
+      min_lower_free_cells: 2
+      lower_free_ratio_min: 0.90
+      upper_occupied_ratio_min_observed: 0.80
+      min_upper_observed_cells: 3
+      min_upper_occupied_cells: 3
+      require_occupied_centroid_above_free_centroid: true
+      min_top_occupied_cells: 3
+      allow_unknown_tail_after_top_occupied: true
+      allow_end_of_active_range_after_top_occupied: true
+      reject_unknown_before_top_occupied: true
+      reject_occupied_below_top_threshold: true
+      reject_free_after_unknown_tail: true
+      reject_occupied_after_unknown_tail: true
+      reject_conflict_in_seed_pattern: true
+      seed_connectivity: 8
+      min_seed_component_cells: 1
+      max_seed_component_cells: 160
+      max_component_thickness_m: 0.45
+      line_fit_max_residual_cells: 1.25
+      single_seed_infer_from_wall_enabled: true
+      single_seed_wall_search_radius_m: 1.20
+      door_width_min_m: 0.35
+      door_width_max_m: 1.60
+      enforce_seed_door_width_limits: false
+      extend_max_m: 1.80
+      wall_anchor_radius_cells: 3
+      wall_anchor_min_cells: 1
+      inner_unknown_ratio_max: 0.20
+      inner_wall_ratio_max: 0.10
+      inner_free_or_seed_ratio_min: 0.40
+      cut_thickness_cells: 1
+      reject_if_intersects_other_door: true
+      reject_if_endpoint_is_other_door: true
+      conflict_dilation_cells: 1
+      vectorized_seed_classification: true
+      seed_cluster_morph_close_radius_cells: 2
+      seed_cluster_merge_distance_cells: 8
+      seed_cluster_collinear_angle_deg: 25.0
+      seed_cluster_max_perpendicular_gap_cells: 4
+      seed_cluster_max_along_gap_cells: 16
+      seed_cluster_max_width_m: 1.80
+      seed_cluster_min_shared_anchor_score: 0.0
+      completion_orientation_mode: pca_plus_axis_plus_wall_pair
+      allow_diagonal_orientation_candidates: false
+      infer_orientation_from_wall_pairs: true
+      infer_orientation_from_local_free_neck: true
+      visual_walk_ignore_other_seed_clusters: true
+      visual_walk_continue_through_unknown: true
+      visual_walk_unknown_bridge_max_cells: 2
+      visual_width_min_m: 0.15
+      visual_width_max_m: 1.80
+      one_seed_one_wall_visual_width_max_m: 1.60
+      seed_pair_bridge_visual_width_max_m: 1.80
+      partition_cut_bridge_unknown_max_cells: 4
+      partition_cut_bridge_nonfree_max_cells: 1
+      partition_cut_seed_dilation_cells: 1
+      partition_cut_require_seed_overlap: true
+      partition_cut_min_cells: 1
+      partition_inner_unknown_ratio_max: 0.80
+      partition_inner_wall_ratio_max: 0.40
+      partition_inner_free_or_seed_ratio_min: 0.10
+      partition_topology_enabled: true
+      partition_topology_local_radius_cells: 18
+      partition_topology_allow_anchor_closure_without_global_gain: true
+      partition_topology_allow_neck_cut_without_global_gain: true
+      partition_topology_min_side_area_cells: 3
+      partition_topology_min_side_width_cells: 1
+      enable_one_seed_one_wall_completion: true
+      enable_seed_pair_bridge_completion: true
+      seed_pair_max_center_distance_m: 1.40
+      seed_pair_max_perpendicular_gap_cells: 2
+      seed_pair_max_angle_deg: 25.0
+      seed_pair_bridge_gap_tolerance_cells: 2
+      door_walk_strip_half_width_cells: 1
+      door_walk_anchor_snap_radius_cells: 3
+      door_walk_unknown_effective_ignores_anchor: true
+      door_partition_accept_mode: geometry_first
+      partition_topology_reject_mode: warn_only
+      min_geometry_cut_cells: 1
+      door_memory_enabled: true
+      door_memory_initial_confidence: 1.0
+      door_memory_match_iou_min: 0.20
+      door_memory_match_distance_cells: 3
+      door_memory_match_angle_deg: 20.0
+      door_memory_decay_per_update: 0.10
+      door_memory_confirm_increment: 0.35
+      door_memory_min_confidence_to_keep: 0.25
+      door_memory_ttl_updates: 8
+      show_candidate_lines_in_debug: true
+    voxel_roomseg:
+      use_real_wall_as_partition_barrier: true
+      real_wall_barrier_dilation_cells: 0
+      door_seed_wall_carve_radius_cells: 2
+    voxel_visualization:
+      voxel_show_wall_diagnostics: false
+      door_seed_color: [0, 80, 255]
+      door_extension_color: [0, 255, 70]
+      step2_extension_color: [220, 60, 255]
+    voxel_step1:
+      gap_fill_enabled: true
+      gap_fill_max_gap_m: 0.30
+      gap_fill_max_lateral_offset_m: 0.15
+      gap_fill_min_endpoint_support: 0.25
+      gap_fill_forbidden_on_door: true
+    voxel_step2:
+      enabled: true
+      min_extension_m: 0.40
+      max_extension_m: 1.60
+      max_probe_m: 1.80
+      sample_step_m: 0.05
+      hit_radius_m: 0.12
+      free_ratio_min: 0.55
+      unknown_ratio_max: 0.60
+      wall_mid_ratio_max: 0.20
+      require_free_between_start_and_hit: true
+      min_free_cells_between_start_and_hit: 2
+      allow_hit_virtual_door_on_pass2: false
+      reject_if_intersects_door: true
+      door_intersection_dilation_cells: 1
+      reject_if_tiny_side_width_cells_leq: 2
+    voxel_step2_topology:
+      corridor_min_split_area_m2: 0.05
+      corridor_min_new_component_width_m: 0.10
+      corridor_reject_tiny_side_width_cells_leq: 2
+      corridor_tiny_side_min_area_m2: 0.03
+      corridor_tiny_side_min_length_m: 0.35
+      corridor_accept_long_narrow_side: true
+      corridor_local_topology_radius_cells: 20
+    height_profile:
+      enabled: true
+      z_min_m: 0.10
+      z_max_m: 3.20
+      storage_z_max_m: 3.20
+      z_bin_size_m: 0.05
+      active_z_max_mode: ceiling_90pct
+      active_z_max_ceiling_ratio: 0.90
+      active_z_max_fallback_m: 2.00
+      min_free_rays_per_bin: 1
+      min_occupied_points_per_bin: 1
+      min_free_z_bins_for_xy_free: 3
+      wall_occupied_ratio_min: 0.95
+      wall_min_observed_z_bins: 8
+      wall_min_occupied_z_bins: 8
+      use_navigation_free_gate: true
+      navigation_free_gate_dilation_cells: 0
+      hard_wall_overrides_free: true
+      ceiling_estimator:
+        enabled: true
+        candidate_min_z_m: 1.80
+        candidate_max_z_m: 4.00
+        histogram_bin_size_m: 0.05
+        smooth_bins: 2
+        min_points_per_frame: 80
+        min_stable_frames: 3
+        max_frame_to_frame_jump_m: 0.20
+        ema_alpha: 0.20
+        lock_after_stable: true
+    height_profile_evidence:
+      enabled: true
+      free_remove_island_max_area_cells: 4
+      free_close_radius_cells: 0
+      wall_remove_island_max_area_cells: 0
+      wall_micro_close_radius_cells: 0
+      wall_min_component_cells: 1
+      suppress_free_on_navigation_obstacle: true
+      promote_navigation_obstacle_to_wall: false
+      fill_unknown_as_wall: false
+      fill_unknown_as_free: false
+    height_profile_door:
+      enabled: true
+      z_start_m: 0.10
+      top_occupied_min_z_m: 1.80
+      min_lower_free_bins: 3
+      min_top_occupied_bins: 3
+      lower_unknown_max_bins: 0
+      lower_occupied_max_bins: 0
+      reject_unknown_before_top_occupied: true
+      reject_conflict_before_top_occupied: true
+      reject_non_unknown_after_top_occupied_tail: true
+      allow_end_of_profile_as_unknown_tail: true
+      allow_profile_end_as_unknown_tail: true
+      min_unknown_tail_bins: 0
+      reject_free_after_top_occupied: true
+      reject_occupied_after_unknown_tail: true
+      seed_connectivity: 8
+      min_seed_component_cells: 1
+      max_seed_component_cells: 120
+      min_component_line_length_m: 0.10
+      max_component_thickness_m: 0.30
+      line_fit_max_residual_cells: 1.25
+      single_seed_infer_from_wall_enabled: true
+      single_seed_wall_search_radius_m: 1.20
+      door_width_min_m: 0.35
+      door_width_max_m: 1.60
+      extend_max_m: 1.80
+      wall_anchor_radius_cells: 1
+      wall_anchor_min_cells: 1
+      inner_unknown_ratio_max: 0.10
+      inner_wall_ratio_max: 0.10
+      inner_free_or_seed_ratio_min: 0.50
+      cut_thickness_cells: 1
+      conflict_dilation_cells: 1
+      reject_if_intersects_other_door: true
+      reject_if_endpoint_is_other_door: true
+    height_profile_step1:
+      gap_fill_enabled: true
+      gap_fill_max_gap_m: 0.30
+      gap_fill_max_lateral_offset_m: 0.15
+      gap_fill_min_endpoint_support: 0.25
+    height_profile_step2:
+      enabled: true
+      min_extension_m: 0.40
+      max_extension_m: 1.60
+      max_probe_m: 1.60
+      sample_step_m: 0.05
+      hit_radius_m: 0.10
+      free_ratio_min: 0.65
+      unknown_ratio_max: 0.50
+      wall_mid_ratio_max: 0.15
+      require_free_between_start_and_hit: true
+      min_free_cells_between_start_and_hit: 3
+      allow_hit_virtual_door_on_pass2: false
+      reject_if_intersects_door: true
+      door_intersection_dilation_cells: 1
+      reject_if_tiny_side_width_cells_leq: 3
+      reject_if_intersects_door: true
+      door_intersection_dilation_cells: 1
+      reject_if_tiny_side_width_cells_leq: 3
     evidence_fusion:
       enabled: true
       mode: ray_valid_wall_no_navigation_overlay
@@ -256,9 +616,9 @@ mapping:
       debug_dump: true
     ray_valid_wall_inference:
       enabled: true
-      depth_max_m: 3.0
+      depth_max_m: 5.0
       min_endpoint_height_m: 0.20
-      max_endpoint_height_m: 2.00
+      max_endpoint_height_m: 2.3
       min_terminal_wall_count: 1
       terminal_wall_splat_radius_cells: 1
       require_no_vertical_free: true
@@ -500,12 +860,20 @@ mapping:
           short_unknown_gap_closure: 0.35
           doorway_virtual_cut: 0.30
           line_extension_door_neck: 0.30
+          line_extension_corridor_separator: 0.30
           single_sided_wall_extension: 0.50
           corridor_room_neck_cut: 0.30
         min_new_component_width_m: 0.15
         min_new_component_area_cells: 4
         allow_partial_room_split: true
         max_tiny_fragment_count: 3
+        tiny_fragment_count_mode: local_delta
+        local_fragment_radius_cells: 12
+        centered_extension_allow_small_gaps: true
+        centered_extension_max_bridge_gap_cells: 2
+        centered_extension_bridge_unknown: true
+        centered_extension_bridge_nonfree_if_between_free: false
+        require_cut_adjacent_to_wall_or_barrier: true
         reject_corridor_split: true
         open_room_width_min_m: 1.80
         open_room_min_side_area_m2: 2.00
@@ -764,7 +1132,7 @@ sgnav:
     long_edge_geometric_pruning: true
     group_nodes: true
     room_nodes:
-      source: vertical_free_gap_closure_v1_vlm
+      source: voxel_occupancy_door_wall_v9_vlm
       use_dataset_room_labels_in_metric: false
       strict_no_oracle_rooms: true
       room_label_backend: vlm

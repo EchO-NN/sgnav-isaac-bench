@@ -33,6 +33,23 @@ def _cell_in_crop(cell: GridCell, r0: int, r1: int, c0: int, c1: int) -> bool:
     return bool(r0 <= row < r1 and c0 <= col < c1)
 
 
+def _top_reason_text(counts: object) -> str:
+    if not isinstance(counts, Mapping) or not counts:
+        return "none"
+    pairs: list[tuple[str, int]] = []
+    for key, value in counts.items():
+        try:
+            count = int(value)
+        except (TypeError, ValueError):
+            continue
+        if str(key) and count > 0:
+            pairs.append((str(key), count))
+    top = sorted(pairs, key=lambda item: item[1], reverse=True)
+    if not top:
+        return "none"
+    return "%s=%d" % top[0]
+
+
 class SGNavPopupVisualizer:
     def __init__(
         self,
@@ -451,9 +468,9 @@ class SGNavPopupVisualizer:
         divider_h = 0
         map_h_available = int(height)
         if rose_panel_enabled and height >= 180:
-            rose_h = min(max(96, int(round(height * 0.28))), max(1, height // 2))
             divider_h = 2
-            map_h_available = max(1, int(height) - rose_h - divider_h)
+            map_h_available = max(1, (int(height) - divider_h) // 2)
+            rose_h = max(1, int(height) - divider_h - map_h_available)
         h, w = occupancy.shape
         base = np.zeros((h, w, 3), dtype=np.uint8)
         nav = navigable.astype(bool)
@@ -507,8 +524,10 @@ class SGNavPopupVisualizer:
                 "enabled": bool(enabled),
                 "color": [int(color[0]), int(color[1]), int(color[2])],
                 "primitive_count": int(count),
+                "count": int(count),
                 "green_like": bool(_is_green_like(color)),
                 "note": note,
+                "description": note,
             }
             item.update(extra)
             layers.append(item)
@@ -528,6 +547,10 @@ class SGNavPopupVisualizer:
             xy,
             crop_bounds=(r0, r1, c0, c1),
         ) if self.show_room_labels else 0
+        record("navigation_map_panel", True, (218, 222, 224), int(np.count_nonzero(obs)), "top-right navigation map panel")
+        record("navigation_free", True, (218, 222, 224), int(np.count_nonzero(nav & obs)), "runtime navigation free cells in the top-right map")
+        record("navigation_obstacle", True, (24, 24, 24), int(np.count_nonzero(occupancy.astype(bool))), "runtime navigation obstacle cells in the top-right map")
+        record("navigation_unknown", True, (72, 74, 76), int(np.count_nonzero(~obs)), "runtime navigation unknown cells in the top-right map")
         record("room_labels", self.show_room_labels, (250, 250, 255), room_label_count, "VLM room category and reliability")
 
         map_shape = tuple(np.asarray(occupancy).shape[:2])
@@ -866,7 +889,27 @@ class SGNavPopupVisualizer:
         record("agent", True, (255, 60, 60), 1)
         zoom = max(1.0, min(w / max(crop_w, 1), h / max(crop_h, 1)))
         target_count = len(nav_decision.target_cells) if nav_decision is not None else 0
-        self._label(draw, (10, 8), "Map / frontiers / A* / goal candidates  zoom %.1fx target_cells=%d" % (zoom, target_count), (255, 255, 255))
+        if self._should_render_voxel_panel(tuple(np.asarray(occupancy).shape[:2])):
+            nav_unknown = int(np.count_nonzero(~obs))
+            frontier_count = int(sum(len(getattr(frontier, "cells", [])) for frontier in frontiers))
+            backend = str(self._room_segmentation_debug.get("voxel_integration_backend", self._room_segmentation_debug.get("integration_backend", "unknown")))
+            integrate_ms = self._room_segmentation_debug.get("voxel_integrate_total_ms")
+            try:
+                integrate_text = "%.1fms" % float(integrate_ms)
+            except (TypeError, ValueError):
+                integrate_text = "NA"
+            title = "navigation from voxel | free=%d occ=%d unknown=%d frontier=%d backend=%s integrate=%s zoom %.1fx" % (
+                int(np.count_nonzero(nav & obs)),
+                int(np.count_nonzero(occupancy.astype(bool))),
+                nav_unknown,
+                frontier_count,
+                backend,
+                integrate_text,
+                zoom,
+            )
+        else:
+            title = "Map / frontiers / A* / goal candidates  zoom %.1fx target_cells=%d" % (zoom, target_count)
+        self._label(draw, (10, 8), title[:112], (255, 255, 255))
         self._legend(draw, (10, max(32, map_h_available - 148)))
         if rose_panel_enabled and rose_h > 0:
             rose_panel, rose_layers = self._render_rose_occupancy_panel(
@@ -898,6 +941,22 @@ class SGNavPopupVisualizer:
     ) -> Tuple[Image.Image, List[dict]]:
         width, height = size
         shape = tuple(np.asarray(occupancy).shape[:2])
+        if self._should_render_voxel_panel(shape):
+            return self._render_voxel_roomseg_panel(
+                occupancy=occupancy,
+                navigable=navigable,
+                observed=observed,
+                size=size,
+                crop_bounds=crop_bounds,
+            )
+        if self._has_height_profile_roomseg_layers(shape):
+            return self._render_height_profile_roomseg_panel(
+                occupancy=occupancy,
+                navigable=navigable,
+                observed=observed,
+                size=size,
+                crop_bounds=crop_bounds,
+            )
         occ = np.asarray(occupancy, dtype=bool)
         nav = np.asarray(navigable, dtype=bool)
         obs = np.asarray(observed, dtype=bool)
@@ -1104,7 +1163,7 @@ class SGNavPopupVisualizer:
         r0, r1, c0, c1 = crop_bounds
         crop = canvas[r0:r1, c0:c1]
         crop_h, crop_w = crop.shape[:2]
-        label_h = 22
+        label_h = 36
         margin = 8
         available_h = max(1, int(height) - label_h - margin)
         scale = min((width - 2 * margin) / max(crop_w, 1), available_h / max(crop_h, 1))
@@ -1395,6 +1454,578 @@ class SGNavPopupVisualizer:
         ]
         return image, layers
 
+    def _has_height_profile_roomseg_layers(self, shape: Tuple[int, int]) -> bool:
+        keys = (
+            "height_profile_vertical_free_xy",
+            "height_profile_wall_xy",
+            "height_profile_unknown_xy",
+            "height_profile_final_room_label_map",
+            "height_profile_door_cut_mask",
+            "height_profile_step2_extension_separator_map",
+        )
+        for key in keys:
+            raw = self._room_segmentation_debug.get(key)
+            if raw is None:
+                continue
+            try:
+                arr = np.asarray(raw)
+            except Exception:
+                continue
+            if arr.shape == tuple(shape) and np.any(arr):
+                return True
+        return False
+
+    def _is_voxel_roomseg_debug(self, shape: Tuple[int, int]) -> bool:
+        return self._should_render_voxel_panel(shape)
+
+    def _should_render_voxel_panel(self, shape: Tuple[int, int]) -> bool:
+        backend_text = " ".join(
+            str(self._room_segmentation_debug.get(key, ""))
+            for key in (
+                "backend",
+                "actual_backend",
+                "source_backend",
+                "roomseg_backend",
+                "algorithm",
+                "source",
+                "context_source",
+                "room_map_mode",
+                "frontier_source",
+                "source_grid",
+            )
+        ).lower()
+        if "voxel_occupancy_door_wall_v9" in backend_text or "voxel_vertical_free" in backend_text:
+            return True
+        if "voxel" in backend_text:
+            return True
+        for key in (
+            "voxel_vertical_free_xy",
+            "voxel_wall_xy",
+            "voxel_unknown_xy",
+            "voxel_final_room_label_map",
+            "voxel_door_cut_mask",
+            "voxel_step2_extension_separator_map",
+        ):
+            raw = self._room_segmentation_debug.get(key)
+            if raw is None:
+                continue
+            try:
+                arr = np.asarray(raw)
+            except Exception:
+                continue
+            if arr.shape == tuple(shape):
+                return True
+        return False
+
+    def _render_voxel_roomseg_panel(
+        self,
+        *,
+        occupancy: np.ndarray,
+        navigable: np.ndarray,
+        observed: np.ndarray,
+        size: Tuple[int, int],
+        crop_bounds: Tuple[int, int, int, int],
+    ) -> Tuple[Image.Image, List[dict]]:
+        _ = navigable, observed
+        width, height = size
+        shape = tuple(np.asarray(occupancy).shape[:2])
+        required = (
+            "voxel_vertical_free_xy",
+            "voxel_wall_xy",
+            "voxel_unknown_xy",
+            "voxel_final_room_label_map",
+            "voxel_door_cut_mask",
+            "voxel_step2_extension_separator_map",
+            "voxel_display_wall_xy",
+        )
+        missing = []
+        for key in required:
+            raw = self._room_segmentation_debug.get(key)
+            try:
+                ok = raw is not None and np.asarray(raw).shape == tuple(shape)
+            except Exception:
+                ok = False
+            if not ok:
+                missing.append(key)
+        vertical_free = self._room_debug_array("voxel_vertical_free_xy", shape, bool)
+        wall = self._room_debug_array("voxel_wall_xy", shape, bool)
+        raw_wall = self._room_debug_array("voxel_raw_occupied_wall_support_xy", shape, bool)
+        strict_raw_wall = self._room_debug_array("voxel_strict_raw_wall_xy", shape, bool)
+        wall_line_support = self._room_debug_array("voxel_wall_line_support_xy", shape, bool)
+        wall_suppressed_by_free = self._room_debug_array("voxel_wall_suppressed_by_free_xy", shape, bool)
+        ratio_wall_debug = self._room_debug_array("voxel_wall_ratio_raw_xy", shape, bool)
+        if not np.any(ratio_wall_debug):
+            ratio_wall_debug = self._room_debug_array("voxel_ratio_wall_debug_xy", shape, bool)
+        nonstructural_occupied = self._room_debug_array("voxel_nonstructural_occupied_xy", shape, bool)
+        projected_wall = self._room_debug_array("voxel_projected_structural_wall_map", shape, bool)
+        if not np.any(projected_wall):
+            projected_wall = self._room_debug_array("voxel_projected_wall_map", shape, bool)
+        if not np.any(projected_wall):
+            projected_wall = self._room_debug_array("voxel_wall_projected_xy", shape, bool)
+        anchor_projected_wall = self._room_debug_array("voxel_anchor_projected_wall_map", shape, bool)
+        rejected_wall_support = self._room_debug_array("voxel_wall_projection_rejected_support_map", shape, bool)
+        unknown_dominant = self._room_debug_array("voxel_unknown_dominant_xy", shape, bool)
+        unknown_rejected_wall = self._room_debug_array("voxel_wall_support_rejected_unknown_xy", shape, bool)
+        unknown_gated_wall = self._room_debug_array("voxel_wall_support_unknown_gated_xy", shape, bool)
+        unknown = self._room_debug_array("voxel_unknown_xy", shape, bool)
+        conflict = self._room_debug_array("voxel_free_wall_conflict_xy", shape, bool)
+        line_wall = self._room_debug_array("voxel_filtered_wall_line_mask", shape, bool)
+        real_wall = self._room_debug_array("voxel_real_wall_barrier_map", shape, bool)
+        door_seed = self._room_debug_array("voxel_door_seed_mask", shape, bool)
+        door_attempt = self._room_debug_array("voxel_door_extension_attempt_all_mask", shape, bool)
+        if not np.any(door_attempt):
+            door_attempt = self._room_debug_array("voxel_door_trial_candidate_lines_map", shape, bool)
+        door_attempt_rejected = self._room_debug_array("voxel_door_extension_attempt_rejected_mask", shape, bool)
+        if not np.any(door_attempt_rejected):
+            door_attempt_rejected = self._room_debug_array("voxel_door_trial_rejected_lines_map", shape, bool)
+        accepted_door_visual = self._room_debug_array("voxel_accepted_door_centerline_mask", shape, bool)
+        door_visual_all = self._room_debug_array("voxel_door_provisional_accepted_visual_mask", shape, bool)
+        if not np.any(door_visual_all):
+            door_visual_all = self._room_debug_array("voxel_door_current_centerline_visual_mask", shape, bool)
+        if not np.any(door_visual_all):
+            door_visual_all = self._room_debug_array("voxel_door_centerline_visual_mask", shape, bool)
+        if not np.any(door_visual_all):
+            door_visual_all = accepted_door_visual.copy()
+        door_visual = accepted_door_visual.copy()
+        door_visual_only = self._room_debug_array("voxel_door_visual_only_mask", shape, bool)
+        if not np.any(door_visual_only):
+            door_visual_only = door_visual_all & ~door_visual & ~self._room_debug_array("voxel_door_cut_mask", shape, bool)
+        door_partition_candidate = self._room_debug_array("voxel_door_partition_cut_candidate_mask", shape, bool)
+        door_partition_rejected = self._room_debug_array("voxel_door_partition_cut_rejected_mask", shape, bool)
+        door_topology_warning = self._room_debug_array("voxel_door_topology_warning_cut_mask", shape, bool)
+        stable_door_cut = self._room_debug_array("voxel_stable_door_cut_mask", shape, bool)
+        stable_door_visual = self._room_debug_array("voxel_stable_door_visual_mask", shape, bool)
+        door_cut = self._room_debug_array("voxel_door_cut_mask", shape, bool)
+        if not np.any(door_cut):
+            door_cut = self._room_debug_array("voxel_door_partition_cut_accepted_mask", shape, bool)
+        door_trial = self._room_debug_array("voxel_door_trial_candidate_lines_map", shape, bool)
+        door_trial_rejected = self._room_debug_array("voxel_door_trial_rejected_lines_map", shape, bool)
+        door_selected = self._room_debug_array("voxel_door_selected_candidate_lines_map", shape, bool)
+        step1 = self._room_debug_array("voxel_step1_wall_gap_fill_map", shape, bool)
+        step1_completed = self._room_debug_array("voxel_step1_completed_wall_map", shape, bool)
+        if not np.any(step1_completed):
+            step1_completed = self._room_debug_array("voxel_wall_after_step1_map", shape, bool)
+        step2 = self._room_debug_array("voxel_step2_extension_separator_map", shape, bool)
+        step2_hits = self._room_debug_array("voxel_step2_extension_hits_all_map", shape, bool)
+        if not np.any(step2_hits):
+            step2_hits = self._room_debug_array("voxel_step2_extension_candidate_map", shape, bool)
+        step2_pre_topology = self._room_debug_array("voxel_step2_extension_hits_pre_topology_map", shape, bool)
+        step2_candidate = self._room_debug_array("voxel_step2_separator_candidates_pre_topology_map", shape, bool)
+        step2_partition_candidate = self._room_debug_array("voxel_step2_partition_cut_candidate_map", shape, bool)
+        if not np.any(step2_partition_candidate):
+            step2_partition_candidate = step2_candidate
+        step2_partition_accepted = self._room_debug_array("voxel_step2_partition_cut_accepted_map", shape, bool)
+        if np.any(step2_partition_accepted):
+            step2 = step2_partition_accepted
+        step2_topology_rejected = self._room_debug_array("voxel_step2_topology_rejected_separator_map", shape, bool)
+        rejected = self._room_debug_array("voxel_rejected_door_centerline_mask", shape, bool) | self._room_debug_array("voxel_step2_rejected_extension_map", shape, bool)
+        labels = self._room_debug_array("voxel_final_room_label_map", shape, np.int32)
+        frontier = self._room_debug_array("frontier_map", shape, bool)
+        if not np.any(frontier):
+            frontier = self._room_debug_array("voxel_frontier", shape, bool)
+        if not np.any(frontier):
+            frontier = self._room_debug_array("voxel_frontier_mask", shape, bool)
+        show_diag = bool(self._room_segmentation_debug.get("voxel_show_wall_diagnostics", False))
+        clean_display_wall = self._room_debug_array("voxel_display_wall_xy", shape, bool)
+
+        canvas = np.zeros((shape[0], shape[1], 3), dtype=np.uint8)
+        canvas[:, :] = (30, 32, 36)
+        canvas[unknown] = (26, 28, 34)
+        canvas[vertical_free] = (170, 220, 245)
+        palette = [
+            (120, 150, 230),
+            (90, 190, 160),
+            (232, 174, 82),
+            (218, 128, 155),
+            (166, 134, 226),
+            (96, 178, 222),
+        ]
+        for label in np.unique(labels):
+            if int(label) <= 0:
+                continue
+            mask = labels == int(label)
+            color = np.asarray(palette[(int(label) - 1) % len(palette)], dtype=np.float32)
+            base = canvas[mask].astype(np.float32)
+            canvas[mask] = np.clip(base * 0.72 + color * 0.28, 0, 255).astype(np.uint8)
+        wall_visual = clean_display_wall
+        canvas[wall_visual] = (255, 30, 30)
+        if show_diag:
+            canvas[ratio_wall_debug & ~wall_visual] = (112, 64, 180)
+            canvas[wall_suppressed_by_free] = (72, 150, 92)
+            canvas[conflict] = (255, 126, 45)
+            canvas[raw_wall & ~wall_visual] = (92, 78, 64)
+            canvas[wall_line_support & ~wall_visual] = (255, 170, 64)
+            canvas[nonstructural_occupied & ~wall_visual] = (120, 98, 72)
+            canvas[rejected_wall_support] = (255, 142, 45)
+            canvas[unknown_rejected_wall] = (255, 118, 36)
+            canvas[unknown_dominant & ~unknown_rejected_wall] = (74, 70, 92)
+            canvas[unknown_gated_wall & ~wall_visual] = (150, 46, 54)
+            canvas[anchor_projected_wall & ~projected_wall] = (255, 156, 42)
+            canvas[step2_hits & ~step2] = (160, 80, 255)
+            canvas[step2_pre_topology & ~step2] = (140, 72, 210)
+            canvas[step2_partition_candidate & ~step2] = (116, 76, 140)
+            canvas[step2_topology_rejected & ~step2] = (120, 80, 160)
+            canvas[door_attempt & ~door_visual & ~door_cut] = (0, 120, 40)
+            canvas[door_trial & ~door_selected & ~door_visual & ~door_cut] = (0, 120, 40)
+            canvas[door_attempt_rejected & ~door_visual & ~door_cut] = (120, 120, 120)
+            canvas[door_trial_rejected & ~door_visual & ~door_cut] = (120, 120, 120)
+            canvas[door_partition_candidate & ~door_cut] = (170, 220, 80)
+            canvas[door_partition_rejected & ~door_cut] = (255, 100, 50)
+            canvas[door_topology_warning & ~door_cut] = (255, 205, 70)
+            canvas[door_visual_only & ~door_cut] = (120, 220, 140)
+            canvas[rejected] = (130, 112, 118)
+        canvas[step1] = (245, 215, 55)
+        canvas[step2] = (220, 60, 255)
+        canvas[door_visual] = (0, 255, 70)
+        canvas[stable_door_visual & ~door_visual] = (55, 210, 155)
+        canvas[door_cut] = (80, 255, 80)
+        canvas[stable_door_cut] = (55, 235, 155)
+        canvas[door_seed] = (0, 80, 255)
+        canvas[frontier] = (0, 235, 255)
+
+        r0, r1, c0, c1 = crop_bounds
+        crop = canvas[r0:r1, c0:c1]
+        crop_h, crop_w = crop.shape[:2]
+        label_h = 36
+        margin = 8
+        available_h = max(1, int(height) - label_h - margin)
+        scale = min((width - 2 * margin) / max(crop_w, 1), available_h / max(crop_h, 1))
+        map_w, map_h = max(1, int(crop_w * scale)), max(1, int(crop_h * scale))
+        ox = (width - map_w) // 2
+        oy = label_h + max(0, (available_h - map_h) // 2)
+        image = Image.new("RGB", (width, height), (15, 17, 21))
+        image.paste(Image.fromarray(crop).resize((map_w, map_h), Image.NEAREST), (ox, oy))
+        draw = ImageDraw.Draw(image)
+        ceiling = self._room_segmentation_debug.get("voxel_ceiling_height_m")
+        active_z = self._room_segmentation_debug.get("voxel_active_z_max_m")
+        backend = str(self._room_segmentation_debug.get("voxel_integration_backend", self._room_segmentation_debug.get("integration_backend", "unknown")))
+        integrate_ms = self._room_segmentation_debug.get("voxel_integrate_total_ms")
+
+        def fmt_m(value: object) -> str:
+            try:
+                if value is None:
+                    return "NA"
+                return "%.2f" % float(value)
+            except (TypeError, ValueError):
+                return "NA"
+
+        if missing:
+            title_a = "VOXEL DEBUG MISSING | missing %s" % missing[0]
+            title_b = "missing_keys=%d" % int(len(missing))
+        else:
+            raw_wall_count = int(np.count_nonzero(raw_wall))
+            wall_line_support_count = int(np.count_nonzero(wall_line_support))
+            projected_wall_count = int(np.count_nonzero(projected_wall))
+            rejected_wall_support_count = int(np.count_nonzero(rejected_wall_support))
+            display_wall_count = int(np.count_nonzero(wall_visual))
+            door_seed_count = int(np.count_nonzero(door_seed))
+            door_green_count = int(np.count_nonzero(door_visual))
+            door_visual_count = int(np.count_nonzero(door_visual_all))
+            door_visual_only_count = int(np.count_nonzero(door_visual_only))
+            door_cut_candidate_count = int(np.count_nonzero(door_partition_candidate))
+            door_cut_count = int(np.count_nonzero(door_cut))
+            door_cluster_count = int(self._room_segmentation_debug.get("voxel_door_seed_cluster_count", 0) or 0)
+            door_group_count = int(self._room_segmentation_debug.get("voxel_door_seed_group_count", door_cluster_count) or 0)
+            door_trial_count = int(self._room_segmentation_debug.get("voxel_door_trial_candidate_count", np.count_nonzero(door_attempt)) or 0)
+            step2_source_count = int(self._room_segmentation_debug.get("voxel_step2_source_line_count", 0) or 0)
+            step2_hit_count = int(np.count_nonzero(step2_hits))
+            step2_candidate_count = int(self._room_segmentation_debug.get("voxel_step2_candidate_count", np.count_nonzero(step2_candidate)) or 0)
+            step2_accepted_count = int(self._room_segmentation_debug.get("voxel_step2_accepted_count", 0) or 0)
+            try:
+                integrate_text = "%.1fms" % float(integrate_ms)
+            except (TypeError, ValueError):
+                integrate_text = "NA"
+            stable_count = int(np.count_nonzero(stable_door_cut))
+            warning_count = int(np.count_nonzero(door_topology_warning))
+            update_reason = str(self._room_segmentation_debug.get("roomseg_frontier_update_reason", "NA"))
+            title_a = "voxel v19 | wall_support=%d proj=%d proj_rej=%d red=%d step2_src=%d hit=%d acc=%d" % (
+                wall_line_support_count,
+                projected_wall_count,
+                rejected_wall_support_count,
+                display_wall_count,
+                step2_source_count,
+                step2_hit_count,
+                step2_accepted_count,
+            )
+            title_b = "door_seed=%d door_green=%d free=%d unknown=%d raw_occ=%d ratio_wall=%d unkdom=%d update=%s" % (
+                door_seed_count,
+                door_green_count,
+                int(np.count_nonzero(vertical_free)),
+                int(np.count_nonzero(unknown)),
+                int(np.count_nonzero(raw_wall)),
+                int(np.count_nonzero(ratio_wall_debug)),
+                int(np.count_nonzero(unknown_dominant)),
+                update_reason,
+            )
+            door_reject_counts = self._room_segmentation_debug.get("voxel_door_reject_reason_counts", {})
+            door_partition_reject_counts = self._room_segmentation_debug.get("voxel_door_partition_reject_reason_counts", {})
+            door_topology_reject_counts = self._room_segmentation_debug.get("voxel_door_topology_reject_reason_counts", {})
+            step2_reject_counts = self._room_segmentation_debug.get("voxel_step2_topology_reject_reason_counts", self._room_segmentation_debug.get("voxel_step2_reject_reason_counts", {}))
+            door_counts = door_topology_reject_counts if isinstance(door_topology_reject_counts, dict) and door_topology_reject_counts else door_partition_reject_counts
+            if not isinstance(door_counts, dict) or not door_counts:
+                door_counts = door_reject_counts
+            door_reject_text = _top_reason_text(door_counts)
+            step2_reject_text = _top_reason_text(step2_reject_counts)
+            if show_diag:
+                title_b = "%s | vis=%d visual_only=%d cut=%d rooms=%d reject=%s step2_reject=%s" % (
+                    title_b,
+                    door_visual_count,
+                    door_visual_only_count,
+                    door_cut_count,
+                    int(len([v for v in np.unique(labels) if int(v) > 0])),
+                    door_reject_text,
+                    step2_reject_text,
+                )
+        title_color = (255, 70, 70) if missing or backend == "python_debug" else (255, 255, 255)
+        self._label(draw, (8, 5), title_a[:96], title_color)
+        self._label(draw, (8, 18), title_b[:96], title_color if backend == "python_debug" else (255, 255, 255))
+        legend_y = oy + map_h + 4
+        if legend_y + 50 <= height:
+            self._voxel_roomseg_legend(draw, (8, legend_y))
+        rooms = int(len([v for v in np.unique(labels) if int(v) > 0]))
+        strict_wall_count = int(np.count_nonzero(strict_raw_wall))
+        projected_wall_count = int(np.count_nonzero(projected_wall))
+        step1_completed_count = int(np.count_nonzero(step1_completed))
+        line_wall_count = int(np.count_nonzero(line_wall & ~projected_wall & ~strict_raw_wall))
+        layers = [
+            self._overlay_record(
+                "voxel_vertical_panel",
+                True,
+                (170, 220, 245),
+                int(np.count_nonzero(vertical_free)),
+                "bottom-right voxel vertical-free map panel",
+                vertical_free_cells=int(np.count_nonzero(vertical_free)),
+                strict_wall_cells=strict_wall_count,
+                raw_wall_cells=int(np.count_nonzero(raw_wall)),
+                wall_line_support_cells=int(np.count_nonzero(wall_line_support)),
+                projected_wall_cells=projected_wall_count,
+                display_wall_cells=int(np.count_nonzero(wall_visual)),
+                anchor_projected_wall_cells=int(np.count_nonzero(anchor_projected_wall)),
+                step1_completed_wall_cells=step1_completed_count,
+                wall_suppressed_by_free_cells=int(np.count_nonzero(wall_suppressed_by_free)),
+                ratio_wall_debug_cells=int(np.count_nonzero(ratio_wall_debug)),
+                nonstructural_occupied_cells=int(np.count_nonzero(nonstructural_occupied)),
+                rejected_wall_support_cells=int(np.count_nonzero(rejected_wall_support)),
+                unknown_dominant_cells=int(np.count_nonzero(unknown_dominant)),
+                unknown_rejected_wall_cells=int(np.count_nonzero(unknown_rejected_wall)),
+                unknown_gated_wall_cells=int(np.count_nonzero(unknown_gated_wall)),
+                unknown_cells=int(np.count_nonzero(unknown)),
+                conflict_cells=int(np.count_nonzero(conflict)),
+                door_seed_cells=int(np.count_nonzero(door_seed)),
+                door_attempt_cells=int(np.count_nonzero(door_attempt)),
+                door_attempt_rejected_cells=int(np.count_nonzero(door_attempt_rejected)),
+                door_trial_cells=int(np.count_nonzero(door_trial)),
+                door_selected_cells=int(np.count_nonzero(door_selected)),
+                door_visual_cells=int(np.count_nonzero(door_visual)),
+                door_provisional_visual_cells=int(np.count_nonzero(door_visual_all)),
+                door_visual_only_cells=int(np.count_nonzero(door_visual_only)),
+                door_partition_candidate_cells=int(np.count_nonzero(door_partition_candidate)),
+                door_partition_rejected_cells=int(np.count_nonzero(door_partition_rejected)),
+                door_topology_warning_cells=int(np.count_nonzero(door_topology_warning)),
+                door_cut_cells=int(np.count_nonzero(door_cut)),
+                stable_door_cut_cells=int(np.count_nonzero(stable_door_cut)),
+                stable_door_visual_cells=int(np.count_nonzero(stable_door_visual)),
+                step2_hit_cells=int(np.count_nonzero(step2_hits)),
+                step2_pre_topology_cells=int(np.count_nonzero(step2_pre_topology)),
+                step2_candidate_cells=int(np.count_nonzero(step2_candidate)),
+                step2_topology_rejected_cells=int(np.count_nonzero(step2_topology_rejected)),
+                step1_gap_fill_cells=int(np.count_nonzero(step1)),
+                step2_separator_cells=int(np.count_nonzero(step2)),
+                frontier_cells=int(np.count_nonzero(frontier)),
+                diagnostics_visible=show_diag,
+                missing_keys=list(missing),
+                ceiling_height_estimate_m=None if ceiling is None else fmt_m(ceiling),
+                voxel_active_z_max_m=None if active_z is None else fmt_m(active_z),
+                voxel_integration_backend=backend,
+                voxel_integrate_total_ms=integrate_ms,
+                roomseg_frontier_update_reason=self._room_segmentation_debug.get("roomseg_frontier_update_reason"),
+                room_count=rooms,
+            ),
+            self._overlay_record("vertical_free", True, (170, 220, 245), int(np.count_nonzero(vertical_free)), "voxel vertical free cells used by roomseg"),
+            self._overlay_record("voxel_vertical_free", True, (170, 220, 245), int(np.count_nonzero(vertical_free)), "voxel vertical free cells used by roomseg"),
+            self._overlay_record("voxel_display_wall", True, (255, 30, 30), int(np.count_nonzero(wall_visual)), "clean v19 display wall from voxel_display_wall_xy only"),
+            self._overlay_record("voxel_raw_occupied_wall_support", bool(show_diag and np.any(raw_wall)), (92, 78, 64), int(np.count_nonzero(raw_wall)), "diagnostic raw occupied-any support, not default red wall"),
+            self._overlay_record("voxel_wall_line_support", bool(show_diag and np.any(wall_line_support)), (255, 170, 64), int(np.count_nonzero(wall_line_support)), "diagnostic structural wall-line support candidate before projection validation"),
+            self._overlay_record("voxel_wall_raw", bool(show_diag and np.any(ratio_wall_debug)), (112, 64, 180), int(np.count_nonzero(ratio_wall_debug)), "diagnostic ratio wall candidates before priority filtering"),
+            self._overlay_record("voxel_strict_raw_wall", bool(np.any(strict_raw_wall)), (255, 30, 30), strict_wall_count, "clean structural voxel wall after free and unknown priority"),
+            self._overlay_record("voxel_wall_suppressed_by_free", bool(show_diag and np.any(wall_suppressed_by_free)), (72, 150, 92), int(np.count_nonzero(wall_suppressed_by_free)), "diagnostic occupied support suppressed by free voxel threshold"),
+            self._overlay_record("voxel_ratio_wall_debug", bool(show_diag and np.any(ratio_wall_debug)), (112, 64, 180), int(np.count_nonzero(ratio_wall_debug)), "diagnostic ratio wall candidates before priority filtering"),
+            self._overlay_record("voxel_nonstructural_occupied", bool(show_diag and np.any(nonstructural_occupied)), (120, 98, 72), int(np.count_nonzero(nonstructural_occupied)), "diagnostic occupied cells that are not structural wall"),
+            self._overlay_record("voxel_unknown_dominant", bool(show_diag and np.any(unknown_dominant)), (74, 70, 92), int(np.count_nonzero(unknown_dominant)), "unknown-heavy columns gated out of structural wall, projection, Step2, and door anchors"),
+            self._overlay_record("voxel_wall_support_unknown_gated", bool(show_diag and np.any(unknown_gated_wall)), (150, 46, 54), int(np.count_nonzero(unknown_gated_wall)), "occupied-any wall support that passed unknown gating"),
+            self._overlay_record("voxel_wall_support_rejected_unknown", bool(show_diag and np.any(unknown_rejected_wall)), (255, 118, 36), int(np.count_nonzero(unknown_rejected_wall)), "occupied-any wall support rejected because the column is unknown-dominant"),
+            self._overlay_record("voxel_wall_projected", bool(np.any(projected_wall)), (255, 30, 30), projected_wall_count, "projected structural wall line used by room boundaries and anchors"),
+            self._overlay_record("voxel_anchor_projected_wall", bool(show_diag and np.any(anchor_projected_wall)), (255, 156, 42), int(np.count_nonzero(anchor_projected_wall)), "diagnostic relaxed short projected wall anchors for door and step2"),
+            self._overlay_record("voxel_wall_projection_rejected_support", bool(show_diag and np.any(rejected_wall_support)), (255, 142, 45), int(np.count_nonzero(rejected_wall_support)), "diagnostic raw wall support rejected by wall projection"),
+            self._overlay_record("voxel_step1_completed_wall", bool(np.any(step1_completed)), (226, 192, 46), step1_completed_count, "wall map after step1 gap completion"),
+            self._overlay_record("voxel_wall_red", True, (255, 30, 30), int(np.count_nonzero(wall_visual)), "default clean red wall display"),
+            self._overlay_record("voxel_wall", True, (255, 30, 30), int(np.count_nonzero(wall)), "final voxel wall layer"),
+            self._overlay_record("voxel_line_supported_wall", bool(np.any(line_wall)), (148, 20, 24), line_wall_count, "line-supported wall derived from projected wall evidence"),
+            self._overlay_record("voxel_conflict", bool(show_diag and np.any(conflict)), (255, 126, 45), int(np.count_nonzero(conflict)), "diagnostic xy cells with simultaneous vertical-free and strict-wall evidence"),
+            self._overlay_record("voxel_unknown", True, (26, 28, 34), int(np.count_nonzero(unknown)), "voxel unknown cells preserved as unknown"),
+            self._overlay_record("voxel_door_seed", bool(np.any(door_seed)), (0, 80, 255), int(np.count_nonzero(door_seed)), "door seed cells from per-xy voxel z-pattern detection"),
+            self._overlay_record("voxel_door_extension_attempt", bool(show_diag and np.any(door_attempt)), (0, 120, 40), int(np.count_nonzero(door_attempt)), "diagnostic all door extension attempt paths"),
+            self._overlay_record("voxel_door_trial_candidates", bool(show_diag and np.any(door_trial)), (54, 96, 74), int(np.count_nonzero(door_trial)), "diagnostic all door orientation trial lines"),
+            self._overlay_record("voxel_door_selected_candidates", bool(show_diag and np.any(door_selected)), (0, 180, 70), int(np.count_nonzero(door_selected)), "diagnostic selected door candidate line per seed cluster"),
+            self._overlay_record("voxel_door_trial_rejected", bool(show_diag and np.any(door_attempt_rejected | door_trial_rejected)), (120, 120, 120), int(np.count_nonzero(door_attempt_rejected | door_trial_rejected)), "diagnostic rejected door orientation trial lines"),
+            self._overlay_record("voxel_door_centerline", bool(np.any(door_visual)), (0, 255, 70), int(np.count_nonzero(door_visual)), "topology accepted door partition centerline"),
+            self._overlay_record("voxel_door_visual_only", bool(show_diag and np.any(door_visual_only)), (120, 220, 140), int(np.count_nonzero(door_visual_only)), "diagnostic door visual line rejected by partition topology"),
+            self._overlay_record("voxel_door_partition_cut_candidate", bool(show_diag and np.any(door_partition_candidate)), (170, 220, 80), int(np.count_nonzero(door_partition_candidate)), "diagnostic door partition cut candidates"),
+            self._overlay_record("voxel_door_partition_cut_rejected", bool(show_diag and np.any(door_partition_rejected)), (255, 100, 50), int(np.count_nonzero(door_partition_rejected)), "diagnostic door partition cut rejected by topology"),
+            self._overlay_record("voxel_door_topology_warning_cut", bool(show_diag and np.any(door_topology_warning)), (255, 205, 70), int(np.count_nonzero(door_topology_warning)), "door partition cut accepted by geometry while topology no-gain is recorded as warning"),
+            self._overlay_record("voxel_stable_door_cut", bool(np.any(stable_door_cut)), (55, 235, 155), int(np.count_nonzero(stable_door_cut)), "stable door memory cut ORed into final partition"),
+            self._overlay_record("voxel_stable_door_visual", bool(show_diag and np.any(stable_door_visual)), (55, 210, 155), int(np.count_nonzero(stable_door_visual)), "stable door memory visual centerline"),
+            self._overlay_record("voxel_door_cut", bool(np.any(door_cut)), (80, 255, 80), int(np.count_nonzero(door_cut)), "final door partition cut including geometry-first and stable memory"),
+            self._overlay_record("voxel_step1_gap_fill", bool(np.any(step1)), (245, 215, 55), int(np.count_nonzero(step1)), "real-wall short gap fill before virtual separators"),
+            self._overlay_record("voxel_step2_extension", bool(np.any(step2)), (220, 60, 255), int(np.count_nonzero(step2)), "accepted Step2 wall-line extension separators"),
+            self._overlay_record("voxel_step2_source_line", bool(show_diag and "voxel_step2_source_line_count" in self._room_segmentation_debug), (160, 160, 170), int(self._room_segmentation_debug.get("voxel_step2_source_line_count", 0) or 0), "diagnostic Step2 source line pool after filtered+relaxed dedup"),
+            self._overlay_record("voxel_step2_extension_hits", bool(show_diag and np.any(step2_hits)), (160, 80, 255), int(np.count_nonzero(step2_hits)), "diagnostic all Step2 extension hit traces"),
+            self._overlay_record("voxel_step2_partition_cut_candidate", bool(show_diag and np.any(step2_partition_candidate)), (116, 76, 140), int(np.count_nonzero(step2_partition_candidate)), "diagnostic Step2 partition cut candidates"),
+            self._overlay_record("voxel_step2_topology_rejected", bool(show_diag and np.any(step2_topology_rejected)), (120, 80, 160), int(np.count_nonzero(step2_topology_rejected)), "diagnostic Step2 topology rejected separators"),
+            self._overlay_record("voxel_rejected_candidates", bool(show_diag and np.any(rejected)), (130, 112, 118), int(np.count_nonzero(rejected)), "diagnostic rejected door centerlines and Step2 extension candidates"),
+            self._overlay_record("voxel_frontier", bool(np.any(frontier)), (0, 235, 255), int(np.count_nonzero(frontier)), "frontier cells generated from voxel vertical free source"),
+            self._overlay_record("voxel_final_room_labels", bool(np.any(labels > 0)), (120, 150, 230), int(np.count_nonzero(labels > 0)), "final 4-connectivity voxel room labels"),
+        ]
+        return image, layers
+
+    def _render_height_profile_roomseg_panel(
+        self,
+        *,
+        occupancy: np.ndarray,
+        navigable: np.ndarray,
+        observed: np.ndarray,
+        size: Tuple[int, int],
+        crop_bounds: Tuple[int, int, int, int],
+    ) -> Tuple[Image.Image, List[dict]]:
+        width, height = size
+        shape = tuple(np.asarray(occupancy).shape[:2])
+        vertical_free = self._room_debug_array("height_profile_vertical_free_xy", shape, bool)
+        wall = self._room_debug_array("height_profile_wall_xy", shape, bool)
+        unknown = self._room_debug_array("height_profile_unknown_xy", shape, bool)
+        conflict = self._room_debug_array("height_profile_free_wall_conflict_xy", shape, bool)
+        line_wall = self._room_debug_array("height_profile_filtered_wall_line_mask", shape, bool)
+        door_seed = self._room_debug_array("height_profile_door_seed_mask", shape, bool)
+        door_cut = self._room_debug_array("height_profile_accepted_door_centerline_mask", shape, bool)
+        if not np.any(door_cut):
+            door_cut = self._room_debug_array("height_profile_door_cut_mask", shape, bool)
+        step1 = self._room_debug_array("height_profile_step1_wall_gap_fill_map", shape, bool)
+        step2 = self._room_debug_array("height_profile_step2_extension_separator_map", shape, bool)
+        rejected = self._room_debug_array("height_profile_rejected_door_centerline_mask", shape, bool) | self._room_debug_array("height_profile_step2_line_extensions_rejected", shape, bool)
+        labels = self._room_debug_array("height_profile_final_room_label_map", shape, np.int32)
+        frontier = self._room_debug_array("frontier_map", shape, bool)
+        if not np.any(frontier):
+            frontier = self._room_debug_array("height_profile_frontier", shape, bool)
+        if not np.any(frontier):
+            frontier = self._room_debug_array("height_profile_frontier_mask", shape, bool)
+
+        canvas = np.zeros((shape[0], shape[1], 3), dtype=np.uint8)
+        canvas[:, :] = (30, 32, 36)
+        canvas[unknown] = (26, 28, 34)
+        canvas[vertical_free] = (180, 216, 238)
+        palette = [
+            (120, 150, 230),
+            (90, 190, 160),
+            (232, 174, 82),
+            (218, 128, 155),
+            (166, 134, 226),
+            (96, 178, 222),
+        ]
+        for label in np.unique(labels):
+            if int(label) <= 0:
+                continue
+            mask = labels == int(label)
+            color = np.asarray(palette[(int(label) - 1) % len(palette)], dtype=np.float32)
+            base = canvas[mask].astype(np.float32)
+            canvas[mask] = np.clip(base * 0.72 + color * 0.28, 0, 255).astype(np.uint8)
+        canvas[conflict] = (255, 126, 45)
+        canvas[wall] = (238, 42, 42)
+        canvas[line_wall & ~wall] = (148, 20, 24)
+        canvas[step1] = (245, 215, 55)
+        canvas[rejected] = (130, 112, 118)
+        canvas[step2] = (40, 175, 255)
+        canvas[door_seed] = (150, 245, 255)
+        canvas[door_cut] = (255, 95, 220)
+        canvas[frontier] = (0, 235, 255)
+
+        r0, r1, c0, c1 = crop_bounds
+        crop = canvas[r0:r1, c0:c1]
+        crop_h, crop_w = crop.shape[:2]
+        label_h = 22
+        margin = 8
+        available_h = max(1, int(height) - label_h - margin)
+        scale = min((width - 2 * margin) / max(crop_w, 1), available_h / max(crop_h, 1))
+        map_w, map_h = max(1, int(crop_w * scale)), max(1, int(crop_h * scale))
+        ox = (width - map_w) // 2
+        oy = label_h + max(0, (available_h - map_h) // 2)
+        image = Image.new("RGB", (width, height), (15, 17, 21))
+        image.paste(Image.fromarray(crop).resize((map_w, map_h), Image.NEAREST), (ox, oy))
+        draw = ImageDraw.Draw(image)
+        ceiling = self._room_segmentation_debug.get("ceiling_height_estimate_m")
+        active_z = self._room_segmentation_debug.get("height_profile_active_z_max_m")
+
+        def fmt_m(value: object) -> str:
+            try:
+                if value is None:
+                    return "NA"
+                return "%.2f" % float(value)
+            except (TypeError, ValueError):
+                return "NA"
+
+        title_a = "height-profile vertical free | free=%d wall=%d unknown=%d" % (
+            int(np.count_nonzero(vertical_free)),
+            int(np.count_nonzero(wall)),
+            int(np.count_nonzero(unknown)),
+        )
+        title_b = "conflict=%d door=%d step2=%d ceiling=%s active_z=%s" % (
+            int(np.count_nonzero(conflict)),
+            int(np.count_nonzero(door_cut)),
+            int(np.count_nonzero(step2)),
+            fmt_m(ceiling),
+            fmt_m(active_z),
+        )
+        self._label(draw, (8, 5), title_a[:96], (255, 255, 255))
+        self._label(draw, (8, 18), title_b[:96], (255, 255, 255))
+        self._height_profile_legend(draw, (8, max(label_h + 4, height - 58)))
+        rooms = int(len([v for v in np.unique(labels) if int(v) > 0]))
+        strict_wall_count = int(np.count_nonzero(wall))
+        line_wall_count = int(np.count_nonzero(line_wall & ~wall))
+        layers = [
+            self._overlay_record(
+                "height_profile_vertical_panel",
+                True,
+                (180, 216, 238),
+                int(np.count_nonzero(vertical_free)),
+                "bottom-right height-profile vertical-free map panel",
+                vertical_free_cells=int(np.count_nonzero(vertical_free)),
+                strict_wall_cells=strict_wall_count,
+                unknown_cells=int(np.count_nonzero(unknown)),
+                conflict_cells=int(np.count_nonzero(conflict)),
+                door_seed_cells=int(np.count_nonzero(door_seed)),
+                door_cut_cells=int(np.count_nonzero(door_cut)),
+                step1_gap_fill_cells=int(np.count_nonzero(step1)),
+                step2_separator_cells=int(np.count_nonzero(step2)),
+                frontier_cells=int(np.count_nonzero(frontier)),
+                ceiling_height_estimate_m=None if ceiling is None else fmt_m(ceiling),
+                height_profile_active_z_max_m=None if active_z is None else fmt_m(active_z),
+                room_count=rooms,
+            ),
+            self._overlay_record("vertical_free", True, (180, 216, 238), int(np.count_nonzero(vertical_free)), "height-profile vertical free cells used by roomseg"),
+            self._overlay_record("height_profile_vertical_free", True, (180, 216, 238), int(np.count_nonzero(vertical_free)), "height-profile vertical free cells used by roomseg"),
+            self._overlay_record("height_profile_wall_red", True, (238, 42, 42), strict_wall_count, "strict known wall from 95 percent of active height bins"),
+            self._overlay_record("height_profile_wall", True, (238, 42, 42), strict_wall_count, "strict known wall from 95 percent of active height bins"),
+            self._overlay_record("height_profile_line_supported_wall", bool(np.any(line_wall)), (148, 20, 24), line_wall_count, "line-supported wall derived only from strict wall evidence"),
+            self._overlay_record("height_profile_conflict", bool(np.any(conflict)), (255, 126, 45), int(np.count_nonzero(conflict)), "xy cells with simultaneous vertical-free and strict-wall evidence"),
+            self._overlay_record("height_profile_unknown", True, (26, 28, 34), int(np.count_nonzero(unknown)), "height-profile unknown cells preserved as unknown"),
+            self._overlay_record("height_profile_door_seed", bool(np.any(door_seed)), (150, 245, 255), int(np.count_nonzero(door_seed)), "door seed cells from per-xy z-pattern detection"),
+            self._overlay_record("height_profile_door_centerline", bool(np.any(door_cut)), (255, 95, 220), int(np.count_nonzero(door_cut)), "door separators detected from vertical z-pattern and centerline projection"),
+            self._overlay_record("height_profile_step1_gap_fill", bool(np.any(step1)), (245, 215, 55), int(np.count_nonzero(step1)), "real-wall short gap fill before virtual separators"),
+            self._overlay_record("height_profile_step2_extension", bool(np.any(step2)), (40, 175, 255), int(np.count_nonzero(step2)), "Step2 wall-line extension separators"),
+            self._overlay_record("height_profile_rejected_candidates", bool(np.any(rejected)), (130, 112, 118), int(np.count_nonzero(rejected)), "rejected door centerlines and Step2 extension candidates"),
+            self._overlay_record("height_profile_frontier", bool(np.any(frontier)), (0, 235, 255), int(np.count_nonzero(frontier)), "frontier cells generated from vertical free source"),
+            self._overlay_record("height_profile_final_room_labels", bool(np.any(labels > 0)), (120, 150, 230), int(np.count_nonzero(labels > 0)), "final 4-connectivity height-profile room labels"),
+        ]
+        return image, layers
+
     def _room_debug_array(self, key: str, shape: Tuple[int, int], dtype) -> np.ndarray:
         raw = self._room_segmentation_debug.get(key)
         if raw is None:
@@ -1421,8 +2052,10 @@ class SGNavPopupVisualizer:
             "enabled": bool(enabled),
             "color": [int(color[0]), int(color[1]), int(color[2])],
             "primitive_count": int(count),
+            "count": int(count),
             "green_like": bool(_is_green_like(color)),
             "note": note,
+            "description": note,
         }
         item.update(extra)
         return item
@@ -1467,6 +2100,42 @@ class SGNavPopupVisualizer:
             ((255, 35, 35), "wall line / dashed extension"),
             ((255, 80, 130), "closed window"),
             ((80, 255, 130), "doorway portal"),
+        ]
+        for color, label in items:
+            self._dot(draw, (x + 5, y + 7), color, radius=4)
+            draw.text((x + 14, y), label, fill=(230, 232, 235), font=self._font)
+            y += 10
+
+    def _height_profile_legend(self, draw: ImageDraw.ImageDraw, xy: Tuple[int, int]) -> None:
+        x, y = xy
+        items = [
+            ((180, 216, 238), "vertical free"),
+            ((255, 126, 45), "free/wall conflict"),
+            ((238, 42, 42), "strict wall"),
+            ((148, 20, 24), "line wall"),
+            ((245, 215, 55), "step1 gap"),
+            ((40, 175, 255), "step2 extension"),
+            ((150, 245, 255), "door seed"),
+            ((255, 95, 220), "door centerline"),
+            ((130, 112, 118), "rejected"),
+            ((0, 235, 255), "frontier"),
+        ]
+        for color, label in items:
+            self._dot(draw, (x + 5, y + 7), color, radius=4)
+            draw.text((x + 14, y), label, fill=(230, 232, 235), font=self._font)
+            y += 10
+
+    def _voxel_roomseg_legend(self, draw: ImageDraw.ImageDraw, xy: Tuple[int, int]) -> None:
+        x, y = xy
+        items = [
+            ((170, 220, 245), "vertical free"),
+            ((255, 30, 30), "known wall"),
+            ((0, 80, 255), "door seed"),
+            ((0, 255, 70), "door extension"),
+            ((80, 255, 80), "door accepted cut"),
+            ((245, 215, 55), "step1 gap"),
+            ((220, 60, 255), "step2 accepted"),
+            ((0, 235, 255), "frontier"),
         ]
         for color, label in items:
             self._dot(draw, (x + 5, y + 7), color, radius=4)

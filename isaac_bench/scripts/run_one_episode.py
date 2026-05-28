@@ -31,6 +31,7 @@ from isaac_bench.mapping.coordinate_transform import MapInfo, grid_to_world_xy, 
 from isaac_bench.mapping.frontier import extract_frontiers, frontier_debug_layers
 from isaac_bench.mapping.frontier_room_context import assign_frontier_room_context
 from isaac_bench.mapping.frontier_debug import save_frontier_debug_snapshot
+from isaac_bench.mapping.height_column_profile import HeightColumnProfileConfig
 from isaac_bench.mapping.online_mapper import OnlineMapper
 from isaac_bench.mapping.room_map_from_rooms_json import build_room_index_map, load_rooms
 from isaac_bench.mapping.room_segmentation import (
@@ -40,8 +41,12 @@ from isaac_bench.mapping.room_segmentation import (
 )
 from isaac_bench.mapping.rose2_room_segmentation import OnlineROSE2RoomSegmenter
 from isaac_bench.mapping.online_roomseg import (
+    HEIGHT_PROFILE_DOOR_WALL_V8_BACKEND,
+    HEIGHT_PROFILE_DOOR_WALL_V8_CONTEXT,
     ONLINE_ROSE_STYLE_BACKEND,
     ONLINE_ROSE_STYLE_CONTEXT,
+    HeightProfileDoorWallRoomSegConfig,
+    HeightProfileDoorWallRoomSegmenter,
     OnlineRoseStyleConfig,
     OnlineRoseStyleRoomSegmenter,
 )
@@ -65,6 +70,13 @@ from isaac_bench.mapping.vertical_free_gap_closure_roomseg import (
     VERTICAL_FREE_GAP_CLOSURE_BACKEND,
     VERTICAL_FREE_GAP_CLOSURE_CONTEXT,
 )
+from isaac_bench.mapping.voxel_occupancy_door_wall_roomseg import (
+    VOXEL_OCCUPANCY_ROOMSEG_BACKEND,
+    VOXEL_OCCUPANCY_ROOMSEG_CONTEXT,
+    VoxelOccupancyDoorWallRoomSegConfig,
+    VoxelOccupancyDoorWallRoomSegmenter,
+)
+from isaac_bench.mapping.voxel_roomseg_evidence import build_voxel_roomseg_evidence
 from isaac_bench.graph.room_semantics import (
     DEFAULT_ROOM_CATEGORIES,
     VLMRoomLabeler,
@@ -91,6 +103,56 @@ from isaac_bench.sensors.camera_geometry import CameraIntrinsics
 from isaac_bench.sensors.depth_backproject import detections_to_3d
 from isaac_bench.visualization.draw_map import save_map_png
 from isaac_bench.visualization.sgnav_popup import SGNavPopupVisualizer
+
+
+@dataclass
+class FrontierRoomsegUpdateGateState:
+    initialized: bool = False
+    last_update_step: int = -1
+    last_update_reason: str | None = None
+    last_skip_reason: str | None = None
+
+
+def should_update_roomseg_frontiers(
+    *,
+    step: int,
+    has_current_path: bool,
+    gate_state: FrontierRoomsegUpdateGateState,
+    policy: str = "at_frontier_arrival",
+    freeze_during_navigation: bool = True,
+    target_reached: bool = False,
+    target_invalidated: bool = False,
+    no_progress: bool = False,
+    debug_force: bool = False,
+) -> tuple[bool, str]:
+    _ = step
+    normalized_policy = str(policy or "always").strip().lower()
+    if not bool(freeze_during_navigation) or normalized_policy in {"always", "every_replan", "legacy"}:
+        return True, "legacy_replan"
+    if bool(debug_force):
+        return True, "debug_force"
+    if not bool(gate_state.initialized):
+        return True, "initial"
+    if bool(target_reached):
+        return True, "target_reached"
+    if bool(target_invalidated):
+        return True, "target_invalidated"
+    if bool(no_progress):
+        return True, "no_progress"
+    if not bool(has_current_path):
+        return True, "no_active_path"
+    return False, "cached_during_navigation"
+
+
+def mark_roomseg_frontier_gate_update(gate_state: FrontierRoomsegUpdateGateState, *, step: int, reason: str) -> None:
+    gate_state.initialized = True
+    gate_state.last_update_step = int(step)
+    gate_state.last_update_reason = str(reason)
+    gate_state.last_skip_reason = None
+
+
+def mark_roomseg_frontier_gate_skip(gate_state: FrontierRoomsegUpdateGateState, *, reason: str) -> None:
+    gate_state.last_skip_reason = str(reason)
 
 
 def load_preprocessed_for_episode(episode: dict):
@@ -142,6 +204,7 @@ def _resolve_roomseg_depth_stride_px(room_segmentation_config: Mapping[str, obje
     if isinstance(top_level_depth, Mapping):
         candidate_blocks.append(top_level_depth)
     for section in (
+        "voxel_grid",
         "online_roomseg",
         "online_watershed_roomseg",
         "vertical_free_roomseg",
@@ -155,9 +218,123 @@ def _resolve_roomseg_depth_stride_px(room_segmentation_config: Mapping[str, obje
             candidate_blocks.append(depth_cfg)
     for block in candidate_blocks:
         parsed = _positive_int_or_none(block.get("roomseg_depth_stride_px"))
+        if parsed is None:
+            parsed = _positive_int_or_none(block.get("depth_stride_px"))
         if parsed is not None:
             strides.append(parsed)
     return min(strides)
+
+
+def resolve_frontier_source_layers(
+    *,
+    room_debug: Mapping[str, object] | None,
+    mapper: object | None,
+    navigation_free: np.ndarray,
+    navigation_observed: np.ndarray,
+    navigation_occupancy: np.ndarray,
+    frontier_traversible: np.ndarray,
+    source: str = "navigation",
+    require_navigation_reachable: bool = True,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict]:
+    nav_free = np.asarray(navigation_free, dtype=bool)
+    nav_observed = np.asarray(navigation_observed, dtype=bool)
+    nav_occupancy = np.asarray(navigation_occupancy, dtype=bool)
+    traversible = np.asarray(frontier_traversible, dtype=bool)
+    if nav_free.shape != nav_observed.shape or nav_free.shape != nav_occupancy.shape or nav_free.shape != traversible.shape:
+        raise ValueError("frontier source masks must share one HxW shape")
+    src = str(source or "navigation").strip().lower()
+    vertical_sources = {"vertical_free", "height_profile_vertical_free", "voxel_vertical_free"}
+    if src not in vertical_sources:
+        return nav_free & traversible, nav_observed, nav_occupancy, {
+            "frontier_source": "navigation",
+            "frontier_cells_from_navigation_free": int(np.count_nonzero(nav_free & traversible)),
+        }
+
+    debug = dict(room_debug or {})
+    vfree = None
+    vobserved = None
+    vwall = None
+    source_detail = "roomseg_debug"
+    if src in {"vertical_free", "voxel_vertical_free"}:
+        vfree = _debug_bool_array(debug, "voxel_vertical_free_xy", nav_free.shape)
+        vobserved = _debug_bool_array(debug, "voxel_vertical_observed_xy", nav_free.shape)
+        if vobserved is None:
+            vobserved = _debug_bool_array(debug, "voxel_active_observed_xy", nav_free.shape)
+        vwall = _debug_bool_array(debug, "voxel_wall_xy", nav_free.shape)
+        if vfree is not None and vobserved is not None and vwall is not None:
+            source_detail = "roomseg_debug_voxel"
+    if (vfree is None or vobserved is None or vwall is None) and src in {"vertical_free", "height_profile_vertical_free"}:
+        vfree = _debug_bool_array(debug, "height_profile_vertical_free_xy", nav_free.shape)
+        vobserved = _debug_bool_array(debug, "height_profile_vertical_observed_xy", nav_free.shape)
+        vwall = _debug_bool_array(debug, "height_profile_wall_xy", nav_free.shape)
+        if vfree is not None and vobserved is not None and vwall is not None:
+            source_detail = "roomseg_debug_height_profile"
+    if vfree is None or vobserved is None or vwall is None:
+        voxel_grid = getattr(mapper, "voxel_grid", None)
+        if src in {"vertical_free", "voxel_vertical_free"} and voxel_grid is not None:
+            try:
+                evidence = build_voxel_roomseg_evidence(
+                    voxel_grid=voxel_grid,
+                    navigation_free_mask=nav_free,
+                    navigation_obstacle_mask=nav_occupancy,
+                    unknown_mask_from_navigation=~nav_observed,
+                    resolution_m=float(getattr(getattr(mapper, "grid", None), "map_info", None).resolution_m),
+                    config=None,
+                )
+                vfree = np.asarray(evidence.vertical_free_xy, dtype=bool)
+                vobserved = np.asarray(evidence.active_observed_xy, dtype=bool)
+                vwall = np.asarray(evidence.wall_xy, dtype=bool)
+                source_detail = "mapper_voxel_grid"
+            except Exception:
+                vfree = vobserved = vwall = None
+    if vfree is None or vobserved is None or vwall is None:
+        height_profile = getattr(mapper, "height_profile", None)
+        if src in {"vertical_free", "height_profile_vertical_free"} and height_profile is not None:
+            hp_cfg = getattr(mapper, "height_profile_config", HeightColumnProfileConfig())
+            cls = height_profile.classify_columns(navigation_free_mask=nav_free, cfg=hp_cfg)
+            vfree = np.asarray(cls.vertical_free_xy, dtype=bool)
+            vobserved = np.asarray(cls.observed_z_bin_count_xy > 0, dtype=bool)
+            vwall = np.asarray(cls.wall_xy, dtype=bool)
+            source_detail = "mapper_height_profile"
+    if vfree is None or vobserved is None or vwall is None:
+        fallback = nav_free & traversible
+        return fallback, nav_observed, nav_occupancy, {
+            "frontier_source": "navigation",
+            "frontier_source_requested": src,
+            "frontier_source_fallback_reason": "%s_unavailable" % src,
+            "frontier_cells_from_navigation_free": int(np.count_nonzero(fallback)),
+        }
+    vertical_cells = int(np.count_nonzero(vfree))
+    frontier_free = np.asarray(vfree, dtype=bool)
+    removed = int(np.count_nonzero(frontier_free & ~traversible)) if bool(require_navigation_reachable) else 0
+    if bool(require_navigation_reachable):
+        frontier_free = frontier_free & traversible
+    source_name = "voxel_vertical_free" if source_detail in {"roomseg_debug_voxel", "mapper_voxel_grid"} or src == "voxel_vertical_free" else "vertical_free"
+    if source_name == "voxel_vertical_free":
+        frontier_observed = np.asarray(vobserved, dtype=bool) | np.asarray(vfree, dtype=bool) | np.asarray(vwall, dtype=bool)
+    else:
+        frontier_observed = np.asarray(vobserved, dtype=bool)
+    return frontier_free.astype(bool), frontier_observed.astype(bool), np.asarray(vwall, dtype=bool), {
+        "frontier_source": source_name,
+        "frontier_source_requested": src,
+        "frontier_source_detail": source_detail,
+        "frontier_vertical_free_cells": vertical_cells,
+        "frontier_vertical_observed_cells": int(np.count_nonzero(frontier_observed)),
+        "frontier_vertical_wall_cells": int(np.count_nonzero(vwall)),
+        "frontier_cells_from_vertical_free": int(np.count_nonzero(frontier_free)),
+        "frontier_cells_removed_by_navigation_unreachable": int(removed),
+        "frontier_vertical_free_require_navigation_reachable": bool(require_navigation_reachable),
+    }
+
+
+def _debug_bool_array(debug: Mapping[str, object], key: str, shape: tuple[int, int]) -> np.ndarray | None:
+    value = debug.get(key)
+    if value is None:
+        return None
+    arr = np.asarray(value, dtype=bool)
+    if arr.shape != shape:
+        return None
+    return arr
 
 
 def _roomseg_debug_for_layer_dump(room_debug: Mapping[str, object], room_segmenter: object | None) -> dict:
@@ -182,6 +359,15 @@ def _roomseg_debug_for_layer_dump(room_debug: Mapping[str, object], room_segment
             "pass2_line_extension_completion": "pass2_line_extension_completion",
             "wall_target_after_line_extension": "wall_target_after_line_extension",
             "completed_wall_after_line_extension": "completed_wall_after_line_extension",
+            "height_profile_vertical_free_xy": "height_profile_vertical_free_xy",
+            "height_profile_wall_xy": "height_profile_wall_xy",
+            "height_profile_unknown_xy": "height_profile_unknown_xy",
+            "height_profile_door_seed_mask": "height_profile_door_seed_mask",
+            "height_profile_door_cut_mask": "height_profile_door_cut_mask",
+            "height_profile_step1_wall_gap_fill_map": "height_profile_step1_wall_gap_fill_map",
+            "height_profile_step2_extension_separator_map": "height_profile_step2_extension_separator_map",
+            "height_profile_final_room_label_map": "height_profile_final_room_label_map",
+            "height_profile_boundary_source_map": "height_profile_boundary_source_map",
             "vertical_free_clipped_outside_navigation_map": "vertical_free_clipped_outside_navigation_map",
             "free_wall_conflict_map_before_sanitize": "free_wall_conflict_map_before_sanitize",
             "roomseg_sanitized_free": "roomseg_sanitized_free",
@@ -1256,6 +1442,10 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
         lookahead_m=float(args.lookahead_m),
     )
     vertical_or_free_cfg = dict(getattr(args, "room_segmentation_config", {}).get("vertical_or_free", {}) or {})
+    height_profile_cfg = dict(getattr(args, "room_segmentation_config", {}).get("height_profile", {}) or {})
+    voxel_grid_cfg = dict(getattr(args, "room_segmentation_config", {}).get("voxel_grid", {}) or {})
+    voxel_nav_cfg = dict(getattr(args, "room_segmentation_config", {}).get("voxel_navigation_projection", {}) or {})
+    voxel_blind_zone_cfg = dict(getattr(args, "room_segmentation_config", {}).get("voxel_navigation_blind_zone", {}) or {})
     roomseg_depth_stride_px = _resolve_roomseg_depth_stride_px(
         getattr(args, "room_segmentation_config", {}),
         int(args.depth_stride_px),
@@ -1282,6 +1472,24 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
         free_splat_point_threshold=int(args.free_splat_point_threshold),
         robot_radius_m=float(args.robot_radius_m),
         inflation_radius_m=float(args.online_inflation_radius_m),
+        height_profile_enabled=bool(height_profile_cfg.get("enabled", True)),
+        height_profile_z_min_m=float(height_profile_cfg.get("z_min_m", 0.10)),
+        height_profile_z_max_m=float(height_profile_cfg.get("z_max_m", height_profile_cfg.get("storage_z_max_m", 3.20))),
+        height_profile_storage_z_max_m=float(height_profile_cfg.get("storage_z_max_m", height_profile_cfg.get("z_max_m", 3.20))),
+        height_profile_active_z_max_fallback_m=float(height_profile_cfg.get("active_z_max_fallback_m", 2.00)),
+        height_profile_active_z_max_ceiling_ratio=float(height_profile_cfg.get("active_z_max_ceiling_ratio", 0.90)),
+        height_profile_z_bin_size_m=float(height_profile_cfg.get("z_bin_size_m", 0.05)),
+        ceiling_height_estimator_config=dict(height_profile_cfg.get("ceiling_estimator", {}) or {}),
+        voxel_grid_enabled=bool(voxel_grid_cfg.get("enabled", True)),
+        voxel_grid_z_min_m=float(voxel_grid_cfg.get("z_min_m", 0.00)),
+        voxel_grid_z_max_m=float(voxel_grid_cfg.get("z_max_m", 3.20)),
+        voxel_grid_z_resolution_m=float(voxel_grid_cfg.get("z_resolution_m", 0.05)),
+        voxel_grid_active_z_min_m=float(voxel_grid_cfg.get("active_z_min_m", 0.10)),
+        voxel_grid_active_z_max_fallback_m=float(voxel_grid_cfg.get("active_z_max_fallback_m", 2.00)),
+        voxel_grid_active_z_max_ceiling_ratio=float(voxel_grid_cfg.get("active_z_max_ceiling_ratio", 0.90)),
+        voxel_grid_config=voxel_grid_cfg,
+        voxel_navigation_projection_config=voxel_nav_cfg,
+        voxel_navigation_blind_zone_config=voxel_blind_zone_cfg,
     )
     static_goal_cells = [(int(r), int(c)) for r, c in episode["goal_regions_grid"]]
     start_pose = tuple(float(v) for v in episode["start_pose_world"])
@@ -1399,6 +1607,76 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
             map_info=dynamic_map_info,
         )
         room_segmenter = OnlineROSE2RoomSegmenter(room_cfg)
+        room_label_client = (
+            getattr(scenegraph, "paper_llm_client", None)
+            if str(getattr(args, "room_label_backend", "vlm")).strip().lower() == "vlm"
+            else None
+        )
+        room_labeler = VLMRoomLabeler(
+            client=room_label_client,
+            allowed_categories=getattr(args, "room_label_allowed_categories", DEFAULT_ROOM_CATEGORIES),
+            min_confidence=float(getattr(args, "room_label_min_confidence", 0.60)),
+            ambiguity_margin=float(getattr(args, "room_label_ambiguity_margin", 0.15)),
+            min_reliable_objects=int(getattr(args, "room_label_min_reliable_objects", 2)),
+            unknown_category=str(getattr(args, "room_label_unknown_category", "unknown")),
+            require_backend=bool(getattr(args, "strict_benchmark", False))
+            and str(getattr(args, "room_label_backend", "vlm")).strip().lower() == "vlm",
+            max_room_objects_in_prompt=int(getattr(args, "max_room_objects_in_prompt", 25)),
+        )
+        last_room_semantics_debug["backend"] = room_labeler.backend
+    elif room_map_mode in {
+        VOXEL_OCCUPANCY_ROOMSEG_BACKEND,
+        VOXEL_OCCUPANCY_ROOMSEG_CONTEXT,
+        "voxel_occupancy_door_wall",
+        "voxel_occupancy_door_wall_vlm",
+    }:
+        roomseg_backend = str(
+            getattr(args, "room_segmentation_config", {}).get("backend", VOXEL_OCCUPANCY_ROOMSEG_BACKEND)
+            or VOXEL_OCCUPANCY_ROOMSEG_BACKEND
+        ).strip().lower()
+        if roomseg_backend != VOXEL_OCCUPANCY_ROOMSEG_BACKEND:
+            raise ValueError("voxel_occupancy_door_wall_v9 room_map_mode requires --roomseg-backend %s" % VOXEL_OCCUPANCY_ROOMSEG_BACKEND)
+        voxel_cfg = VoxelOccupancyDoorWallRoomSegConfig.from_mapping(
+            getattr(args, "room_segmentation_config", {}),
+            resolution_m=float(dynamic_map_info.resolution_m),
+            map_info=dynamic_map_info,
+        )
+        room_segmenter = VoxelOccupancyDoorWallRoomSegmenter(voxel_cfg, map_info=dynamic_map_info)
+        room_label_client = (
+            getattr(scenegraph, "paper_llm_client", None)
+            if str(getattr(args, "room_label_backend", "vlm")).strip().lower() == "vlm"
+            else None
+        )
+        room_labeler = VLMRoomLabeler(
+            client=room_label_client,
+            allowed_categories=getattr(args, "room_label_allowed_categories", DEFAULT_ROOM_CATEGORIES),
+            min_confidence=float(getattr(args, "room_label_min_confidence", 0.60)),
+            ambiguity_margin=float(getattr(args, "room_label_ambiguity_margin", 0.15)),
+            min_reliable_objects=int(getattr(args, "room_label_min_reliable_objects", 2)),
+            unknown_category=str(getattr(args, "room_label_unknown_category", "unknown")),
+            require_backend=bool(getattr(args, "strict_benchmark", False))
+            and str(getattr(args, "room_label_backend", "vlm")).strip().lower() == "vlm",
+            max_room_objects_in_prompt=int(getattr(args, "max_room_objects_in_prompt", 25)),
+        )
+        last_room_semantics_debug["backend"] = room_labeler.backend
+    elif room_map_mode in {
+        HEIGHT_PROFILE_DOOR_WALL_V8_BACKEND,
+        HEIGHT_PROFILE_DOOR_WALL_V8_CONTEXT,
+        "height_profile_door_wall",
+        "height_profile_door_wall_vlm",
+    }:
+        roomseg_backend = str(
+            getattr(args, "room_segmentation_config", {}).get("backend", HEIGHT_PROFILE_DOOR_WALL_V8_BACKEND)
+            or HEIGHT_PROFILE_DOOR_WALL_V8_BACKEND
+        ).strip().lower()
+        if roomseg_backend != HEIGHT_PROFILE_DOOR_WALL_V8_BACKEND:
+            raise ValueError("height_profile_door_wall_v8 room_map_mode requires --roomseg-backend %s" % HEIGHT_PROFILE_DOOR_WALL_V8_BACKEND)
+        hp_cfg = HeightProfileDoorWallRoomSegConfig.from_mapping(
+            getattr(args, "room_segmentation_config", {}),
+            resolution_m=float(dynamic_map_info.resolution_m),
+            map_info=dynamic_map_info,
+        )
+        room_segmenter = HeightProfileDoorWallRoomSegmenter(hp_cfg, map_info=dynamic_map_info)
         room_label_client = (
             getattr(scenegraph, "paper_llm_client", None)
             if str(getattr(args, "room_label_backend", "vlm")).strip().lower() == "vlm"
@@ -1565,6 +1843,7 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
     detection_category_counts = Counter()
     goal_detection_history = []
     last_frontiers = []
+    roomseg_frontier_update_gate = FrontierRoomsegUpdateGateState()
     last_nav_decision = None
     last_frontier_commitment_metadata = {}
     last_frontier_commitment_reason = ""
@@ -2200,6 +2479,12 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
             vertical_profile = getattr(mapper, "vertical_profile", None)
             if vertical_profile is not None:
                 update_kwargs["vertical_profile"] = vertical_profile
+            height_profile = getattr(mapper, "height_profile", None)
+            if height_profile is not None:
+                update_kwargs["height_profile"] = height_profile
+            voxel_grid = getattr(mapper, "voxel_grid", None)
+            if voxel_grid is not None:
+                update_kwargs["voxel_grid"] = voxel_grid
             roomseg_static_structural = getattr(mapper, "roomseg_static_structural_occupied", None)
             if roomseg_static_structural is not None:
                 update_kwargs["roomseg_static_structural_occupied"] = roomseg_static_structural
@@ -2216,6 +2501,8 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
                 )
             except TypeError:
                 update_kwargs.pop("vertical_profile", None)
+                update_kwargs.pop("height_profile", None)
+                update_kwargs.pop("voxel_grid", None)
                 update_kwargs.pop("roomseg_static_structural_occupied", None)
                 update_kwargs.pop("roomseg_ray_evidence", None)
                 masks = room_segmenter.update(
@@ -2498,13 +2785,71 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
                     current_path = suffix
                 else:
                     needs_replan = True
+            update_roomseg_frontiers, roomseg_frontier_update_reason = should_update_roomseg_frontiers(
+                step=int(step),
+                has_current_path=bool(current_path),
+                gate_state=roomseg_frontier_update_gate,
+                policy=str(getattr(args, "roomseg_frontier_update_policy", "at_frontier_arrival")),
+                freeze_during_navigation=bool(getattr(args, "freeze_roomseg_and_frontiers_during_navigation", True)),
+                target_invalidated=bool(needs_replan and not current_path and roomseg_frontier_update_gate.initialized),
+                debug_force=bool(getattr(args, "force_roomseg_frontier_update", False)),
+            )
+            if needs_replan and not update_roomseg_frontiers and current_path:
+                needs_replan = False
+                mark_roomseg_frontier_gate_skip(roomseg_frontier_update_gate, reason=roomseg_frontier_update_reason)
+                last_room_segmentation_debug = {
+                    **dict(last_room_segmentation_debug),
+                    "roomseg_frontier_update_due": False,
+                    "roomseg_frontier_update_reason": roomseg_frontier_update_reason,
+                    "roomseg_frontier_update_policy": str(getattr(args, "roomseg_frontier_update_policy", "at_frontier_arrival")),
+                    "roomseg_frontier_last_update_step": int(roomseg_frontier_update_gate.last_update_step),
+                    "roomseg_frontier_last_update_reason": roomseg_frontier_update_gate.last_update_reason,
+                    "frontiers_frozen_during_navigation": True,
+                }
 
             if needs_replan:
+                mark_roomseg_frontier_gate_update(roomseg_frontier_update_gate, step=int(step), reason=roomseg_frontier_update_reason)
                 planning_started_at = time.perf_counter()
                 llm_requests_before = total_llm_requests()
                 astar_traversible = np.asarray(map_state.get("astar_navigable", navigable), dtype=bool)
                 frontier_traversible = navigable.astype(bool)
-                frontier_free = free.astype(bool) & frontier_traversible
+                room_context_result = None
+                roomseg_context_needed = (
+                    room_segmenter is not None
+                    and (
+                        str(getattr(args, "frontier_source", "navigation")).strip().lower()
+                        in {"vertical_free", "height_profile_vertical_free", "voxel_vertical_free"}
+                        or bool(getattr(args, "save_roomseg_snapshots", False))
+                        or bool(getattr(args, "debug_roomseg_layers", False))
+                        or viz is not None
+                    )
+                    and (
+                        not paper_mode
+                        or str(getattr(args, "frontier_selection_mode", "sgnav")).strip().lower() in {"nearest", "random"}
+                    )
+                )
+                if roomseg_context_needed:
+                    room_context_result = update_room_context_for_frontier_scoring(step, map_state)
+                frontier_free, frontier_observed, frontier_occupancy, frontier_source_metadata = resolve_frontier_source_layers(
+                    room_debug=last_room_segmentation_debug,
+                    mapper=mapper,
+                    navigation_free=free,
+                    navigation_observed=observed,
+                    navigation_occupancy=occupancy,
+                    frontier_traversible=frontier_traversible,
+                    source=str(getattr(args, "frontier_source", "navigation")),
+                    require_navigation_reachable=bool(getattr(args, "frontier_vertical_free_require_navigation_reachable", True)),
+                )
+                last_room_segmentation_debug = {
+                    **dict(last_room_segmentation_debug),
+                    **dict(frontier_source_metadata),
+                    "roomseg_frontier_update_due": True,
+                    "roomseg_frontier_update_reason": roomseg_frontier_update_reason,
+                    "roomseg_frontier_update_policy": str(getattr(args, "roomseg_frontier_update_policy", "at_frontier_arrival")),
+                    "roomseg_frontier_last_update_step": int(roomseg_frontier_update_gate.last_update_step),
+                    "roomseg_frontier_last_update_reason": roomseg_frontier_update_gate.last_update_reason,
+                    "frontiers_frozen_during_navigation": False,
+                }
                 distance_traversible = frontier_traversible.copy()
                 rr, cc = int(current_grid[0]), int(current_grid[1])
                 if 0 <= rr < distance_traversible.shape[0] and 0 <= cc < distance_traversible.shape[1]:
@@ -2517,15 +2862,15 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
                     static_only_nearfield = None
                 frontier_layers = frontier_debug_layers(
                     frontier_free,
-                    observed=observed,
-                    occupancy=occupancy,
+                    observed=frontier_observed,
+                    occupancy=frontier_occupancy,
                     obstacle_dilation_radius_cells=int(args.frontier_obstacle_dilation_radius_cells),
                     unknown_dilation_radius_cells=int(args.frontier_unknown_dilation_radius_cells),
                     exclude_mask=static_only_nearfield,
-                    unknown_source=str(args.frontier_unknown_source),
+                    unknown_source="observed" if str(frontier_source_metadata.get("frontier_source")) in {"vertical_free", "voxel_vertical_free"} else str(args.frontier_unknown_source),
                 )
                 if bool(getattr(args, "frontier_debug_dump", False)):
-                    assert frontier_free.shape == observed.shape == occupancy.shape == distance_traversible.shape
+                    assert frontier_free.shape == frontier_observed.shape == frontier_occupancy.shape == distance_traversible.shape
                     assert int(np.count_nonzero(frontier_layers["frontier"] & ~frontier_free)) == 0
                 frontiers = list(last_frontiers)
                 locked_goal_used = False
@@ -2561,25 +2906,24 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
                     last_frontier_raw_cells = int(np.count_nonzero(frontier_layers["frontier"]))
                     frontiers = extract_frontiers(
                         free=frontier_free,
-                        observed=observed,
+                        observed=frontier_observed,
                         traversible=distance_traversible,
                         map_info=dynamic_map_info,
                         agent_grid=current_grid,
                         min_cluster_size=int(args.frontier_min_cluster_size),
                         min_distance_m=float(args.frontier_min_distance_m),
                         max_count=int(args.frontier_max_count),
-                        occupancy=occupancy,
+                        occupancy=frontier_occupancy,
                         obstacle_dilation_radius_cells=int(args.frontier_obstacle_dilation_radius_cells),
                         unknown_dilation_radius_cells=int(args.frontier_unknown_dilation_radius_cells),
                         exclude_mask=static_only_nearfield,
-                        unknown_source=str(args.frontier_unknown_source),
+                        unknown_source="observed" if str(frontier_source_metadata.get("frontier_source")) in {"vertical_free", "voxel_vertical_free"} else str(args.frontier_unknown_source),
                         cluster_distance_mode=str(args.frontier_cluster_distance_mode),
                         allow_near_frontier_fallback=bool(args.frontier_allow_near_fallback),
                         require_reachable=not bool(frontier_mask_probe or explore_until_no_frontiers),
                     )
                     last_frontier_clusters = len(frontiers)
                     last_frontiers = list(frontiers)
-                    room_context_result = None
                     candidate_preview = None
                     if paper_mode and frontiers and candidate_override is None and not frontier_mask_probe:
                         candidate_preview = decision_policy.select_goal_candidate(
@@ -2588,7 +2932,7 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
                             pose,
                             current_step=step,
                         )
-                        if bool(args.score_frontiers_before_candidate) or candidate_preview is None:
+                        if room_context_result is None and (bool(args.score_frontiers_before_candidate) or candidate_preview is None):
                             room_context_result = update_room_context_for_frontier_scoring(step, map_state)
                             update_scenegraph_frame(obs, step, map_state)
                     nav_decision = candidate_override or decision_policy.choose_navigation_target(
@@ -2602,6 +2946,10 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
                         allow_frontier=True,
                         current_step=step,
                     )
+                    nav_decision.metadata = {
+                        **dict(nav_decision.metadata or {}),
+                        **dict(frontier_source_metadata),
+                    }
                     if nav_decision.mode == "none" and nav_decision.reason == "no_frontiers" and last_frontier_raw_cells > 0:
                         nav_decision.reason = "no_selectable_frontiers"
                         nav_decision.metadata = {
@@ -3842,6 +4190,13 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--frontier-obstacle-dilation-radius-cells", type=int, default=None)
     parser.add_argument("--frontier-unknown-dilation-radius-cells", type=int, default=None)
     parser.add_argument("--frontier-unknown-source", "--frontier_unknown_source", default=None, choices=["observed", "implicit"])
+    parser.add_argument("--frontier-source", "--frontier_source", default=None, choices=["navigation", "vertical_free", "height_profile_vertical_free", "voxel_vertical_free"])
+    parser.add_argument(
+        "--frontier-vertical-free-require-navigation-reachable",
+        "--frontier_vertical_free_require_navigation_reachable",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
     parser.add_argument(
         "--frontier-cluster-distance-mode",
         "--frontier_cluster_distance_mode",
@@ -3907,6 +4262,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             VERTICAL_FREE_ROOMSEG_BACKEND,
             VERTICAL_FREE_ROOMSEG_ALGORITHM,
             VERTICAL_FREE_GAP_CLOSURE_BACKEND,
+            HEIGHT_PROFILE_DOOR_WALL_V8_BACKEND,
+            VOXEL_OCCUPANCY_ROOMSEG_BACKEND,
         ],
     )
     parser.add_argument("--debug-rose2-source", action=argparse.BooleanOptionalAction, default=None)
@@ -4219,7 +4576,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     args.camera_forward_offset_m = float(args.camera_forward_offset_m if args.camera_forward_offset_m is not None else get_nested(cfg, "camera.forward_offset_m", 0.0))
     args.camera_pitch_deg = float(args.camera_pitch_deg if args.camera_pitch_deg is not None else get_nested(cfg, "camera.pitch_deg", 0.0))
     args.camera_near_m = float(args.camera_near_m if args.camera_near_m is not None else get_nested(cfg, "camera.near_m", 0.02))
-    args.camera_far_m = float(args.camera_far_m if args.camera_far_m is not None else get_nested(cfg, "camera.far_m", 5.0))
+    args.camera_far_m = float(args.camera_far_m if args.camera_far_m is not None else get_nested(cfg, "camera.far_m", 10.0))
     args.camera_annotator_device = str(args.camera_annotator_device or get_nested(cfg, "isaac.camera_annotator_device", "cuda")).strip().lower()
     args.read_depth = bool(args.read_depth if args.read_depth is not None else get_nested(cfg, "isaac.read_depth", False))
     args.nearfield_depth = bool(args.nearfield_depth if args.nearfield_depth is not None else get_nested(cfg, "nearfield_depth.enabled", False))
@@ -4282,6 +4639,14 @@ def main(argv: Optional[List[str]] = None) -> int:
     args.frontier_unknown_source = str(args.frontier_unknown_source or get_nested(cfg, "mapping.frontier_unknown_source", "observed"))
     if args.frontier_unknown_source not in {"observed", "implicit"}:
         raise ValueError("mapping.frontier_unknown_source must be 'observed' or 'implicit'")
+    args.frontier_source = str(args.frontier_source or get_nested(cfg, "mapping.frontier_source", "navigation")).strip().lower()
+    if args.frontier_source not in {"navigation", "vertical_free", "height_profile_vertical_free", "voxel_vertical_free"}:
+        raise ValueError("mapping.frontier_source must be 'navigation', 'vertical_free', 'height_profile_vertical_free', or 'voxel_vertical_free'")
+    args.frontier_vertical_free_require_navigation_reachable = bool(
+        args.frontier_vertical_free_require_navigation_reachable
+        if args.frontier_vertical_free_require_navigation_reachable is not None
+        else get_nested(cfg, "mapping.frontier_vertical_free_require_navigation_reachable", True)
+    )
     args.frontier_cluster_distance_mode = str(
         args.frontier_cluster_distance_mode or get_nested(cfg, "mapping.frontier_cluster_distance_mode", "mean")
     )
@@ -4358,6 +4723,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     roomseg_debug_layers_cfg = dict(args.room_segmentation_config.get("debug_layers", {}) or {})
     roomseg_overlay_cfg = dict(args.room_segmentation_config.get("navigation_free_context_overlay", {}) or {})
     roomseg_frontier_context_cfg = dict(args.room_segmentation_config.get("frontier_room_context", {}) or {})
+    roomseg_frontier_update_cfg = dict(args.room_segmentation_config.get("frontier_update_gate", {}) or {})
     roomseg_wall_gating_fix_cfg = dict(args.room_segmentation_config.get("wall_gating_fix", {}) or {})
     roomseg_online_cfg = dict(args.room_segmentation_config.get("online_roomseg", {}) or {})
     roomseg_watershed_cfg = dict(args.room_segmentation_config.get("online_watershed_roomseg", {}) or {})
@@ -4409,6 +4775,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     args.room_segmentation_config["debug_layers"] = roomseg_debug_layers_cfg
     args.room_segmentation_config["navigation_free_context_overlay"] = roomseg_overlay_cfg
     args.room_segmentation_config["frontier_room_context"] = roomseg_frontier_context_cfg
+    args.room_segmentation_config["frontier_update_gate"] = roomseg_frontier_update_cfg
     args.room_segmentation_config["wall_gating_fix"] = roomseg_wall_gating_fix_cfg
     args.room_segmentation_config["online_roomseg"] = roomseg_online_cfg
     args.room_segmentation_config["online_watershed_roomseg"] = roomseg_watershed_cfg
@@ -4419,7 +4786,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     args.roomseg_snapshot_dir = str(args.roomseg_snapshot_dir or "result/roomseg_snapshots")
     args.roomseg_snapshot_max_saves = int(args.roomseg_snapshot_max_saves if args.roomseg_snapshot_max_saves is not None else 500)
     if args.debug_roomseg_layers:
-        for nested_key in ("vertical_free_roomseg", "vertical_free_gap_closure", "online_roomseg", "online_watershed_roomseg"):
+        for nested_key in ("vertical_free_roomseg", "vertical_free_gap_closure", "online_roomseg", "online_watershed_roomseg", "height_profile_door_wall", "voxel_occupancy_door_wall"):
             nested_cfg = dict(args.room_segmentation_config.get(nested_key, {}) or {})
             nested_cfg["debug_dump"] = True
             nested_cfg.setdefault("debug_dir", args.debug_roomseg_dir)
@@ -4441,6 +4808,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     args.roomseg_finalization_mode = str(args.room_segmentation_config.get("finalization_mode", "no_merge_until_source_backend_verified"))
     args.roomseg_nav_free_overlay = bool(roomseg_overlay_cfg.get("enabled", False))
     args.frontier_room_known_free_side = bool(roomseg_frontier_context_cfg.get("enabled", True) and roomseg_frontier_context_cfg.get("use_known_free_side", True))
+    args.roomseg_frontier_update_policy = str(roomseg_frontier_update_cfg.get("policy", "at_frontier_arrival"))
+    args.freeze_roomseg_and_frontiers_during_navigation = bool(roomseg_frontier_update_cfg.get("freeze_during_navigation", True))
+    args.force_roomseg_frontier_update = bool(roomseg_frontier_update_cfg.get("debug_force_update", False))
     room_semantics_cfg = dict(get_nested(cfg, "room_semantics", {}) or {})
     for key in (
         "use_premerge_labels_for_open_plan_merge",
@@ -4656,7 +5026,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         debug_layers_cfg.setdefault("output_dir", str(getattr(args, "debug_roomseg_dir", "debug/roomseg_layers")))
         args.room_segmentation_config["debug_layers"] = debug_layers_cfg
         args.debug_roomseg_dir = str(debug_layers_cfg.get("output_dir", getattr(args, "debug_roomseg_dir", "debug/roomseg_layers")))
-        for nested_key in ("vertical_free_roomseg", "vertical_free_gap_closure", "online_roomseg", "online_watershed_roomseg"):
+        for nested_key in ("vertical_free_roomseg", "vertical_free_gap_closure", "online_roomseg", "online_watershed_roomseg", "height_profile_door_wall", "voxel_occupancy_door_wall"):
             nested_cfg = dict(args.room_segmentation_config.get(nested_key, {}) or {})
             nested_cfg["debug_dump"] = True
             nested_cfg.setdefault("debug_dir", args.debug_roomseg_dir)

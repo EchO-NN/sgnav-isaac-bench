@@ -31,7 +31,7 @@ def detection_to_world_points(
     intr: CameraIntrinsics,
     camera_pose_world: Tuple[float, float, float, float],
     depth_min_m: float = 0.05,
-    depth_max_m: float = 6.0,
+    depth_max_m: float = 5.0,
     min_points: int = 20,
     stride: int = 4,
 ) -> Optional[np.ndarray]:
@@ -76,7 +76,7 @@ def detections_to_3d(
     depth: np.ndarray,
     intr: CameraIntrinsics,
     camera_pose_world: Tuple[float, float, float, float],
-    depth_max_m: float = 6.0,
+    depth_max_m: float = 5.0,
     min_points: int = 20,
 ) -> List[Detection3D]:
     out: List[Detection3D] = []

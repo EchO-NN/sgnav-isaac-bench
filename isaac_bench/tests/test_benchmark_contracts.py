@@ -198,10 +198,11 @@ def test_config_defaults_match_benchmark_contract():
     assert cfg["nearfield_static_map"]["enabled"] is False
     assert cfg["mapping"]["frontier_allow_near_fallback"] is False
     assert cfg["mapping"]["frontier_min_distance_m"] == 1.0
-    assert cfg["mapping"]["room_map_mode"] == "vertical_free_gap_closure_v1_vlm"
+    assert cfg["mapping"]["room_map_mode"] == "voxel_occupancy_door_wall_v9_vlm"
     assert cfg["mapping"]["strict_no_oracle_rooms"] is True
-    assert cfg["mapping"]["room_segmentation"]["algorithm"] == "vertical_free_gap_closure_v1"
-    assert cfg["mapping"]["room_segmentation"]["backend"] == "vertical_free_gap_closure_v1"
+    assert cfg["mapping"]["room_segmentation"]["algorithm"] == "voxel_occupancy_door_wall_v9"
+    assert cfg["mapping"]["room_segmentation"]["backend"] == "voxel_occupancy_door_wall_v9"
+    assert cfg["mapping"]["frontier_source"] == "voxel_vertical_free"
     assert cfg["mapping"]["room_segmentation"]["source_mode"] == "declutter_reconstruct_external"
     assert cfg["mapping"]["room_segmentation"]["legacy_watershed_allowed"] == "debug_only"
     assert cfg["mapping"]["room_segmentation"]["local_rose2_lite_allowed"] == "debug_only"
@@ -222,6 +223,10 @@ def test_config_defaults_match_benchmark_contract():
     assert cfg["mapping"]["room_segmentation"]["vertical_free_gap_closure"]["enabled"] is True
     assert cfg["mapping"]["room_segmentation"]["vertical_free_gap_closure"]["close_max_gap_m"] == 1.50
     assert cfg["mapping"]["room_segmentation"]["vertical_free_gap_closure"]["topology_verify_enabled"] is True
+    assert cfg["mapping"]["room_segmentation"]["height_profile"]["z_bin_size_m"] == 0.05
+    assert cfg["mapping"]["room_segmentation"]["height_profile"]["min_free_z_bins_for_xy_free"] == 3
+    assert cfg["mapping"]["room_segmentation"]["height_profile_door"]["top_occupied_min_z_m"] == 1.80
+    assert cfg["mapping"]["room_segmentation"]["height_profile_step2"]["max_extension_m"] == 1.60
     assert cfg["mapping"]["room_segmentation"]["wall_confidence_threshold"] == 0.55
     assert cfg["mapping"]["room_segmentation"]["vertical_free_suppression_weight"] == 0.35
     assert cfg["mapping"]["room_segmentation"]["furniture_suppression_radius_m"] == 0.90

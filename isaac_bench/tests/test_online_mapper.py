@@ -18,6 +18,7 @@ def test_online_mapper_ray_casts_depth_obstacle_and_floor_free_cells():
         free_max_height_m=0.1,
         splat_point_threshold=1,
         robot_radius_m=0.1,
+        voxel_grid_enabled=False,
     )
     mapper.reset((0.0, 0.0))
     intr = CameraIntrinsics(width=5, height=5, fx=2.0, fy=2.0, cx=2.0, cy=2.0)
@@ -152,8 +153,13 @@ def test_online_mapper_vertical_profile_free_uses_ray_height_not_floor_endpoint_
 
     assert mapper.last_debug_stats["vertical_profile_ray_count"] == 1
     assert mapper.last_debug_stats["vertical_profile_skipped_height_rays"] == 0
+    assert mapper.last_debug_stats["height_profile_ray_count"] == 1
+    assert mapper.last_debug_stats["height_profile_skipped_height_rays"] == 0
+    assert mapper.last_debug_stats["height_profile"]["free_ray_cells"] > 0
+    assert mapper.last_debug_stats["height_profile"]["observed_cells"] > 0
     assert int(np.count_nonzero(mapper.vertical_profile.free_ray_count[band_index("robot_body")])) > 0
     assert int(np.count_nonzero(mapper.vertical_profile.free_ray_count[band_index("mid")])) > 0
+    assert int(np.count_nonzero(mapper.height_profile.free_ray_count)) > 0
     floor_endpoint_cell = mapper.grid.world_to_grid(1.0, 0.0)
     assert int(np.sum(mapper.vertical_profile.free_ray_count[:, floor_endpoint_cell[0], floor_endpoint_cell[1]])) == 0
 
@@ -251,6 +257,7 @@ def test_online_mapper_floor_ray_follows_camera_yaw():
         free_max_height_m=0.1,
         splat_point_threshold=1,
         robot_radius_m=0.1,
+        voxel_grid_enabled=False,
     )
     mapper.reset((0.0, 0.0))
     intr = CameraIntrinsics(width=5, height=5, fx=2.0, fy=2.0, cx=2.0, cy=2.0)
@@ -274,6 +281,7 @@ def test_online_mapper_free_ray_clears_stale_obstacle_cells():
         free_max_height_m=0.1,
         splat_point_threshold=1,
         robot_radius_m=0.1,
+        voxel_grid_enabled=False,
     )
     mapper.reset((0.0, 0.0))
     shared_cell = mapper.grid.world_to_grid(1.0, 0.0)
@@ -301,6 +309,7 @@ def test_online_mapper_obstacle_endpoint_protects_navigation_occupied_from_later
         free_max_height_m=0.1,
         splat_point_threshold=1,
         robot_radius_m=0.1,
+        voxel_grid_enabled=False,
     )
     mapper.reset((0.0, 0.0))
     intr = CameraIntrinsics(width=5, height=5, fx=2.0, fy=2.0, cx=2.0, cy=2.0)
