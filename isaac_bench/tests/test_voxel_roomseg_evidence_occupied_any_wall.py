@@ -41,7 +41,7 @@ def _evidence(grid: VoxelOccupancyGrid3D, extra_config: dict | None = None):
         voxel_grid=grid,
         navigation_free_mask=np.zeros(shape, dtype=bool),
         navigation_obstacle_mask=np.zeros(shape, dtype=bool),
-        unknown_mask_from_navigation=np.ones(shape, dtype=bool),
+        unknown_mask_from_navigation=np.zeros(shape, dtype=bool),
         resolution_m=0.10,
         config=config,
     )

@@ -122,6 +122,21 @@ ROOMSEG_ARRAY_KEYS = (
     "voxel_active_free_count_xy",
     "voxel_active_occupied_count_xy",
     "voxel_active_unknown_count_xy",
+    "voxel_sensor_range_count_xy",
+    "voxel_sensor_range_ratio_xy",
+    "voxel_sensor_in_range_unknown_count_xy",
+    "voxel_sensor_outside_range_unknown_count_xy",
+    "voxel_in_range_unknown_ratio_xy",
+    "voxel_outside_unknown_ratio_xy",
+    "voxel_generalized_occupied_count_xy",
+    "voxel_generalized_occupied_ratio_xy",
+    "voxel_wall_generalized_raw_xy",
+    "voxel_wall_actual_ratio_raw_xy",
+    "voxel_wall_actual_occupied_requirement_xy",
+    "voxel_wall_rejected_by_outside_unknown_xy",
+    "voxel_wall_from_in_range_unknown_xy",
+    "voxel_roomseg_nav_obstacle_suppressed_by_vertical_free_xy",
+    "voxel_outside_unknown_dominant_xy",
     "voxel_active_z_bin_count_xy",
     "voxel_occupied_ratio_active_xy",
     "voxel_free_wall_conflict_xy",
@@ -219,6 +234,21 @@ ROOMSEG_SNAPSHOT_ARRAY_KEYS = (
     "voxel_active_free_count_xy",
     "voxel_active_occupied_count_xy",
     "voxel_active_unknown_count_xy",
+    "voxel_sensor_range_count_xy",
+    "voxel_sensor_range_ratio_xy",
+    "voxel_sensor_in_range_unknown_count_xy",
+    "voxel_sensor_outside_range_unknown_count_xy",
+    "voxel_in_range_unknown_ratio_xy",
+    "voxel_outside_unknown_ratio_xy",
+    "voxel_generalized_occupied_count_xy",
+    "voxel_generalized_occupied_ratio_xy",
+    "voxel_wall_generalized_raw_xy",
+    "voxel_wall_actual_ratio_raw_xy",
+    "voxel_wall_actual_occupied_requirement_xy",
+    "voxel_wall_rejected_by_outside_unknown_xy",
+    "voxel_wall_from_in_range_unknown_xy",
+    "voxel_roomseg_nav_obstacle_suppressed_by_vertical_free_xy",
+    "voxel_outside_unknown_dominant_xy",
     "voxel_active_z_bin_count_xy",
     "voxel_occupied_ratio_active_xy",
     "voxel_free_wall_conflict_xy",
@@ -469,6 +499,11 @@ def build_roomseg_debug_arrays(
         else np.zeros(shape, dtype=bool)
     )
     arrays["selected_frontier_sector_missing_overlap"] = arrays["selected_frontier_sector"] & arrays["observed_free_mask"] & (arrays["final_room_label_map"].astype(np.int32) <= 0)
+    for key in ROOMSEG_ARRAY_KEYS:
+        if key in arrays or key not in room_debug:
+            continue
+        dtype = _roomseg_debug_dtype(key)
+        arrays[key] = _array_from_debug(room_debug, key, shape, dtype)
     for key in ROOMSEG_ARRAY_KEYS:
         arrays.setdefault(key, np.zeros(shape, dtype=np.uint8))
     return arrays
@@ -816,6 +851,26 @@ def _array_from_debug(debug: Mapping[str, object], key: str, shape: tuple[int, i
     if arr.shape != shape:
         return np.zeros(shape, dtype=arr_dtype)
     return arr
+
+
+def _roomseg_debug_dtype(key: str):
+    if (
+        "ratio" in key
+        or "weight" in key
+        or "confidence" in key
+        or "reliability" in key
+        or "height_" in key
+        or "depth_" in key
+        or key in {"watershed_dist_struct", "watershed_dist_free_extent", "watershed_elevation"}
+    ):
+        return np.float32
+    if key.endswith("_count_xy") or key.endswith("_count") or "_count_" in key:
+        return np.uint16
+    if "label" in key or key.endswith("_source_map") or key.endswith("_reason_map"):
+        return np.int32
+    if key.endswith("_map") and ("source" in key or "reason" in key):
+        return np.int32
+    return bool
 
 
 def _bool_array(value: object, shape: tuple[int, int]) -> np.ndarray:

@@ -55,7 +55,7 @@ from isaac_bench.mapping.voxel_roomseg_evidence import (
     VoxelRoomsegEvidenceConfig,
     build_voxel_roomseg_evidence,
 )
-from isaac_bench.mapping.wall_projection import WallProjectionConfig, project_wall_evidence_to_lines
+from isaac_bench.mapping.wall_projection import WallProjectionConfig, project_wall_evidence_to_axis_accumulator_lines
 
 
 VOXEL_OCCUPANCY_ROOMSEG_BACKEND = "voxel_occupancy_door_wall_v9"
@@ -345,39 +345,114 @@ def run_voxel_occupancy_door_wall_roomseg(
     door_seed_result = classify_voxel_door_seeds(voxel_grid=voxel_grid, config=cfg.door)
     door_seed_mask = np.asarray(door_seed_result.door_seed_mask, dtype=bool)
 
-    projection_input = np.asarray(evidence.wall_line_support_xy, dtype=bool)
-    projection_forbidden_free = np.asarray(evidence.vertical_free_xy, dtype=bool) | door_seed_mask
-    projection_forbidden_unknown = np.asarray(evidence.wall_line_support_rejected_by_unknown_xy, dtype=bool)
-    wall_projection = project_wall_evidence_to_lines(
-        wall_raw=projection_input,
-        free_map=projection_forbidden_free,
-        occupied_ratio=evidence.occupied_ratio_active_xy,
+    wall_line_support_strong_xy = np.asarray(
+        evidence.wall_line_support_strong_xy
+        if evidence.wall_line_support_strong_xy is not None
+        else evidence.wall_line_support_xy,
+        dtype=bool,
+    )
+    wall_line_support_conflict_xy = np.asarray(
+        evidence.wall_line_support_conflict_xy
+        if evidence.wall_line_support_conflict_xy is not None
+        else np.zeros(shape, dtype=bool),
+        dtype=bool,
+    )
+    wall_line_support_rejected_unknown_xy = np.asarray(
+        evidence.wall_line_support_rejected_unknown_xy
+        if evidence.wall_line_support_rejected_unknown_xy is not None
+        else evidence.wall_line_support_rejected_by_unknown_xy,
+        dtype=bool,
+    )
+    wall_line_support_weight_xy = np.asarray(
+        evidence.wall_line_support_weight_xy
+        if evidence.wall_line_support_weight_xy is not None
+        else wall_line_support_strong_xy.astype(np.float32),
+        dtype=np.float32,
+    )
+    projection_seed = np.asarray(
+        evidence.support_seed_for_projection_xy
+        if evidence.support_seed_for_projection_xy is not None
+        else (
+            evidence.wall_support_strong_xy
+            if evidence.wall_support_strong_xy is not None
+            else wall_line_support_strong_xy
+        ),
+        dtype=bool,
+    )
+    projection_bridge = np.asarray(
+        evidence.support_bridge_for_projection_xy
+        if evidence.support_bridge_for_projection_xy is not None
+        else np.zeros(shape, dtype=bool),
+        dtype=bool,
+    )
+    projection_input = np.asarray(
+        evidence.wall_support_for_projection_xy
+        if evidence.wall_support_for_projection_xy is not None
+        else (projection_seed | projection_bridge),
+        dtype=bool,
+    )
+    projection_weight = np.asarray(
+        evidence.wall_support_weight_xy
+        if evidence.wall_support_weight_xy is not None
+        else wall_line_support_weight_xy,
+        dtype=np.float32,
+    )
+    frontier_unknown_band = np.asarray(
+        evidence.frontier_unknown_band_xy
+        if evidence.frontier_unknown_band_xy is not None
+        else np.zeros(shape, dtype=bool),
+        dtype=bool,
+    )
+    forbidden_frontier_residual = np.asarray(
+        evidence.forbidden_frontier_residual_support_xy
+        if evidence.forbidden_frontier_residual_support_xy is not None
+        else np.zeros(shape, dtype=bool),
+        dtype=bool,
+    )
+    forbidden_unknown_boundary = np.asarray(
+        evidence.forbidden_unknown_boundary_support_xy
+        if evidence.forbidden_unknown_boundary_support_xy is not None
+        else np.zeros(shape, dtype=bool),
+        dtype=bool,
+    )
+    forbidden_residual_support = forbidden_frontier_residual | forbidden_unknown_boundary
+    protected_structural_wall_band = np.asarray(
+        evidence.protected_structural_wall_band_xy
+        if evidence.protected_structural_wall_band_xy is not None
+        else np.zeros(shape, dtype=bool),
+        dtype=bool,
+    )
+    wall_projection = project_wall_evidence_to_axis_accumulator_lines(
+        support_seed_map=projection_seed,
+        support_bridge_map=projection_bridge,
+        forbidden_frontier_residual_map=forbidden_residual_support,
+        protected_structural_wall_band=protected_structural_wall_band,
+        support_weight=projection_weight,
         door_forbidden_mask=door_seed_mask,
-        unknown_forbidden_mask=projection_forbidden_unknown,
         vertical_free_map=evidence.vertical_free_xy,
         unknown_map=evidence.unknown_xy,
+        unknown_ratio_map=evidence.unknown_ratio_active_xy,
+        navigation_unknown_map=np.asarray(unknown_mask, dtype=bool),
+        frontier_unknown_band=frontier_unknown_band,
+        structural_side_support_map=np.asarray(evidence.wall_xy, dtype=bool)
+        | np.asarray(evidence.structural_wall_ratio_xy, dtype=bool)
+        | projection_seed,
         resolution_m=float(resolution_m),
         config=cfg.wall_projection,
     )
-    anchor_projection_cfg = replace(
-        cfg.wall_projection,
-        min_projected_line_length_m=float(cfg.wall_projection.anchor_min_projected_line_length_m),
-        min_projected_support_ratio=float(cfg.wall_projection.anchor_min_projected_support_ratio),
-        max_fill_gap_m=min(float(cfg.wall_projection.max_fill_gap_m), 0.15),
+    anchor_wall_projection = wall_projection
+    projected_wall_map = np.asarray(
+        wall_projection.projected_wall_display_map
+        if wall_projection.projected_wall_display_map is not None
+        else wall_projection.projected_wall_map,
+        dtype=bool,
     )
-    anchor_wall_projection = project_wall_evidence_to_lines(
-        wall_raw=projection_input,
-        free_map=projection_forbidden_free,
-        occupied_ratio=evidence.occupied_ratio_active_xy,
-        door_forbidden_mask=door_seed_mask,
-        unknown_forbidden_mask=projection_forbidden_unknown,
-        vertical_free_map=evidence.vertical_free_xy,
-        unknown_map=evidence.unknown_xy,
-        resolution_m=float(resolution_m),
-        config=anchor_projection_cfg,
+    anchor_projected_wall_map = np.asarray(
+        wall_projection.projected_wall_anchor_map
+        if wall_projection.projected_wall_anchor_map is not None
+        else projected_wall_map,
+        dtype=bool,
     )
-    projected_wall_map = np.asarray(wall_projection.projected_wall_map, dtype=bool)
-    anchor_projected_wall_map = np.asarray(anchor_wall_projection.projected_wall_map, dtype=bool)
     wall_for_line_extraction = np.asarray(evidence.wall_xy, dtype=bool) | projected_wall_map
     segments, wall_debug = extract_line_supported_walls(
         wall_for_line_extraction,
@@ -657,6 +732,31 @@ def run_voxel_occupancy_door_wall_roomseg(
         "voxel_wall_line_support_rejected_by_observed_xy": np.asarray(evidence.wall_line_support_rejected_by_observed_xy, dtype=bool),
         "voxel_wall_line_support_rejected_by_nav_edge_xy": np.asarray(evidence.wall_line_support_rejected_by_nav_edge_xy, dtype=bool),
         "voxel_wall_projection_support_input_xy": projection_input,
+        "voxel_wall_support_raw_occupied_xy": np.asarray(evidence.wall_support_raw_occupied_xy if evidence.wall_support_raw_occupied_xy is not None else evidence.wall_line_support_raw_xy, dtype=bool),
+        "voxel_wall_support_known_xy": np.asarray(evidence.wall_support_known_xy if evidence.wall_support_known_xy is not None else wall_line_support_strong_xy, dtype=bool),
+        "voxel_wall_support_for_projection_xy": np.asarray(evidence.wall_support_for_projection_xy if evidence.wall_support_for_projection_xy is not None else projection_input, dtype=bool),
+        "voxel_wall_support_weight_xy": projection_weight,
+        "voxel_wall_support_unknown_rejected_xy": np.asarray(evidence.wall_support_unknown_rejected_xy if evidence.wall_support_unknown_rejected_xy is not None else wall_line_support_rejected_unknown_xy, dtype=bool),
+        "voxel_wall_support_nav_unknown_rejected_xy": np.asarray(evidence.wall_support_nav_unknown_rejected_xy if evidence.wall_support_nav_unknown_rejected_xy is not None else np.zeros(shape, dtype=bool), dtype=bool),
+        "voxel_wall_support_frontier_band_rejected_xy": np.asarray(evidence.wall_support_frontier_band_rejected_xy if evidence.wall_support_frontier_band_rejected_xy is not None else forbidden_frontier_residual, dtype=bool),
+        "voxel_wall_support_free_conflict_xy": np.asarray(evidence.wall_support_free_conflict_xy if evidence.wall_support_free_conflict_xy is not None else np.zeros(shape, dtype=bool), dtype=bool),
+        "voxel_frontier_unknown_band_xy": frontier_unknown_band,
+        "voxel_strong_structural_support_xy": np.asarray(evidence.strong_structural_support_xy if evidence.strong_structural_support_xy is not None else projection_seed, dtype=bool),
+        "voxel_bridge_only_support_xy": np.asarray(evidence.bridge_only_support_xy if evidence.bridge_only_support_xy is not None else projection_bridge, dtype=bool),
+        "voxel_forbidden_frontier_residual_support_xy": forbidden_frontier_residual,
+        "voxel_forbidden_unknown_boundary_support_xy": forbidden_unknown_boundary,
+        "voxel_free_conflict_support_xy": np.asarray(evidence.free_conflict_support_xy if evidence.free_conflict_support_xy is not None else np.zeros(shape, dtype=bool), dtype=bool),
+        "voxel_protected_structural_wall_band_xy": protected_structural_wall_band,
+        "voxel_support_seed_for_projection_xy": projection_seed,
+        "voxel_support_bridge_for_projection_xy": projection_bridge,
+        "voxel_support_for_projection_display_xy": projection_input,
+        "voxel_projected_wall_display_map": np.asarray(wall_projection.projected_wall_display_map if wall_projection.projected_wall_display_map is not None else projected_wall_map, dtype=bool),
+        "voxel_projected_wall_anchor_map": anchor_projected_wall_map,
+        "voxel_projected_wall_step2_source_map": np.asarray(wall_projection.projected_wall_step2_source_map if wall_projection.projected_wall_step2_source_map is not None else projected_wall_map, dtype=bool),
+        "voxel_wall_projection_accumulator_h_votes": np.asarray(wall_projection.debug.get("voxel_wall_projection_accumulator_h_votes", np.zeros(shape, dtype=np.float32)), dtype=np.float32),
+        "voxel_wall_projection_accumulator_v_votes": np.asarray(wall_projection.debug.get("voxel_wall_projection_accumulator_v_votes", np.zeros(shape, dtype=np.float32)), dtype=np.float32),
+        "voxel_wall_projection_reject_reason_map": np.asarray(wall_projection.debug.get("voxel_wall_projection_reject_reason_map", np.zeros(shape, dtype=np.uint8)), dtype=np.uint8),
+        "voxel_wall_projection_step2_source_reject_reason_map": np.asarray(wall_projection.debug.get("voxel_wall_projection_step2_source_reject_reason_map", np.zeros(shape, dtype=np.uint8)), dtype=np.uint8),
         "voxel_wall_rejected_by_free_xy": np.asarray(evidence.wall_rejected_by_free_xy, dtype=bool),
         "voxel_wall_rejected_by_unknown_xy": np.asarray(evidence.wall_rejected_by_unknown_xy, dtype=bool),
         "voxel_nonstructural_occupied_xy": np.asarray(evidence.nonstructural_occupied_xy, dtype=bool),
@@ -769,6 +869,13 @@ def run_voxel_occupancy_door_wall_roomseg(
         "voxel_raw_occupied_wall_support_cells": int(np.count_nonzero(evidence.raw_occupied_wall_support_xy)),
         "voxel_wall_line_support_cells": int(np.count_nonzero(evidence.wall_line_support_xy)),
         "voxel_wall_line_support_raw_cells": int(np.count_nonzero(evidence.wall_line_support_raw_xy)),
+        "voxel_wall_line_support_strong_cells": int(np.count_nonzero(wall_line_support_strong_xy)),
+        "voxel_wall_line_support_conflict_cells": int(np.count_nonzero(wall_line_support_conflict_xy)),
+        "voxel_frontier_unknown_band_cells": int(np.count_nonzero(frontier_unknown_band)),
+        "voxel_forbidden_frontier_residual_support_cells": int(np.count_nonzero(forbidden_frontier_residual)),
+        "voxel_forbidden_unknown_boundary_support_cells": int(np.count_nonzero(forbidden_unknown_boundary)),
+        "voxel_support_seed_for_projection_cells": int(np.count_nonzero(projection_seed)),
+        "voxel_support_bridge_for_projection_cells": int(np.count_nonzero(projection_bridge)),
         "voxel_strict_raw_wall_cells": int(np.count_nonzero(evidence.strict_raw_wall_xy)),
         "voxel_wall_projected_cells": int(np.count_nonzero(projected_wall_map)),
         "voxel_projected_structural_wall_cells": int(np.count_nonzero(projected_wall_map)),
@@ -823,6 +930,7 @@ def run_voxel_occupancy_door_wall_roomseg(
         "source_backend": VOXEL_OCCUPANCY_ROOMSEG_BACKEND,
         "roomseg_backend": VOXEL_OCCUPANCY_ROOMSEG_BACKEND,
         "algorithm": VOXEL_OCCUPANCY_ROOMSEG_ALGORITHM,
+        "variant": "voxel_v25_1_wall_lines_on_v19",
         "source": VOXEL_OCCUPANCY_ROOMSEG_BACKEND,
         "context_source": VOXEL_OCCUPANCY_ROOMSEG_CONTEXT,
         "room_map_mode": VOXEL_OCCUPANCY_ROOMSEG_CONTEXT,
