@@ -7,7 +7,7 @@ from isaac_bench.mapping.voxel_occupancy_grid import VOXEL_FREE, VOXEL_OCCUPIED,
 from isaac_bench.mapping.wall_projection import WallProjectionConfig, project_wall_evidence_to_axis_accumulator_lines
 
 
-def test_v21_free_conflict_wall_support_recovers_projected_wall_without_final_wall() -> None:
+def test_v23_free_conflict_support_is_bridge_only_without_strong_seed() -> None:
     shape = (12, 16)
     state = np.full((6, *shape), int(VOXEL_UNKNOWN), dtype=np.uint8)
     state[0:2, 6, 3:13] = int(VOXEL_OCCUPIED)
@@ -29,11 +29,15 @@ def test_v21_free_conflict_wall_support_recovers_projected_wall_without_final_wa
 
     assert classified["vertical_free"][6, 8]
     assert not classified["wall"][6, 8]
-    assert classified["wall_line_support_conflict"][6, 8]
-    assert classified["wall_line_support"][6, 8]
+    assert classified["free_conflict_support"][6, 8]
+    assert not classified["wall_line_support_conflict"][6, 8]
+    assert not classified["wall_line_support"][6, 8]
+    assert not classified["support_seed_for_projection"][6, 8]
+    assert not classified["support_bridge_for_projection"][6, 8]
 
     result = project_wall_evidence_to_axis_accumulator_lines(
-        support_map=classified["wall_line_support"],
+        support_seed_map=classified["support_seed_for_projection"],
+        support_bridge_map=classified["support_bridge_for_projection"],
         support_weight=classified["wall_line_support_weight"],
         vertical_free_map=classified["vertical_free"],
         unknown_map=classified["unknown"],
@@ -42,8 +46,7 @@ def test_v21_free_conflict_wall_support_recovers_projected_wall_without_final_wa
         config=WallProjectionConfig(min_projected_line_length_m=0.30, min_projected_support_ratio=0.25),
     )
 
-    assert np.any(result.projected_wall_display_map[6, 3:13])
-    assert int(np.count_nonzero(result.projected_wall_display_map[6, 3:13])) >= 8
+    assert not np.any(result.projected_wall_display_map[6, 3:13])
 
 
 def test_v21_furniture_island_is_rejected_from_wall_support_boundary() -> None:

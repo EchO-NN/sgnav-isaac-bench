@@ -62,7 +62,9 @@ def test_voxel_v10_roomseg_uses_projected_wall_and_centroid_door_seed() -> None:
     assert np.any(result.layers["voxel_wall_projected_xy"][5:17, 20])
     assert np.any(result.layers["voxel_door_seed_mask"][door_rows, 20])
     assert np.any(result.layers["voxel_door_cut_mask"])
-    assert result.debug["voxel_door_seed_method"] == "centroid_ratio"
+    assert result.debug["voxel_door_seed_method"] == "sensor_aware_turn_search"
+    assert "voxel_door_seed_mask_centroid_legacy" in result.debug
+    assert "voxel_door_seed_mask_v25_sensor_aware" in result.debug
     assert int(result.room_label_map.max()) >= 2
 
 

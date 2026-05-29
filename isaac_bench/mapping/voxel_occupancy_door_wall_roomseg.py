@@ -275,6 +275,17 @@ class PartitionMapBundle:
 
 
 @dataclass
+class DoorSeedMasksForStep2:
+    raw_seed_mask: np.ndarray
+    accepted_seed_cluster_mask: np.ndarray
+    accepted_door_cut_mask: np.ndarray
+    stable_door_cut_mask: np.ndarray
+    accepted_door_visual_mask: np.ndarray
+    step2_suppression_band: np.ndarray
+    wall_carve_seed_mask: np.ndarray
+
+
+@dataclass
 class VoxelStep2TopologyConfig:
     corridor_min_split_area_m2: float = 0.05
     corridor_min_new_component_width_m: float = 0.10
@@ -318,12 +329,24 @@ class VoxelOccupancyDoorWallRoomSegConfig:
     reject_step2_if_intersects_door_seed: bool = False
     reject_step2_if_intersects_existing_extension: bool = True
     reject_step2_if_hits_extension_not_wall: bool = True
+    reject_step2_if_hits_frontier_residual_wall: bool = True
+    reject_step2_if_crosses_frontier_unknown_band: bool = True
     door_intersection_dilation_cells: int = 1
     step2_source_min_line_length_m: float = 0.60
     step2_source_min_support_ratio: float = 0.30
     step2_source_min_support_cells: int = 6
     step2_source_forbid_frontier_unknown_band: bool = True
     step2_source_forbid_door_band: bool = True
+    corridor_neck_source_enabled: bool = True
+    corridor_neck_source_min_line_length_m: float = 0.35
+    corridor_neck_source_min_support_cells: int = 4
+    corridor_neck_source_min_support_ratio: float = 0.45
+    corridor_neck_source_must_touch_large_free: bool = True
+    corridor_neck_source_min_adjacent_free_area_cells: int = 60
+    corridor_neck_source_forbid_raw_seed_band: bool = False
+    corridor_neck_source_forbid_accepted_door_band: bool = True
+    corridor_neck_source_max_unknown_ratio_on_line: float = 0.25
+    corridor_neck_source_allow_only_projected_or_strict: bool = True
     extension_intersection_policy: str = "reject"
     enable_extension_intersection_fallback: bool = False
     separator_memory_enabled: bool = True
@@ -347,6 +370,9 @@ class VoxelOccupancyDoorWallRoomSegConfig:
     voxel_show_step2_source_candidates: bool = False
     voxel_show_step2_rejected_candidates: bool = False
     voxel_show_door_visual_only_candidates: bool = False
+    voxel_show_raw_door_seed_band: bool = False
+    voxel_show_corridor_neck_sources: bool = False
+    voxel_show_door_seed_reject_reason_overlay: bool = False
     debug_dump: bool = False
     debug_dir: str = "debug/voxel_occupancy_door_wall_roomseg"
 
@@ -411,12 +437,24 @@ class VoxelOccupancyDoorWallRoomSegConfig:
             "reject_if_intersects_door_seed": "reject_step2_if_intersects_door_seed",
             "reject_if_intersects_existing_extension": "reject_step2_if_intersects_existing_extension",
             "reject_if_hits_extension_not_wall": "reject_step2_if_hits_extension_not_wall",
+            "reject_if_hits_frontier_residual_wall": "reject_step2_if_hits_frontier_residual_wall",
+            "reject_if_crosses_frontier_unknown_band": "reject_step2_if_crosses_frontier_unknown_band",
             "door_intersection_dilation_cells": "door_intersection_dilation_cells",
             "source_min_line_length_m": "step2_source_min_line_length_m",
             "source_min_support_ratio": "step2_source_min_support_ratio",
             "source_min_support_cells": "step2_source_min_support_cells",
             "source_forbid_frontier_unknown_band": "step2_source_forbid_frontier_unknown_band",
             "source_forbid_door_band": "step2_source_forbid_door_band",
+            "corridor_neck_source_enabled": "corridor_neck_source_enabled",
+            "corridor_neck_source_min_line_length_m": "corridor_neck_source_min_line_length_m",
+            "corridor_neck_source_min_support_cells": "corridor_neck_source_min_support_cells",
+            "corridor_neck_source_min_support_ratio": "corridor_neck_source_min_support_ratio",
+            "corridor_neck_source_must_touch_large_free": "corridor_neck_source_must_touch_large_free",
+            "corridor_neck_source_min_adjacent_free_area_cells": "corridor_neck_source_min_adjacent_free_area_cells",
+            "corridor_neck_source_forbid_raw_seed_band": "corridor_neck_source_forbid_raw_seed_band",
+            "corridor_neck_source_forbid_accepted_door_band": "corridor_neck_source_forbid_accepted_door_band",
+            "corridor_neck_source_max_unknown_ratio_on_line": "corridor_neck_source_max_unknown_ratio_on_line",
+            "corridor_neck_source_allow_only_projected_or_strict": "corridor_neck_source_allow_only_projected_or_strict",
             "extension_intersection_policy": "extension_intersection_policy",
             "enable_extension_intersection_fallback": "enable_extension_intersection_fallback",
             "separator_memory_enabled": "separator_memory_enabled",
@@ -441,6 +479,9 @@ class VoxelOccupancyDoorWallRoomSegConfig:
             "show_step2_source_candidates": "voxel_show_step2_source_candidates",
             "show_step2_rejected_candidates": "voxel_show_step2_rejected_candidates",
             "show_door_visual_only_candidates": "voxel_show_door_visual_only_candidates",
+            "show_raw_door_seed_band": "voxel_show_raw_door_seed_band",
+            "show_corridor_neck_sources": "voxel_show_corridor_neck_sources",
+            "show_door_seed_reject_reason_overlay": "voxel_show_door_seed_reject_reason_overlay",
         }.items():
             if src in voxel_visualization:
                 raw[dst] = voxel_visualization[src]
@@ -582,14 +623,29 @@ def run_voxel_occupancy_door_wall_roomseg(
         resolution_m=float(resolution_m),
         config=cfg.voxel_evidence,
     )
-    door_seed_result = classify_voxel_door_seeds(voxel_grid=voxel_grid, config=cfg.door)
+    door_seed_result = classify_voxel_door_seeds(
+        voxel_grid=voxel_grid,
+        config=cfg.door,
+        sensor_range_count=getattr(voxel_grid, "sensor_range_count", None),
+        sensor_range_threshold=int(getattr(cfg.voxel_evidence, "sensor_range_count_threshold_for_roomseg", 1)),
+        roomseg_evidence=evidence,
+    )
     door_seed_mask = np.asarray(door_seed_result.door_seed_mask, dtype=bool)
 
-    projection_input = np.asarray(evidence.wall_support_for_projection_xy if evidence.wall_support_for_projection_xy is not None else evidence.wall_line_support_xy, dtype=bool)
+    projection_seed = np.asarray(evidence.support_seed_for_projection_xy if evidence.support_seed_for_projection_xy is not None else evidence.wall_support_strong_xy, dtype=bool)
+    projection_bridge = np.asarray(evidence.support_bridge_for_projection_xy if evidence.support_bridge_for_projection_xy is not None else np.zeros(shape, dtype=bool), dtype=bool)
+    projection_input = np.asarray(evidence.wall_support_for_projection_xy if evidence.wall_support_for_projection_xy is not None else (projection_seed | projection_bridge), dtype=bool)
     projection_weight = np.asarray(evidence.wall_support_weight_xy if evidence.wall_support_weight_xy is not None else evidence.wall_line_support_weight_xy, dtype=np.float32)
     frontier_unknown_band = np.asarray(evidence.frontier_unknown_band_xy if evidence.frontier_unknown_band_xy is not None else np.zeros(shape, dtype=bool), dtype=bool)
+    forbidden_frontier_residual = np.asarray(evidence.forbidden_frontier_residual_support_xy if evidence.forbidden_frontier_residual_support_xy is not None else np.zeros(shape, dtype=bool), dtype=bool)
+    forbidden_unknown_boundary = np.asarray(evidence.forbidden_unknown_boundary_support_xy if evidence.forbidden_unknown_boundary_support_xy is not None else np.zeros(shape, dtype=bool), dtype=bool)
+    forbidden_residual_support = forbidden_frontier_residual | forbidden_unknown_boundary
+    protected_structural_wall_band = np.asarray(evidence.protected_structural_wall_band_xy if evidence.protected_structural_wall_band_xy is not None else np.zeros(shape, dtype=bool), dtype=bool)
     wall_projection = project_wall_evidence_to_axis_accumulator_lines(
-        support_map=projection_input,
+        support_seed_map=projection_seed,
+        support_bridge_map=projection_bridge,
+        forbidden_frontier_residual_map=forbidden_residual_support,
+        protected_structural_wall_band=protected_structural_wall_band,
         support_weight=projection_weight,
         door_forbidden_mask=door_seed_mask,
         vertical_free_map=evidence.vertical_free_xy,
@@ -597,7 +653,7 @@ def run_voxel_occupancy_door_wall_roomseg(
         unknown_ratio_map=evidence.unknown_ratio_active_xy,
         navigation_unknown_map=np.asarray(unknown_mask, dtype=bool),
         frontier_unknown_band=frontier_unknown_band,
-        structural_side_support_map=np.asarray(evidence.wall_xy, dtype=bool) | projection_input,
+        structural_side_support_map=np.asarray(evidence.wall_xy, dtype=bool) | np.asarray(evidence.structural_wall_ratio_xy, dtype=bool) | projection_seed,
         resolution_m=float(resolution_m),
         config=cfg.wall_projection,
     )
@@ -607,6 +663,7 @@ def run_voxel_occupancy_door_wall_roomseg(
     step2_source_projected_wall_map = np.asarray(wall_projection.projected_wall_step2_source_map if wall_projection.projected_wall_step2_source_map is not None else projected_wall_map, dtype=bool)
     projected_display_lines = list(wall_projection.projected_display_lines or wall_projection.projected_lines)
     projected_step2_source_lines = list(wall_projection.projected_step2_source_lines or [])
+    projected_corridor_neck_source_lines = list(getattr(wall_projection, "projected_corridor_neck_source_lines", []) or [])
     wall_for_line_extraction = np.asarray(evidence.wall_xy, dtype=bool) | projected_wall_map
     segments, wall_debug = extract_line_supported_walls(
         wall_for_line_extraction,
@@ -668,9 +725,9 @@ def run_voxel_occupancy_door_wall_roomseg(
         step1_gap_fill_map &= ~dilate(door_seed_mask, int(cfg.door_intersection_dilation_cells))
     step1_gap_fill_map &= ~np.asarray(evidence.vertical_free_xy, dtype=bool)
     step1_completed_wall_map = wall_base_pre_step1 | step1_gap_fill_map
-    partition_maps = build_voxel_partition_maps(
+    pre_partition_maps = build_voxel_partition_maps(
         evidence=evidence,
-        door_seed_mask=door_seed_mask,
+        door_seed_carve_mask=np.zeros(shape, dtype=bool),
         strict_raw_wall=np.asarray(evidence.wall_xy, dtype=bool),
         projected_wall_map=projected_wall_map,
         anchor_projected_wall_map=anchor_projected_wall_map,
@@ -679,14 +736,14 @@ def run_voxel_occupancy_door_wall_roomseg(
         step1_gap_fill_map=step1_gap_fill_map,
         cfg=cfg,
     )
-    real_wall_barrier_map = np.asarray(partition_maps.partition_real_wall_map, dtype=bool)
+    real_wall_barrier_map = np.asarray(pre_partition_maps.partition_real_wall_map, dtype=bool)
     if int(cfg.real_wall_barrier_dilation_cells) > 0:
         real_wall_barrier_for_partition = dilate(real_wall_barrier_map, int(cfg.real_wall_barrier_dilation_cells))
     else:
         real_wall_barrier_for_partition = real_wall_barrier_map.copy()
-    base_partition_free = np.asarray(partition_maps.base_partition_free, dtype=bool) & ~real_wall_barrier_for_partition
+    base_partition_free = np.asarray(pre_partition_maps.base_partition_free, dtype=bool) & ~real_wall_barrier_for_partition
     free_after_step1 = base_partition_free.copy()
-    unknown_after_step1 = np.asarray(partition_maps.partition_unknown, dtype=bool)
+    unknown_after_step1 = np.asarray(pre_partition_maps.partition_unknown, dtype=bool)
     door_anchor_source_map = _door_anchor_source_map(
         shape,
         strict_raw_wall=np.asarray(evidence.wall_xy, dtype=bool),
@@ -695,10 +752,10 @@ def run_voxel_occupancy_door_wall_roomseg(
         step1_gap_fill=step1_gap_fill_map,
         filtered_line=np.zeros(shape, dtype=bool),
     )
-    door_anchor_source_map = np.where(partition_maps.door_anchor_wall_map, door_anchor_source_map, 0).astype(np.uint8)
-    door_anchor_source_map[(partition_maps.door_anchor_wall_map) & (door_anchor_source_map == 0)] = DOOR_ANCHOR_STRICT_RAW
-    door_anchor_wall_map = np.asarray(partition_maps.door_anchor_wall_map, dtype=bool)
-    door_cluster_barrier = np.asarray(partition_maps.partition_real_wall_map, dtype=bool) & ~dilate(door_seed_mask, 2)
+    door_anchor_source_map = np.where(pre_partition_maps.door_anchor_wall_map, door_anchor_source_map, 0).astype(np.uint8)
+    door_anchor_source_map[(pre_partition_maps.door_anchor_wall_map) & (door_anchor_source_map == 0)] = DOOR_ANCHOR_STRICT_RAW
+    door_anchor_wall_map = np.asarray(pre_partition_maps.door_anchor_wall_map, dtype=bool)
+    door_cluster_barrier = np.asarray(pre_partition_maps.partition_real_wall_map, dtype=bool) & ~dilate(door_seed_mask, 2)
     door_completion = complete_voxel_doors_from_seeds(
         seed_result=door_seed_result,
         free_map=evidence.vertical_free_xy,
@@ -737,21 +794,74 @@ def run_voxel_occupancy_door_wall_roomseg(
     door_cut_mask = current_door_cut_mask | stable_door_cut_mask
     door_visual_mask = current_door_visual_mask | stable_door_visual_mask
     accepted_door_visual_mask = np.asarray(door_completion.debug.get("voxel_accepted_door_centerline_mask", current_door_cut_mask), dtype=bool) | stable_door_visual_mask
-    door_suppression_band = dilate(door_cut_mask | stable_door_cut_mask | door_seed_mask | accepted_door_visual_mask, 2)
+    accepted_seed_cluster_mask = _accepted_door_seed_cluster_mask(
+        np.asarray(door_completion.debug.get("voxel_door_seed_cluster_map", np.zeros(shape, dtype=np.int32)), dtype=np.int32),
+        door_completion.debug.get("voxel_door_seed_clusters", []),
+    )
+    accepted_seed_for_partition = accepted_seed_cluster_mask & np.asarray(door_completion.debug.get("voxel_door_seed_mask", door_seed_mask), dtype=bool)
+    partition_maps = build_voxel_partition_maps(
+        evidence=evidence,
+        door_seed_carve_mask=accepted_seed_for_partition,
+        strict_raw_wall=np.asarray(evidence.wall_xy, dtype=bool),
+        projected_wall_map=projected_wall_map,
+        anchor_projected_wall_map=anchor_projected_wall_map,
+        filtered_line_map=filtered_line_map_clean,
+        extension_seed_line_map=validated_extension_seed_line_map,
+        step1_gap_fill_map=step1_gap_fill_map,
+        cfg=cfg,
+    )
+    real_wall_barrier_map = np.asarray(partition_maps.partition_real_wall_map, dtype=bool)
+    if int(cfg.real_wall_barrier_dilation_cells) > 0:
+        real_wall_barrier_for_partition = dilate(real_wall_barrier_map, int(cfg.real_wall_barrier_dilation_cells))
+    else:
+        real_wall_barrier_for_partition = real_wall_barrier_map.copy()
+    base_partition_free = np.asarray(partition_maps.base_partition_free, dtype=bool) & ~real_wall_barrier_for_partition
+    free_after_step1 = base_partition_free.copy()
+    unknown_after_step1 = np.asarray(partition_maps.partition_unknown, dtype=bool)
+    door_suppression_band = dilate(
+        door_cut_mask | stable_door_cut_mask | accepted_door_visual_mask,
+        int(cfg.door_intersection_dilation_cells),
+    )
+    raw_door_seed_band_for_debug = dilate(door_seed_mask, 2)
+    door_seed_masks_for_step2 = DoorSeedMasksForStep2(
+        raw_seed_mask=door_seed_mask.astype(bool),
+        accepted_seed_cluster_mask=accepted_seed_cluster_mask.astype(bool),
+        accepted_door_cut_mask=door_cut_mask.astype(bool),
+        stable_door_cut_mask=stable_door_cut_mask.astype(bool),
+        accepted_door_visual_mask=accepted_door_visual_mask.astype(bool),
+        step2_suppression_band=door_suppression_band.astype(bool),
+        wall_carve_seed_mask=accepted_seed_for_partition.astype(bool),
+    )
+    step2_target_wall_override = np.asarray(partition_maps.step2_target_wall_map, dtype=bool) | np.asarray(pre_partition_maps.step2_target_wall_map, dtype=bool)
+    step2_target_wall_override &= ~door_suppression_band
     step1_wall_mask = step1_completed_wall_map
     step2_line_pool = build_step2_line_pool(
         filtered_lines=filtered_lines,
         extension_seed_lines=extension_seed_lines,
         projected_display_lines=projected_display_lines,
         projected_source_lines=projected_step2_source_lines,
-        source_support_map=projection_input | np.asarray(evidence.wall_xy, dtype=bool) | projected_wall_map,
+        projected_corridor_neck_source_lines=projected_corridor_neck_source_lines,
+        source_support_map=np.asarray(evidence.support_for_step2_source_xy if evidence.support_for_step2_source_xy is not None else projection_seed, dtype=bool) | np.asarray(evidence.wall_xy, dtype=bool) | projected_wall_map,
         frontier_unknown_band=frontier_unknown_band,
         door_suppression_band=door_suppression_band,
+        raw_door_seed_band=raw_door_seed_band_for_debug,
+        vertical_free_map=evidence.vertical_free_xy,
+        unknown_ratio_map=evidence.unknown_ratio_active_xy,
         source_min_line_length_m=float(cfg.step2_source_min_line_length_m),
         source_min_support_ratio=float(cfg.step2_source_min_support_ratio),
         source_min_support_cells=int(cfg.step2_source_min_support_cells),
         source_forbid_frontier_unknown_band=bool(cfg.step2_source_forbid_frontier_unknown_band),
         source_forbid_door_band=bool(cfg.step2_source_forbid_door_band),
+        corridor_neck_source_enabled=bool(cfg.corridor_neck_source_enabled),
+        corridor_neck_source_min_line_length_m=float(cfg.corridor_neck_source_min_line_length_m),
+        corridor_neck_source_min_support_cells=int(cfg.corridor_neck_source_min_support_cells),
+        corridor_neck_source_min_support_ratio=float(cfg.corridor_neck_source_min_support_ratio),
+        corridor_neck_source_must_touch_large_free=bool(cfg.corridor_neck_source_must_touch_large_free),
+        corridor_neck_source_min_adjacent_free_area_cells=int(cfg.corridor_neck_source_min_adjacent_free_area_cells),
+        corridor_neck_source_forbid_raw_seed_band=bool(cfg.corridor_neck_source_forbid_raw_seed_band),
+        corridor_neck_source_forbid_accepted_door_band=bool(cfg.corridor_neck_source_forbid_accepted_door_band),
+        corridor_neck_source_max_unknown_ratio_on_line=float(cfg.corridor_neck_source_max_unknown_ratio_on_line),
+        corridor_neck_source_allow_only_projected_or_strict=bool(cfg.corridor_neck_source_allow_only_projected_or_strict),
         strict_raw_wall=np.asarray(evidence.wall_xy, dtype=bool),
         projected_wall_map=projected_wall_map,
         anchor_projected_wall_map=anchor_projected_wall_map,
@@ -761,13 +871,8 @@ def run_voxel_occupancy_door_wall_roomseg(
         projected_source_line_map=step2_source_projected_wall_map,
         shape=shape,
         resolution_m=float(resolution_m),
-        target_wall_override=partition_maps.step2_target_wall_map,
+        target_wall_override=step2_target_wall_override,
     )
-    accepted_seed_cluster_mask = _accepted_door_seed_cluster_mask(
-        np.asarray(door_completion.debug.get("voxel_door_seed_cluster_map", np.zeros(shape, dtype=np.int32)), dtype=np.int32),
-        door_completion.debug.get("voxel_door_seed_clusters", []),
-    )
-    accepted_seed_for_partition = accepted_seed_cluster_mask & np.asarray(door_completion.debug.get("voxel_door_seed_mask", door_seed_mask), dtype=bool)
     step2_door_reject_mask = build_step2_door_reject_mask(
         current_door_cut_mask=door_cut_mask,
         stable_door_cut_mask=stable_door_cut_mask,
@@ -776,6 +881,11 @@ def run_voxel_occupancy_door_wall_roomseg(
         door_intersection_dilation_cells=int(cfg.door_intersection_dilation_cells),
         reject_if_intersects_door_visual=bool(getattr(cfg, "reject_step2_if_intersects_door_visual", False)),
         reject_if_intersects_door_seed=bool(getattr(cfg, "reject_step2_if_intersects_door_seed", False)),
+    )
+    previous_stable_step2_separator_map = (
+        separator_memory.stable_mask(shape)
+        if separator_memory is not None
+        else np.zeros(shape, dtype=bool)
     )
 
     line_cfg = replace(
@@ -798,6 +908,20 @@ def run_voxel_occupancy_door_wall_roomseg(
         reject_if_intersects_door=bool(cfg.reject_step2_if_intersects_door),
         door_intersection_dilation_cells=int(cfg.door_intersection_dilation_cells),
     )
+    hit_validation_debug = reject_step2_extension_hits_v23(
+        step2_extensions,
+        forbidden_frontier_residual_map=forbidden_residual_support,
+        frontier_unknown_band=frontier_unknown_band,
+        target_wall_map=step2_line_pool.target_wall_map,
+        target_source_map=step2_line_pool.target_source_map,
+        anchor_projected_wall_map=anchor_projected_wall_map,
+        existing_separator_map=previous_stable_step2_separator_map,
+        shape=shape,
+        reject_if_hits_frontier_residual=bool(getattr(cfg, "reject_step2_if_hits_frontier_residual_wall", True)),
+        reject_if_crosses_frontier_unknown_band=bool(getattr(cfg, "reject_step2_if_crosses_frontier_unknown_band", True)),
+        reject_if_intersects_existing_separator=bool(getattr(cfg, "reject_step2_if_intersects_existing_extension", True)),
+    )
+    step2_extension_debug = {**dict(step2_extension_debug), **hit_validation_debug}
     step2_candidates, step2_candidate_debug = build_step2_separator_candidates_from_extensions(
         step2_extensions,
         accepted_virtual_targets=None,
@@ -842,11 +966,6 @@ def run_voxel_occupancy_door_wall_roomseg(
         intersection_pre_rejected = []
         intersection_target_map = np.zeros(shape, dtype=bool)
         intersection_debug["voxel_step2_extension_intersection_candidates_suppressed"] = int(len(debug_intersection_candidates))
-    previous_stable_step2_separator_map = (
-        separator_memory.stable_mask(shape)
-        if separator_memory is not None
-        else np.zeros(shape, dtype=bool)
-    )
     all_step2_candidates = [*step2_candidates, *intersection_candidates]
     all_step2_candidates, conflict_rejected_step2, conflict_debug = reject_step2_candidate_conflicts_v22(
         all_step2_candidates,
@@ -927,6 +1046,12 @@ def run_voxel_occupancy_door_wall_roomseg(
     step2_topology_rejected_map = _rasterize_candidates(rejected_step2, shape)
     step2_reject_reason_map = _step2_reject_reason_map(step2_extensions, rejected_step2, shape)
     step2_intersection_candidate_map = _rasterize_candidates(intersection_candidates, shape)
+    corridor_neck_source_lines = [
+        line for line in step2_line_pool.source_lines if str(line.debug.get("step2_source_role", "")) == "corridor_neck_source"
+    ]
+    corridor_neck_source_map = filtered_wall_line_mask(corridor_neck_source_lines, shape)
+    raw_seed_not_suppressing_step2_map = raw_door_seed_band_for_debug & ~door_suppression_band
+    step2_suppression_from_accepted_door_map = door_suppression_band.astype(bool)
     step2_stage_maps = Step2StageMaps(
         extension_hits_all_map=step2_layers["all"].astype(bool),
         extension_hits_pre_topology_map=step2_layers["accepted"].astype(bool),
@@ -954,6 +1079,7 @@ def run_voxel_occupancy_door_wall_roomseg(
         "voxel_projected_wall_display_map": projected_wall_map,
         "voxel_projected_wall_anchor_map": anchor_projected_wall_map,
         "voxel_projected_wall_step2_source_map": step2_source_projected_wall_map,
+        "voxel_projected_corridor_neck_source_map": corridor_neck_source_map,
         "voxel_projected_structural_wall_map": projected_wall_map,
         "voxel_anchor_projected_wall_map": anchor_projected_wall_map,
         "voxel_unknown_xy": evidence.unknown_xy,
@@ -982,6 +1108,22 @@ def run_voxel_occupancy_door_wall_roomseg(
         "voxel_wall_support_rejected_by_frontier_band_xy": np.asarray(evidence.wall_support_frontier_band_rejected_xy, dtype=bool),
         "voxel_wall_support_free_conflict_xy": np.asarray(evidence.wall_support_free_conflict_xy, dtype=bool),
         "voxel_frontier_unknown_band_xy": np.asarray(evidence.frontier_unknown_band_xy, dtype=bool),
+        "voxel_v23_protected_structural_wall_band_xy": protected_structural_wall_band,
+        "voxel_v23_frontier_residual_band_xy": np.asarray(evidence.debug.get("voxel_v23_frontier_residual_band_xy", forbidden_residual_support), dtype=bool),
+        "voxel_v23_nav_unknown_band_xy": np.asarray(evidence.debug.get("voxel_v23_nav_unknown_band_xy", np.zeros(shape, dtype=bool)), dtype=bool),
+        "voxel_v23_unknown_dominant_band_xy": np.asarray(evidence.debug.get("voxel_v23_unknown_dominant_band_xy", np.zeros(shape, dtype=bool)), dtype=bool),
+        "voxel_v23_free_boundary_band_xy": np.asarray(evidence.debug.get("voxel_v23_free_boundary_band_xy", np.zeros(shape, dtype=bool)), dtype=bool),
+        "voxel_strong_structural_support_xy": np.asarray(evidence.strong_structural_support_xy if evidence.strong_structural_support_xy is not None else projection_seed, dtype=bool),
+        "voxel_bridge_only_support_xy": np.asarray(evidence.bridge_only_support_xy if evidence.bridge_only_support_xy is not None else projection_bridge, dtype=bool),
+        "voxel_forbidden_frontier_residual_support_xy": forbidden_frontier_residual,
+        "voxel_forbidden_unknown_boundary_support_xy": forbidden_unknown_boundary,
+        "voxel_free_conflict_support_xy": np.asarray(evidence.free_conflict_support_xy if evidence.free_conflict_support_xy is not None else np.zeros(shape, dtype=bool), dtype=bool),
+        "voxel_protected_structural_wall_band_xy": protected_structural_wall_band,
+        "voxel_support_seed_for_projection_xy": projection_seed,
+        "voxel_support_bridge_for_projection_xy": projection_bridge,
+        "voxel_support_for_projection_display_xy": projection_input,
+        "voxel_support_for_step2_target_xy": np.asarray(evidence.support_for_step2_target_xy if evidence.support_for_step2_target_xy is not None else partition_maps.step2_target_wall_map, dtype=bool),
+        "voxel_support_for_step2_source_xy": np.asarray(evidence.support_for_step2_source_xy if evidence.support_for_step2_source_xy is not None else projection_seed, dtype=bool),
         "voxel_wall_rejected_by_free_xy": np.asarray(evidence.wall_rejected_by_free_xy, dtype=bool),
         "voxel_wall_rejected_by_unknown_xy": np.asarray(evidence.wall_rejected_by_unknown_xy, dtype=bool),
         "voxel_nonstructural_occupied_xy": np.asarray(evidence.nonstructural_occupied_xy, dtype=bool),
@@ -990,6 +1132,21 @@ def run_voxel_occupancy_door_wall_roomseg(
         "voxel_wall_support_rejected_unknown_xy": np.asarray(evidence.wall_support_rejected_unknown_xy, dtype=bool),
         "voxel_free_raw_xy": np.asarray(evidence.debug.get("voxel_free_raw_xy", evidence.vertical_free_xy), dtype=bool),
         "voxel_wall_raw_xy": np.asarray(evidence.structural_wall_ratio_xy, dtype=bool),
+        "voxel_sensor_range_count_xy": np.asarray(evidence.debug.get("voxel_sensor_range_count_xy", np.zeros(shape, dtype=np.uint16)), dtype=np.uint16),
+        "voxel_sensor_range_ratio_xy": np.asarray(evidence.debug.get("voxel_sensor_range_ratio_xy", np.zeros(shape, dtype=np.float32)), dtype=np.float32),
+        "voxel_sensor_in_range_unknown_count_xy": np.asarray(evidence.debug.get("voxel_sensor_in_range_unknown_count_xy", np.zeros(shape, dtype=np.uint16)), dtype=np.uint16),
+        "voxel_sensor_outside_range_unknown_count_xy": np.asarray(evidence.debug.get("voxel_sensor_outside_range_unknown_count_xy", np.zeros(shape, dtype=np.uint16)), dtype=np.uint16),
+        "voxel_in_range_unknown_ratio_xy": np.asarray(evidence.debug.get("voxel_in_range_unknown_ratio_xy", np.zeros(shape, dtype=np.float32)), dtype=np.float32),
+        "voxel_outside_unknown_ratio_xy": np.asarray(evidence.debug.get("voxel_outside_unknown_ratio_xy", np.zeros(shape, dtype=np.float32)), dtype=np.float32),
+        "voxel_generalized_occupied_count_xy": np.asarray(evidence.debug.get("voxel_generalized_occupied_count_xy", np.zeros(shape, dtype=np.uint16)), dtype=np.uint16),
+        "voxel_generalized_occupied_ratio_xy": np.asarray(evidence.debug.get("voxel_generalized_occupied_ratio_xy", np.zeros(shape, dtype=np.float32)), dtype=np.float32),
+        "voxel_wall_generalized_raw_xy": np.asarray(evidence.debug.get("voxel_wall_generalized_raw_xy", np.zeros(shape, dtype=bool)), dtype=bool),
+        "voxel_wall_actual_ratio_raw_xy": np.asarray(evidence.debug.get("voxel_wall_actual_ratio_raw_xy", np.zeros(shape, dtype=bool)), dtype=bool),
+        "voxel_wall_actual_occupied_requirement_xy": np.asarray(evidence.debug.get("voxel_wall_actual_occupied_requirement_xy", np.zeros(shape, dtype=bool)), dtype=bool),
+        "voxel_wall_rejected_by_outside_unknown_xy": np.asarray(evidence.debug.get("voxel_wall_rejected_by_outside_unknown_xy", np.zeros(shape, dtype=bool)), dtype=bool),
+        "voxel_wall_from_in_range_unknown_xy": np.asarray(evidence.debug.get("voxel_wall_from_in_range_unknown_xy", np.zeros(shape, dtype=bool)), dtype=bool),
+        "voxel_roomseg_nav_obstacle_suppressed_by_vertical_free_xy": np.asarray(evidence.debug.get("voxel_roomseg_nav_obstacle_suppressed_by_vertical_free_xy", np.zeros(shape, dtype=bool)), dtype=bool),
+        "voxel_outside_unknown_dominant_xy": np.asarray(evidence.debug.get("voxel_outside_unknown_dominant_xy", np.zeros(shape, dtype=bool)), dtype=bool),
         "voxel_occupied_any_xy": np.asarray(evidence.occupied_any_xy, dtype=bool),
         "voxel_raw_occupied_wall_support_xy": np.asarray(evidence.raw_occupied_wall_support_xy, dtype=bool),
         "voxel_strict_raw_wall_xy": np.asarray(evidence.strict_raw_wall_xy, dtype=bool),
@@ -1000,8 +1157,14 @@ def run_voxel_occupancy_door_wall_roomseg(
         "voxel_door_anchor_source_map": door_anchor_source_map,
         "voxel_wall_anchor_support_map": partition_maps.wall_anchor_support_map,
         "voxel_door_anchor_wall_map": partition_maps.door_anchor_wall_map,
+        "voxel_pre_door_wall_anchor_support_map": pre_partition_maps.wall_anchor_support_map,
+        "voxel_pre_door_step2_target_wall_map": pre_partition_maps.step2_target_wall_map,
+        "voxel_final_step2_target_wall_map": partition_maps.step2_target_wall_map,
+        "voxel_step2_target_wall_union_pre_final_map": step2_target_wall_override,
         "voxel_partition_real_wall_map": partition_maps.partition_real_wall_map,
         "voxel_partition_real_wall_removed_by_seed_carve_map": partition_maps.removed_by_seed_carve_map,
+        "voxel_pre_door_partition_real_wall_map": pre_partition_maps.partition_real_wall_map,
+        "voxel_pre_door_partition_real_wall_removed_by_seed_carve_map": pre_partition_maps.removed_by_seed_carve_map,
         "voxel_partition_unknown": partition_maps.partition_unknown,
         "voxel_wall_projection_support_map": np.asarray(wall_projection.support_map, dtype=bool),
         "voxel_wall_projection_rejected_support_map": np.asarray(wall_projection.rejected_support_map, dtype=bool),
@@ -1017,6 +1180,13 @@ def run_voxel_occupancy_door_wall_roomseg(
         "voxel_extension_seed_wall_line_mask": extension_seed_line_map,
         "voxel_wall_base_map": wall_base_pre_step1,
         "voxel_door_seed_mask": door_seed_mask,
+        "voxel_raw_door_seed_mask": door_seed_masks_for_step2.raw_seed_mask,
+        "voxel_raw_door_seed_band_for_debug": raw_door_seed_band_for_debug,
+        "voxel_raw_door_seed_not_suppressing_step2_map": raw_seed_not_suppressing_step2_map,
+        "voxel_step2_suppression_from_accepted_door_map": step2_suppression_from_accepted_door_map,
+        "voxel_step2_suppression_band": door_suppression_band,
+        "voxel_accepted_seed_cluster_mask": accepted_seed_cluster_mask,
+        "voxel_door_seed_wall_carve_mask": accepted_seed_for_partition,
         "voxel_door_seed_component_map": door_seed_result.door_seed_component_map,
         "voxel_door_extension_attempt_all_mask": door_completion.door_extension_attempt_all_mask,
         "voxel_door_extension_attempt_selected_mask": np.asarray(door_completion.debug.get("voxel_door_extension_attempt_selected_mask", np.zeros(shape, dtype=bool)), dtype=bool),
@@ -1049,6 +1219,7 @@ def run_voxel_occupancy_door_wall_roomseg(
         "voxel_real_wall_barrier_for_partition": real_wall_barrier_for_partition,
         "voxel_base_partition_free": base_partition_free,
         "voxel_step2_source_line_map": step2_line_pool.source_line_map,
+        "voxel_step2_corridor_neck_source_line_map": corridor_neck_source_map,
         "voxel_step2_target_wall_map": step2_line_pool.target_wall_map,
         "voxel_step2_target_source_map": step2_line_pool.target_source_map,
         "voxel_step2_door_reject_mask": step2_door_reject_mask,
@@ -1065,6 +1236,8 @@ def run_voxel_occupancy_door_wall_roomseg(
         "voxel_previous_stable_step2_separator_map": previous_stable_step2_separator_map,
         "voxel_step2_topology_rejected_separator_map": step2_stage_maps.topology_rejected_separator_map,
         "voxel_step2_reject_reason_map": step2_reject_reason_map,
+        "voxel_step2_hit_frontier_residual_rejected_map": np.asarray(hit_validation_debug.get("voxel_step2_hit_frontier_residual_rejected_map", np.zeros(shape, dtype=bool)), dtype=bool),
+        "voxel_step2_v23_rejected_hit_map": np.asarray(hit_validation_debug.get("voxel_step2_v23_rejected_hit_map", np.zeros(shape, dtype=bool)), dtype=bool),
         "voxel_step2_accepted_separator_map": step2_stage_maps.accepted_separator_map,
         "voxel_step2_extension_separator_map": final_step2_separator_map,
         "voxel_step2_current_extension_separator_map": step2_extension_separator_map,
@@ -1093,11 +1266,16 @@ def run_voxel_occupancy_door_wall_roomseg(
         "filtered_wall_line_count": int(len(filtered_lines)),
         "extension_seed_wall_line_count": int(len(extension_seed_lines)),
         "voxel_step2_source_line_count": int(step2_line_pool.debug.get("voxel_step2_source_line_count", 0)),
+        "voxel_step2_source_line_count_main": int(step2_line_pool.debug.get("voxel_step2_source_line_count_main", 0)),
+        "voxel_step2_source_line_count_corridor_neck": int(step2_line_pool.debug.get("voxel_step2_source_line_count_corridor_neck", 0)),
         "voxel_step2_filtered_line_count": int(step2_line_pool.debug.get("voxel_step2_filtered_line_count", 0)),
         "voxel_step2_extension_seed_line_count": int(step2_line_pool.debug.get("voxel_step2_extension_seed_line_count", 0)),
         "voxel_step2_projected_source_line_count": int(step2_line_pool.debug.get("voxel_step2_projected_source_line_count", 0)),
         "voxel_step2_source_line_dedup_count": int(step2_line_pool.debug.get("voxel_step2_source_line_dedup_count", 0)),
         "voxel_step2_target_wall_cells": int(step2_line_pool.debug.get("voxel_step2_target_wall_cells", 0)),
+        "voxel_step2_target_wall_pre_door_cells": int(np.count_nonzero(pre_partition_maps.step2_target_wall_map)),
+        "voxel_step2_target_wall_final_cells": int(np.count_nonzero(partition_maps.step2_target_wall_map)),
+        "voxel_step2_target_wall_union_pre_final_cells": int(np.count_nonzero(step2_target_wall_override)),
         "voxel_step2_target_source_counts": dict(step2_line_pool.debug.get("voxel_step2_target_source_counts", {}) or {}),
         "voxel_wall_raw_cells": int(np.count_nonzero(evidence.structural_wall_ratio_xy)),
         "voxel_wall_ratio_raw_cells": int(np.count_nonzero(evidence.structural_wall_ratio_xy)),
@@ -1111,6 +1289,19 @@ def run_voxel_occupancy_door_wall_roomseg(
         "voxel_wall_support_rejected_by_nav_unknown_cells": int(np.count_nonzero(np.asarray(evidence.wall_support_nav_unknown_rejected_xy, dtype=bool))),
         "voxel_wall_support_rejected_by_frontier_band_cells": int(np.count_nonzero(np.asarray(evidence.wall_support_frontier_band_rejected_xy, dtype=bool))),
         "voxel_frontier_unknown_band_cells": int(np.count_nonzero(np.asarray(evidence.frontier_unknown_band_xy, dtype=bool))),
+        "voxel_sensor_range_xy_cells": int(evidence.debug.get("voxel_sensor_range_xy_cells", 0) or 0),
+        "voxel_in_range_unknown_cells_xy": int(evidence.debug.get("voxel_in_range_unknown_cells_xy", 0) or 0),
+        "voxel_outside_unknown_dominant_cells": int(evidence.debug.get("voxel_outside_unknown_dominant_cells", 0) or 0),
+        "voxel_generalized_wall_raw_cells": int(evidence.debug.get("voxel_generalized_wall_raw_cells", 0) or 0),
+        "voxel_wall_from_generalized_unknown_cells": int(evidence.debug.get("voxel_wall_from_generalized_unknown_cells", 0) or 0),
+        "voxel_wall_rejected_by_outside_unknown_cells": int(evidence.debug.get("voxel_wall_rejected_by_outside_unknown_cells", 0) or 0),
+        "voxel_wall_actual_occupied_requirement_cells": int(evidence.debug.get("voxel_wall_actual_occupied_requirement_cells", 0) or 0),
+        "voxel_forbidden_frontier_residual_support_cells": int(np.count_nonzero(forbidden_frontier_residual)),
+        "voxel_forbidden_unknown_boundary_support_cells": int(np.count_nonzero(forbidden_unknown_boundary)),
+        "voxel_bridge_only_support_cells": int(np.count_nonzero(projection_bridge)),
+        "voxel_support_seed_for_projection_cells": int(np.count_nonzero(projection_seed)),
+        "voxel_support_bridge_for_projection_cells": int(np.count_nonzero(projection_bridge)),
+        "voxel_support_for_step2_source_cells": int(np.count_nonzero(np.asarray(evidence.support_for_step2_source_xy if evidence.support_for_step2_source_xy is not None else projection_seed, dtype=bool))),
         "voxel_strict_raw_wall_cells": int(np.count_nonzero(evidence.strict_raw_wall_xy)),
         "voxel_wall_projected_cells": int(np.count_nonzero(projected_wall_map)),
         "voxel_projected_structural_wall_cells": int(np.count_nonzero(projected_wall_map)),
@@ -1118,6 +1309,7 @@ def run_voxel_occupancy_door_wall_roomseg(
         "voxel_anchor_projected_wall_cells": int(np.count_nonzero(anchor_projected_wall_map)),
         "voxel_step2_source_projected_wall_cells": int(np.count_nonzero(step2_source_projected_wall_map)),
         "voxel_door_anchor_wall_cells": int(np.count_nonzero(door_anchor_wall_map)),
+        "voxel_pre_door_partition_debug": dict(pre_partition_maps.debug),
         **partition_maps.debug,
         "voxel_door_accepted_count": int(door_completion.debug.get("voxel_door_accepted_count", 0)),
         "voxel_door_visual_accepted_count": int(door_completion.debug.get("voxel_door_visual_accepted_count", 0)),
@@ -1133,12 +1325,19 @@ def run_voxel_occupancy_door_wall_roomseg(
         "voxel_step2_extension_count": int(len(step2_extensions)),
         "voxel_step2_candidate_count": int(len(all_step2_candidates)),
         "voxel_step2_hit_candidate_count": int(len(step2_candidates)),
+        "voxel_step2_extension_hit_count": int(sum(1 for hit in step2_extensions if hit.reject_reason is None)),
         "voxel_step2_intersection_candidate_count": int(len(intersection_candidates)),
         "voxel_step2_intersection_pre_rejected_count": int(len(intersection_pre_rejected)),
         "voxel_step2_accepted_count": int(len(accepted_step2)),
         "voxel_step2_rejected_count": int(len(rejected_step2)),
         "voxel_step2_extension_reject_reason_counts": _extension_reason_counts(step2_extensions),
+        "voxel_step2_v23_hit_reject_reason_counts": dict(hit_validation_debug.get("voxel_step2_v23_hit_reject_reason_counts", {}) or {}),
         "voxel_step2_topology_reject_reason_counts": _candidate_reason_counts(rejected_step2),
+        "voxel_step2_hit_target_source_counts": dict(Counter(int(v) for v in np.asarray(step2_line_pool.target_source_map, dtype=np.uint8)[step2_layers["accepted"] & step2_line_pool.target_wall_map].tolist())),
+        "voxel_step2_blocked_by_raw_seed_count": int(step2_line_pool.debug.get("voxel_step2_blocked_by_raw_seed_count", 0)),
+        "voxel_step2_blocked_by_accepted_door_count": int(step2_line_pool.debug.get("voxel_step2_blocked_by_accepted_door_count", 0)),
+        "voxel_raw_door_seed_not_suppressing_step2_cells": int(np.count_nonzero(raw_seed_not_suppressing_step2_map)),
+        "voxel_step2_suppression_from_accepted_door_cells": int(np.count_nonzero(step2_suppression_from_accepted_door_map)),
         "voxel_step2_partition_cut_empty_count": int(step2_partition_cut_empty_count),
         "voxel_step2_partition_cut_candidate_cells": int(np.count_nonzero(step2_partition_cut_candidate_map)),
         "voxel_step2_partition_cut_accepted_cells": int(np.count_nonzero(step2_extension_separator_map)),
@@ -1189,8 +1388,12 @@ def run_voxel_occupancy_door_wall_roomseg(
         "voxel_show_step2_source_candidates": bool(cfg.voxel_show_step2_source_candidates),
         "voxel_show_step2_rejected_candidates": bool(cfg.voxel_show_step2_rejected_candidates),
         "voxel_show_door_visual_only_candidates": bool(cfg.voxel_show_door_visual_only_candidates),
+        "voxel_show_raw_door_seed_band": bool(cfg.voxel_show_raw_door_seed_band),
+        "voxel_show_corridor_neck_sources": bool(cfg.voxel_show_corridor_neck_sources),
+        "voxel_show_door_seed_reject_reason_overlay": bool(cfg.voxel_show_door_seed_reject_reason_overlay),
         "voxel_step2_reject_reason_counts": report["voxel_step2_reject_reason_counts"],
         "voxel_step2_extension_reject_reason_counts": report["voxel_step2_extension_reject_reason_counts"],
+        "voxel_step2_v23_hit_reject_reason_counts": report["voxel_step2_v23_hit_reject_reason_counts"],
         "voxel_step2_topology_reject_reason_counts": report["voxel_step2_topology_reject_reason_counts"],
         "voxel_step2_conflict_reject_reason_counts": report.get("voxel_step2_conflict_reject_reason_counts", {}),
         "voxel_step2_partition_cut_empty_count": int(step2_partition_cut_empty_count),
@@ -1207,10 +1410,12 @@ def run_voxel_occupancy_door_wall_roomseg(
             **seed_filter_debug,
         },
         "line_extension_report": {"pass2": step2_extension_debug},
+        "voxel_step2_v23_hit_validation": hit_validation_debug,
         "voxel_step1_gap_fill_report": step1_gap_debug,
         "voxel_wall_run_report": wall_run_debug,
         "topology_report": {"final": topology_debug, "step2_candidates": step2_candidate_debug},
         "voxel_step2_intersection_debug": intersection_debug,
+        "voxel_pre_door_partition_debug": dict(pre_partition_maps.debug),
         **conflict_debug,
         **separator_memory_debug,
         "accepted_separators": [candidate.to_dict() for candidate in accepted_step2],
@@ -1434,7 +1639,6 @@ def _accepted_door_seed_cluster_mask(cluster_map: np.ndarray, clusters: object) 
 def build_voxel_partition_maps(
     *,
     evidence: VoxelRoomsegEvidence,
-    door_seed_mask: np.ndarray,
     strict_raw_wall: np.ndarray,
     projected_wall_map: np.ndarray,
     anchor_projected_wall_map: np.ndarray,
@@ -1442,8 +1646,13 @@ def build_voxel_partition_maps(
     extension_seed_line_map: np.ndarray,
     step1_gap_fill_map: np.ndarray,
     cfg: VoxelOccupancyDoorWallRoomSegConfig,
+    door_seed_carve_mask: np.ndarray | None = None,
+    door_seed_mask: np.ndarray | None = None,
 ) -> PartitionMapBundle:
-    seed = np.asarray(door_seed_mask, dtype=bool)
+    seed_source = door_seed_carve_mask if door_seed_carve_mask is not None else door_seed_mask
+    if seed_source is None:
+        raise ValueError("door_seed_carve_mask is required")
+    seed = np.asarray(seed_source, dtype=bool)
     strict = np.asarray(strict_raw_wall, dtype=bool)
     projected = np.asarray(projected_wall_map, dtype=bool)
     anchor_projected = np.asarray(anchor_projected_wall_map, dtype=bool)
@@ -1453,6 +1662,10 @@ def build_voxel_partition_maps(
     raw_support = np.asarray(evidence.raw_occupied_wall_support_xy, dtype=bool)
     unknown_dominant = np.asarray(getattr(evidence, "unknown_dominant_xy", np.zeros_like(strict, dtype=bool)), dtype=bool)
     unknown_rejected = np.asarray(getattr(evidence, "wall_rejected_by_unknown_xy", np.zeros_like(strict, dtype=bool)), dtype=bool)
+    forbidden_frontier_residual = np.asarray(getattr(evidence, "forbidden_frontier_residual_support_xy", np.zeros_like(strict, dtype=bool)), dtype=bool)
+    forbidden_unknown_boundary = np.asarray(getattr(evidence, "forbidden_unknown_boundary_support_xy", np.zeros_like(strict, dtype=bool)), dtype=bool)
+    forbidden_residual = forbidden_frontier_residual | forbidden_unknown_boundary
+    bridge_only = np.asarray(getattr(evidence, "bridge_only_support_xy", np.zeros_like(strict, dtype=bool)), dtype=bool)
     vertical_free = np.asarray(evidence.vertical_free_xy, dtype=bool)
     shape = vertical_free.shape
     for name, arr in {
@@ -1462,19 +1675,25 @@ def build_voxel_partition_maps(
         "filtered_line_map": filtered,
         "extension_seed_line_map": extension_seed,
         "step1_gap_fill_map": step1,
-        "door_seed_mask": seed,
+        "door_seed_carve_mask": seed,
     }.items():
         if arr.shape != shape:
             raise ValueError("%s must match voxel evidence shape" % name)
     seed_carve_radius = int(getattr(cfg, "door_seed_wall_carve_radius_cells", cfg.door.seed_cluster_morph_close_radius_cells))
     seed_carve = dilate(seed, max(0, seed_carve_radius))
-    clean_structural_wall = strict & ~vertical_free
-    projected_structural_wall = projected & ~vertical_free
-    anchor_projected_structural_wall = anchor_projected & ~vertical_free
-    step1_structural_wall = step1 & ~vertical_free
+    structural_forbid = vertical_free | unknown_dominant | forbidden_residual
+    clean_structural_wall = strict & ~structural_forbid
+    projected_structural_wall = projected & ~structural_forbid
+    anchor_projected_structural_wall = anchor_projected & ~structural_forbid
+    step1_structural_wall = step1 & ~structural_forbid
     wall_anchor_support_map = clean_structural_wall | projected_structural_wall | anchor_projected_structural_wall | step1_structural_wall
     door_anchor_wall_map = wall_anchor_support_map.copy()
-    step2_target_wall_map = wall_anchor_support_map.copy()
+    step2_target_wall_map = clean_structural_wall | projected_structural_wall | step1_structural_wall
+    step2_target_wall_map &= ~seed_carve
+    step2_target_wall_map &= ~extension_seed
+    step2_target_wall_map &= ~bridge_only
+    step2_target_wall_map &= ~forbidden_residual
+    step2_target_wall_map &= ~unknown_dominant
     partition_real_wall_raw = clean_structural_wall | projected_structural_wall | step1_structural_wall
     if not bool(cfg.use_real_wall_as_partition_barrier):
         partition_real_wall_raw = np.zeros(shape, dtype=bool)
@@ -1489,17 +1708,24 @@ def build_voxel_partition_maps(
         "voxel_wall_anchor_support_cells": int(np.count_nonzero(wall_anchor_support_map)),
         "voxel_door_anchor_wall_cells": int(np.count_nonzero(door_anchor_wall_map)),
         "voxel_door_anchor_allowed_sources": ["structural_wall", "projected_structural_wall", "anchor_projected_wall", "step1"],
-        "voxel_step2_target_allowed_sources": ["structural_wall", "projected_structural_wall", "anchor_projected_wall", "step1"],
+        "voxel_step2_target_allowed_sources": ["structural_wall", "projected_structural_wall", "step1"],
         "voxel_door_anchor_unknown_overlap_cells": int(np.count_nonzero(door_anchor_wall_map & partition_unknown)),
         "voxel_step2_target_wall_cells_v18": int(np.count_nonzero(step2_target_wall_map)),
         "voxel_step2_target_wall_cells_v15": int(np.count_nonzero(step2_target_wall_map)),
         "voxel_step2_target_wall_unknown_rejected_cells": int(np.count_nonzero((strict | projected | anchor_projected | filtered | extension_seed | step1) & unknown_dominant)),
+        "voxel_step2_target_wall_frontier_residual_rejected_cells": int(np.count_nonzero((strict | projected | anchor_projected | filtered | extension_seed | step1) & forbidden_frontier_residual)),
+        "voxel_step2_target_wall_unknown_boundary_rejected_cells": int(np.count_nonzero((strict | projected | anchor_projected | filtered | extension_seed | step1) & forbidden_unknown_boundary)),
+        "voxel_step2_target_wall_bridge_only_rejected_cells": int(np.count_nonzero((strict | projected | anchor_projected | filtered | extension_seed | step1) & bridge_only)),
+        "voxel_step2_target_wall_door_seed_rejected_cells": int(np.count_nonzero((strict | projected | anchor_projected | filtered | extension_seed | step1) & seed_carve)),
         "voxel_step2_false_frontier_wall_rejected_map": unknown_rejected.astype(bool),
+        "voxel_step2_frontier_residual_wall_rejected_map": forbidden_residual.astype(bool),
         "voxel_partition_extension_seed_excluded_cells": int(np.count_nonzero(extension_seed & ~partition_real_wall_map)),
         "voxel_partition_filtered_line_excluded_cells": int(np.count_nonzero(filtered & ~partition_real_wall_map)),
         "voxel_partition_anchor_projection_excluded_cells": int(np.count_nonzero(anchor_projected & ~partition_real_wall_map)),
         "voxel_partition_real_wall_cells": int(np.count_nonzero(partition_real_wall_map)),
         "voxel_partition_real_wall_removed_by_seed_carve_cells": int(np.count_nonzero(removed_by_seed_carve)),
+        "voxel_partition_seed_carve_source": "accepted_seed_cluster_only",
+        "voxel_partition_raw_seed_carve_enabled": False,
         "voxel_base_partition_free_cells": int(np.count_nonzero(base_partition_free)),
         "voxel_base_partition_free_lost_to_old_raw_support_cells": int(np.count_nonzero(old_raw_support_loss)),
         "voxel_seed_wall_carve_radius_cells": int(seed_carve_radius),
@@ -1522,14 +1748,28 @@ def build_step2_line_pool(
     extension_seed_lines: Sequence[FilteredWallLine],
     projected_display_lines: Sequence[ProjectedWallLine] | None = None,
     projected_source_lines: Sequence[ProjectedWallLine] | None = None,
+    projected_corridor_neck_source_lines: Sequence[ProjectedWallLine] | None = None,
     source_support_map: np.ndarray | None = None,
     frontier_unknown_band: np.ndarray | None = None,
     door_suppression_band: np.ndarray | None = None,
+    raw_door_seed_band: np.ndarray | None = None,
+    vertical_free_map: np.ndarray | None = None,
+    unknown_ratio_map: np.ndarray | None = None,
     source_min_line_length_m: float = 0.60,
     source_min_support_ratio: float = 0.30,
     source_min_support_cells: int = 6,
     source_forbid_frontier_unknown_band: bool = True,
     source_forbid_door_band: bool = True,
+    corridor_neck_source_enabled: bool = False,
+    corridor_neck_source_min_line_length_m: float = 0.35,
+    corridor_neck_source_min_support_cells: int = 4,
+    corridor_neck_source_min_support_ratio: float = 0.45,
+    corridor_neck_source_must_touch_large_free: bool = True,
+    corridor_neck_source_min_adjacent_free_area_cells: int = 60,
+    corridor_neck_source_forbid_raw_seed_band: bool = False,
+    corridor_neck_source_forbid_accepted_door_band: bool = True,
+    corridor_neck_source_max_unknown_ratio_on_line: float = 0.25,
+    corridor_neck_source_allow_only_projected_or_strict: bool = True,
     strict_raw_wall: np.ndarray,
     projected_wall_map: np.ndarray,
     anchor_projected_wall_map: np.ndarray,
@@ -1544,13 +1784,26 @@ def build_step2_line_pool(
     support = np.ones(shape, dtype=bool) if source_support_map is None else np.asarray(source_support_map, dtype=bool)
     frontier_band = np.zeros(shape, dtype=bool) if frontier_unknown_band is None else np.asarray(frontier_unknown_band, dtype=bool)
     door_band = np.zeros(shape, dtype=bool) if door_suppression_band is None else np.asarray(door_suppression_band, dtype=bool)
+    raw_seed_band = np.zeros(shape, dtype=bool) if raw_door_seed_band is None else np.asarray(raw_door_seed_band, dtype=bool)
+    vertical_free = None if vertical_free_map is None else np.asarray(vertical_free_map, dtype=bool)
+    unknown_ratio = np.zeros(shape, dtype=np.float32) if unknown_ratio_map is None else np.asarray(unknown_ratio_map, dtype=np.float32)
     if support.shape != shape or frontier_band.shape != shape or door_band.shape != shape:
         raise ValueError("Step2 source validation masks must match shape")
+    if raw_seed_band.shape != shape or unknown_ratio.shape != shape:
+        raise ValueError("Step2 raw seed and unknown-ratio masks must match shape")
+    if vertical_free is not None and vertical_free.shape != shape:
+        raise ValueError("Step2 vertical_free_map must match shape")
     projected_source_filtered = projected_wall_lines_to_filtered_lines(
         list(projected_source_lines or []),
         shape=shape,
         resolution_m=float(resolution_m),
         source_name="projected_step2_source_wall",
+    )
+    corridor_neck_projected_filtered = projected_wall_lines_to_filtered_lines(
+        list(projected_corridor_neck_source_lines or []),
+        shape=shape,
+        resolution_m=float(resolution_m),
+        source_name="projected_corridor_neck_source_wall",
     )
     source_debug: list[dict[str, object]] = []
     rejected_source_debug: list[dict[str, object]] = []
@@ -1579,14 +1832,51 @@ def build_step2_line_pool(
             rejected_source_debug.append(record)
         return bool(accepted)
 
+    def validate_corridor_neck(line: FilteredWallLine) -> bool:
+        accepted, reason, debug = validate_corridor_neck_step2_source_line_v25(
+            line,
+            shape=shape,
+            resolution_m=float(resolution_m),
+            support_map=support,
+            frontier_unknown_band=frontier_band,
+            accepted_door_suppression_band=door_band,
+            raw_door_seed_band=raw_seed_band,
+            vertical_free_map=vertical_free,
+            unknown_ratio_map=unknown_ratio,
+            min_line_length_m=float(corridor_neck_source_min_line_length_m),
+            min_support_ratio=float(corridor_neck_source_min_support_ratio),
+            min_support_cells=int(corridor_neck_source_min_support_cells),
+            must_touch_large_free=bool(corridor_neck_source_must_touch_large_free),
+            min_adjacent_free_area_cells=int(corridor_neck_source_min_adjacent_free_area_cells),
+            forbid_raw_seed_band=bool(corridor_neck_source_forbid_raw_seed_band),
+            forbid_accepted_door_band=bool(corridor_neck_source_forbid_accepted_door_band),
+            max_unknown_ratio_on_line=float(corridor_neck_source_max_unknown_ratio_on_line),
+            allow_only_projected_or_strict=bool(corridor_neck_source_allow_only_projected_or_strict),
+        )
+        line.debug = dict(line.debug)
+        line.debug["step2_source_role"] = "corridor_neck_source"
+        line.debug["step2_source_validation"] = dict(debug)
+        record = {"role": "corridor_neck_source", "accepted": bool(accepted), "reject_reason": reason, **dict(debug)}
+        if accepted:
+            source_debug.append(record)
+        else:
+            rejected_source_debug.append(record)
+        return bool(accepted)
+
     filtered_valid = [line for line in filtered_lines if validate(line, "filtered_wall_line")]
     extension_valid = [line for line in extension_seed_lines if validate(line, "extension_seed_line")]
     projected_source_valid = [line for line in projected_source_filtered if validate(line, "projected_step2_source_wall")]
+    corridor_neck_valid = [
+        line
+        for line in corridor_neck_projected_filtered
+        if bool(corridor_neck_source_enabled) and validate_corridor_neck(line)
+    ]
     source_lines, dedup_count = _dedup_step2_lines(
         [
             *filtered_valid,
             *extension_valid,
             *projected_source_valid,
+            *corridor_neck_valid,
         ]
     )
     source_line_map = filtered_wall_line_mask(source_lines, shape)
@@ -1594,7 +1884,6 @@ def build_step2_line_pool(
     projected_source_map = np.zeros(shape, dtype=bool) if projected_source_line_map is None else np.asarray(projected_source_line_map, dtype=bool)
     target_source[np.asarray(strict_raw_wall, dtype=bool)] = 1
     target_source[np.asarray(projected_wall_map, dtype=bool)] = 2
-    target_source[np.asarray(anchor_projected_wall_map, dtype=bool)] = 3
     target_source[np.asarray(step1_completed_wall_map, dtype=bool)] = 4
     target_source[projected_source_map] = 7
     target_wall = target_source > 0
@@ -1603,7 +1892,6 @@ def build_step2_line_pool(
         clean_source = np.zeros(shape, dtype=np.uint8)
         clean_source[np.asarray(strict_raw_wall, dtype=bool) & target_wall] = 1
         clean_source[np.asarray(projected_wall_map, dtype=bool) & target_wall] = 2
-        clean_source[np.asarray(anchor_projected_wall_map, dtype=bool) & target_wall] = 3
         clean_source[np.asarray(step1_completed_wall_map, dtype=bool) & target_wall] = 4
         clean_source[projected_source_map & target_wall & (clean_source == 0)] = 7
         target_source = clean_source
@@ -1618,15 +1906,23 @@ def build_step2_line_pool(
     }
     debug = {
         "voxel_step2_source_line_count": int(len(source_lines)),
+        "voxel_step2_source_line_count_main": int(len(filtered_valid) + len(extension_valid) + len(projected_source_valid)),
+        "voxel_step2_source_line_count_corridor_neck": int(len(corridor_neck_valid)),
         "voxel_step2_filtered_line_count": int(len(filtered_valid)),
         "voxel_step2_extension_seed_line_count": int(len(extension_valid)),
         "voxel_step2_projected_display_line_count": 0,
         "voxel_step2_projected_source_line_count": int(len(projected_source_valid)),
+        "voxel_step2_corridor_neck_projected_line_count": int(len(corridor_neck_projected_filtered)),
+        "voxel_step2_corridor_neck_source_line_count": int(len(corridor_neck_valid)),
         "voxel_step2_rejected_source_line_count": int(len(rejected_source_debug)),
         "voxel_step2_source_line_validation": source_debug[:1024],
         "voxel_step2_rejected_source_line_validation": rejected_source_debug[:1024],
         "voxel_step2_source_reject_reason_counts": dict(Counter(str(item.get("reject_reason")) for item in rejected_source_debug)),
         "voxel_step2_source_line_dedup_count": int(dedup_count),
+        "voxel_step2_blocked_by_raw_seed_count": 0,
+        "voxel_step2_blocked_by_accepted_door_count": int(
+            sum(1 for item in rejected_source_debug if str(item.get("reject_reason")) in {"reject_step2_source_door_frame_duplicate", "reject_corridor_neck_source_accepted_door_band"})
+        ),
         "voxel_step2_target_wall_cells": int(np.count_nonzero(target_wall)),
         "voxel_step2_target_source_counts": source_counts,
         "voxel_step2_source_lines": [line.to_dict() for line in source_lines[:1024]],
@@ -1666,6 +1962,93 @@ def build_step2_door_reject_mask(
     if bool(reject_if_intersects_door_seed):
         reject |= seed
     return reject.astype(bool)
+
+
+def reject_step2_extension_hits_v23(
+    extensions: Sequence[LineExtensionHit],
+    *,
+    forbidden_frontier_residual_map: np.ndarray,
+    frontier_unknown_band: np.ndarray,
+    target_wall_map: np.ndarray,
+    target_source_map: np.ndarray,
+    anchor_projected_wall_map: np.ndarray,
+    existing_separator_map: np.ndarray,
+    shape: tuple[int, int],
+    reject_if_hits_frontier_residual: bool = True,
+    reject_if_crosses_frontier_unknown_band: bool = True,
+    reject_if_intersects_existing_separator: bool = True,
+    max_frontier_cross_ratio: float = 0.20,
+) -> dict[str, object]:
+    residual = np.asarray(forbidden_frontier_residual_map, dtype=bool)
+    frontier = np.asarray(frontier_unknown_band, dtype=bool)
+    target_wall = np.asarray(target_wall_map, dtype=bool)
+    target_source = np.asarray(target_source_map, dtype=np.uint8)
+    anchor = np.asarray(anchor_projected_wall_map, dtype=bool)
+    existing = np.asarray(existing_separator_map, dtype=bool)
+    for name, arr in {
+        "forbidden_frontier_residual_map": residual,
+        "frontier_unknown_band": frontier,
+        "target_wall_map": target_wall,
+        "target_source_map": target_source,
+        "anchor_projected_wall_map": anchor,
+        "existing_separator_map": existing,
+    }.items():
+        if arr.shape != shape:
+            raise ValueError("%s must match shape" % name)
+    rejected_map = np.zeros(shape, dtype=bool)
+    residual_hit_map = np.zeros(shape, dtype=bool)
+    reason_counts: Counter[str] = Counter()
+    records: list[dict[str, object]] = []
+    for hit in extensions:
+        if hit.reject_reason is not None:
+            continue
+        line = rasterize_line(hit.p_start_rc, hit.p_hit_rc, shape)
+        line_cells = int(np.count_nonzero(line))
+        hit_cell = np.zeros(shape, dtype=bool)
+        r, c = np.rint(np.asarray(hit.p_hit_rc, dtype=np.float32)).astype(np.int32).tolist()
+        if 0 <= int(r) < shape[0] and 0 <= int(c) < shape[1]:
+            hit_cell[int(r), int(c)] = True
+        hit_disk = dilate(hit_cell, 1)
+        target_overlap = bool(np.any(hit_disk & target_wall))
+        residual_overlap = bool(np.any(hit_disk & residual))
+        anchor_overlap = bool(np.any(hit_disk & anchor & ~target_wall))
+        source_values = [int(v) for v in np.unique(target_source[hit_disk]) if int(v) > 0]
+        frontier_ratio = float(np.count_nonzero(line & frontier)) / float(max(1, line_cells))
+        existing_overlap = bool(np.any(line & existing & ~target_wall))
+        reason = None
+        if bool(reject_if_hits_frontier_residual) and residual_overlap and not target_overlap:
+            reason = "reject_step2_hit_frontier_residual_wall"
+            residual_hit_map |= hit_disk & residual
+        elif anchor_overlap and not target_overlap:
+            reason = "reject_step2_hit_anchor_only_wall"
+        elif bool(reject_if_crosses_frontier_unknown_band) and frontier_ratio > float(max_frontier_cross_ratio):
+            reason = "reject_step2_crosses_frontier_unknown_band"
+        elif bool(reject_if_intersects_existing_separator) and existing_overlap:
+            reason = "reject_step2_intersects_existing_separator"
+        record = {
+            "extension_id": int(hit.extension_id),
+            "source_line_id": int(hit.source_line_id),
+            "hit_cell": [int(r), int(c)],
+            "target_overlap": bool(target_overlap),
+            "target_source_values": source_values,
+            "residual_overlap": bool(residual_overlap),
+            "anchor_only_overlap": bool(anchor_overlap),
+            "frontier_unknown_ratio": float(frontier_ratio),
+            "existing_separator_overlap": bool(existing_overlap),
+            "reject_reason": reason,
+        }
+        hit.debug["v23_hit_validation"] = dict(record)
+        if reason is not None:
+            hit.reject_reason = str(reason)
+            rejected_map |= line
+            reason_counts[str(reason)] += 1
+        records.append(record)
+    return {
+        "voxel_step2_v23_hit_validation": records[:1024],
+        "voxel_step2_v23_hit_reject_reason_counts": dict(reason_counts),
+        "voxel_step2_hit_frontier_residual_rejected_map": residual_hit_map.astype(bool),
+        "voxel_step2_v23_rejected_hit_map": rejected_map.astype(bool),
+    }
 
 
 def validate_step2_source_line_v22(
@@ -1716,6 +2099,96 @@ def validate_step2_source_line_v22(
         return False, "reject_step2_source_frontier_unknown_edge", debug
     if bool(forbid_door_band) and overlaps_door:
         return False, "reject_step2_source_door_frame_duplicate", debug
+    return True, None, debug
+
+
+def validate_corridor_neck_step2_source_line_v25(
+    line: FilteredWallLine,
+    *,
+    shape: tuple[int, int],
+    resolution_m: float,
+    support_map: np.ndarray,
+    frontier_unknown_band: np.ndarray,
+    accepted_door_suppression_band: np.ndarray,
+    raw_door_seed_band: np.ndarray,
+    vertical_free_map: np.ndarray | None,
+    unknown_ratio_map: np.ndarray,
+    min_line_length_m: float,
+    min_support_ratio: float,
+    min_support_cells: int,
+    must_touch_large_free: bool,
+    min_adjacent_free_area_cells: int,
+    forbid_raw_seed_band: bool,
+    forbid_accepted_door_band: bool,
+    max_unknown_ratio_on_line: float,
+    allow_only_projected_or_strict: bool = True,
+) -> tuple[bool, str | None, dict[str, object]]:
+    mask = _filtered_line_mask(line, shape)
+    support = np.asarray(support_map, dtype=bool)
+    frontier = np.asarray(frontier_unknown_band, dtype=bool)
+    accepted_door = np.asarray(accepted_door_suppression_band, dtype=bool)
+    raw_seed = np.asarray(raw_door_seed_band, dtype=bool)
+    unknown_ratio = np.asarray(unknown_ratio_map, dtype=np.float32)
+    if support.shape != shape or frontier.shape != shape or accepted_door.shape != shape or raw_seed.shape != shape or unknown_ratio.shape != shape:
+        raise ValueError("corridor neck source validation masks must match shape")
+    projected_cells = int(np.count_nonzero(mask))
+    support_cells = int(np.count_nonzero(mask & support))
+    support_ratio = float(getattr(line, "support_ratio", 0.0) or 0.0)
+    if projected_cells > 0:
+        support_ratio = max(support_ratio, float(support_cells) / float(projected_cells))
+    length_m = float(getattr(line, "length_m", 0.0) or 0.0)
+    if length_m <= 0.0:
+        length_m = float(projected_cells) * float(resolution_m)
+    unknown_ratio_on_line = float(np.mean(unknown_ratio[mask])) if projected_cells > 0 else 1.0
+    overlaps_frontier = bool(np.any(mask & frontier))
+    overlaps_raw_seed = bool(np.any(mask & raw_seed))
+    overlaps_accepted_door = bool(np.any(mask & accepted_door))
+    adjacent_free_area = 0
+    if vertical_free_map is not None:
+        free = np.asarray(vertical_free_map, dtype=bool)
+        if free.shape != shape:
+            raise ValueError("vertical_free_map must match shape")
+        labels, count = ndimage.label(free, structure=conn(4))
+        around = dilate(mask, 1) & free
+        touched = [int(v) for v in np.unique(labels[around]) if int(v) > 0]
+        if touched:
+            areas = np.bincount(labels.reshape(-1).astype(np.int32))
+            adjacent_free_area = int(max(int(areas[label]) for label in touched))
+    debug = {
+        "length_m": float(length_m),
+        "projected_cells": int(projected_cells),
+        "support_cells": int(support_cells),
+        "support_ratio": float(support_ratio),
+        "unknown_ratio_on_line": float(unknown_ratio_on_line),
+        "overlaps_frontier_unknown_band": bool(overlaps_frontier),
+        "overlaps_raw_door_seed_band": bool(overlaps_raw_seed),
+        "overlaps_accepted_door_band": bool(overlaps_accepted_door),
+        "adjacent_free_area_cells": int(adjacent_free_area),
+        "allow_only_projected_or_strict": bool(allow_only_projected_or_strict),
+    }
+    if bool(allow_only_projected_or_strict):
+        source_text = str(line.debug.get("source", line.endpoint_quality.get("source", ""))).lower()
+        if "projected" not in source_text and "strict" not in source_text:
+            return False, "reject_corridor_neck_source_not_projected_or_strict", debug
+    if length_m + 1e-9 < float(min_line_length_m):
+        return False, "reject_corridor_neck_source_too_short", debug
+    if support_ratio + 1e-9 < float(min_support_ratio):
+        return False, "reject_corridor_neck_source_support_ratio_low", debug
+    if support_cells < max(1, int(min_support_cells)):
+        return False, "reject_corridor_neck_source_support_cells_low", debug
+    if unknown_ratio_on_line > float(max_unknown_ratio_on_line) + 1e-9:
+        return False, "reject_corridor_neck_source_unknown_ratio_high", debug
+    if overlaps_frontier:
+        return False, "reject_corridor_neck_source_frontier_unknown_edge", debug
+    if bool(forbid_raw_seed_band) and overlaps_raw_seed:
+        return False, "reject_corridor_neck_source_raw_seed_band", debug
+    if bool(forbid_accepted_door_band) and overlaps_accepted_door:
+        return False, "reject_corridor_neck_source_accepted_door_band", debug
+    if bool(must_touch_large_free):
+        if vertical_free_map is None:
+            return False, "reject_corridor_neck_source_missing_free_map", debug
+        if adjacent_free_area < max(1, int(min_adjacent_free_area_cells)):
+            return False, "reject_corridor_neck_source_adjacent_free_too_small", debug
     return True, None, debug
 
 
@@ -2025,9 +2498,13 @@ def _step2_reject_code(reason: str) -> int:
         "hit_not_wall": 8,
         "reject_step2_intersects_door": 9,
         "reject_step2_intersects_existing_extension": 10,
+        "reject_step2_intersects_existing_separator": 10,
         "reject_step2_hits_extension_not_wall": 11,
         "reject_step2_pairwise_crossing_ambiguous": 12,
         "reject_step2_pairwise_crossing_loser": 13,
+        "reject_step2_hit_frontier_residual_wall": 14,
+        "reject_step2_hit_anchor_only_wall": 15,
+        "reject_step2_crosses_frontier_unknown_band": 16,
         "reject_step2_source_too_short": 21,
         "reject_step2_source_support_ratio_low": 22,
         "reject_step2_source_support_cells_low": 23,

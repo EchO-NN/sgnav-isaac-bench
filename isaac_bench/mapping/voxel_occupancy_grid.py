@@ -50,6 +50,16 @@ class VoxelOccupancyGridConfig:
     conflict_enabled: bool = False
     conflict_margin: int = 0
     voxel_grid_drives_navigation: bool = True
+    sensor_range_tracking_enabled: bool = True
+    sensor_range_count_delta: int = 1
+    sensor_range_count_max: int = 255
+    sensor_range_count_threshold: int = 1
+    sensor_range_mark_endpoint_column_enabled: bool = True
+    sensor_range_endpoint_column_xy_radius_cells: int = 0
+    sensor_range_mark_active_z_only: bool = True
+    sensor_range_mark_ray_samples_enabled: bool = True
+    sensor_range_behind_endpoint_margin_m: float = 0.00
+    sensor_range_count_decay_per_update: int = 0
 
     @classmethod
     def from_mapping(cls, data: Mapping[str, object] | None = None, **overrides: object) -> "VoxelOccupancyGridConfig":
@@ -93,6 +103,8 @@ class VoxelIntegrationStats:
     refresh_changed_voxels: int = 0
     cuda_chunk_rays: int = 0
     cuda_max_samples_per_ray: int = 0
+    sensor_range_update_count: int = 0
+    sensor_range_decay_applied: int = 0
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -112,6 +124,8 @@ class VoxelIntegrationStats:
             "voxel_refresh_changed_voxels": int(self.refresh_changed_voxels),
             "voxel_cuda_chunk_rays": int(self.cuda_chunk_rays),
             "voxel_cuda_max_samples_per_ray": int(self.cuda_max_samples_per_ray),
+            "voxel_sensor_range_update_count": int(self.sensor_range_update_count),
+            "voxel_sensor_range_decay_applied": int(self.sensor_range_decay_applied),
         }
 
 
@@ -119,6 +133,7 @@ class VoxelIntegrationStats:
 class VoxelOccupancyGrid3D:
     log_odds: np.ndarray
     state: np.ndarray
+    sensor_range_count: np.ndarray
     z_min_m: float
     z_max_m: float
     z_resolution_m: float
@@ -145,9 +160,11 @@ class VoxelOccupancyGrid3D:
             raise ValueError("voxel grid requires at least one z bin")
         log_odds = np.zeros((z_bins, height, width), dtype=np.int16)
         state = np.zeros((z_bins, height, width), dtype=np.uint8)
+        sensor_range_count = np.zeros((z_bins, height, width), dtype=np.uint8)
         return cls(
             log_odds=log_odds,
             state=state,
+            sensor_range_count=sensor_range_count,
             z_min_m=float(config.z_min_m),
             z_max_m=float(config.z_max_m),
             z_resolution_m=float(config.z_resolution_m),
@@ -175,6 +192,7 @@ class VoxelOccupancyGrid3D:
         height, width = int(shape[0]), int(shape[1])
         self.log_odds = np.zeros((self.z_bin_count, height, width), dtype=np.int16)
         self.state = np.zeros((self.z_bin_count, height, width), dtype=np.uint8)
+        self.sensor_range_count = np.zeros((self.z_bin_count, height, width), dtype=np.uint8)
         self.last_integration_stats = VoxelIntegrationStats()
         self.last_navigation_debug = {}
 
@@ -236,6 +254,8 @@ class VoxelOccupancyGrid3D:
             stats.integrate_total_ms = float((time.perf_counter() - started_at) * 1000.0)
             self.last_integration_stats = stats
             return stats
+        sensor_range_decay_applied = self.decay_sensor_range_count()
+        stats.sensor_range_decay_applied = int(sensor_range_decay_applied)
         points = np.asarray(points_world, dtype=np.float32)
         if points.ndim != 2 or points.shape[1] < 3 or points.size == 0:
             stats.integration_backend = self._resolve_integration_backend()
@@ -282,6 +302,7 @@ class VoxelOccupancyGrid3D:
             )
         else:
             raise RuntimeError("unsupported voxel integration backend: %s" % backend)
+        stats.sensor_range_decay_applied = int(sensor_range_decay_applied)
         stats.integrate_total_ms = float((time.perf_counter() - started_at) * 1000.0)
         self.last_integration_stats = stats
         return stats
@@ -341,14 +362,22 @@ class VoxelOccupancyGrid3D:
         origin = np.asarray(camera_origin_world, dtype=np.float32).reshape(-1)[:3]
         free_voxels: list[tuple[int, int, int]] = []
         occupied_voxels: list[tuple[int, int, int]] = []
+        sensor_range_voxels: list[tuple[int, int, int]] = []
         flush_threshold = 250_000
         exclude_n = max(0, int(self.config.free_excludes_last_n_voxels_before_endpoint))
+        sensor_enabled = bool(getattr(self.config, "sensor_range_tracking_enabled", True))
+        sensor_ray_enabled = sensor_enabled and bool(getattr(self.config, "sensor_range_mark_ray_samples_enabled", True))
+        sensor_endpoint_enabled = sensor_enabled and bool(getattr(self.config, "sensor_range_mark_endpoint_column_enabled", True))
         for point in points[valid]:
             voxels = self.ray_voxels_3d(origin, point[:3], floor_z=float(floor_z), include_endpoint=True)
             if not voxels:
                 stats.skipped_empty_rays += 1
                 continue
             stats.depth_rays_integrated += 1
+            if sensor_ray_enabled:
+                sensor_range_voxels.extend(voxels)
+            if sensor_endpoint_enabled:
+                sensor_range_voxels.extend(self._sensor_endpoint_column_voxels(voxels[-1]))
             if bool(self.config.mark_endpoint_occupied):
                 occupied_voxels.extend(self._endpoint_splat(voxels[-1]))
             if bool(self.config.free_excludes_endpoint):
@@ -362,8 +391,14 @@ class VoxelOccupancyGrid3D:
             if len(occupied_voxels) >= flush_threshold:
                 stats.occupied_update_count += self.mark_occupied_voxels(occupied_voxels)
                 occupied_voxels.clear()
+            if len(sensor_range_voxels) >= flush_threshold:
+                count, _changed = self.mark_sensor_range_voxels_array(sensor_range_voxels)
+                stats.sensor_range_update_count += int(count)
+                sensor_range_voxels.clear()
         stats.free_update_count += self.mark_free_voxels(free_voxels)
         stats.occupied_update_count += self.mark_occupied_voxels(occupied_voxels)
+        count, _changed = self.mark_sensor_range_voxels_array(sensor_range_voxels)
+        stats.sensor_range_update_count += int(count)
         refresh_started_at = time.perf_counter()
         self.refresh_state()
         stats.refresh_state_ms = float((time.perf_counter() - refresh_started_at) * 1000.0)
@@ -377,6 +412,63 @@ class VoxelOccupancyGrid3D:
     def mark_occupied_voxels(self, voxels: Iterable[Sequence[int]]) -> int:
         count, _changed = self._add_logodds_array(voxels, int(self.config.occupied_logodds_delta))
         return int(count)
+
+    def mark_sensor_range_voxels_array(self, voxels: np.ndarray | Iterable[Sequence[int]]) -> tuple[int, np.ndarray]:
+        if not bool(getattr(self.config, "sensor_range_tracking_enabled", True)):
+            return 0, np.zeros(0, dtype=np.int64)
+        if isinstance(voxels, np.ndarray):
+            arr = np.asarray(voxels, dtype=np.int64)
+        else:
+            arr = np.asarray(list(voxels), dtype=np.int64)
+        if arr.size == 0:
+            return 0, np.zeros(0, dtype=np.int64)
+        arr = arr.reshape(-1, 3)
+        z = arr[:, 0]
+        r = arr[:, 1]
+        c = arr[:, 2]
+        valid = (z >= 0) & (z < self.z_bin_count) & (r >= 0) & (r < self.state.shape[1]) & (c >= 0) & (c < self.state.shape[2])
+        if not np.any(valid):
+            return 0, np.zeros(0, dtype=np.int64)
+        arr = np.unique(arr[valid], axis=0)
+        z = arr[:, 0]
+        r = arr[:, 1]
+        c = arr[:, 2]
+        delta = max(0, int(getattr(self.config, "sensor_range_count_delta", 1)))
+        max_value = int(np.clip(int(getattr(self.config, "sensor_range_count_max", 255)), 0, 255))
+        if delta <= 0 or max_value <= 0:
+            return int(arr.shape[0]), self.flat_indices_from_voxels(arr)
+        current = self.sensor_range_count[z, r, c].astype(np.uint16) + int(delta)
+        self.sensor_range_count[z, r, c] = np.minimum(current, int(max_value)).astype(np.uint8)
+        return int(arr.shape[0]), self.flat_indices_from_voxels(arr)
+
+    def mark_sensor_range_flat_indices(self, flat_indices: np.ndarray | Iterable[int]) -> int:
+        if not bool(getattr(self.config, "sensor_range_tracking_enabled", True)):
+            return 0
+        idx = np.asarray(flat_indices, dtype=np.int64).reshape(-1)
+        if idx.size == 0:
+            return 0
+        idx = np.unique(idx[(idx >= 0) & (idx < self.sensor_range_count.size)])
+        if idx.size == 0:
+            return 0
+        delta = max(0, int(getattr(self.config, "sensor_range_count_delta", 1)))
+        max_value = int(np.clip(int(getattr(self.config, "sensor_range_count_max", 255)), 0, 255))
+        if delta <= 0 or max_value <= 0:
+            return int(idx.size)
+        flat = self.sensor_range_count.reshape(-1)
+        updated = flat[idx].astype(np.uint16) + int(delta)
+        flat[idx] = np.minimum(updated, int(max_value)).astype(np.uint8)
+        return int(idx.size)
+
+    def decay_sensor_range_count(self) -> int:
+        if not bool(getattr(self.config, "sensor_range_tracking_enabled", True)):
+            return 0
+        decay = max(0, int(getattr(self.config, "sensor_range_count_decay_per_update", 0)))
+        if decay <= 0:
+            return 0
+        before = int(np.count_nonzero(self.sensor_range_count))
+        values = self.sensor_range_count.astype(np.int16) - int(decay)
+        self.sensor_range_count[:, :, :] = np.maximum(values, 0).astype(np.uint8)
+        return int(before - np.count_nonzero(self.sensor_range_count))
 
     def mark_free_voxels_array(self, voxels: np.ndarray | Iterable[Sequence[int]]) -> tuple[int, np.ndarray]:
         return self._add_logodds_array(voxels, int(self.config.free_logodds_delta))
@@ -541,6 +633,12 @@ class VoxelOccupancyGrid3D:
             "voxel_state_occupied_count_3d": int(np.count_nonzero(self.state == int(VOXEL_OCCUPIED))),
             "voxel_state_unknown_count_3d": int(np.count_nonzero(self.state == int(VOXEL_UNKNOWN))),
             "voxel_state_conflict_count_3d": int(np.count_nonzero(self.state == int(VOXEL_CONFLICT))),
+            "voxel_sensor_range_tracking_enabled": bool(getattr(self.config, "sensor_range_tracking_enabled", True)),
+            "voxel_sensor_range_count_nonzero_3d": int(np.count_nonzero(self.sensor_range_count)),
+            "voxel_sensor_range_count_threshold": int(getattr(self.config, "sensor_range_count_threshold", 1)),
+            "voxel_sensor_range_endpoint_column_enabled": bool(getattr(self.config, "sensor_range_mark_endpoint_column_enabled", True)),
+            "voxel_sensor_range_mark_ray_samples_enabled": bool(getattr(self.config, "sensor_range_mark_ray_samples_enabled", True)),
+            "voxel_sensor_range_behind_endpoint_margin_m": float(getattr(self.config, "sensor_range_behind_endpoint_margin_m", 0.0)),
         }
         debug.update(self.last_integration_stats.to_dict())
         debug.update(dict(self.last_navigation_debug))
@@ -583,6 +681,22 @@ class VoxelOccupancyGrid3D:
                     z, r, c = z0 + dz, r0 + dr, c0 + dc
                     if 0 <= z < self.z_bin_count and 0 <= r < self.state.shape[1] and 0 <= c < self.state.shape[2]:
                         out.append((z, r, c))
+        return out
+
+    def _sensor_endpoint_column_voxels(self, voxel: tuple[int, int, int]) -> list[tuple[int, int, int]]:
+        _z0, r0, c0 = (int(voxel[0]), int(voxel[1]), int(voxel[2]))
+        radius = max(0, int(getattr(self.config, "sensor_range_endpoint_column_xy_radius_cells", 0)))
+        if bool(getattr(self.config, "sensor_range_mark_active_z_only", True)):
+            z_values = [int(v) for v in self.active_z_indices().tolist()]
+        else:
+            z_values = list(range(int(self.z_bin_count)))
+        out: list[tuple[int, int, int]] = []
+        for dr in range(-radius, radius + 1):
+            for dc in range(-radius, radius + 1):
+                r, c = r0 + dr, c0 + dc
+                if not (0 <= r < self.state.shape[1] and 0 <= c < self.state.shape[2]):
+                    continue
+                out.extend((int(z), int(r), int(c)) for z in z_values)
         return out
 
     def _clip_segment_to_volume(self, p0: np.ndarray, p1: np.ndarray) -> tuple[np.ndarray, np.ndarray] | None:

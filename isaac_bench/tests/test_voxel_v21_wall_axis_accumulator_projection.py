@@ -34,7 +34,7 @@ def test_v21_axis_accumulator_merges_fragmented_wall_support() -> None:
     assert result.debug["voxel_projected_wall_step2_source_cells"] >= 11
 
 
-def test_v21_axis_accumulator_rejects_both_sides_free_furniture_line() -> None:
+def test_v23_axis_accumulator_keeps_both_sides_free_as_debug_only() -> None:
     shape = (18, 18)
     support = np.zeros(shape, dtype=bool)
     support[8, 5:12] = True
@@ -50,5 +50,6 @@ def test_v21_axis_accumulator_rejects_both_sides_free_furniture_line() -> None:
         config=WallProjectionConfig(min_projected_line_length_m=0.30),
     )
 
-    assert not np.any(result.projected_wall_display_map)
-    assert result.debug["voxel_wall_projection_reject_reason_counts"]["projected_wall_both_sides_free_furniture_like"] >= 1
+    assert np.any(result.projected_wall_display_map)
+    assert result.debug["voxel_wall_projection_reject_reason_counts"].get("projected_wall_both_sides_free_furniture_like", 0) == 0
+    assert any(bool(line.debug.get("both_sides_free_like", False)) for line in result.projected_display_lines)

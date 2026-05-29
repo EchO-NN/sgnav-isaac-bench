@@ -5,7 +5,7 @@ import time
 import numpy as np
 
 from isaac_bench.mapping.voxel_occupancy_grid import VoxelIntegrationStats
-from isaac_bench.mapping.voxel_cpu_fast_backend import _endpoint_splat_lines, _world_to_voxel_float_array
+from isaac_bench.mapping.voxel_cpu_fast_backend import _endpoint_range_column_lines, _endpoint_splat_lines, _world_to_voxel_float_array
 
 
 class VoxelCudaBackend:
@@ -76,6 +76,12 @@ class VoxelCudaBackend:
         z_bins = int(grid.state.shape[0])
         total_voxels = int(grid.state.size)
         log_flat = torch.as_tensor(grid.log_odds.reshape(-1).astype(np.int32), dtype=torch.int32, device=device).clone()
+        sensor_enabled = bool(getattr(grid.config, "sensor_range_tracking_enabled", True))
+        sensor_ray_enabled = sensor_enabled and bool(getattr(grid.config, "sensor_range_mark_ray_samples_enabled", True))
+        sensor_endpoint_enabled = sensor_enabled and bool(getattr(grid.config, "sensor_range_mark_endpoint_column_enabled", True))
+        sensor_delta = max(0, int(getattr(grid.config, "sensor_range_count_delta", 1)))
+        sensor_max = int(np.clip(int(getattr(grid.config, "sensor_range_count_max", 255)), 0, 255))
+        sensor_flat = torch.as_tensor(grid.sensor_range_count.reshape(-1).astype(np.int32), dtype=torch.int32, device=device).clone()
         origin = torch.as_tensor(origin_np, dtype=torch.float32, device=device)
         endpoints = torch.as_tensor(endpoints_np, dtype=torch.float32, device=device)
         free_delta = int(grid.config.free_logodds_delta)
@@ -101,6 +107,12 @@ class VoxelCudaBackend:
             in_bounds = valid_step & (z >= 0) & (z < z_bins) & (r >= 0) & (r < height) & (c >= 0) & (c < width)
             integrated += int(torch.count_nonzero(torch.any(in_bounds, dim=1)).item())
             lin = z * int(height * width) + r * int(width) + c
+            if sensor_ray_enabled and int(torch.count_nonzero(in_bounds).item()):
+                range_unique = torch.unique(lin[in_bounds])
+                if int(range_unique.numel()):
+                    if sensor_delta > 0 and sensor_max > 0:
+                        sensor_flat[range_unique] = torch.clamp(sensor_flat[range_unique] + int(sensor_delta), max=int(sensor_max))
+                    stats.sensor_range_update_count += int(range_unique.numel())
             stats.ray_sample_ms += float((time.perf_counter() - sample_started) * 1000.0)
 
             unique_started = time.perf_counter()
@@ -123,6 +135,14 @@ class VoxelCudaBackend:
             )
             endpoint_lin = endpoint_vox[:, 0] * int(height * width) + endpoint_vox[:, 1] * int(width) + endpoint_vox[:, 2]
             endpoint_lin_valid = endpoint_lin[endpoint_valid]
+            if sensor_endpoint_enabled and int(endpoint_valid.sum().item()):
+                endpoint_cpu = endpoint_vox[endpoint_valid].detach().cpu().numpy().astype(np.int32)
+                range_np = _endpoint_range_column_lines(grid, endpoint_cpu, height=height, width=width, z_bins=z_bins)
+                if range_np.size:
+                    range_unique = torch.as_tensor(range_np, dtype=torch.int64, device=device)
+                    if sensor_delta > 0 and sensor_max > 0:
+                        sensor_flat[range_unique] = torch.clamp(sensor_flat[range_unique] + int(sensor_delta), max=int(sensor_max))
+                    stats.sensor_range_update_count += int(range_unique.numel())
             if int(free_lin.numel()):
                 free_unique, free_counts = torch.unique(free_lin, return_counts=True)
             else:
@@ -157,6 +177,8 @@ class VoxelCudaBackend:
             stats.scatter_ms += float((time.perf_counter() - scatter_started) * 1000.0)
 
         grid.log_odds.reshape(-1)[:] = log_flat.detach().cpu().numpy().astype(np.int16)
+        if sensor_enabled:
+            grid.sensor_range_count.reshape(-1)[:] = sensor_flat.detach().cpu().numpy().astype(np.uint8)
         stats.depth_rays_integrated = int(integrated)
         stats.skipped_empty_rays = max(0, int(endpoints_np.shape[0]) - int(integrated))
         refresh_started = time.perf_counter()

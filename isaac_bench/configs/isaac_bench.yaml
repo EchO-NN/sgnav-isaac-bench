@@ -286,6 +286,16 @@ mapping:
       conflict_enabled: false
       conflict_margin: 0
       voxel_grid_drives_navigation: true
+      sensor_range_tracking_enabled: true
+      sensor_range_count_delta: 1
+      sensor_range_count_max: 255
+      sensor_range_count_threshold: 1
+      sensor_range_mark_endpoint_column_enabled: true
+      sensor_range_endpoint_column_xy_radius_cells: 0
+      sensor_range_mark_active_z_only: true
+      sensor_range_mark_ray_samples_enabled: true
+      sensor_range_behind_endpoint_margin_m: 0.00
+      sensor_range_count_decay_per_update: 0
     voxel_navigation_projection:
       obstacle_z_min_m: 0.20
       obstacle_z_max_m: 0.90
@@ -313,6 +323,13 @@ mapping:
       wall_mode: free_unknown_then_ratio_wall
       wall_occupied_ratio_min_for_xy_wall: 0.90
       wall_min_occupied_z_cells_for_xy_wall: 3
+      wall_use_generalized_occupied_ratio: true
+      count_in_range_unknown_as_occupied_for_wall: true
+      wall_generalized_occupied_ratio_min_for_xy_wall: 0.90
+      wall_min_actual_occupied_z_cells_for_xy_wall: 3
+      sensor_range_count_threshold_for_roomseg: 1
+      outside_unknown_ratio_min_for_xy_unknown: 0.50
+      min_effective_range_z_cells_for_known_column: 3
       unknown_ratio_min_for_xy_unknown: 0.50
       min_observed_z_cells_for_known_column: 3
       free_priority_over_wall: true
@@ -352,6 +369,18 @@ mapping:
       wall_line_support_conflict_weight: 0.35
       wall_line_support_strong_weight: 1.0
       wall_line_support_remove_small_area_cells: 3
+      wall_line_support_policy: seed_and_bridge
+      free_conflict_support_policy: bridge_only
+      bridge_support_near_strong_wall_cells: 2
+      protected_structural_wall_band_cells: 2
+      protected_wall_line_support_min_run_cells: 6
+      frontier_residual_nav_unknown_dilation_cells: 5
+      frontier_residual_unknown_dilation_cells: 3
+      frontier_residual_free_dilation_cells: 5
+      frontier_residual_free_boundary_dilation_cells: 3
+      frontier_residual_unknown_ratio_min: 0.25
+      frontier_residual_observed_ratio_max: 0.35
+      frontier_residual_reject_unprotected_raw_occ: true
     voxel_wall_projection:
       enabled: true
       projection_band_cells: 2
@@ -381,7 +410,14 @@ mapping:
       side_band_cells: 3
       side_min_free_ratio: 0.15
       side_min_nonfree_ratio: 0.15
-      reject_if_both_sides_free_ratio_gt: 0.55
+      reject_if_both_sides_free_ratio_gt: 1.01
+      both_sides_free_debug_only: true
+      min_seed_support_cells_per_projected_line: 3
+      min_seed_support_ratio_per_projected_line: 0.15
+      min_seed_support_cells_for_both_sides_free: 3
+      max_frontier_residual_ratio_on_projected_line: 0.25
+      max_nav_unknown_ratio_on_projected_line: 0.35
+      max_bridge_to_seed_support_ratio: 2.0
       reject_if_both_sides_unknown_ratio_gt: 0.85
       reject_if_no_free_side: true
       reject_if_no_nonfree_side: true
@@ -391,7 +427,7 @@ mapping:
       keep_accepted_line_cells_even_if_unknown_dominant: true
     voxel_door:
       enabled: true
-      seed_method: centroid_ratio
+      seed_method: sensor_aware_turn_search
       z_scan_min_m: 0.10
       z_scan_max_mode: active_z_max
       top_occupied_min_z_m: 1.80
@@ -431,6 +467,25 @@ mapping:
       reject_if_endpoint_is_other_door: true
       conflict_dilation_cells: 1
       vectorized_seed_classification: true
+      sensor_aware_seed_enabled: true
+      use_in_range_unknown_as_upper_solid: true
+      use_effective_observed_denominator: true
+      lower_min_effective_cells: 2
+      lower_free_ratio_min_effective: 0.80
+      lower_actual_occupied_ratio_max: 0.15
+      lower_in_range_unknown_ratio_max: 0.20
+      upper_solid_ratio_min_effective: 0.75
+      upper_actual_occupied_min_cells_for_seed: 1
+      upper_actual_occupied_min_cells_for_cluster: 3
+      upper_effective_observed_min_cells: 3
+      turn_search_enabled: true
+      turn_min_z_m: 1.70
+      turn_max_z_m: 2.20
+      turn_candidate_stride_bins: 1
+      turn_score_lower_weight: 1.0
+      turn_score_upper_weight: 1.0
+      turn_score_actual_occ_bonus: 0.20
+      centroid_ratio_fallback_enabled: true
       seed_cluster_morph_close_radius_cells: 2
       seed_cluster_merge_distance_cells: 8
       seed_cluster_collinear_angle_deg: 25.0
@@ -510,6 +565,9 @@ mapping:
       show_step2_source_candidates: false
       show_step2_rejected_candidates: false
       show_door_visual_only_candidates: false
+      show_raw_door_seed_band: false
+      show_corridor_neck_sources: false
+      show_door_seed_reject_reason_overlay: false
       door_seed_color: [0, 80, 255]
       door_extension_color: [0, 255, 70]
       step2_extension_color: [220, 60, 255]
@@ -537,6 +595,8 @@ mapping:
       reject_if_intersects_door_seed: false
       reject_if_intersects_existing_extension: true
       reject_if_hits_extension_not_wall: true
+      reject_if_hits_frontier_residual_wall: true
+      reject_if_crosses_frontier_unknown_band: true
       door_intersection_dilation_cells: 1
       reject_if_tiny_side_width_cells_leq: 2
       source_min_line_length_m: 0.60
@@ -544,6 +604,16 @@ mapping:
       source_min_support_cells: 6
       source_forbid_frontier_unknown_band: true
       source_forbid_door_band: true
+      corridor_neck_source_enabled: true
+      corridor_neck_source_min_line_length_m: 0.35
+      corridor_neck_source_min_support_cells: 4
+      corridor_neck_source_min_support_ratio: 0.45
+      corridor_neck_source_must_touch_large_free: true
+      corridor_neck_source_min_adjacent_free_area_cells: 60
+      corridor_neck_source_forbid_raw_seed_band: false
+      corridor_neck_source_forbid_accepted_door_band: true
+      corridor_neck_source_max_unknown_ratio_on_line: 0.25
+      corridor_neck_source_allow_only_projected_or_strict: true
       extension_intersection_policy: reject
       enable_extension_intersection_fallback: false
       separator_memory_enabled: true

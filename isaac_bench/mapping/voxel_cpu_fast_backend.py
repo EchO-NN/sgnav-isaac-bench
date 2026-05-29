@@ -68,6 +68,12 @@ class VoxelCpuVectorizedBackend:
         free_delta = int(grid.config.free_logodds_delta)
         occ_delta = int(grid.config.occupied_logodds_delta)
         exclude_n = max(0, int(grid.config.free_excludes_last_n_voxels_before_endpoint))
+        sensor_enabled = bool(getattr(grid.config, "sensor_range_tracking_enabled", True))
+        sensor_ray_enabled = sensor_enabled and bool(getattr(grid.config, "sensor_range_mark_ray_samples_enabled", True))
+        sensor_endpoint_enabled = sensor_enabled and bool(getattr(grid.config, "sensor_range_mark_endpoint_column_enabled", True))
+        sensor_flat = grid.sensor_range_count.reshape(-1)
+        sensor_delta = max(0, int(getattr(grid.config, "sensor_range_count_delta", 1)))
+        sensor_max = int(np.clip(int(getattr(grid.config, "sensor_range_count_max", 255)), 0, 255))
         changed_chunks: list[np.ndarray] = []
 
         integrated = 0
@@ -101,6 +107,9 @@ class VoxelCpuVectorizedBackend:
             lin = z.astype(np.int64) * int(height * width) + r.astype(np.int64) * int(width) + c.astype(np.int64)
             ray_id = np.arange(end - start, dtype=np.int64)[:, None]
             combined = ray_id * int(total_voxels) + lin
+            if sensor_ray_enabled:
+                range_sample_lin = np.unique(np.asarray(lin[in_bounds], dtype=np.int64))
+                stats.sensor_range_update_count += _apply_sensor_range_flat_updates(sensor_flat, range_sample_lin, sensor_delta, sensor_max)
             stats.ray_sample_ms += float((time.perf_counter() - sample_started) * 1000.0)
 
             unique_started = time.perf_counter()
@@ -127,6 +136,9 @@ class VoxelCpuVectorizedBackend:
             )
             endpoint_ids = np.arange(end - start, dtype=np.int64)[endpoint_valid]
             endpoint_lin_valid = endpoint_lin[endpoint_valid]
+            if sensor_endpoint_enabled and np.any(endpoint_valid):
+                range_endpoint_lin = _endpoint_range_column_lines(grid, endpoint_vox[endpoint_valid], height=height, width=width, z_bins=z_bins)
+                stats.sensor_range_update_count += _apply_sensor_range_flat_updates(sensor_flat, range_endpoint_lin, sensor_delta, sensor_max)
             if bool(grid.config.free_excludes_endpoint) and free_combined.size and endpoint_lin_valid.size:
                 endpoint_combined = endpoint_ids * int(total_voxels) + endpoint_lin_valid
                 free_combined = free_combined[~np.isin(free_combined, endpoint_combined, assume_unique=False)]
@@ -208,6 +220,31 @@ def _endpoint_splat_lines(grid, endpoint_vox: np.ndarray, *, height: int, width:
     return z[valid].astype(np.int64) * int(height * width) + r[valid].astype(np.int64) * int(width) + c[valid].astype(np.int64)
 
 
+def _endpoint_range_column_lines(grid, endpoint_vox: np.ndarray, *, height: int, width: int, z_bins: int) -> np.ndarray:
+    endpoint_vox = np.asarray(endpoint_vox, dtype=np.int32)
+    if endpoint_vox.size == 0:
+        return np.zeros(0, dtype=np.int64)
+    rc = endpoint_vox[:, 1:3]
+    radius = max(0, int(getattr(grid.config, "sensor_range_endpoint_column_xy_radius_cells", 0)))
+    if radius > 0:
+        offsets = np.asarray([(dr, dc) for dr in range(-radius, radius + 1) for dc in range(-radius, radius + 1)], dtype=np.int32)
+        rc = (rc[:, None, :] + offsets[None, :, :]).reshape(-1, 2)
+    valid_rc = (rc[:, 0] >= 0) & (rc[:, 0] < height) & (rc[:, 1] >= 0) & (rc[:, 1] < width)
+    if not np.any(valid_rc):
+        return np.zeros(0, dtype=np.int64)
+    rc = np.unique(rc[valid_rc], axis=0)
+    if bool(getattr(grid.config, "sensor_range_mark_active_z_only", True)):
+        active_z = np.asarray(grid.active_z_indices(), dtype=np.int64)
+    else:
+        active_z = np.arange(int(z_bins), dtype=np.int64)
+    if active_z.size == 0 or rc.size == 0:
+        return np.zeros(0, dtype=np.int64)
+    zz = np.repeat(active_z, int(rc.shape[0]))
+    rr = np.tile(rc[:, 0].astype(np.int64), int(active_z.size))
+    cc = np.tile(rc[:, 1].astype(np.int64), int(active_z.size))
+    return np.unique(zz * int(height * width) + rr * int(width) + cc)
+
+
 def _apply_flat_updates(
     log_flat: np.ndarray,
     indices: np.ndarray,
@@ -224,3 +261,17 @@ def _apply_flat_updates(
     values = np.clip(values, int(log_min), int(log_max)).astype(np.int16)
     log_flat[idx] = values
     return int(np.sum(count, dtype=np.int64))
+
+
+def _apply_sensor_range_flat_updates(sensor_flat: np.ndarray, indices: np.ndarray, delta: int, max_value: int) -> int:
+    if indices.size == 0:
+        return 0
+    idx = np.asarray(indices, dtype=np.int64)
+    idx = np.unique(idx[(idx >= 0) & (idx < sensor_flat.size)])
+    if idx.size == 0:
+        return 0
+    if int(delta) <= 0 or int(max_value) <= 0:
+        return int(idx.size)
+    values = sensor_flat[idx].astype(np.uint16) + int(delta)
+    sensor_flat[idx] = np.minimum(values, int(max_value)).astype(np.uint8)
+    return int(idx.size)

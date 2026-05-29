@@ -44,7 +44,7 @@ DOOR_COMPLETION_REJECTED = "rejected"
 @dataclass
 class VoxelDoorDetectorConfig:
     enabled: bool = True
-    seed_method: str = "centroid_ratio"
+    seed_method: str = "sensor_aware_turn_search"
     z_scan_min_m: float = 0.10
     z_scan_max_mode: str = "active_z_max"
     centroid_turn_extent_scale: float = 0.50
@@ -84,6 +84,25 @@ class VoxelDoorDetectorConfig:
     reject_if_endpoint_is_other_door: bool = True
     conflict_dilation_cells: int = 1
     vectorized_seed_classification: bool = True
+    sensor_aware_seed_enabled: bool = True
+    use_in_range_unknown_as_upper_solid: bool = True
+    use_effective_observed_denominator: bool = True
+    lower_min_effective_cells: int = 2
+    lower_free_ratio_min_effective: float = 0.80
+    lower_actual_occupied_ratio_max: float = 0.15
+    lower_in_range_unknown_ratio_max: float = 0.20
+    upper_solid_ratio_min_effective: float = 0.75
+    upper_actual_occupied_min_cells_for_seed: int = 1
+    upper_actual_occupied_min_cells_for_cluster: int = 3
+    upper_effective_observed_min_cells: int = 3
+    turn_search_enabled: bool = True
+    turn_min_z_m: float = 1.70
+    turn_max_z_m: float = 2.20
+    turn_candidate_stride_bins: int = 1
+    turn_score_lower_weight: float = 1.0
+    turn_score_upper_weight: float = 1.0
+    turn_score_actual_occ_bonus: float = 0.20
+    centroid_ratio_fallback_enabled: bool = True
     seed_cluster_morph_close_radius_cells: int = 2
     seed_cluster_merge_distance_cells: int = 8
     seed_cluster_collinear_angle_deg: float = 25.0
@@ -197,6 +216,21 @@ class VoxelDoorSeedEvidence:
             "upper_observed_cells": int(self.upper_observed_cells),
             "upper_occupied_cells": int(self.upper_occupied_cells),
         }
+
+
+@dataclass
+class DoorColumnEvidence:
+    z_state_active: np.ndarray
+    sensor_in_range_active: np.ndarray
+    free_bin: np.ndarray
+    actual_occupied_bin: np.ndarray
+    in_range_unknown_bin: np.ndarray
+    outside_range_unknown_bin: np.ndarray
+    effective_observed_bin: np.ndarray
+    upper_solid_bin: np.ndarray
+    z_centers_m: np.ndarray
+    active_z_indices: np.ndarray
+    debug: dict[str, object] = field(default_factory=dict)
 
 
 @dataclass
@@ -890,6 +924,9 @@ def classify_voxel_door_seeds(
     *,
     voxel_grid: VoxelOccupancyGrid3D,
     config: VoxelDoorDetectorConfig | Mapping[str, object] | None = None,
+    sensor_range_count: np.ndarray | None = None,
+    sensor_range_threshold: int | None = None,
+    roomseg_evidence: object | None = None,
 ) -> VoxelDoorSeedResult:
     cfg = config if isinstance(config, VoxelDoorDetectorConfig) else VoxelDoorDetectorConfig.from_mapping(config)
     shape = tuple(voxel_grid.shape)
@@ -911,8 +948,18 @@ def classify_voxel_door_seeds(
     active_idx = voxel_grid.active_z_indices(z_min_m=float(cfg.z_scan_min_m), z_max_m=float(voxel_grid.active_z_max_m or voxel_grid.config.active_z_max_fallback_m))
     z_centers = voxel_grid.z_centers_m
     z_state = np.asarray(voxel_grid.state, dtype=np.uint8)
+    sensor_3d = sensor_range_count
+    if sensor_3d is None:
+        sensor_3d = getattr(voxel_grid, "sensor_range_count", None)
+    sensor_threshold = int(
+        sensor_range_threshold
+        if sensor_range_threshold is not None
+        else getattr(voxel_grid.config, "sensor_range_count_threshold", 1)
+    )
+    method_name = str(getattr(cfg, "seed_method", "centroid_ratio") or "centroid_ratio").strip().lower()
+    force_vectorized_sensor_aware = method_name in {"sensor_aware_turn_search", "sensor_aware_turn_search_v25", "sensor_aware", "v25_sensor_aware"}
     seed_started_at = time.perf_counter()
-    if bool(cfg.vectorized_seed_classification):
+    if bool(cfg.vectorized_seed_classification) or bool(force_vectorized_sensor_aware):
         (
             seed,
             reason_map,
@@ -923,7 +970,16 @@ def classify_voxel_door_seeds(
             rejected_seed_reasons,
             accepted_seed_evidence,
             seed_debug_maps,
-        ) = classify_voxel_door_seeds_vectorized(z_state, z_centers, active_idx, cfg, shape=shape, return_debug=True)
+        ) = classify_voxel_door_seeds_vectorized(
+            z_state,
+            z_centers,
+            active_idx,
+            cfg,
+            shape=shape,
+            return_debug=True,
+            sensor_range_count=sensor_3d,
+            sensor_range_threshold=sensor_threshold,
+        )
     else:
         seed = np.zeros(shape, dtype=bool)
         reason_map = np.zeros(shape, dtype=np.uint8)
@@ -950,11 +1006,44 @@ def classify_voxel_door_seeds(
                     rejected_seed_reasons[str(ev.reject_reason)] += 1
                     reason_map[r, c] = _seed_reject_code(str(ev.reject_reason))
     seed_ms = float((time.perf_counter() - seed_started_at) * 1000.0)
+    cluster_removed_cells = 0
+    cluster_removed_components = 0
+    method = str(getattr(cfg, "seed_method", "centroid_ratio") or "centroid_ratio").strip().lower()
+    if method in {"sensor_aware_turn_search", "sensor_aware_turn_search_v25", "sensor_aware", "v25_sensor_aware"}:
+        upper_actual_for_cluster = np.asarray(
+            seed_debug_maps.get(
+                "voxel_door_upper_actual_occupied_count_xy",
+                seed_debug_maps.get("voxel_door_upper_occupied_count_xy", np.zeros(shape, dtype=np.uint16)),
+            ),
+            dtype=np.int32,
+        )
+        min_cluster_actual = max(0, int(getattr(cfg, "upper_actual_occupied_min_cells_for_cluster", 3)))
+        if min_cluster_actual > 0 and np.any(seed):
+            pre_labels, pre_count = ndimage.label(seed, structure=conn(int(cfg.seed_connectivity)))
+            for cid in range(1, int(pre_count) + 1):
+                comp = pre_labels == int(cid)
+                actual_sum = int(np.sum(upper_actual_for_cluster[comp]))
+                if actual_sum >= min_cluster_actual:
+                    continue
+                cluster_removed_components += 1
+                removed = int(np.count_nonzero(comp))
+                cluster_removed_cells += removed
+                seed[comp] = False
+                reason_map[comp] = _seed_reject_code("cluster_upper_actual_occupied_too_few")
+                rejected_seed_reasons["cluster_upper_actual_occupied_too_few"] += int(removed)
+            if cluster_removed_cells > 0:
+                accepted_seed_evidence = [item for item in accepted_seed_evidence if bool(seed[int(item.row), int(item.col)])]
     labels, _count = ndimage.label(seed, structure=conn(int(cfg.seed_connectivity)))
     debug = {
         "voxel_door_enabled": bool(cfg.enabled),
         "voxel_door_seed_only": True,
         "voxel_door_seed_method": str(cfg.seed_method),
+        "voxel_door_sensor_aware_seed_enabled": bool(getattr(cfg, "sensor_aware_seed_enabled", True)),
+        "voxel_door_sensor_range_threshold": int(sensor_threshold),
+        "voxel_door_sensor_range_available": bool(
+            sensor_3d is not None and np.asarray(sensor_3d).shape == np.asarray(z_state).shape
+        ),
+        "voxel_door_roomseg_evidence_passed": bool(roomseg_evidence is not None),
         "voxel_door_turn_z_estimate_mode": "free_centroid_plus_scaled_free_extent",
         "voxel_door_centroid_turn_extent_scale": float(cfg.centroid_turn_extent_scale),
         "voxel_door_vectorized_seed_classification": bool(cfg.vectorized_seed_classification),
@@ -968,6 +1057,9 @@ def classify_voxel_door_seeds(
         "voxel_door_seed_first_occupied_z_xy": first_occ_z_xy.astype(np.float32),
         "voxel_door_seed_unknown_tail_cells_xy": unknown_tail_xy.astype(np.uint16),
         "voxel_door_seed_cells": int(np.count_nonzero(seed)),
+        "voxel_door_seed_cluster_upper_actual_gate_min_cells": int(getattr(cfg, "upper_actual_occupied_min_cells_for_cluster", 3)),
+        "voxel_door_seed_cluster_upper_actual_gate_removed_cells": int(cluster_removed_cells),
+        "voxel_door_seed_cluster_upper_actual_gate_removed_components": int(cluster_removed_components),
         "voxel_door_seed_evidence": [item.to_dict() for item in accepted_seed_evidence[:2048]],
         **seed_debug_maps,
     }
@@ -1373,6 +1465,65 @@ def detect_voxel_doors(
         debug=debug,
     )
 
+def build_door_column_evidence(
+    z_state: np.ndarray,
+    z_centers_m: np.ndarray,
+    active_z_indices: np.ndarray,
+    cfg: VoxelDoorDetectorConfig,
+    *,
+    shape: tuple[int, int],
+    sensor_range_count: np.ndarray | None = None,
+    sensor_range_threshold: int | None = None,
+) -> DoorColumnEvidence:
+    states_all = np.asarray(z_state, dtype=np.uint8)
+    centers = np.asarray(z_centers_m, dtype=np.float32).reshape(-1)
+    idxs = np.asarray(active_z_indices, dtype=np.int32).reshape(-1)
+    idxs = idxs[(idxs >= 0) & (idxs < states_all.shape[0]) & (centers[idxs] >= float(cfg.z_scan_min_m))]
+    if states_all.ndim != 3 or tuple(states_all.shape[1:]) != tuple(shape):
+        raise ValueError("z_state must be a ZxHxW voxel state array")
+    if sensor_range_count is None:
+        sensor_all = np.zeros_like(states_all, dtype=np.uint8)
+        sensor_available = False
+    else:
+        sensor_all = np.asarray(sensor_range_count)
+        if sensor_all.shape != states_all.shape:
+            sensor_all = np.zeros_like(states_all, dtype=np.uint8)
+            sensor_available = False
+        else:
+            sensor_available = True
+    state_active = states_all[idxs] if idxs.size else np.zeros((0, int(shape[0]), int(shape[1])), dtype=np.uint8)
+    sensor_active_raw = sensor_all[idxs] if idxs.size else np.zeros_like(state_active, dtype=np.uint8)
+    threshold = max(1, int(sensor_range_threshold if sensor_range_threshold is not None else 1))
+    sensor_in_range = sensor_active_raw >= threshold
+    free_bin = state_active == int(VOXEL_FREE)
+    actual_occupied_bin = state_active == int(VOXEL_OCCUPIED)
+    unknown_bin = state_active == int(VOXEL_UNKNOWN)
+    in_range_unknown_bin = unknown_bin & sensor_in_range
+    outside_range_unknown_bin = unknown_bin & ~sensor_in_range
+    effective_observed_bin = free_bin | actual_occupied_bin | in_range_unknown_bin
+    if bool(getattr(cfg, "use_in_range_unknown_as_upper_solid", True)):
+        upper_solid_bin = actual_occupied_bin | in_range_unknown_bin
+    else:
+        upper_solid_bin = actual_occupied_bin.copy()
+    return DoorColumnEvidence(
+        z_state_active=state_active.astype(np.uint8),
+        sensor_in_range_active=sensor_in_range.astype(bool),
+        free_bin=free_bin.astype(bool),
+        actual_occupied_bin=actual_occupied_bin.astype(bool),
+        in_range_unknown_bin=in_range_unknown_bin.astype(bool),
+        outside_range_unknown_bin=outside_range_unknown_bin.astype(bool),
+        effective_observed_bin=effective_observed_bin.astype(bool),
+        upper_solid_bin=upper_solid_bin.astype(bool),
+        z_centers_m=centers[idxs].astype(np.float32),
+        active_z_indices=idxs.astype(np.int32),
+        debug={
+            "voxel_door_sensor_range_available": bool(sensor_available),
+            "voxel_door_sensor_range_threshold": int(threshold),
+            "voxel_door_active_z_count": int(idxs.size),
+        },
+    )
+
+
 def classify_voxel_door_seeds_vectorized(
     z_state: np.ndarray,
     z_centers_m: np.ndarray,
@@ -1381,8 +1532,73 @@ def classify_voxel_door_seeds_vectorized(
     *,
     shape: tuple[int, int],
     return_debug: bool = False,
+    sensor_range_count: np.ndarray | None = None,
+    sensor_range_threshold: int | None = None,
 ):
     method = str(getattr(cfg, "seed_method", "centroid_ratio") or "centroid_ratio").strip().lower()
+    if method in {"sensor_aware_turn_search", "sensor_aware_turn_search_v25", "sensor_aware", "v25_sensor_aware"} and bool(getattr(cfg, "sensor_aware_seed_enabled", True)):
+        sensor_result = classify_voxel_door_seeds_sensor_aware_v25_vectorized(
+            z_state,
+            z_centers_m,
+            active_z_indices,
+            cfg,
+            shape=shape,
+            return_debug=True,
+            sensor_range_count=sensor_range_count,
+            sensor_range_threshold=sensor_range_threshold,
+        )
+        centroid_result = classify_voxel_door_seeds_centroid_ratio_vectorized(
+            z_state,
+            z_centers_m,
+            active_z_indices,
+            cfg,
+            shape=shape,
+            return_debug=True,
+        )
+        strict_result = classify_voxel_door_seeds_strict_contiguous_vectorized(
+            z_state,
+            z_centers_m,
+            active_z_indices,
+            cfg,
+            shape=shape,
+            return_debug=True,
+        )
+        sensor_seed = np.asarray(sensor_result[0], dtype=bool)
+        centroid_seed = np.asarray(centroid_result[0], dtype=bool)
+        strict_seed = np.asarray(strict_result[0], dtype=bool)
+        debug_maps = dict(sensor_result[8])
+        debug_maps.update(
+            {
+                "voxel_door_seed_mask_v25_sensor_aware": sensor_seed.astype(bool),
+                "voxel_door_seed_mask_centroid_legacy": centroid_seed.astype(bool),
+                "voxel_door_seed_mask_strict_legacy": strict_seed.astype(bool),
+                "voxel_door_seed_cells_v25_sensor_aware": int(np.count_nonzero(sensor_seed)),
+                "voxel_door_seed_cells_centroid_legacy": int(np.count_nonzero(centroid_seed)),
+                "voxel_door_seed_cells_strict_legacy": int(np.count_nonzero(strict_seed)),
+            }
+        )
+        use_fallback = bool(getattr(cfg, "centroid_ratio_fallback_enabled", True)) and not np.any(sensor_seed) and np.any(centroid_seed)
+        if use_fallback:
+            result = centroid_result[:8]
+            debug_maps.update(
+                {
+                    "voxel_door_centroid_fallback_used": True,
+                    "voxel_door_seed_actual_method": "centroid_ratio_fallback",
+                    "voxel_door_seed_mask_v25_final": centroid_seed.astype(bool),
+                    "voxel_door_seed_reject_reason_map_centroid_legacy": np.asarray(centroid_result[1], dtype=np.uint8),
+                }
+            )
+            return (*result, debug_maps) if bool(return_debug) else result
+        result = sensor_result[:8]
+        debug_maps.update(
+            {
+                "voxel_door_centroid_fallback_used": False,
+                "voxel_door_seed_actual_method": "sensor_aware_turn_search_v25",
+                "voxel_door_seed_mask_v25_final": sensor_seed.astype(bool),
+                "voxel_door_seed_reject_reason_map_centroid_legacy": np.asarray(centroid_result[1], dtype=np.uint8),
+            }
+        )
+        return (*result, debug_maps) if bool(return_debug) else result
     if method in {"centroid_ratio", "centroid", "ratio"}:
         return classify_voxel_door_seeds_centroid_ratio_vectorized(
             z_state,
@@ -1400,6 +1616,296 @@ def classify_voxel_door_seeds_vectorized(
         shape=shape,
         return_debug=return_debug,
     )
+
+
+def classify_voxel_door_seeds_sensor_aware_v25_vectorized(
+    z_state: np.ndarray,
+    z_centers_m: np.ndarray,
+    active_z_indices: np.ndarray,
+    cfg: VoxelDoorDetectorConfig,
+    *,
+    shape: tuple[int, int],
+    return_debug: bool = False,
+    sensor_range_count: np.ndarray | None = None,
+    sensor_range_threshold: int | None = None,
+):
+    height, width = int(shape[0]), int(shape[1])
+    column_count = int(height * width)
+    seed = np.zeros(shape, dtype=bool)
+    reason_map = np.zeros(shape, dtype=np.uint8)
+    lower_free_xy = np.zeros(shape, dtype=np.uint16)
+    top_occ_xy = np.zeros(shape, dtype=np.uint16)
+    unknown_tail_xy = np.zeros(shape, dtype=np.uint16)
+    first_occ_z_xy = np.full(shape, np.nan, dtype=np.float32)
+    accepted_seed_evidence: list[VoxelDoorSeedEvidence] = []
+    rejected_seed_reasons: Counter[str] = Counter()
+
+    evidence = build_door_column_evidence(
+        z_state,
+        z_centers_m,
+        active_z_indices,
+        cfg,
+        shape=shape,
+        sensor_range_count=sensor_range_count,
+        sensor_range_threshold=sensor_range_threshold,
+    )
+    z = np.asarray(evidence.z_centers_m, dtype=np.float32).reshape(-1)
+    z_count = int(z.size)
+    empty_debug = _empty_seed_debug_maps(shape)
+    empty_debug.update(dict(evidence.debug))
+    if z_count == 0:
+        reason_map[:, :] = _seed_reject_code("no_active_z_bins")
+        rejected_seed_reasons["no_active_z_bins"] = int(column_count)
+        result = (seed, reason_map, lower_free_xy, top_occ_xy, unknown_tail_xy, first_occ_z_xy, rejected_seed_reasons, accepted_seed_evidence)
+        return (*result, empty_debug) if bool(return_debug) else result
+
+    free = np.asarray(evidence.free_bin, dtype=bool).reshape(z_count, column_count)
+    actual_occ = np.asarray(evidence.actual_occupied_bin, dtype=bool).reshape(z_count, column_count)
+    in_range_unknown = np.asarray(evidence.in_range_unknown_bin, dtype=bool).reshape(z_count, column_count)
+    outside_unknown = np.asarray(evidence.outside_range_unknown_bin, dtype=bool).reshape(z_count, column_count)
+    effective = np.asarray(evidence.effective_observed_bin, dtype=bool).reshape(z_count, column_count)
+    upper_solid_bin = np.asarray(evidence.upper_solid_bin, dtype=bool).reshape(z_count, column_count)
+
+    free_cum = np.cumsum(free, axis=0, dtype=np.int32)
+    occ_cum = np.cumsum(actual_occ, axis=0, dtype=np.int32)
+    in_unknown_cum = np.cumsum(in_range_unknown, axis=0, dtype=np.int32)
+    eff_cum = np.cumsum(effective, axis=0, dtype=np.int32)
+    solid_cum = np.cumsum(upper_solid_bin, axis=0, dtype=np.int32)
+    total_free = free_cum[-1]
+    total_occ = occ_cum[-1]
+    total_in_unknown = in_unknown_cum[-1]
+    total_eff = eff_cum[-1]
+    total_solid = solid_cum[-1]
+    total_outside_unknown = np.sum(outside_unknown, axis=0, dtype=np.int32)
+
+    first_occ_z = _first_true_z(actual_occ, z)
+    stride = max(1, int(getattr(cfg, "turn_candidate_stride_bins", 1)))
+    candidate_pos = np.flatnonzero((z >= float(cfg.turn_min_z_m) - 1e-6) & (z <= float(cfg.turn_max_z_m) + 1e-6)).astype(np.int32)
+    candidate_pos = candidate_pos[candidate_pos > 0][::stride]
+    if candidate_pos.size == 0:
+        reason_map[:, :] = _seed_reject_code("turn_outside_active_range")
+        rejected_seed_reasons["turn_outside_active_range"] = int(column_count)
+        debug_maps = dict(empty_debug)
+        debug_maps.update(
+            {
+                "voxel_door_seed_mask_v25_sensor_aware": seed.astype(bool),
+                "voxel_door_seed_reject_reason_map_v25": reason_map.astype(np.uint8),
+                "voxel_door_seed_reject_reason_counts_v25": dict(rejected_seed_reasons),
+                "voxel_door_best_turn_z_xy": np.full(shape, np.nan, dtype=np.float32),
+                "voxel_door_best_turn_score_xy": np.full(shape, -np.inf, dtype=np.float32),
+            }
+        )
+        result = (seed, reason_map, lower_free_xy, top_occ_xy, unknown_tail_xy, first_occ_z_xy, rejected_seed_reasons, accepted_seed_evidence)
+        return (*result, debug_maps) if bool(return_debug) else result
+
+    best_score = np.full(column_count, -np.inf, dtype=np.float32)
+    best_turn = np.full(column_count, np.nan, dtype=np.float32)
+    best_lower_free = np.zeros(column_count, dtype=np.int32)
+    best_lower_eff = np.zeros(column_count, dtype=np.int32)
+    best_lower_occ = np.zeros(column_count, dtype=np.int32)
+    best_lower_in_unknown = np.zeros(column_count, dtype=np.int32)
+    best_upper_eff = np.zeros(column_count, dtype=np.int32)
+    best_upper_occ = np.zeros(column_count, dtype=np.int32)
+    best_upper_solid = np.zeros(column_count, dtype=np.int32)
+    best_lower_free_ratio = np.zeros(column_count, dtype=np.float32)
+    best_lower_occ_ratio = np.zeros(column_count, dtype=np.float32)
+    best_lower_unknown_ratio = np.zeros(column_count, dtype=np.float32)
+    best_upper_solid_ratio = np.zeros(column_count, dtype=np.float32)
+
+    valid_score = np.full(column_count, -np.inf, dtype=np.float32)
+    valid_turn = np.full(column_count, np.nan, dtype=np.float32)
+    valid_lower_free = np.zeros(column_count, dtype=np.int32)
+    valid_lower_eff = np.zeros(column_count, dtype=np.int32)
+    valid_lower_occ = np.zeros(column_count, dtype=np.int32)
+    valid_lower_in_unknown = np.zeros(column_count, dtype=np.int32)
+    valid_upper_eff = np.zeros(column_count, dtype=np.int32)
+    valid_upper_occ = np.zeros(column_count, dtype=np.int32)
+    valid_upper_solid = np.zeros(column_count, dtype=np.int32)
+    valid_lower_free_ratio = np.zeros(column_count, dtype=np.float32)
+    valid_lower_occ_ratio = np.zeros(column_count, dtype=np.float32)
+    valid_lower_unknown_ratio = np.zeros(column_count, dtype=np.float32)
+    valid_upper_solid_ratio = np.zeros(column_count, dtype=np.float32)
+
+    any_lower_eff = np.zeros(column_count, dtype=bool)
+    any_lower_free = np.zeros(column_count, dtype=bool)
+    any_lower_free_ratio = np.zeros(column_count, dtype=bool)
+    any_lower_occ_ratio = np.zeros(column_count, dtype=bool)
+    any_lower_unknown_ratio = np.zeros(column_count, dtype=bool)
+    any_upper_actual = np.zeros(column_count, dtype=bool)
+    any_upper_eff = np.zeros(column_count, dtype=bool)
+    any_upper_solid = np.zeros(column_count, dtype=bool)
+
+    min_lower_eff = max(1, int(getattr(cfg, "lower_min_effective_cells", 2)))
+    min_lower_free = max(1, int(getattr(cfg, "min_lower_free_cells", 2)))
+    min_upper_eff = max(1, int(getattr(cfg, "upper_effective_observed_min_cells", 3)))
+    min_upper_actual = max(1, int(getattr(cfg, "upper_actual_occupied_min_cells_for_seed", 1)))
+    use_eff_denom = bool(getattr(cfg, "use_effective_observed_denominator", True))
+
+    for pos in candidate_pos:
+        p = int(pos)
+        lower_free = _gather_cum_before(free_cum, np.full(column_count, p, dtype=np.int32))
+        lower_occ = _gather_cum_before(occ_cum, np.full(column_count, p, dtype=np.int32))
+        lower_in = _gather_cum_before(in_unknown_cum, np.full(column_count, p, dtype=np.int32))
+        lower_eff = _gather_cum_before(eff_cum, np.full(column_count, p, dtype=np.int32))
+        lower_total = np.full(column_count, p, dtype=np.int32)
+        upper_eff = (total_eff - lower_eff).astype(np.int32)
+        upper_occ = (total_occ - lower_occ).astype(np.int32)
+        upper_solid = (total_solid - _gather_cum_before(solid_cum, np.full(column_count, p, dtype=np.int32))).astype(np.int32)
+        lower_denom = lower_eff if use_eff_denom else lower_total
+        upper_denom = upper_eff if use_eff_denom else np.full(column_count, z_count - p, dtype=np.int32)
+        lower_free_ratio = np.zeros(column_count, dtype=np.float32)
+        lower_occ_ratio = np.zeros(column_count, dtype=np.float32)
+        lower_unknown_ratio = np.zeros(column_count, dtype=np.float32)
+        upper_solid_ratio = np.zeros(column_count, dtype=np.float32)
+        np.divide(lower_free.astype(np.float32), np.maximum(lower_denom, 1), out=lower_free_ratio, where=lower_denom > 0)
+        np.divide(lower_occ.astype(np.float32), np.maximum(lower_denom, 1), out=lower_occ_ratio, where=lower_denom > 0)
+        np.divide(lower_in.astype(np.float32), np.maximum(lower_denom, 1), out=lower_unknown_ratio, where=lower_denom > 0)
+        np.divide(upper_solid.astype(np.float32), np.maximum(upper_denom, 1), out=upper_solid_ratio, where=upper_denom > 0)
+
+        g1 = lower_eff >= min_lower_eff
+        g2 = g1 & (lower_free >= min_lower_free)
+        g3 = g2 & (lower_free_ratio >= float(getattr(cfg, "lower_free_ratio_min_effective", 0.80)) - 1e-6)
+        g4 = g3 & (lower_occ_ratio <= float(getattr(cfg, "lower_actual_occupied_ratio_max", 0.15)) + 1e-6)
+        g5 = g4 & (lower_unknown_ratio <= float(getattr(cfg, "lower_in_range_unknown_ratio_max", 0.20)) + 1e-6)
+        g6 = g5 & (upper_occ >= min_upper_actual)
+        g7 = g6 & (upper_eff >= min_upper_eff)
+        g8 = g7 & (upper_solid_ratio >= float(getattr(cfg, "upper_solid_ratio_min_effective", 0.75)) - 1e-6)
+        any_lower_eff |= g1
+        any_lower_free |= g2
+        any_lower_free_ratio |= g3
+        any_lower_occ_ratio |= g4
+        any_lower_unknown_ratio |= g5
+        any_upper_actual |= g6
+        any_upper_eff |= g7
+        any_upper_solid |= g8
+
+        score = (
+            float(getattr(cfg, "turn_score_lower_weight", 1.0)) * lower_free_ratio
+            + float(getattr(cfg, "turn_score_upper_weight", 1.0)) * upper_solid_ratio
+            + float(getattr(cfg, "turn_score_actual_occ_bonus", 0.20)) * (upper_occ > 0).astype(np.float32)
+        ).astype(np.float32)
+        better = score > best_score
+        if np.any(better):
+            best_score[better] = score[better]
+            best_turn[better] = float(z[p])
+            best_lower_free[better] = lower_free[better]
+            best_lower_eff[better] = lower_eff[better]
+            best_lower_occ[better] = lower_occ[better]
+            best_lower_in_unknown[better] = lower_in[better]
+            best_upper_eff[better] = upper_eff[better]
+            best_upper_occ[better] = upper_occ[better]
+            best_upper_solid[better] = upper_solid[better]
+            best_lower_free_ratio[better] = lower_free_ratio[better]
+            best_lower_occ_ratio[better] = lower_occ_ratio[better]
+            best_lower_unknown_ratio[better] = lower_unknown_ratio[better]
+            best_upper_solid_ratio[better] = upper_solid_ratio[better]
+        better_valid = g8 & (score > valid_score)
+        if np.any(better_valid):
+            valid_score[better_valid] = score[better_valid]
+            valid_turn[better_valid] = float(z[p])
+            valid_lower_free[better_valid] = lower_free[better_valid]
+            valid_lower_eff[better_valid] = lower_eff[better_valid]
+            valid_lower_occ[better_valid] = lower_occ[better_valid]
+            valid_lower_in_unknown[better_valid] = lower_in[better_valid]
+            valid_upper_eff[better_valid] = upper_eff[better_valid]
+            valid_upper_occ[better_valid] = upper_occ[better_valid]
+            valid_upper_solid[better_valid] = upper_solid[better_valid]
+            valid_lower_free_ratio[better_valid] = lower_free_ratio[better_valid]
+            valid_lower_occ_ratio[better_valid] = lower_occ_ratio[better_valid]
+            valid_lower_unknown_ratio[better_valid] = lower_unknown_ratio[better_valid]
+            valid_upper_solid_ratio[better_valid] = upper_solid_ratio[better_valid]
+
+    accepted = np.isfinite(valid_score)
+    reason = np.full(column_count, "accepted", dtype=object)
+    reason[~any_lower_eff] = "lower_effective_cells_too_few"
+    reason[any_lower_eff & ~any_lower_free] = "lower_free_cells_too_few"
+    reason[any_lower_free & ~any_lower_free_ratio] = "lower_free_ratio_too_low"
+    reason[any_lower_free_ratio & ~any_lower_occ_ratio] = "lower_occupied_ratio_too_high"
+    reason[any_lower_occ_ratio & ~any_lower_unknown_ratio] = "lower_in_range_unknown_ratio_too_high"
+    reason[any_lower_unknown_ratio & ~any_upper_actual] = "upper_actual_occupied_cells_too_few"
+    reason[any_upper_actual & ~any_upper_eff] = "upper_observed_cells_too_few"
+    reason[any_upper_eff & ~any_upper_solid] = "upper_solid_ratio_too_low"
+    reason[accepted] = "accepted"
+
+    final_score = np.where(accepted, valid_score, best_score).astype(np.float32)
+    final_turn = np.where(accepted, valid_turn, best_turn).astype(np.float32)
+    final_lower_free = np.where(accepted, valid_lower_free, best_lower_free).astype(np.int32)
+    final_lower_eff = np.where(accepted, valid_lower_eff, best_lower_eff).astype(np.int32)
+    final_lower_occ = np.where(accepted, valid_lower_occ, best_lower_occ).astype(np.int32)
+    final_lower_in = np.where(accepted, valid_lower_in_unknown, best_lower_in_unknown).astype(np.int32)
+    final_upper_eff = np.where(accepted, valid_upper_eff, best_upper_eff).astype(np.int32)
+    final_upper_occ = np.where(accepted, valid_upper_occ, best_upper_occ).astype(np.int32)
+    final_upper_solid = np.where(accepted, valid_upper_solid, best_upper_solid).astype(np.int32)
+    final_lower_free_ratio = np.where(accepted, valid_lower_free_ratio, best_lower_free_ratio).astype(np.float32)
+    final_lower_occ_ratio = np.where(accepted, valid_lower_occ_ratio, best_lower_occ_ratio).astype(np.float32)
+    final_lower_unknown_ratio = np.where(accepted, valid_lower_unknown_ratio, best_lower_unknown_ratio).astype(np.float32)
+    final_upper_solid_ratio = np.where(accepted, valid_upper_solid_ratio, best_upper_solid_ratio).astype(np.float32)
+
+    reason_flat = np.zeros(column_count, dtype=np.uint8)
+    reason_flat[accepted] = 1
+    for item in reason[~accepted]:
+        rejected_seed_reasons[str(item)] += 1
+    for idx_col in np.flatnonzero(~accepted):
+        reason_flat[idx_col] = _seed_reject_code(str(reason[idx_col]))
+
+    seed[:, :] = accepted.reshape(shape)
+    reason_map[:, :] = reason_flat.reshape(shape)
+    lower_free_xy[:, :] = np.clip(final_lower_free, 0, np.iinfo(np.uint16).max).reshape(shape).astype(np.uint16)
+    top_occ_xy[:, :] = np.clip(final_upper_occ, 0, np.iinfo(np.uint16).max).reshape(shape).astype(np.uint16)
+    unknown_tail_xy[:, :] = np.clip(total_in_unknown - final_lower_in, 0, np.iinfo(np.uint16).max).reshape(shape).astype(np.uint16)
+    first_occ_z_xy[:, :] = first_occ_z.reshape(shape).astype(np.float32)
+
+    for idx_col in np.flatnonzero(accepted)[:2048]:
+        row = int(idx_col // width)
+        col = int(idx_col % width)
+        accepted_seed_evidence.append(
+            _seed_ev(
+                row,
+                col,
+                None if not np.isfinite(first_occ_z[idx_col]) else float(first_occ_z[idx_col]),
+                int(final_lower_free[idx_col]),
+                int(final_upper_occ[idx_col]),
+                int(total_in_unknown[idx_col] - final_lower_in[idx_col]),
+                True,
+                None,
+                turn_z=None if not np.isfinite(final_turn[idx_col]) else float(final_turn[idx_col]),
+                lower_free_ratio=float(final_lower_free_ratio[idx_col]),
+                upper_occupied_ratio=float(final_upper_solid_ratio[idx_col]),
+                upper_observed=int(final_upper_eff[idx_col]),
+                upper_occupied=int(final_upper_occ[idx_col]),
+            )
+        )
+
+    debug_maps = {
+        **dict(evidence.debug),
+        "voxel_door_seed_mask_v25_sensor_aware": seed.astype(bool),
+        "voxel_door_seed_reject_reason_map_v25": reason_map.astype(np.uint8),
+        "voxel_door_seed_reject_reason_counts_v25": dict(rejected_seed_reasons),
+        "voxel_door_effective_observed_count_xy": np.clip(total_eff, 0, np.iinfo(np.uint16).max).reshape(shape).astype(np.uint16),
+        "voxel_door_in_range_unknown_count_xy": np.clip(total_in_unknown, 0, np.iinfo(np.uint16).max).reshape(shape).astype(np.uint16),
+        "voxel_door_outside_range_unknown_count_xy": np.clip(total_outside_unknown, 0, np.iinfo(np.uint16).max).reshape(shape).astype(np.uint16),
+        "voxel_door_upper_solid_count_xy": np.clip(final_upper_solid, 0, np.iinfo(np.uint16).max).reshape(shape).astype(np.uint16),
+        "voxel_door_upper_actual_occupied_count_xy": np.clip(final_upper_occ, 0, np.iinfo(np.uint16).max).reshape(shape).astype(np.uint16),
+        "voxel_door_lower_effective_count_xy": np.clip(final_lower_eff, 0, np.iinfo(np.uint16).max).reshape(shape).astype(np.uint16),
+        "voxel_door_lower_free_ratio_effective_xy": final_lower_free_ratio.reshape(shape).astype(np.float32),
+        "voxel_door_lower_occupied_ratio_effective_xy": final_lower_occ_ratio.reshape(shape).astype(np.float32),
+        "voxel_door_lower_in_range_unknown_ratio_effective_xy": final_lower_unknown_ratio.reshape(shape).astype(np.float32),
+        "voxel_door_upper_solid_ratio_effective_xy": final_upper_solid_ratio.reshape(shape).astype(np.float32),
+        "voxel_door_best_turn_z_xy": final_turn.reshape(shape).astype(np.float32),
+        "voxel_door_best_turn_score_xy": final_score.reshape(shape).astype(np.float32),
+        "voxel_door_turn_z_estimate_xy": final_turn.reshape(shape).astype(np.float32),
+        "voxel_door_free_centroid_z_xy": np.full(shape, np.nan, dtype=np.float32),
+        "voxel_door_occupied_centroid_z_xy": np.full(shape, np.nan, dtype=np.float32),
+        "voxel_door_lower_free_ratio_xy": final_lower_free_ratio.reshape(shape).astype(np.float32),
+        "voxel_door_upper_occupied_ratio_observed_xy": final_upper_solid_ratio.reshape(shape).astype(np.float32),
+        "voxel_door_upper_observed_count_xy": np.clip(final_upper_eff, 0, np.iinfo(np.uint16).max).reshape(shape).astype(np.uint16),
+        "voxel_door_upper_occupied_count_xy": np.clip(final_upper_occ, 0, np.iinfo(np.uint16).max).reshape(shape).astype(np.uint16),
+        "voxel_door_free_count_xy": np.clip(total_free, 0, np.iinfo(np.uint16).max).reshape(shape).astype(np.uint16),
+        "voxel_door_occupied_count_xy": np.clip(total_occ, 0, np.iinfo(np.uint16).max).reshape(shape).astype(np.uint16),
+        "voxel_door_observed_count_xy": np.clip(total_eff, 0, np.iinfo(np.uint16).max).reshape(shape).astype(np.uint16),
+    }
+    result = (seed, reason_map, lower_free_xy, top_occ_xy, unknown_tail_xy, first_occ_z_xy, rejected_seed_reasons, accepted_seed_evidence)
+    return (*result, debug_maps) if bool(return_debug) else result
 
 
 def classify_voxel_door_seeds_strict_contiguous_vectorized(
@@ -1728,6 +2234,48 @@ def classify_voxel_door_seed_column(
     col: int = 0,
 ) -> VoxelDoorSeedEvidence:
     method = str(getattr(cfg, "seed_method", "centroid_ratio") or "centroid_ratio").strip().lower()
+    if method in {"sensor_aware_turn_search", "sensor_aware_turn_search_v25", "sensor_aware", "v25_sensor_aware"}:
+        states = np.asarray(z_state_col, dtype=np.uint8).reshape(-1, 1, 1)
+        (
+            seed,
+            reason_map,
+            lower_free,
+            upper_occ,
+            unknown_tail,
+            first_occ_z,
+            _counts,
+            _accepted,
+            maps,
+        ) = classify_voxel_door_seeds_sensor_aware_v25_vectorized(
+            states,
+            z_centers_m,
+            active_z_indices,
+            cfg,
+            shape=(1, 1),
+            return_debug=True,
+            sensor_range_count=None,
+            sensor_range_threshold=1,
+        )
+        accepted = bool(seed[0, 0])
+        code = int(reason_map[0, 0])
+        reason = None if accepted else _seed_reject_reason_from_code(code)
+        first = float(first_occ_z[0, 0]) if np.isfinite(first_occ_z[0, 0]) else None
+        turn = float(maps["voxel_door_best_turn_z_xy"][0, 0]) if np.isfinite(maps["voxel_door_best_turn_z_xy"][0, 0]) else None
+        return _seed_ev(
+            int(row),
+            int(col),
+            first,
+            int(lower_free[0, 0]),
+            int(upper_occ[0, 0]),
+            int(unknown_tail[0, 0]),
+            accepted,
+            reason,
+            turn_z=turn,
+            lower_free_ratio=float(maps["voxel_door_lower_free_ratio_effective_xy"][0, 0]),
+            upper_occupied_ratio=float(maps["voxel_door_upper_solid_ratio_effective_xy"][0, 0]),
+            upper_observed=int(maps["voxel_door_upper_observed_count_xy"][0, 0]),
+            upper_occupied=int(maps["voxel_door_upper_actual_occupied_count_xy"][0, 0]),
+        )
     if method in {"centroid_ratio", "centroid", "ratio"}:
         return _classify_centroid_ratio_seed_column(z_state_col, z_centers_m, active_z_indices, cfg, row=row, col=col)
     states = np.asarray(z_state_col, dtype=np.uint8).reshape(-1)
@@ -3545,6 +4093,12 @@ _SEED_REJECT_CODES = {
     "upper_occupied_ratio_too_low": 17,
     "occupied_centroid_not_above_free_centroid": 18,
     "no_active_z_bins": 19,
+    "lower_effective_cells_too_few": 20,
+    "lower_occupied_ratio_too_high": 21,
+    "lower_in_range_unknown_ratio_too_high": 22,
+    "upper_actual_occupied_cells_too_few": 23,
+    "upper_solid_ratio_too_low": 24,
+    "cluster_upper_actual_occupied_too_few": 25,
 }
 
 
@@ -3574,6 +4128,12 @@ def _seed_reject_reason_maps(reason_map: np.ndarray) -> dict[str, np.ndarray]:
         "voxel_door_upper_observed_cells_too_few_cells": np.asarray(reason_map == _SEED_REJECT_CODES["upper_observed_cells_too_few"], dtype=bool),
         "voxel_door_upper_occupied_ratio_too_low_cells": np.asarray(reason_map == _SEED_REJECT_CODES["upper_occupied_ratio_too_low"], dtype=bool),
         "voxel_door_occupied_centroid_not_above_free_centroid_cells": np.asarray(reason_map == _SEED_REJECT_CODES["occupied_centroid_not_above_free_centroid"], dtype=bool),
+        "voxel_door_lower_effective_cells_too_few_cells": np.asarray(reason_map == _SEED_REJECT_CODES["lower_effective_cells_too_few"], dtype=bool),
+        "voxel_door_lower_occupied_ratio_too_high_cells": np.asarray(reason_map == _SEED_REJECT_CODES["lower_occupied_ratio_too_high"], dtype=bool),
+        "voxel_door_lower_in_range_unknown_ratio_too_high_cells": np.asarray(reason_map == _SEED_REJECT_CODES["lower_in_range_unknown_ratio_too_high"], dtype=bool),
+        "voxel_door_upper_actual_occupied_cells_too_few_cells": np.asarray(reason_map == _SEED_REJECT_CODES["upper_actual_occupied_cells_too_few"], dtype=bool),
+        "voxel_door_upper_solid_ratio_too_low_cells": np.asarray(reason_map == _SEED_REJECT_CODES["upper_solid_ratio_too_low"], dtype=bool),
+        "voxel_door_cluster_upper_actual_occupied_too_few_cells": np.asarray(reason_map == _SEED_REJECT_CODES["cluster_upper_actual_occupied_too_few"], dtype=bool),
     }
 
 
@@ -3589,6 +4149,23 @@ def _empty_seed_debug_maps(shape: tuple[int, int]) -> dict[str, np.ndarray]:
         "voxel_door_free_count_xy": np.zeros(shape, dtype=np.uint16),
         "voxel_door_occupied_count_xy": np.zeros(shape, dtype=np.uint16),
         "voxel_door_observed_count_xy": np.zeros(shape, dtype=np.uint16),
+        "voxel_door_effective_observed_count_xy": np.zeros(shape, dtype=np.uint16),
+        "voxel_door_in_range_unknown_count_xy": np.zeros(shape, dtype=np.uint16),
+        "voxel_door_outside_range_unknown_count_xy": np.zeros(shape, dtype=np.uint16),
+        "voxel_door_upper_solid_count_xy": np.zeros(shape, dtype=np.uint16),
+        "voxel_door_upper_actual_occupied_count_xy": np.zeros(shape, dtype=np.uint16),
+        "voxel_door_lower_effective_count_xy": np.zeros(shape, dtype=np.uint16),
+        "voxel_door_lower_free_ratio_effective_xy": np.zeros(shape, dtype=np.float32),
+        "voxel_door_lower_occupied_ratio_effective_xy": np.zeros(shape, dtype=np.float32),
+        "voxel_door_lower_in_range_unknown_ratio_effective_xy": np.zeros(shape, dtype=np.float32),
+        "voxel_door_upper_solid_ratio_effective_xy": np.zeros(shape, dtype=np.float32),
+        "voxel_door_best_turn_z_xy": np.full(shape, np.nan, dtype=np.float32),
+        "voxel_door_best_turn_score_xy": np.full(shape, -np.inf, dtype=np.float32),
+        "voxel_door_seed_mask_v25_sensor_aware": np.zeros(shape, dtype=bool),
+        "voxel_door_seed_mask_centroid_legacy": np.zeros(shape, dtype=bool),
+        "voxel_door_seed_mask_strict_legacy": np.zeros(shape, dtype=bool),
+        "voxel_door_seed_reject_reason_map_v25": np.zeros(shape, dtype=np.uint8),
+        "voxel_door_seed_reject_reason_counts_v25": {},
     }
 
 

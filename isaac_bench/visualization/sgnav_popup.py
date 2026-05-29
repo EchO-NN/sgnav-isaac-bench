@@ -1568,11 +1568,20 @@ class SGNavPopupVisualizer:
         anchor_projected_wall = self._room_debug_array("voxel_anchor_projected_wall_map", shape, bool)
         rejected_wall_support = self._room_debug_array("voxel_wall_projection_rejected_support_map", shape, bool)
         unknown_dominant = self._room_debug_array("voxel_unknown_dominant_xy", shape, bool)
+        in_range_unknown = self._room_debug_array("voxel_sensor_in_range_unknown_count_xy", shape, np.uint16) > 0
+        outside_range_unknown = self._room_debug_array("voxel_sensor_outside_range_unknown_count_xy", shape, np.uint16) > 0
+        wall_generalized_raw = self._room_debug_array("voxel_wall_generalized_raw_xy", shape, bool)
+        wall_from_in_range_unknown = self._room_debug_array("voxel_wall_from_in_range_unknown_xy", shape, bool)
+        wall_rejected_by_outside_unknown = self._room_debug_array("voxel_wall_rejected_by_outside_unknown_xy", shape, bool)
         unknown_rejected_wall = self._room_debug_array("voxel_wall_support_rejected_by_unknown_ratio_xy", shape, bool)
         if not np.any(unknown_rejected_wall):
             unknown_rejected_wall = self._room_debug_array("voxel_wall_support_rejected_unknown_xy", shape, bool)
         frontier_unknown_band = self._room_debug_array("voxel_frontier_unknown_band_xy", shape, bool)
         frontier_rejected_wall = self._room_debug_array("voxel_wall_support_rejected_by_frontier_band_xy", shape, bool)
+        forbidden_frontier_residual = self._room_debug_array("voxel_forbidden_frontier_residual_support_xy", shape, bool)
+        forbidden_unknown_boundary = self._room_debug_array("voxel_forbidden_unknown_boundary_support_xy", shape, bool)
+        bridge_only_support = self._room_debug_array("voxel_bridge_only_support_xy", shape, bool)
+        rejected_frontier_projection = self._room_debug_array("voxel_wall_projection_forbidden_frontier_residual_map", shape, bool)
         unknown_gated_wall = self._room_debug_array("voxel_wall_support_unknown_gated_xy", shape, bool)
         wall_line_support_strong = self._room_debug_array("voxel_wall_line_support_strong_xy", shape, bool)
         wall_line_support_conflict = self._room_debug_array("voxel_wall_line_support_conflict_xy", shape, bool)
@@ -1582,6 +1591,9 @@ class SGNavPopupVisualizer:
         line_wall = self._room_debug_array("voxel_filtered_wall_line_mask", shape, bool)
         real_wall = self._room_debug_array("voxel_real_wall_barrier_map", shape, bool)
         door_seed = self._room_debug_array("voxel_door_seed_mask", shape, bool)
+        raw_door_seed_band = self._room_debug_array("voxel_raw_door_seed_band_for_debug", shape, bool)
+        corridor_neck_source = self._room_debug_array("voxel_step2_corridor_neck_source_line_map", shape, bool)
+        door_seed_reject_reason_overlay = self._room_debug_array("voxel_door_seed_reject_reason_map", shape, np.uint8) > 1
         door_attempt = self._room_debug_array("voxel_door_extension_attempt_all_mask", shape, bool)
         if not np.any(door_attempt):
             door_attempt = self._room_debug_array("voxel_door_trial_candidate_lines_map", shape, bool)
@@ -1628,6 +1640,7 @@ class SGNavPopupVisualizer:
         if np.any(step2_partition_accepted):
             step2 = step2_partition_accepted
         step2_topology_rejected = self._room_debug_array("voxel_step2_topology_rejected_separator_map", shape, bool)
+        step2_hit_frontier_residual_rejected = self._room_debug_array("voxel_step2_hit_frontier_residual_rejected_map", shape, bool)
         rejected = self._room_debug_array("voxel_rejected_door_centerline_mask", shape, bool) | self._room_debug_array("voxel_step2_rejected_extension_map", shape, bool)
         labels = self._room_debug_array("voxel_final_room_label_map", shape, np.int32)
         frontier = self._room_debug_array("frontier_map", shape, bool)
@@ -1642,6 +1655,9 @@ class SGNavPopupVisualizer:
         show_step2_source = bool(show_diag and self._room_segmentation_debug.get("voxel_show_step2_source_candidates", False))
         show_step2_rejected = bool(show_diag and self._room_segmentation_debug.get("voxel_show_step2_rejected_candidates", False))
         show_door_visual_only = bool(show_diag and self._room_segmentation_debug.get("voxel_show_door_visual_only_candidates", False))
+        show_raw_door_seed_band = bool(show_diag and self._room_segmentation_debug.get("voxel_show_raw_door_seed_band", False))
+        show_corridor_neck_sources = bool(show_diag and self._room_segmentation_debug.get("voxel_show_corridor_neck_sources", False))
+        show_door_seed_reject_reason_overlay = bool(show_diag and self._room_segmentation_debug.get("voxel_show_door_seed_reject_reason_overlay", False))
         clean_display_wall = self._room_debug_array("voxel_display_wall_xy", shape, bool)
 
         canvas = np.zeros((shape[0], shape[1], 3), dtype=np.uint8)
@@ -1672,11 +1688,19 @@ class SGNavPopupVisualizer:
             if show_raw_support:
                 canvas[raw_wall & ~wall_visual] = (92, 78, 64)
                 canvas[wall_support_for_projection & ~wall_visual] = (255, 170, 64)
+                canvas[bridge_only_support & ~wall_visual] = (245, 210, 70)
             canvas[nonstructural_occupied & ~wall_visual] = (120, 98, 72)
             if show_unknown_reject:
                 canvas[rejected_wall_support] = (255, 142, 45)
                 canvas[unknown_rejected_wall] = (255, 118, 36)
                 canvas[frontier_rejected_wall] = (255, 92, 36)
+                canvas[forbidden_frontier_residual] = (255, 126, 38)
+                canvas[forbidden_unknown_boundary] = (215, 88, 34)
+                canvas[rejected_frontier_projection] = (170, 82, 30)
+                canvas[wall_rejected_by_outside_unknown] = (118, 48, 36)
+                canvas[outside_range_unknown & ~wall_visual] = (42, 42, 48)
+                canvas[in_range_unknown & ~wall_visual] = (148, 126, 40)
+                canvas[wall_from_in_range_unknown] = (255, 78, 58)
             if show_frontier_unknown_band:
                 canvas[frontier_unknown_band & ~wall_visual] = (90, 70, 125)
             canvas[unknown_dominant & ~unknown_rejected_wall] = (74, 70, 92)
@@ -1686,8 +1710,15 @@ class SGNavPopupVisualizer:
                 canvas[step2_hits & ~step2] = (160, 80, 255)
                 canvas[step2_pre_topology & ~step2] = (140, 72, 210)
                 canvas[step2_partition_candidate & ~step2] = (116, 76, 140)
+            if show_corridor_neck_sources:
+                canvas[corridor_neck_source & ~step2] = (185, 92, 255)
             if show_step2_rejected:
                 canvas[step2_topology_rejected & ~step2] = (120, 80, 160)
+                canvas[step2_hit_frontier_residual_rejected] = (140, 32, 42)
+            if show_raw_door_seed_band:
+                canvas[raw_door_seed_band & ~door_seed & ~door_cut] = (40, 95, 190)
+            if show_door_seed_reject_reason_overlay:
+                canvas[door_seed_reject_reason_overlay & ~door_seed & ~door_cut] = (80, 60, 120)
             canvas[door_attempt & ~door_visual & ~door_cut] = (0, 120, 40)
             canvas[door_trial & ~door_selected & ~door_visual & ~door_cut] = (0, 120, 40)
             canvas[door_attempt_rejected & ~door_visual & ~door_cut] = (120, 120, 120)
@@ -1745,6 +1776,7 @@ class SGNavPopupVisualizer:
             raw_wall_count = int(np.count_nonzero(raw_wall))
             wall_line_support_count = int(np.count_nonzero(wall_support_for_projection))
             wall_line_support_conflict_count = int(np.count_nonzero(wall_line_support_conflict))
+            bridge_only_count = int(np.count_nonzero(bridge_only_support))
             projected_wall_count = int(np.count_nonzero(projected_wall))
             anchor_projected_wall_count = int(np.count_nonzero(anchor_projected_wall))
             rejected_wall_support_count = int(np.count_nonzero(rejected_wall_support))
@@ -1759,6 +1791,7 @@ class SGNavPopupVisualizer:
             door_group_count = int(self._room_segmentation_debug.get("voxel_door_seed_group_count", door_cluster_count) or 0)
             door_trial_count = int(self._room_segmentation_debug.get("voxel_door_trial_candidate_count", np.count_nonzero(door_attempt)) or 0)
             step2_source_count = int(self._room_segmentation_debug.get("voxel_step2_source_line_count", 0) or 0)
+            step2_neck_source_count = int(self._room_segmentation_debug.get("voxel_step2_source_line_count_corridor_neck", 0) or 0)
             step2_hit_count = int(np.count_nonzero(step2_hits))
             step2_candidate_count = int(self._room_segmentation_debug.get("voxel_step2_candidate_count", np.count_nonzero(step2_candidate)) or 0)
             step2_accepted_count = int(self._room_segmentation_debug.get("voxel_step2_accepted_count", 0) or 0)
@@ -1768,35 +1801,39 @@ class SGNavPopupVisualizer:
                 integrate_text = "NA"
             stable_count = int(np.count_nonzero(stable_door_cut))
             unknown_rejected_count = int(np.count_nonzero(unknown_rejected_wall))
-            frontier_rejected_count = int(np.count_nonzero(frontier_rejected_wall))
+            frontier_rejected_count = int(np.count_nonzero(frontier_rejected_wall | forbidden_frontier_residual | forbidden_unknown_boundary))
+            hit_residual_rejected_count = int(np.count_nonzero(step2_hit_frontier_residual_rejected))
+            wall_generalized_count = int(np.count_nonzero(wall_generalized_raw))
+            in_range_unknown_count = int(np.count_nonzero(in_range_unknown))
+            outside_range_unknown_count = int(np.count_nonzero(outside_range_unknown))
+            wall_from_in_range_unknown_count = int(np.count_nonzero(wall_from_in_range_unknown))
             warning_count = int(np.count_nonzero(door_topology_warning))
             update_reason = str(self._room_segmentation_debug.get("roomseg_frontier_update_reason", "NA"))
             roomseg_update_index = int(self._room_segmentation_debug.get("voxel_door_memory_update_index", self._room_segmentation_debug.get("roomseg_update_index", 0)) or 0)
             proj_reject_text = _top_reason_text(self._room_segmentation_debug.get("voxel_wall_projection_reject_reason_counts", {}))
             step2_reject_counts = self._room_segmentation_debug.get("voxel_step2_topology_reject_reason_counts", self._room_segmentation_debug.get("voxel_step2_reject_reason_counts", {}))
             step2_reject_text = _top_reason_text(step2_reject_counts)
+            seed_reject_text = _top_reason_text(self._room_segmentation_debug.get("voxel_door_seed_reject_reason_counts_v25", self._room_segmentation_debug.get("voxel_door_seed_reject_reason_counts", {})))
             prune_text = _top_reason_text(self._room_segmentation_debug.get("voxel_door_memory_prune_reason_counts", {}))
-            title_a = "voxel v22 | free=%d wall=%d unknown=%d raw_occ=%d ratio_wall=%d unkdom=%d wall_sup=%d unk_rej=%d front_rej=%d" % (
+            title_a = "v25 | free=%d wall=%d wall_gen=%d door_seed=%d door_cut=%d stable=%d seed_reject=%s" % (
                 int(np.count_nonzero(vertical_free)),
                 display_wall_count,
-                int(np.count_nonzero(unknown)),
-                raw_wall_count,
-                int(np.count_nonzero(ratio_wall_debug)),
-                int(np.count_nonzero(unknown_dominant)),
-                wall_line_support_count,
-                unknown_rejected_count,
-                frontier_rejected_count,
-            )
-            title_b = "proj=%d anchor=%d proj_rej=%s door_seed=%d door_cut=%d stable_door=%d stable_sep=%d mem=%d prune=%s idx=%d" % (
-                projected_wall_count,
-                anchor_projected_wall_count,
-                proj_reject_text,
+                wall_generalized_count,
                 door_seed_count,
                 door_cut_count,
                 stable_count,
-                stable_separator_count,
-                int(self._room_segmentation_debug.get("voxel_door_memory_track_count", 0) or 0),
-                prune_text,
+                seed_reject_text,
+            )
+            title_b = "proj=%d anchor=%d proj_rej=%s step2_src=%d neck_src=%d hit=%d cand=%d acc=%d top_rej=%s idx=%d" % (
+                projected_wall_count,
+                anchor_projected_wall_count,
+                proj_reject_text,
+                step2_source_count,
+                step2_neck_source_count,
+                step2_hit_count,
+                step2_candidate_count,
+                step2_accepted_count,
+                step2_reject_text,
                 roomseg_update_index,
             )
             door_reject_counts = self._room_segmentation_debug.get("voxel_door_reject_reason_counts", {})
@@ -1807,16 +1844,14 @@ class SGNavPopupVisualizer:
                 door_counts = door_reject_counts
             door_reject_text = _top_reason_text(door_counts)
             if show_diag:
-                title_b = "%s | update=%s step2_src=%d hit=%d cand=%d acc=%d top_rej=%s rooms=%d door_rej=%s" % (
+                title_b = "%s | update=%s rooms=%d door_rej=%s in_rng_unk=%d out_unk=%d residual_rej=%d" % (
                     title_b,
                     update_reason,
-                    step2_source_count,
-                    step2_hit_count,
-                    step2_candidate_count,
-                    step2_accepted_count,
-                    step2_reject_text,
                     int(len([v for v in np.unique(labels) if int(v) > 0])),
                     door_reject_text,
+                    in_range_unknown_count,
+                    outside_range_unknown_count,
+                    frontier_rejected_count,
                 )
         title_color = (255, 70, 70) if missing or backend == "python_debug" else (255, 255, 255)
         self._label(draw, (8, 5), title_a[:96], title_color)
@@ -1850,6 +1885,11 @@ class SGNavPopupVisualizer:
                 nonstructural_occupied_cells=int(np.count_nonzero(nonstructural_occupied)),
                 rejected_wall_support_cells=int(np.count_nonzero(rejected_wall_support)),
                 unknown_dominant_cells=int(np.count_nonzero(unknown_dominant)),
+                wall_generalized_raw_cells=int(np.count_nonzero(wall_generalized_raw)),
+                in_range_unknown_cells=int(np.count_nonzero(in_range_unknown)),
+                outside_range_unknown_cells=int(np.count_nonzero(outside_range_unknown)),
+                wall_from_in_range_unknown_cells=int(np.count_nonzero(wall_from_in_range_unknown)),
+                wall_rejected_by_outside_unknown_cells=int(np.count_nonzero(wall_rejected_by_outside_unknown)),
                 unknown_rejected_wall_cells=int(np.count_nonzero(unknown_rejected_wall)),
                 frontier_unknown_band_cells=int(np.count_nonzero(frontier_unknown_band)),
                 frontier_rejected_wall_cells=int(np.count_nonzero(frontier_rejected_wall)),
@@ -1889,14 +1929,20 @@ class SGNavPopupVisualizer:
             ),
             self._overlay_record("vertical_free", True, (170, 220, 245), int(np.count_nonzero(vertical_free)), "voxel vertical free cells used by roomseg"),
             self._overlay_record("voxel_vertical_free", True, (170, 220, 245), int(np.count_nonzero(vertical_free)), "voxel vertical free cells used by roomseg"),
-            self._overlay_record("voxel_display_wall", True, (255, 30, 30), int(np.count_nonzero(wall_visual)), "clean v22 display wall from voxel_display_wall_xy only"),
+            self._overlay_record("voxel_display_wall", True, (255, 30, 30), int(np.count_nonzero(wall_visual)), "clean v23 display wall from voxel_display_wall_xy only"),
             self._overlay_record("voxel_raw_occupied_wall_support", bool(show_raw_support and np.any(raw_wall)), (92, 78, 64), int(np.count_nonzero(raw_wall)), "diagnostic raw occupied-any support, not default red wall"),
             self._overlay_record("voxel_wall_support_for_projection", bool(show_raw_support and np.any(wall_support_for_projection)), (255, 170, 64), int(np.count_nonzero(wall_support_for_projection)), "diagnostic wall support after unknown/frontier gating for projection"),
-            self._overlay_record("voxel_wall_line_support", bool(show_raw_support and np.any(wall_support_for_projection)), (255, 170, 64), int(np.count_nonzero(wall_support_for_projection)), "compatibility alias for v22 wall support after unknown/frontier gating"),
+            self._overlay_record("voxel_wall_line_support", bool(show_raw_support and np.any(wall_support_for_projection)), (255, 170, 64), int(np.count_nonzero(wall_support_for_projection)), "compatibility alias for v23 seed+bridge projection support"),
+            self._overlay_record("voxel_bridge_only_support", bool(show_raw_support and np.any(bridge_only_support)), (245, 210, 70), int(np.count_nonzero(bridge_only_support)), "diagnostic bridge-only support allowed only between seed wall supports"),
             self._overlay_record("voxel_wall_line_support_strong", bool(show_diag and np.any(wall_line_support_strong)), (255, 190, 76), int(np.count_nonzero(wall_line_support_strong)), "diagnostic strong wall-line support before projection validation"),
             self._overlay_record("voxel_wall_line_support_conflict", bool(show_diag and np.any(wall_line_support_conflict)), (255, 126, 45), int(np.count_nonzero(wall_line_support_conflict)), "diagnostic free-conflict wall-line support used at lower projection weight"),
             self._overlay_record("voxel_wall_line_support_rejected_furniture", bool(show_diag and np.any(wall_line_support_rejected_furniture)), (120, 98, 72), int(np.count_nonzero(wall_line_support_rejected_furniture)), "diagnostic occupied support rejected away from free/nonfree boundary"),
             self._overlay_record("voxel_wall_raw", bool(show_diag and np.any(ratio_wall_debug)), (112, 64, 180), int(np.count_nonzero(ratio_wall_debug)), "diagnostic ratio wall candidates before priority filtering"),
+            self._overlay_record("voxel_wall_generalized_raw", bool(show_diag and np.any(wall_generalized_raw)), (255, 92, 74), int(np.count_nonzero(wall_generalized_raw)), "diagnostic v24 generalized occupied wall candidates before priority filtering"),
+            self._overlay_record("voxel_in_range_unknown", bool(show_unknown_reject and np.any(in_range_unknown)), (148, 126, 40), int(np.count_nonzero(in_range_unknown)), "diagnostic unknown voxels inside effective sensor range"),
+            self._overlay_record("voxel_outside_range_unknown", bool(show_unknown_reject and np.any(outside_range_unknown)), (42, 42, 48), int(np.count_nonzero(outside_range_unknown)), "diagnostic unknown voxels outside effective sensor range"),
+            self._overlay_record("voxel_wall_from_in_range_unknown", bool(show_unknown_reject and np.any(wall_from_in_range_unknown)), (255, 78, 58), int(np.count_nonzero(wall_from_in_range_unknown)), "diagnostic final wall cells whose generalized ratio used in-range unknown"),
+            self._overlay_record("voxel_wall_rejected_by_outside_unknown", bool(show_unknown_reject and np.any(wall_rejected_by_outside_unknown)), (118, 48, 36), int(np.count_nonzero(wall_rejected_by_outside_unknown)), "diagnostic generalized wall candidates rejected by outside-range unknown dominance"),
             self._overlay_record("voxel_strict_raw_wall", bool(np.any(strict_raw_wall)), (255, 30, 30), strict_wall_count, "clean structural voxel wall after free and unknown priority"),
             self._overlay_record("voxel_wall_suppressed_by_free", bool(show_diag and np.any(wall_suppressed_by_free)), (72, 150, 92), int(np.count_nonzero(wall_suppressed_by_free)), "diagnostic occupied support suppressed by free voxel threshold"),
             self._overlay_record("voxel_ratio_wall_debug", bool(show_diag and np.any(ratio_wall_debug)), (112, 64, 180), int(np.count_nonzero(ratio_wall_debug)), "diagnostic ratio wall candidates before priority filtering"),
@@ -1905,6 +1951,9 @@ class SGNavPopupVisualizer:
             self._overlay_record("voxel_wall_support_unknown_gated", bool(show_diag and np.any(unknown_gated_wall)), (150, 46, 54), int(np.count_nonzero(unknown_gated_wall)), "occupied-any wall support that passed unknown gating"),
             self._overlay_record("voxel_wall_support_rejected_unknown", bool(show_unknown_reject and np.any(unknown_rejected_wall)), (255, 118, 36), int(np.count_nonzero(unknown_rejected_wall)), "occupied-any wall support rejected because the column is unknown-dominant"),
             self._overlay_record("voxel_wall_support_rejected_frontier_unknown", bool(show_unknown_reject and np.any(frontier_rejected_wall)), (255, 92, 36), int(np.count_nonzero(frontier_rejected_wall)), "occupied-any wall support rejected near frontier unknown boundary"),
+            self._overlay_record("voxel_forbidden_frontier_residual_support", bool(show_unknown_reject and np.any(forbidden_frontier_residual)), (255, 126, 38), int(np.count_nonzero(forbidden_frontier_residual)), "v23 sparse occupied residual suppressed near frontier/range edge"),
+            self._overlay_record("voxel_forbidden_unknown_boundary_support", bool(show_unknown_reject and np.any(forbidden_unknown_boundary)), (215, 88, 34), int(np.count_nonzero(forbidden_unknown_boundary)), "v23 occupied residual suppressed near unknown/free boundary"),
+            self._overlay_record("voxel_rejected_projected_wall_frontier_residual", bool(show_unknown_reject and np.any(rejected_frontier_projection)), (170, 82, 30), int(np.count_nonzero(rejected_frontier_projection)), "diagnostic projected wall cells rejected by v23 residual validation"),
             self._overlay_record("voxel_frontier_unknown_band", bool(show_frontier_unknown_band and np.any(frontier_unknown_band)), (90, 70, 125), int(np.count_nonzero(frontier_unknown_band)), "frontier unknown band used to reject false wall support"),
             self._overlay_record("voxel_wall_projected", bool(np.any(projected_wall)), (255, 30, 30), projected_wall_count, "projected structural wall line used by room boundaries and anchors"),
             self._overlay_record("voxel_anchor_projected_wall", bool(show_diag and np.any(anchor_projected_wall)), (255, 156, 42), int(np.count_nonzero(anchor_projected_wall)), "diagnostic relaxed short projected wall anchors for door and step2"),
@@ -1916,11 +1965,13 @@ class SGNavPopupVisualizer:
             self._overlay_record("voxel_conflict", bool(show_diag and np.any(conflict)), (255, 126, 45), int(np.count_nonzero(conflict)), "diagnostic xy cells with simultaneous vertical-free and strict-wall evidence"),
             self._overlay_record("voxel_unknown", True, (26, 28, 34), int(np.count_nonzero(unknown)), "voxel unknown cells preserved as unknown"),
             self._overlay_record("voxel_door_seed", bool(np.any(door_seed)), (0, 80, 255), int(np.count_nonzero(door_seed)), "door seed cells from per-xy voxel z-pattern detection"),
+            self._overlay_record("voxel_raw_door_seed_band", bool(show_raw_door_seed_band and np.any(raw_door_seed_band)), (40, 95, 190), int(np.count_nonzero(raw_door_seed_band)), "diagnostic raw seed dilation band; v25 does not suppress Step2 with this layer"),
+            self._overlay_record("voxel_door_seed_reject_reason_overlay", bool(show_door_seed_reject_reason_overlay and np.any(door_seed_reject_reason_overlay)), (80, 60, 120), int(np.count_nonzero(door_seed_reject_reason_overlay)), "diagnostic v25 door seed reject reason map"),
             self._overlay_record("voxel_door_extension_attempt", bool(show_diag and np.any(door_attempt)), (0, 120, 40), int(np.count_nonzero(door_attempt)), "diagnostic all door extension attempt paths"),
             self._overlay_record("voxel_door_trial_candidates", bool(show_diag and np.any(door_trial)), (54, 96, 74), int(np.count_nonzero(door_trial)), "diagnostic all door orientation trial lines"),
             self._overlay_record("voxel_door_selected_candidates", bool(show_diag and np.any(door_selected)), (0, 180, 70), int(np.count_nonzero(door_selected)), "diagnostic selected door candidate line per seed cluster"),
             self._overlay_record("voxel_door_trial_rejected", bool(show_diag and np.any(door_attempt_rejected | door_trial_rejected)), (120, 120, 120), int(np.count_nonzero(door_attempt_rejected | door_trial_rejected)), "diagnostic rejected door orientation trial lines"),
-            self._overlay_record("voxel_door_centerline", bool(np.any(door_cut)), (80, 255, 80), int(np.count_nonzero(door_cut)), "accepted door partition cut; v22 default green does not include visual-only centerlines"),
+            self._overlay_record("voxel_door_centerline", bool(np.any(door_cut)), (80, 255, 80), int(np.count_nonzero(door_cut)), "accepted door partition cut; v23 default green does not include visual-only centerlines"),
             self._overlay_record("voxel_door_visual_only", bool(show_door_visual_only and np.any(door_visual_only)), (120, 220, 140), int(np.count_nonzero(door_visual_only)), "diagnostic door visual line rejected by partition topology"),
             self._overlay_record("voxel_door_partition_cut_candidate", bool(show_diag and np.any(door_partition_candidate)), (170, 220, 80), int(np.count_nonzero(door_partition_candidate)), "diagnostic door partition cut candidates"),
             self._overlay_record("voxel_door_partition_cut_rejected", bool(show_diag and np.any(door_partition_rejected)), (255, 100, 50), int(np.count_nonzero(door_partition_rejected)), "diagnostic door partition cut rejected by topology"),
@@ -1930,10 +1981,12 @@ class SGNavPopupVisualizer:
             self._overlay_record("voxel_door_cut", bool(np.any(door_cut)), (80, 255, 80), int(np.count_nonzero(door_cut)), "final door partition cut including geometry-first and stable memory"),
             self._overlay_record("voxel_step1_gap_fill", bool(np.any(step1)), (245, 215, 55), int(np.count_nonzero(step1)), "real-wall short gap fill before virtual separators"),
             self._overlay_record("voxel_step2_extension", bool(np.any(step2)), (220, 60, 255), int(np.count_nonzero(step2)), "accepted Step2 wall-line extension separators"),
-            self._overlay_record("voxel_step2_source_line", bool(show_step2_source and "voxel_step2_source_line_count" in self._room_segmentation_debug), (160, 160, 170), int(self._room_segmentation_debug.get("voxel_step2_source_line_count", 0) or 0), "diagnostic Step2 source line pool after v22 strict validation"),
+            self._overlay_record("voxel_step2_source_line", bool(show_step2_source and "voxel_step2_source_line_count" in self._room_segmentation_debug), (160, 160, 170), int(self._room_segmentation_debug.get("voxel_step2_source_line_count", 0) or 0), "diagnostic Step2 source line pool after v23 residual validation"),
+            self._overlay_record("voxel_step2_corridor_neck_source_line", bool(show_corridor_neck_sources and np.any(corridor_neck_source)), (185, 92, 255), int(np.count_nonzero(corridor_neck_source)), "diagnostic v25 short projected corridor-neck source lines"),
             self._overlay_record("voxel_step2_extension_hits", bool(show_step2_source and np.any(step2_hits)), (160, 80, 255), int(np.count_nonzero(step2_hits)), "diagnostic all Step2 extension hit traces"),
             self._overlay_record("voxel_step2_partition_cut_candidate", bool(show_step2_source and np.any(step2_partition_candidate)), (116, 76, 140), int(np.count_nonzero(step2_partition_candidate)), "diagnostic Step2 partition cut candidates"),
             self._overlay_record("voxel_step2_topology_rejected", bool(show_step2_rejected and np.any(step2_topology_rejected)), (120, 80, 160), int(np.count_nonzero(step2_topology_rejected)), "diagnostic Step2 topology rejected separators"),
+            self._overlay_record("voxel_step2_hit_frontier_residual_rejected", bool(show_step2_rejected and np.any(step2_hit_frontier_residual_rejected)), (140, 32, 42), int(np.count_nonzero(step2_hit_frontier_residual_rejected)), "diagnostic Step2 hit rejected because target was v23 frontier residual"),
             self._overlay_record("voxel_rejected_candidates", bool(show_diag and np.any(rejected)), (130, 112, 118), int(np.count_nonzero(rejected)), "diagnostic rejected door centerlines and Step2 extension candidates"),
             self._overlay_record("voxel_frontier", bool(np.any(frontier)), (0, 235, 255), int(np.count_nonzero(frontier)), "frontier cells generated from voxel vertical free source"),
             self._overlay_record("voxel_final_room_labels", bool(np.any(labels > 0)), (120, 150, 230), int(np.count_nonzero(labels > 0)), "final 4-connectivity voxel room labels"),

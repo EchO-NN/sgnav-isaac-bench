@@ -53,10 +53,27 @@ def test_required_sgnav_defaults():
     assert cfg["mapping"]["room_segmentation"]["voxel_grid"]["voxel_grid_drives_navigation"] is True
     assert cfg["mapping"]["room_segmentation"]["voxel_grid"]["integration_backend"] == "cpu_vectorized"
     assert cfg["mapping"]["room_segmentation"]["voxel_grid"]["python_debug_backend_allowed"] is False
+    assert cfg["mapping"]["room_segmentation"]["voxel_grid"]["sensor_range_tracking_enabled"] is True
+    assert cfg["mapping"]["room_segmentation"]["voxel_grid"]["sensor_range_count_delta"] == 1
+    assert cfg["mapping"]["room_segmentation"]["voxel_grid"]["sensor_range_count_max"] == 255
+    assert cfg["mapping"]["room_segmentation"]["voxel_grid"]["sensor_range_count_threshold"] == 1
+    assert cfg["mapping"]["room_segmentation"]["voxel_grid"]["sensor_range_mark_endpoint_column_enabled"] is True
+    assert cfg["mapping"]["room_segmentation"]["voxel_grid"]["sensor_range_endpoint_column_xy_radius_cells"] == 0
+    assert cfg["mapping"]["room_segmentation"]["voxel_grid"]["sensor_range_mark_active_z_only"] is True
+    assert cfg["mapping"]["room_segmentation"]["voxel_grid"]["sensor_range_mark_ray_samples_enabled"] is True
+    assert cfg["mapping"]["room_segmentation"]["voxel_grid"]["sensor_range_behind_endpoint_margin_m"] == 0.00
+    assert cfg["mapping"]["room_segmentation"]["voxel_grid"]["sensor_range_count_decay_per_update"] == 0
     assert cfg["mapping"]["room_segmentation"]["voxel_roomseg_evidence"]["min_free_z_cells_for_xy_free"] == 3
     assert cfg["mapping"]["room_segmentation"]["voxel_roomseg_evidence"]["wall_mode"] == "free_unknown_then_ratio_wall"
     assert cfg["mapping"]["room_segmentation"]["voxel_roomseg_evidence"]["wall_occupied_ratio_min_for_xy_wall"] == 0.90
     assert cfg["mapping"]["room_segmentation"]["voxel_roomseg_evidence"]["wall_min_occupied_z_cells_for_xy_wall"] == 3
+    assert cfg["mapping"]["room_segmentation"]["voxel_roomseg_evidence"]["wall_use_generalized_occupied_ratio"] is True
+    assert cfg["mapping"]["room_segmentation"]["voxel_roomseg_evidence"]["count_in_range_unknown_as_occupied_for_wall"] is True
+    assert cfg["mapping"]["room_segmentation"]["voxel_roomseg_evidence"]["wall_generalized_occupied_ratio_min_for_xy_wall"] == 0.90
+    assert cfg["mapping"]["room_segmentation"]["voxel_roomseg_evidence"]["wall_min_actual_occupied_z_cells_for_xy_wall"] == 3
+    assert cfg["mapping"]["room_segmentation"]["voxel_roomseg_evidence"]["sensor_range_count_threshold_for_roomseg"] == 1
+    assert cfg["mapping"]["room_segmentation"]["voxel_roomseg_evidence"]["outside_unknown_ratio_min_for_xy_unknown"] == 0.50
+    assert cfg["mapping"]["room_segmentation"]["voxel_roomseg_evidence"]["min_effective_range_z_cells_for_known_column"] == 3
     assert cfg["mapping"]["room_segmentation"]["voxel_roomseg_evidence"]["unknown_ratio_min_for_xy_unknown"] == 0.50
     assert cfg["mapping"]["room_segmentation"]["voxel_roomseg_evidence"]["min_observed_z_cells_for_known_column"] == 3
     assert cfg["mapping"]["room_segmentation"]["voxel_roomseg_evidence"]["free_priority_over_wall"] is True
@@ -81,6 +98,18 @@ def test_required_sgnav_defaults():
     assert cfg["mapping"]["room_segmentation"]["voxel_roomseg_evidence"]["wall_line_support_use_nav_edge_gate"] is True
     assert cfg["mapping"]["room_segmentation"]["voxel_roomseg_evidence"]["wall_line_support_nav_edge_radius_cells"] == 3
     assert cfg["mapping"]["room_segmentation"]["voxel_roomseg_evidence"]["wall_line_support_remove_small_area_cells"] == 3
+    assert cfg["mapping"]["room_segmentation"]["voxel_roomseg_evidence"]["wall_line_support_policy"] == "seed_and_bridge"
+    assert cfg["mapping"]["room_segmentation"]["voxel_roomseg_evidence"]["free_conflict_support_policy"] == "bridge_only"
+    assert cfg["mapping"]["room_segmentation"]["voxel_roomseg_evidence"]["bridge_support_near_strong_wall_cells"] == 2
+    assert cfg["mapping"]["room_segmentation"]["voxel_roomseg_evidence"]["protected_structural_wall_band_cells"] == 2
+    assert cfg["mapping"]["room_segmentation"]["voxel_roomseg_evidence"]["protected_wall_line_support_min_run_cells"] == 6
+    assert cfg["mapping"]["room_segmentation"]["voxel_roomseg_evidence"]["frontier_residual_nav_unknown_dilation_cells"] == 5
+    assert cfg["mapping"]["room_segmentation"]["voxel_roomseg_evidence"]["frontier_residual_unknown_dilation_cells"] == 3
+    assert cfg["mapping"]["room_segmentation"]["voxel_roomseg_evidence"]["frontier_residual_free_dilation_cells"] == 5
+    assert cfg["mapping"]["room_segmentation"]["voxel_roomseg_evidence"]["frontier_residual_free_boundary_dilation_cells"] == 3
+    assert cfg["mapping"]["room_segmentation"]["voxel_roomseg_evidence"]["frontier_residual_unknown_ratio_min"] == 0.25
+    assert cfg["mapping"]["room_segmentation"]["voxel_roomseg_evidence"]["frontier_residual_observed_ratio_max"] == 0.35
+    assert cfg["mapping"]["room_segmentation"]["voxel_roomseg_evidence"]["frontier_residual_reject_unprotected_raw_occ"] is True
     assert cfg["mapping"]["room_segmentation"]["voxel_navigation_blind_zone"]["initial_blind_zone_radius_m"] == 0.80
     assert cfg["mapping"]["room_segmentation"]["voxel_navigation_blind_zone"]["initial_blind_zone_steps"] == 60
     assert cfg["mapping"]["room_segmentation"]["voxel_navigation_blind_zone"]["current_footprint_radius_m"] == 0.35
@@ -105,7 +134,14 @@ def test_required_sgnav_defaults():
     assert cfg["mapping"]["room_segmentation"]["voxel_wall_projection"]["side_band_cells"] == 3
     assert cfg["mapping"]["room_segmentation"]["voxel_wall_projection"]["side_min_free_ratio"] == 0.15
     assert cfg["mapping"]["room_segmentation"]["voxel_wall_projection"]["side_min_nonfree_ratio"] == 0.15
-    assert cfg["mapping"]["room_segmentation"]["voxel_wall_projection"]["reject_if_both_sides_free_ratio_gt"] == 0.55
+    assert cfg["mapping"]["room_segmentation"]["voxel_wall_projection"]["reject_if_both_sides_free_ratio_gt"] == 1.01
+    assert cfg["mapping"]["room_segmentation"]["voxel_wall_projection"]["both_sides_free_debug_only"] is True
+    assert cfg["mapping"]["room_segmentation"]["voxel_wall_projection"]["min_seed_support_cells_per_projected_line"] == 3
+    assert cfg["mapping"]["room_segmentation"]["voxel_wall_projection"]["min_seed_support_ratio_per_projected_line"] == 0.15
+    assert cfg["mapping"]["room_segmentation"]["voxel_wall_projection"]["min_seed_support_cells_for_both_sides_free"] == 3
+    assert cfg["mapping"]["room_segmentation"]["voxel_wall_projection"]["max_frontier_residual_ratio_on_projected_line"] == 0.25
+    assert cfg["mapping"]["room_segmentation"]["voxel_wall_projection"]["max_nav_unknown_ratio_on_projected_line"] == 0.35
+    assert cfg["mapping"]["room_segmentation"]["voxel_wall_projection"]["max_bridge_to_seed_support_ratio"] == 2.0
     assert cfg["mapping"]["room_segmentation"]["voxel_wall_projection"]["reject_if_both_sides_unknown_ratio_gt"] == 0.85
     assert cfg["mapping"]["room_segmentation"]["voxel_wall_projection"]["reject_if_no_free_side"] is True
     assert cfg["mapping"]["room_segmentation"]["voxel_wall_projection"]["reject_if_no_nonfree_side"] is True
@@ -113,7 +149,7 @@ def test_required_sgnav_defaults():
     assert cfg["mapping"]["room_segmentation"]["voxel_wall_projection"]["side_min_structural_ratio"] == 0.08
     assert cfg["mapping"]["room_segmentation"]["voxel_wall_projection"]["min_line_observed_support_cells"] == 3
     assert cfg["mapping"]["room_segmentation"]["voxel_wall_projection"]["keep_accepted_line_cells_even_if_unknown_dominant"] is True
-    assert cfg["mapping"]["room_segmentation"]["voxel_door"]["seed_method"] == "centroid_ratio"
+    assert cfg["mapping"]["room_segmentation"]["voxel_door"]["seed_method"] == "sensor_aware_turn_search"
     assert cfg["mapping"]["room_segmentation"]["voxel_door"]["top_occupied_min_z_m"] == 1.80
     assert cfg["mapping"]["room_segmentation"]["voxel_door"]["min_lower_free_cells"] == 2
     assert cfg["mapping"]["room_segmentation"]["voxel_door"]["centroid_turn_extent_scale"] == 0.50
@@ -121,6 +157,21 @@ def test_required_sgnav_defaults():
     assert cfg["mapping"]["room_segmentation"]["voxel_door"]["upper_occupied_ratio_min_observed"] == 0.80
     assert cfg["mapping"]["room_segmentation"]["voxel_door"]["enforce_seed_door_width_limits"] is False
     assert cfg["mapping"]["room_segmentation"]["voxel_door"]["vectorized_seed_classification"] is True
+    assert cfg["mapping"]["room_segmentation"]["voxel_door"]["sensor_aware_seed_enabled"] is True
+    assert cfg["mapping"]["room_segmentation"]["voxel_door"]["use_in_range_unknown_as_upper_solid"] is True
+    assert cfg["mapping"]["room_segmentation"]["voxel_door"]["use_effective_observed_denominator"] is True
+    assert cfg["mapping"]["room_segmentation"]["voxel_door"]["lower_min_effective_cells"] == 2
+    assert cfg["mapping"]["room_segmentation"]["voxel_door"]["lower_free_ratio_min_effective"] == 0.80
+    assert cfg["mapping"]["room_segmentation"]["voxel_door"]["lower_actual_occupied_ratio_max"] == 0.15
+    assert cfg["mapping"]["room_segmentation"]["voxel_door"]["lower_in_range_unknown_ratio_max"] == 0.20
+    assert cfg["mapping"]["room_segmentation"]["voxel_door"]["upper_solid_ratio_min_effective"] == 0.75
+    assert cfg["mapping"]["room_segmentation"]["voxel_door"]["upper_actual_occupied_min_cells_for_seed"] == 1
+    assert cfg["mapping"]["room_segmentation"]["voxel_door"]["upper_actual_occupied_min_cells_for_cluster"] == 3
+    assert cfg["mapping"]["room_segmentation"]["voxel_door"]["upper_effective_observed_min_cells"] == 3
+    assert cfg["mapping"]["room_segmentation"]["voxel_door"]["turn_search_enabled"] is True
+    assert cfg["mapping"]["room_segmentation"]["voxel_door"]["turn_min_z_m"] == 1.70
+    assert cfg["mapping"]["room_segmentation"]["voxel_door"]["turn_max_z_m"] == 2.20
+    assert cfg["mapping"]["room_segmentation"]["voxel_door"]["centroid_ratio_fallback_enabled"] is True
     assert cfg["mapping"]["room_segmentation"]["voxel_door"]["inner_unknown_ratio_max"] == 0.20
     assert cfg["mapping"]["room_segmentation"]["voxel_door"]["max_component_thickness_m"] == 0.45
     assert cfg["mapping"]["room_segmentation"]["voxel_door"]["extend_max_m"] == 1.80
@@ -162,6 +213,9 @@ def test_required_sgnav_defaults():
     assert cfg["mapping"]["room_segmentation"]["voxel_visualization"]["voxel_show_wall_diagnostics"] is False
     assert cfg["mapping"]["room_segmentation"]["voxel_visualization"]["show_raw_wall_support"] is False
     assert cfg["mapping"]["room_segmentation"]["voxel_visualization"]["show_frontier_unknown_band"] is False
+    assert cfg["mapping"]["room_segmentation"]["voxel_visualization"]["show_raw_door_seed_band"] is False
+    assert cfg["mapping"]["room_segmentation"]["voxel_visualization"]["show_corridor_neck_sources"] is False
+    assert cfg["mapping"]["room_segmentation"]["voxel_visualization"]["show_door_seed_reject_reason_overlay"] is False
     assert cfg["mapping"]["room_segmentation"]["voxel_visualization"]["door_seed_color"] == [0, 80, 255]
     assert cfg["mapping"]["room_segmentation"]["voxel_visualization"]["door_extension_color"] == [0, 255, 70]
     assert cfg["mapping"]["room_segmentation"]["voxel_visualization"]["step2_extension_color"] == [220, 60, 255]
@@ -174,6 +228,16 @@ def test_required_sgnav_defaults():
     assert cfg["mapping"]["room_segmentation"]["voxel_step2"]["reject_if_tiny_side_width_cells_leq"] == 2
     assert cfg["mapping"]["room_segmentation"]["voxel_step2"]["source_min_line_length_m"] == 0.60
     assert cfg["mapping"]["room_segmentation"]["voxel_step2"]["source_min_support_cells"] == 6
+    assert cfg["mapping"]["room_segmentation"]["voxel_step2"]["corridor_neck_source_enabled"] is True
+    assert cfg["mapping"]["room_segmentation"]["voxel_step2"]["corridor_neck_source_min_line_length_m"] == 0.35
+    assert cfg["mapping"]["room_segmentation"]["voxel_step2"]["corridor_neck_source_min_support_cells"] == 4
+    assert cfg["mapping"]["room_segmentation"]["voxel_step2"]["corridor_neck_source_min_support_ratio"] == 0.45
+    assert cfg["mapping"]["room_segmentation"]["voxel_step2"]["corridor_neck_source_forbid_raw_seed_band"] is False
+    assert cfg["mapping"]["room_segmentation"]["voxel_step2"]["corridor_neck_source_forbid_accepted_door_band"] is True
+    assert cfg["mapping"]["room_segmentation"]["voxel_step2"]["corridor_neck_source_max_unknown_ratio_on_line"] == 0.25
+    assert cfg["mapping"]["room_segmentation"]["voxel_step2"]["corridor_neck_source_allow_only_projected_or_strict"] is True
+    assert cfg["mapping"]["room_segmentation"]["voxel_step2"]["reject_if_hits_frontier_residual_wall"] is True
+    assert cfg["mapping"]["room_segmentation"]["voxel_step2"]["reject_if_crosses_frontier_unknown_band"] is True
     assert cfg["mapping"]["room_segmentation"]["voxel_step2"]["extension_intersection_policy"] == "reject"
     assert cfg["mapping"]["room_segmentation"]["voxel_step2"]["enable_extension_intersection_fallback"] is False
     assert cfg["mapping"]["room_segmentation"]["voxel_step2_topology"]["corridor_reject_tiny_side_width_cells_leq"] == 2

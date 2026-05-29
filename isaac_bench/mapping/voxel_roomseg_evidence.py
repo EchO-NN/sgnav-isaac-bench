@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Mapping
+from typing import Any, Mapping
 import time
 
 import numpy as np
@@ -30,6 +30,13 @@ class VoxelRoomsegEvidenceConfig:
     wall_mode: str = "free_unknown_then_ratio_wall"
     wall_occupied_ratio_min_for_xy_wall: float = 0.90
     wall_min_occupied_z_cells_for_xy_wall: int = 3
+    wall_use_generalized_occupied_ratio: bool = True
+    wall_generalized_occupied_ratio_min_for_xy_wall: float = 0.90
+    wall_min_actual_occupied_z_cells_for_xy_wall: int = 3
+    sensor_range_count_threshold_for_roomseg: int = 1
+    outside_unknown_ratio_min_for_xy_unknown: float = 0.50
+    min_effective_range_z_cells_for_known_column: int = 3
+    count_in_range_unknown_as_occupied_for_wall: bool = True
     free_priority_over_wall: bool = True
     unknown_priority_over_wall: bool = True
     nav_assisted_free_enabled: bool = True
@@ -52,6 +59,18 @@ class VoxelRoomsegEvidenceConfig:
     wall_line_support_conflict_weight: float = 0.35
     wall_line_support_strong_weight: float = 1.0
     wall_line_support_remove_small_area_cells: int = 3
+    wall_line_support_policy: str = "seed_and_bridge"
+    free_conflict_support_policy: str = "bridge_only"
+    bridge_support_near_strong_wall_cells: int = 2
+    protected_structural_wall_band_cells: int = 2
+    protected_wall_line_support_min_run_cells: int = 6
+    frontier_residual_nav_unknown_dilation_cells: int = 5
+    frontier_residual_unknown_dilation_cells: int = 3
+    frontier_residual_free_dilation_cells: int = 5
+    frontier_residual_free_boundary_dilation_cells: int = 3
+    frontier_residual_unknown_ratio_min: float = 0.25
+    frontier_residual_observed_ratio_max: float = 0.35
+    frontier_residual_reject_unprotected_raw_occ: bool = True
     # Legacy/debug knobs retained for older configs; they no longer define final wall.
     wall_min_occupied_z_cells: int = 1
     wall_free_exclusion_min_z_cells: int = 3
@@ -88,6 +107,14 @@ class VoxelRoomsegEvidenceConfig:
             raw["wall_occupied_ratio_min_for_xy_wall"] = raw["wall_occupied_ratio_min"]
         if "wall_occupied_ratio_min" in raw and "wall_occupied_ratio_debug_threshold" not in raw:
             raw["wall_occupied_ratio_debug_threshold"] = raw["wall_occupied_ratio_min"]
+        if "wall_occupied_ratio_min_for_xy_wall" in raw and "wall_generalized_occupied_ratio_min_for_xy_wall" not in raw:
+            raw["wall_generalized_occupied_ratio_min_for_xy_wall"] = raw["wall_occupied_ratio_min_for_xy_wall"]
+        if "wall_min_occupied_z_cells_for_xy_wall" in raw and "wall_min_actual_occupied_z_cells_for_xy_wall" not in raw:
+            raw["wall_min_actual_occupied_z_cells_for_xy_wall"] = raw["wall_min_occupied_z_cells_for_xy_wall"]
+        if "unknown_ratio_min_for_xy_unknown" in raw and "outside_unknown_ratio_min_for_xy_unknown" not in raw:
+            raw["outside_unknown_ratio_min_for_xy_unknown"] = raw["unknown_ratio_min_for_xy_unknown"]
+        if "min_observed_z_cells_for_known_column" in raw and "min_effective_range_z_cells_for_known_column" not in raw:
+            raw["min_effective_range_z_cells_for_known_column"] = raw["min_observed_z_cells_for_known_column"]
         if "wall_unknown_ratio_max_for_structural" in raw and "unknown_ratio_min_for_xy_unknown" not in raw:
             raw["unknown_ratio_min_for_xy_unknown"] = raw["wall_unknown_ratio_max_for_structural"]
         if "wall_min_observed_z_cells_for_structural" in raw and "min_observed_z_cells_for_known_column" not in raw:
@@ -97,6 +124,33 @@ class VoxelRoomsegEvidenceConfig:
                 raw[key] = value
         fields = {name for name in cls.__dataclass_fields__}
         return cls(**{key: raw[key] for key in raw if key in fields})
+
+
+@dataclass
+class WallSupportLayersV23:
+    vertical_free: np.ndarray
+    strict_wall: np.ndarray
+    unknown: np.ndarray
+    occupied_any: np.ndarray
+    occupied_count: np.ndarray
+    free_count: np.ndarray
+    unknown_count: np.ndarray
+    observed_count: np.ndarray
+    occupied_ratio: np.ndarray
+    unknown_ratio: np.ndarray
+    observed_ratio: np.ndarray
+    strong_structural_support: np.ndarray
+    bridge_only_support: np.ndarray
+    forbidden_frontier_residual_support: np.ndarray
+    forbidden_unknown_boundary_support: np.ndarray
+    free_conflict_support: np.ndarray
+    protected_structural_wall_band: np.ndarray
+    support_seed_for_projection: np.ndarray
+    support_bridge_for_projection: np.ndarray
+    support_for_projection_display: np.ndarray
+    support_for_step2_target: np.ndarray
+    support_for_step2_source: np.ndarray
+    debug: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -151,12 +205,25 @@ class VoxelRoomsegEvidence:
     wall_support_for_projection_xy: np.ndarray | None = None
     wall_support_weight_xy: np.ndarray | None = None
     frontier_unknown_band_xy: np.ndarray | None = None
+    strong_structural_support_xy: np.ndarray | None = None
+    bridge_only_support_xy: np.ndarray | None = None
+    forbidden_frontier_residual_support_xy: np.ndarray | None = None
+    forbidden_unknown_boundary_support_xy: np.ndarray | None = None
+    free_conflict_support_xy: np.ndarray | None = None
+    protected_structural_wall_band_xy: np.ndarray | None = None
+    support_seed_for_projection_xy: np.ndarray | None = None
+    support_bridge_for_projection_xy: np.ndarray | None = None
+    support_for_projection_display_xy: np.ndarray | None = None
+    support_for_step2_target_xy: np.ndarray | None = None
+    support_for_step2_source_xy: np.ndarray | None = None
+    wall_support_layers_v23: WallSupportLayersV23 | None = None
     debug: dict[str, object] = field(default_factory=dict)
 
 
 def classify_voxel_columns_for_roomseg(
     *,
     state_active: np.ndarray,
+    sensor_range_active: np.ndarray | None = None,
     navigation_free_mask: np.ndarray,
     navigation_obstacle_mask: np.ndarray,
     navigation_unknown_mask: np.ndarray | None = None,
@@ -175,44 +242,84 @@ def classify_voxel_columns_for_roomseg(
     if nav_unknown.shape != shape:
         raise ValueError("navigation_unknown_mask must match state_active HxW shape")
     active_count = max(1, int(state.shape[0]))
-    free_count = np.sum(state == int(VOXEL_FREE), axis=0).astype(np.uint16)
-    occupied_count = np.sum(state == int(VOXEL_OCCUPIED), axis=0).astype(np.uint16)
-    unknown_count = np.sum(state == int(VOXEL_UNKNOWN), axis=0).astype(np.uint16)
-    conflict_count = np.sum(state == int(VOXEL_CONFLICT), axis=0).astype(np.uint16)
+    free_bin = state == int(VOXEL_FREE)
+    occupied_bin = state == int(VOXEL_OCCUPIED)
+    unknown_bin = state == int(VOXEL_UNKNOWN)
+    conflict_bin = state == int(VOXEL_CONFLICT)
+    if sensor_range_active is None:
+        sensor_range = np.zeros_like(state, dtype=np.uint8)
+        sensor_range_available = False
+    else:
+        sensor_range = np.asarray(sensor_range_active)
+        if sensor_range.shape != state.shape:
+            raise ValueError("sensor_range_active must match state_active shape")
+        sensor_range_available = True
+    sensor_in_range_bin = sensor_range >= max(1, int(getattr(cfg, "sensor_range_count_threshold_for_roomseg", 1)))
+    in_range_unknown_bin = unknown_bin & sensor_in_range_bin
+    outside_range_unknown_bin = unknown_bin & ~sensor_in_range_bin
+
+    free_count = np.sum(free_bin, axis=0).astype(np.uint16)
+    occupied_count = np.sum(occupied_bin, axis=0).astype(np.uint16)
+    unknown_count = np.sum(unknown_bin, axis=0).astype(np.uint16)
+    conflict_count = np.sum(conflict_bin, axis=0).astype(np.uint16)
+    sensor_range_count_xy = np.sum(sensor_in_range_bin, axis=0).astype(np.uint16)
+    in_range_unknown_count = np.sum(in_range_unknown_bin, axis=0).astype(np.uint16)
+    outside_range_unknown_count = np.sum(outside_range_unknown_bin, axis=0).astype(np.uint16)
     observed_count = np.minimum(
         free_count.astype(np.uint32) + occupied_count.astype(np.uint32) + conflict_count.astype(np.uint32),
         np.iinfo(np.uint16).max,
     ).astype(np.uint16)
+    effective_range_count = np.minimum(
+        sensor_range_count_xy.astype(np.uint32) + observed_count.astype(np.uint32),
+        np.iinfo(np.uint16).max,
+    ).astype(np.uint16)
+    if bool(getattr(cfg, "count_in_range_unknown_as_occupied_for_wall", True)):
+        generalized_occupied_count = np.minimum(
+            occupied_count.astype(np.uint32) + in_range_unknown_count.astype(np.uint32),
+            np.iinfo(np.uint16).max,
+        ).astype(np.uint16)
+    else:
+        generalized_occupied_count = occupied_count.copy()
     active_z_bin_count = np.full(shape, active_count, dtype=np.uint16)
     free_ratio = free_count.astype(np.float32) / float(active_count)
     occupied_ratio = occupied_count.astype(np.float32) / float(active_count)
     unknown_ratio = unknown_count.astype(np.float32) / float(active_count)
     observed_ratio = observed_count.astype(np.float32) / float(active_count)
+    sensor_range_ratio = sensor_range_count_xy.astype(np.float32) / float(active_count)
+    in_range_unknown_ratio = in_range_unknown_count.astype(np.float32) / float(active_count)
+    outside_unknown_ratio = outside_range_unknown_count.astype(np.float32) / float(active_count)
+    generalized_occupied_ratio = generalized_occupied_count.astype(np.float32) / float(active_count)
 
     free_raw = free_count >= max(1, int(cfg.min_free_z_cells_for_xy_free))
-    wall_ratio_raw = (
+    wall_actual_ratio_raw = (
         occupied_ratio >= float(cfg.wall_occupied_ratio_min_for_xy_wall)
     ) & (
         occupied_count >= max(1, int(cfg.wall_min_occupied_z_cells_for_xy_wall))
     )
+    wall_actual_occupied_requirement = occupied_count >= max(1, int(getattr(cfg, "wall_min_actual_occupied_z_cells_for_xy_wall", 3)))
+    wall_generalized_raw = (
+        generalized_occupied_ratio >= float(getattr(cfg, "wall_generalized_occupied_ratio_min_for_xy_wall", 0.90))
+    ) & (
+        wall_actual_occupied_requirement
+    )
+    wall_ratio_raw = wall_generalized_raw if bool(getattr(cfg, "wall_use_generalized_occupied_ratio", True)) else wall_actual_ratio_raw
     nav_assisted_free = np.zeros(shape, dtype=bool)
     if bool(cfg.nav_assisted_free_enabled):
         nav_assisted_free = nav_free.copy()
         if bool(cfg.nav_assisted_free_requires_observed):
-            nav_assisted_free &= observed_count > 0
+            nav_assisted_free &= effective_range_count > 0
         if bool(cfg.nav_assisted_free_forbidden_on_ratio_wall):
             nav_assisted_free &= ~wall_ratio_raw
     vertical_free = free_raw | nav_assisted_free
     if bool(cfg.suppress_free_on_navigation_obstacle):
         vertical_free &= ~nav_obstacle
 
-    unknown_dominant = (
-        unknown_ratio >= float(cfg.unknown_ratio_min_for_xy_unknown)
+    outside_unknown_dominant = (
+        outside_unknown_ratio >= float(getattr(cfg, "outside_unknown_ratio_min_for_xy_unknown", cfg.unknown_ratio_min_for_xy_unknown))
     ) | (
-        observed_count < max(1, int(cfg.min_observed_z_cells_for_known_column))
-    ) | (
-        nav_unknown & ~vertical_free
+        effective_range_count < max(1, int(getattr(cfg, "min_effective_range_z_cells_for_known_column", cfg.min_observed_z_cells_for_known_column)))
     )
+    unknown_dominant = outside_unknown_dominant.astype(bool)
     if bool(cfg.free_priority_over_wall):
         wall_rejected_by_free = wall_ratio_raw & vertical_free
     else:
@@ -233,7 +340,7 @@ def classify_voxel_columns_for_roomseg(
     unknown = ~(vertical_free | wall)
     occupied_any = occupied_count > 0
     wall_support_loose = occupied_any.copy()
-    wall_support_unknown_gated = wall_ratio_raw & ~unknown_dominant
+    wall_support_unknown_gated = wall_ratio_raw & ~outside_unknown_dominant
     wall_support_rejected_unknown = wall_rejected_by_unknown.copy()
     nonstructural_occupied = occupied_any & ~wall & ~vertical_free
     ratio_wall_debug = (
@@ -241,26 +348,75 @@ def classify_voxel_columns_for_roomseg(
     ) if bool(cfg.wall_ratio_debug_enabled) else np.zeros(shape, dtype=bool)
     wall_line_support_raw = occupied_count >= max(1, int(cfg.wall_line_support_min_occupied_z_cells))
     wall_line_support_free_block = free_count >= max(1, int(cfg.min_free_z_cells_for_xy_free))
-    wall_line_support_unknown_block = unknown_ratio >= float(cfg.wall_line_support_unknown_ratio_max)
-    wall_line_support_unknown_hard_block = unknown_ratio >= float(cfg.wall_line_support_unknown_ratio_hard_max)
-    wall_line_support_observed_block = observed_count < max(1, int(cfg.wall_line_support_min_observed_z_cells))
-    wall_line_support_observed_ratio_block = observed_ratio < float(getattr(cfg, "wall_line_support_min_observed_ratio", 0.15))
+    wall_line_support_unknown_block = outside_unknown_ratio >= float(cfg.wall_line_support_unknown_ratio_max)
+    wall_line_support_unknown_hard_block = outside_unknown_ratio >= float(cfg.wall_line_support_unknown_ratio_hard_max)
+    wall_line_support_observed_block = effective_range_count < max(1, int(cfg.wall_line_support_min_observed_z_cells))
+    wall_line_support_observed_ratio_block = (
+        effective_range_count.astype(np.float32) / float(active_count)
+    ) < float(getattr(cfg, "wall_line_support_min_observed_ratio", 0.15))
+
+    long_raw_wall_support = _axis_run_mask(
+        wall_line_support_raw,
+        min_run_cells=max(1, int(getattr(cfg, "protected_wall_line_support_min_run_cells", 6))),
+    )
+    protected_radius = max(0, int(getattr(cfg, "protected_structural_wall_band_cells", 2)))
+    protected_structure = _disk(protected_radius) if protected_radius > 0 else conn(8)
+    protected_structural_wall_band = ndimage.binary_dilation(
+        wall_ratio_raw | wall | long_raw_wall_support,
+        structure=protected_structure,
+    ).astype(bool)
+
+    legacy_frontier_unknown_radius = max(0, int(getattr(cfg, "frontier_unknown_band_dilation_cells", 2)))
+    legacy_frontier_free_radius = max(0, int(getattr(cfg, "frontier_free_band_dilation_cells", 3)))
+    legacy_frontier_unknown_structure = _disk(legacy_frontier_unknown_radius) if legacy_frontier_unknown_radius > 0 else conn(8)
+    legacy_frontier_free_structure = _disk(legacy_frontier_free_radius) if legacy_frontier_free_radius > 0 else conn(8)
+    frontier_unknown_band = (
+        ndimage.binary_dilation(nav_unknown, structure=legacy_frontier_unknown_structure).astype(bool)
+        & ndimage.binary_dilation(vertical_free, structure=legacy_frontier_free_structure).astype(bool)
+    )
+
+    nav_unknown_radius = max(0, int(getattr(cfg, "frontier_residual_nav_unknown_dilation_cells", 5)))
+    unknown_radius = max(0, int(getattr(cfg, "frontier_residual_unknown_dilation_cells", 3)))
+    free_radius = max(0, int(getattr(cfg, "frontier_residual_free_dilation_cells", 5)))
+    free_boundary_radius = max(0, int(getattr(cfg, "frontier_residual_free_boundary_dilation_cells", 3)))
+    nav_unknown_band = ndimage.binary_dilation(nav_unknown, structure=_disk(nav_unknown_radius) if nav_unknown_radius > 0 else conn(8)).astype(bool)
+    unknown_dominant_band = ndimage.binary_dilation(unknown_dominant, structure=_disk(unknown_radius) if unknown_radius > 0 else conn(8)).astype(bool)
+    vertical_free_band = ndimage.binary_dilation(vertical_free, structure=_disk(free_radius) if free_radius > 0 else conn(8)).astype(bool)
+    free_boundary = vertical_free & ndimage.binary_dilation(~vertical_free, structure=conn(8)).astype(bool)
+    free_boundary_band = ndimage.binary_dilation(
+        free_boundary,
+        structure=_disk(free_boundary_radius) if free_boundary_radius > 0 else conn(8),
+    ).astype(bool)
+    frontier_residual_band = (nav_unknown_band | unknown_dominant_band) & vertical_free_band
+    raw_occ = occupied_count > 0
+    weak_occ = raw_occ & ~wall_ratio_raw
+    low_observed = (effective_range_count.astype(np.float32) / float(active_count)) < float(getattr(cfg, "frontier_residual_observed_ratio_max", 0.35))
+    some_unknown = outside_unknown_ratio >= float(getattr(cfg, "frontier_residual_unknown_ratio_min", 0.25))
+    free_conflict_support = raw_occ & vertical_free
+    residual_condition = weak_occ | low_observed | some_unknown | free_conflict_support
+    forbidden_frontier_residual_support = (
+        raw_occ
+        & frontier_residual_band
+        & ~protected_structural_wall_band
+        & residual_condition
+    )
+    forbidden_unknown_boundary_support = (
+        raw_occ
+        & unknown_dominant_band
+        & free_boundary_band
+        & ~protected_structural_wall_band
+        & residual_condition
+    )
+    forbidden_residual_support = forbidden_frontier_residual_support | forbidden_unknown_boundary_support
     wall_line_support_nav_unknown_block = (
         wall_line_support_raw
         & nav_unknown
         & ~vertical_free
+        & ~protected_structural_wall_band
         & bool(getattr(cfg, "wall_line_support_reject_navigation_unknown", True))
     )
-    frontier_unknown_radius = max(0, int(getattr(cfg, "frontier_unknown_band_dilation_cells", 2)))
-    frontier_free_radius = max(0, int(getattr(cfg, "frontier_free_band_dilation_cells", 3)))
-    frontier_unknown_structure = _disk(frontier_unknown_radius) if frontier_unknown_radius > 0 else conn(8)
-    frontier_free_structure = _disk(frontier_free_radius) if frontier_free_radius > 0 else conn(8)
-    frontier_unknown_band = (
-        ndimage.binary_dilation(nav_unknown, structure=frontier_unknown_structure).astype(bool)
-        & ndimage.binary_dilation(vertical_free, structure=frontier_free_structure).astype(bool)
-    )
-    wall_line_support_frontier_band_block = wall_line_support_raw & frontier_unknown_band & ~wall_ratio_raw
-    free_boundary = vertical_free & ndimage.binary_dilation(~vertical_free, structure=conn(8)).astype(bool)
+    wall_line_support_frontier_band_block = wall_line_support_raw & forbidden_frontier_residual_support
+
     boundary_radius = max(0, int(getattr(cfg, "wall_line_support_free_boundary_radius_cells", 3)))
     boundary_structure = _disk(boundary_radius) if boundary_radius > 0 else conn(8)
     near_free_boundary = ndimage.binary_dilation(free_boundary, structure=boundary_structure).astype(bool)
@@ -268,29 +424,53 @@ def classify_voxel_columns_for_roomseg(
     if np.any(structural_boundary_seed):
         near_free_boundary |= ndimage.binary_dilation(structural_boundary_seed, structure=boundary_structure).astype(bool)
     wall_support_common_reject = (
-        wall_line_support_unknown_block
+        wall_line_support_unknown_hard_block
         | wall_line_support_observed_block
         | wall_line_support_observed_ratio_block
-        | wall_line_support_nav_unknown_block
-        | wall_line_support_frontier_band_block
+        | forbidden_residual_support
     )
     support_raw_known = wall_line_support_raw & ~wall_support_common_reject
     wall_line_support_near_free_boundary = support_raw_known & near_free_boundary
-    ratio_wall_safe = wall_ratio_raw & ~vertical_free & ~nav_unknown & ~wall_line_support_unknown_block
-    wall_support_known = wall_line_support_near_free_boundary & ~wall_line_support_free_block
-    wall_line_support_conflict = wall_line_support_near_free_boundary & wall_line_support_free_block
+    legacy_ratio_wall_safe = wall_ratio_raw & ~vertical_free & ~wall_line_support_unknown_block & ~forbidden_residual_support
+    legacy_wall_support_known = wall_line_support_near_free_boundary & ~wall_line_support_free_block
+    strong_structural_support = (
+        (wall | wall_ratio_raw | long_raw_wall_support)
+        & ~vertical_free
+        & ~outside_unknown_dominant
+        & ~forbidden_residual_support
+    )
+    if not bool(getattr(cfg, "frontier_residual_reject_unprotected_raw_occ", True)):
+        strong_structural_support = strong_structural_support | legacy_wall_support_known | legacy_ratio_wall_safe
+    free_conflict_support = free_conflict_support & ~forbidden_residual_support
     if not bool(getattr(cfg, "wall_line_support_allow_free_conflict_for_projection", True)):
-        wall_line_support_conflict = np.zeros(shape, dtype=bool)
-    wall_line_support_strong = wall_support_known | ratio_wall_safe
-    wall_line_support_rejected_furniture = (wall_line_support_raw & ~wall_support_common_reject) & ~near_free_boundary & ~ratio_wall_safe
+        free_conflict_support = np.zeros(shape, dtype=bool)
+    bridge_radius = max(0, int(getattr(cfg, "bridge_support_near_strong_wall_cells", 2)))
+    bridge_band = ndimage.binary_dilation(
+        strong_structural_support | wall_ratio_raw,
+        structure=_disk(bridge_radius) if bridge_radius > 0 else conn(8),
+    ).astype(bool)
+    if str(getattr(cfg, "free_conflict_support_policy", "bridge_only")) == "bridge_only":
+        bridge_only_support = free_conflict_support & bridge_band
+    else:
+        bridge_only_support = free_conflict_support.copy()
+    support_seed_for_projection = strong_structural_support.astype(bool)
+    support_bridge_for_projection = bridge_only_support.astype(bool)
+    wall_line_support_strong = support_seed_for_projection.copy()
+    wall_line_support_conflict = support_bridge_for_projection.copy()
+    wall_support_known = legacy_wall_support_known | legacy_ratio_wall_safe | strong_structural_support
+    wall_line_support_rejected_furniture = support_raw_known & ~near_free_boundary & ~legacy_ratio_wall_safe & ~strong_structural_support
     wall_line_support_rejected_unknown = wall_line_support_raw & wall_line_support_unknown_block
     wall_line_support_rejected_observed = wall_line_support_raw & ~wall_line_support_unknown_block & (wall_line_support_observed_block | wall_line_support_observed_ratio_block)
-    wall_line_support_nav_edge_block = wall_line_support_frontier_band_block.copy()
-    wall_line_support = wall_line_support_strong | wall_line_support_conflict
+    wall_line_support_nav_edge_block = forbidden_frontier_residual_support.copy()
+    wall_line_support = support_seed_for_projection | support_bridge_for_projection
     if not bool(cfg.wall_line_support_enabled):
         wall_line_support = np.zeros(shape, dtype=bool)
         wall_line_support_strong = np.zeros(shape, dtype=bool)
         wall_line_support_conflict = np.zeros(shape, dtype=bool)
+        strong_structural_support = np.zeros(shape, dtype=bool)
+        bridge_only_support = np.zeros(shape, dtype=bool)
+        support_seed_for_projection = np.zeros(shape, dtype=bool)
+        support_bridge_for_projection = np.zeros(shape, dtype=bool)
     wall_line_support = _remove_small_true_components(
         wall_line_support,
         max_area_cells=int(cfg.wall_line_support_remove_small_area_cells),
@@ -299,10 +479,17 @@ def classify_voxel_columns_for_roomseg(
     )
     wall_line_support_strong &= wall_line_support
     wall_line_support_conflict &= wall_line_support
+    strong_structural_support &= wall_line_support
+    bridge_only_support &= wall_line_support
+    support_seed_for_projection &= wall_line_support
+    support_bridge_for_projection &= wall_line_support
+    support_for_projection_display = support_seed_for_projection | support_bridge_for_projection
+    support_for_step2_target = (wall | support_seed_for_projection) & ~forbidden_residual_support & ~unknown_dominant & ~vertical_free
+    support_for_step2_source = support_seed_for_projection & ~forbidden_residual_support & ~unknown_dominant & ~vertical_free
     wall_line_support_weight = np.zeros(shape, dtype=np.float32)
     wall_line_support_weight[wall_line_support_strong] = float(getattr(cfg, "wall_line_support_strong_weight", 1.0))
     wall_line_support_weight[wall_line_support_conflict] = float(getattr(cfg, "wall_line_support_conflict_weight", 0.35))
-    wall_support_for_projection = wall_line_support.astype(bool)
+    wall_support_for_projection = support_for_projection_display.astype(bool)
     wall_support_weight = wall_line_support_weight.astype(np.float32)
 
     small_hole_filled = np.zeros(shape, dtype=bool)
@@ -328,21 +515,38 @@ def classify_voxel_columns_for_roomseg(
         "occupied_count": occupied_count.astype(np.uint16),
         "unknown_count": unknown_count.astype(np.uint16),
         "conflict_count": conflict_count.astype(np.uint16),
+        "sensor_range_count": sensor_range_count_xy.astype(np.uint16),
+        "in_range_unknown_count": in_range_unknown_count.astype(np.uint16),
+        "outside_range_unknown_count": outside_range_unknown_count.astype(np.uint16),
+        "generalized_occupied_count": generalized_occupied_count.astype(np.uint16),
+        "effective_range_count": effective_range_count.astype(np.uint16),
         "observed_count": observed_count.astype(np.uint16),
         "active_z_bin_count": active_z_bin_count.astype(np.uint16),
         "free_ratio": free_ratio.astype(np.float32),
         "occupied_ratio": occupied_ratio.astype(np.float32),
         "unknown_ratio": unknown_ratio.astype(np.float32),
+        "sensor_range_ratio": sensor_range_ratio.astype(np.float32),
+        "in_range_unknown_ratio": in_range_unknown_ratio.astype(np.float32),
+        "outside_unknown_ratio": outside_unknown_ratio.astype(np.float32),
+        "generalized_occupied_ratio": generalized_occupied_ratio.astype(np.float32),
         "observed_ratio": observed_ratio.astype(np.float32),
+        "sensor_range_available": np.full(shape, bool(sensor_range_available), dtype=bool),
         "free_raw": free_raw.astype(bool),
         "nav_assisted_free": nav_assisted_free.astype(bool),
         "vertical_free": vertical_free.astype(bool),
         "unknown_dominant": unknown_dominant.astype(bool),
+        "outside_unknown_dominant": outside_unknown_dominant.astype(bool),
         "wall_ratio_raw": wall_ratio_raw.astype(bool),
+        "wall_generalized_raw": wall_generalized_raw.astype(bool),
+        "wall_actual_ratio_raw": wall_actual_ratio_raw.astype(bool),
+        "wall_actual_occupied_requirement": wall_actual_occupied_requirement.astype(bool),
         "wall": wall.astype(bool),
         "unknown": unknown.astype(bool),
         "wall_rejected_by_free": wall_rejected_by_free.astype(bool),
         "wall_rejected_by_unknown": wall_rejected_by_unknown.astype(bool),
+        "wall_rejected_by_outside_unknown": wall_rejected_by_unknown.astype(bool),
+        "wall_from_in_range_unknown": (wall & (in_range_unknown_count > 0)).astype(bool),
+        "roomseg_nav_obstacle_suppressed_by_vertical_free": (nav_obstacle & vertical_free).astype(bool),
         "occupied_any": occupied_any.astype(bool),
         "raw_occupied_wall_support": occupied_any.astype(bool),
         "wall_support_loose": wall_support_loose.astype(bool),
@@ -368,12 +572,28 @@ def classify_voxel_columns_for_roomseg(
         "wall_support_unknown_rejected": wall_line_support_rejected_unknown.astype(bool),
         "wall_support_nav_unknown_rejected": wall_line_support_nav_unknown_block.astype(bool),
         "wall_support_frontier_band_rejected": wall_line_support_frontier_band_block.astype(bool),
-        "wall_support_free_conflict": wall_line_support_conflict.astype(bool),
+        "wall_support_free_conflict": free_conflict_support.astype(bool),
         "wall_support_strong": wall_line_support_strong.astype(bool),
         "wall_support_for_projection": wall_support_for_projection.astype(bool),
         "wall_support_weight": wall_support_weight.astype(np.float32),
         "frontier_unknown_band": frontier_unknown_band.astype(bool),
         "wall_line_support_unknown_hard_rejected": (wall_line_support_raw & wall_line_support_unknown_hard_block).astype(bool),
+        "v23_protected_structural_wall_band": protected_structural_wall_band.astype(bool),
+        "v23_frontier_residual_band": frontier_residual_band.astype(bool),
+        "v23_nav_unknown_band": nav_unknown_band.astype(bool),
+        "v23_unknown_dominant_band": unknown_dominant_band.astype(bool),
+        "v23_free_boundary_band": free_boundary_band.astype(bool),
+        "strong_structural_support": strong_structural_support.astype(bool),
+        "bridge_only_support": bridge_only_support.astype(bool),
+        "forbidden_frontier_residual_support": forbidden_frontier_residual_support.astype(bool),
+        "forbidden_unknown_boundary_support": forbidden_unknown_boundary_support.astype(bool),
+        "free_conflict_support": free_conflict_support.astype(bool),
+        "protected_structural_wall_band": protected_structural_wall_band.astype(bool),
+        "support_seed_for_projection": support_seed_for_projection.astype(bool),
+        "support_bridge_for_projection": support_bridge_for_projection.astype(bool),
+        "support_for_projection_display": support_for_projection_display.astype(bool),
+        "support_for_step2_target": support_for_step2_target.astype(bool),
+        "support_for_step2_source": support_for_step2_source.astype(bool),
         "promoted_nav_obstacle": promoted_nav_obstacle.astype(bool),
     }
 
@@ -495,6 +715,22 @@ def build_voxel_roomseg_evidence(
                 "voxel_wall_support_rejected_by_frontier_band_xy": empty,
                 "voxel_frontier_unknown_band_xy": empty,
                 "voxel_wall_support_weight_xy": zero_f32,
+                "voxel_v23_protected_structural_wall_band_xy": empty,
+                "voxel_v23_frontier_residual_band_xy": empty,
+                "voxel_v23_nav_unknown_band_xy": empty,
+                "voxel_v23_unknown_dominant_band_xy": empty,
+                "voxel_v23_free_boundary_band_xy": empty,
+                "voxel_strong_structural_support_xy": empty,
+                "voxel_bridge_only_support_xy": empty,
+                "voxel_forbidden_frontier_residual_support_xy": empty,
+                "voxel_forbidden_unknown_boundary_support_xy": empty,
+                "voxel_free_conflict_support_xy": empty,
+                "voxel_protected_structural_wall_band_xy": empty,
+                "voxel_support_seed_for_projection_xy": empty,
+                "voxel_support_bridge_for_projection_xy": empty,
+                "voxel_support_for_projection_display_xy": empty,
+                "voxel_support_for_step2_target_xy": empty,
+                "voxel_support_for_step2_source_xy": empty,
                 "voxel_wall_rejected_by_free_xy": empty,
                 "voxel_wall_rejected_by_unknown_xy": empty,
                 "voxel_nonstructural_occupied_xy": empty,
@@ -535,6 +771,13 @@ def build_voxel_roomseg_evidence(
                 "voxel_wall_support_rejected_by_nav_unknown_cells": 0,
                 "voxel_wall_support_rejected_by_frontier_band_cells": 0,
                 "voxel_frontier_unknown_band_cells": 0,
+                "voxel_forbidden_frontier_residual_support_cells": 0,
+                "voxel_forbidden_unknown_boundary_support_cells": 0,
+                "voxel_bridge_only_support_cells": 0,
+                "voxel_support_seed_for_projection_cells": 0,
+                "voxel_support_bridge_for_projection_cells": 0,
+                "voxel_support_for_step2_target_cells": 0,
+                "voxel_support_for_step2_source_cells": 0,
                 "voxel_wall_support_rejected_unknown_cells": 0,
                 "voxel_small_unknown_hole_filled_cells": 0,
                 "voxel_wall_occupied_ratio_debug_threshold": float(cfg.wall_occupied_ratio_debug_threshold),
@@ -592,12 +835,55 @@ def build_voxel_roomseg_evidence(
             wall_support_for_projection_xy=empty,
             wall_support_weight_xy=zero_f32,
             frontier_unknown_band_xy=empty,
+            strong_structural_support_xy=empty,
+            bridge_only_support_xy=empty,
+            forbidden_frontier_residual_support_xy=empty,
+            forbidden_unknown_boundary_support_xy=empty,
+            free_conflict_support_xy=empty,
+            protected_structural_wall_band_xy=empty,
+            support_seed_for_projection_xy=empty,
+            support_bridge_for_projection_xy=empty,
+            support_for_projection_display_xy=empty,
+            support_for_step2_target_xy=empty,
+            support_for_step2_source_xy=empty,
+            wall_support_layers_v23=WallSupportLayersV23(
+                vertical_free=empty,
+                strict_wall=empty,
+                unknown=np.ones(shape, dtype=bool),
+                occupied_any=empty,
+                occupied_count=zero_u16,
+                free_count=zero_u16,
+                unknown_count=zero_u16,
+                observed_count=zero_u16,
+                occupied_ratio=zero_f32,
+                unknown_ratio=zero_f32,
+                observed_ratio=zero_f32,
+                strong_structural_support=empty,
+                bridge_only_support=empty,
+                forbidden_frontier_residual_support=empty,
+                forbidden_unknown_boundary_support=empty,
+                free_conflict_support=empty,
+                protected_structural_wall_band=empty,
+                support_seed_for_projection=empty,
+                support_bridge_for_projection=empty,
+                support_for_projection_display=empty,
+                support_for_step2_target=empty,
+                support_for_step2_source=empty,
+                debug={},
+            ),
             debug=debug,
         )
 
     active_state = np.asarray(voxel_grid.state[active_idx], dtype=np.uint8)
+    sensor_range_count_3d = getattr(voxel_grid, "sensor_range_count", None)
+    sensor_range_available = sensor_range_count_3d is not None and np.asarray(sensor_range_count_3d).shape == voxel_grid.state.shape
+    if sensor_range_available:
+        active_sensor_range = np.asarray(sensor_range_count_3d[active_idx], dtype=np.uint8)
+    else:
+        active_sensor_range = np.zeros_like(active_state, dtype=np.uint8)
     classified = classify_voxel_columns_for_roomseg(
         state_active=active_state,
+        sensor_range_active=active_sensor_range,
         navigation_free_mask=nav_free,
         navigation_obstacle_mask=nav_obstacle,
         navigation_unknown_mask=nav_unknown,
@@ -608,11 +894,20 @@ def build_voxel_roomseg_evidence(
     free_count = np.asarray(classified["free_count"], dtype=np.uint16)
     occupied_count = np.asarray(classified["occupied_count"], dtype=np.uint16)
     unknown_count = np.asarray(classified["unknown_count"], dtype=np.uint16)
+    sensor_range_count_xy = np.asarray(classified.get("sensor_range_count", np.zeros(shape, dtype=np.uint16)), dtype=np.uint16)
+    in_range_unknown_count = np.asarray(classified.get("in_range_unknown_count", np.zeros(shape, dtype=np.uint16)), dtype=np.uint16)
+    outside_range_unknown_count = np.asarray(classified.get("outside_range_unknown_count", np.zeros(shape, dtype=np.uint16)), dtype=np.uint16)
+    generalized_occupied_count = np.asarray(classified.get("generalized_occupied_count", occupied_count), dtype=np.uint16)
     observed_count = np.asarray(classified["observed_count"], dtype=np.uint16)
+    effective_range_count = np.asarray(classified.get("effective_range_count", observed_count), dtype=np.uint16)
     active_observed = observed_count > 0
     active_z_bin_count = np.asarray(classified["active_z_bin_count"], dtype=np.uint16)
     occupied_ratio = np.asarray(classified["occupied_ratio"], dtype=np.float32)
     unknown_ratio = np.asarray(classified["unknown_ratio"], dtype=np.float32)
+    sensor_range_ratio = np.asarray(classified.get("sensor_range_ratio", np.zeros(shape, dtype=np.float32)), dtype=np.float32)
+    in_range_unknown_ratio = np.asarray(classified.get("in_range_unknown_ratio", np.zeros(shape, dtype=np.float32)), dtype=np.float32)
+    outside_unknown_ratio = np.asarray(classified.get("outside_unknown_ratio", unknown_ratio), dtype=np.float32)
+    generalized_occupied_ratio = np.asarray(classified.get("generalized_occupied_ratio", occupied_ratio), dtype=np.float32)
     observed_ratio = np.asarray(classified["observed_ratio"], dtype=np.float32)
     vertical_free_raw = np.asarray(classified["free_raw"], dtype=bool)
     occupied_any = np.asarray(classified["occupied_any"], dtype=bool)
@@ -631,6 +926,16 @@ def build_voxel_roomseg_evidence(
     wall = np.asarray(classified["wall"], dtype=bool)
     unknown = np.asarray(classified["unknown"], dtype=bool)
     unknown_dominant = np.asarray(classified["unknown_dominant"], dtype=bool)
+    outside_unknown_dominant = np.asarray(classified.get("outside_unknown_dominant", unknown_dominant), dtype=bool)
+    wall_generalized_raw = np.asarray(classified.get("wall_generalized_raw", wall_ratio_raw), dtype=bool)
+    wall_actual_ratio_raw = np.asarray(classified.get("wall_actual_ratio_raw", ratio_wall_debug), dtype=bool)
+    wall_actual_occupied_requirement = np.asarray(classified.get("wall_actual_occupied_requirement", occupied_count >= 3), dtype=bool)
+    wall_rejected_by_outside_unknown = np.asarray(classified.get("wall_rejected_by_outside_unknown", wall_rejected_by_unknown), dtype=bool)
+    wall_from_in_range_unknown = np.asarray(classified.get("wall_from_in_range_unknown", wall & (in_range_unknown_count > 0)), dtype=bool)
+    roomseg_nav_obstacle_suppressed_by_vertical_free = np.asarray(
+        classified.get("roomseg_nav_obstacle_suppressed_by_vertical_free", nav_obstacle & vertical_free),
+        dtype=bool,
+    )
     nonstructural_occupied = np.asarray(classified["nonstructural_occupied"], dtype=bool)
     small_unknown_hole_filled = np.asarray(classified["small_unknown_hole_filled"], dtype=bool)
     wall_line_support = np.asarray(classified["wall_line_support"], dtype=bool)
@@ -655,6 +960,21 @@ def build_voxel_roomseg_evidence(
     wall_support_for_projection = np.asarray(classified.get("wall_support_for_projection", wall_line_support), dtype=bool)
     wall_support_weight = np.asarray(classified.get("wall_support_weight", wall_line_support_weight), dtype=np.float32)
     frontier_unknown_band = np.asarray(classified.get("frontier_unknown_band", np.zeros(shape, dtype=bool)), dtype=bool)
+    strong_structural_support = np.asarray(classified.get("strong_structural_support", wall_support_strong), dtype=bool)
+    bridge_only_support = np.asarray(classified.get("bridge_only_support", wall_line_support_conflict), dtype=bool)
+    forbidden_frontier_residual_support = np.asarray(classified.get("forbidden_frontier_residual_support", wall_support_frontier_band_rejected), dtype=bool)
+    forbidden_unknown_boundary_support = np.asarray(classified.get("forbidden_unknown_boundary_support", np.zeros(shape, dtype=bool)), dtype=bool)
+    free_conflict_support = np.asarray(classified.get("free_conflict_support", wall_support_free_conflict), dtype=bool)
+    protected_structural_wall_band = np.asarray(classified.get("protected_structural_wall_band", wall_ratio_raw | strict_raw_wall), dtype=bool)
+    support_seed_for_projection = np.asarray(classified.get("support_seed_for_projection", strong_structural_support), dtype=bool)
+    support_bridge_for_projection = np.asarray(classified.get("support_bridge_for_projection", bridge_only_support), dtype=bool)
+    support_for_projection_display = np.asarray(classified.get("support_for_projection_display", wall_support_for_projection), dtype=bool)
+    support_for_step2_target = np.asarray(classified.get("support_for_step2_target", strict_raw_wall | support_seed_for_projection), dtype=bool)
+    support_for_step2_source = np.asarray(classified.get("support_for_step2_source", support_seed_for_projection), dtype=bool)
+    v23_frontier_residual_band = np.asarray(classified.get("v23_frontier_residual_band", frontier_unknown_band), dtype=bool)
+    v23_nav_unknown_band = np.asarray(classified.get("v23_nav_unknown_band", np.zeros(shape, dtype=bool)), dtype=bool)
+    v23_unknown_dominant_band = np.asarray(classified.get("v23_unknown_dominant_band", unknown_dominant), dtype=bool)
+    v23_free_boundary_band = np.asarray(classified.get("v23_free_boundary_band", np.zeros(shape, dtype=bool)), dtype=bool)
     promoted_nav_obstacle = np.asarray(classified["promoted_nav_obstacle"], dtype=bool)
     nav_obstacle_overlap_free = vertical_free & nav_obstacle
     wall_before_cleanup = wall.copy()
@@ -671,6 +991,13 @@ def build_voxel_roomseg_evidence(
         "voxel_wall_support_rejected_unknown_cells": int(np.count_nonzero(wall_support_rejected_unknown)),
         "voxel_wall_rejected_by_free_cells": int(np.count_nonzero(wall_rejected_by_free)),
         "voxel_wall_rejected_by_unknown_cells": int(np.count_nonzero(wall_rejected_by_unknown)),
+        "voxel_sensor_range_xy_cells": int(np.count_nonzero(sensor_range_count_xy > 0)),
+        "voxel_in_range_unknown_cells_xy": int(np.count_nonzero(in_range_unknown_count > 0)),
+        "voxel_outside_unknown_dominant_cells": int(np.count_nonzero(outside_unknown_dominant)),
+        "voxel_generalized_wall_raw_cells": int(np.count_nonzero(wall_generalized_raw)),
+        "voxel_wall_from_generalized_unknown_cells": int(np.count_nonzero(wall_from_in_range_unknown)),
+        "voxel_wall_rejected_by_outside_unknown_cells": int(np.count_nonzero(wall_rejected_by_outside_unknown)),
+        "voxel_wall_actual_occupied_requirement_cells": int(np.count_nonzero(wall_actual_occupied_requirement)),
         "voxel_nonstructural_occupied_cells": int(np.count_nonzero(nonstructural_occupied)),
         "voxel_wall_line_support_cells": int(np.count_nonzero(wall_line_support)),
         "voxel_wall_line_support_raw_cells": int(np.count_nonzero(wall_line_support_raw)),
@@ -688,6 +1015,13 @@ def build_voxel_roomseg_evidence(
         "voxel_wall_support_rejected_by_nav_unknown_cells": int(np.count_nonzero(wall_support_nav_unknown_rejected)),
         "voxel_wall_support_rejected_by_frontier_band_cells": int(np.count_nonzero(wall_support_frontier_band_rejected)),
         "voxel_frontier_unknown_band_cells": int(np.count_nonzero(frontier_unknown_band)),
+        "voxel_forbidden_frontier_residual_support_cells": int(np.count_nonzero(forbidden_frontier_residual_support)),
+        "voxel_forbidden_unknown_boundary_support_cells": int(np.count_nonzero(forbidden_unknown_boundary_support)),
+        "voxel_bridge_only_support_cells": int(np.count_nonzero(bridge_only_support)),
+        "voxel_support_seed_for_projection_cells": int(np.count_nonzero(support_seed_for_projection)),
+        "voxel_support_bridge_for_projection_cells": int(np.count_nonzero(support_bridge_for_projection)),
+        "voxel_support_for_step2_target_cells": int(np.count_nonzero(support_for_step2_target)),
+        "voxel_support_for_step2_source_cells": int(np.count_nonzero(support_for_step2_source)),
         "voxel_strict_raw_wall_cells": int(np.count_nonzero(strict_raw_wall)),
         "voxel_unknown_dominant_cells": int(np.count_nonzero(unknown_dominant)),
         "voxel_wall_suppressed_by_free_cells": int(np.count_nonzero(wall_suppressed_by_free)),
@@ -719,6 +1053,14 @@ def build_voxel_roomseg_evidence(
         "voxel_min_observed_z_cells_for_known_column": int(cfg.min_observed_z_cells_for_known_column),
         "voxel_wall_occupied_ratio_min_for_xy_wall": float(cfg.wall_occupied_ratio_min_for_xy_wall),
         "voxel_wall_min_occupied_z_cells_for_xy_wall": int(cfg.wall_min_occupied_z_cells_for_xy_wall),
+        "voxel_wall_use_generalized_occupied_ratio": bool(getattr(cfg, "wall_use_generalized_occupied_ratio", True)),
+        "voxel_count_in_range_unknown_as_occupied_for_wall": bool(getattr(cfg, "count_in_range_unknown_as_occupied_for_wall", True)),
+        "voxel_wall_generalized_occupied_ratio_min_for_xy_wall": float(getattr(cfg, "wall_generalized_occupied_ratio_min_for_xy_wall", 0.90)),
+        "voxel_wall_min_actual_occupied_z_cells_for_xy_wall": int(getattr(cfg, "wall_min_actual_occupied_z_cells_for_xy_wall", 3)),
+        "voxel_sensor_range_available": bool(sensor_range_available),
+        "voxel_sensor_range_count_threshold_for_roomseg": int(getattr(cfg, "sensor_range_count_threshold_for_roomseg", 1)),
+        "voxel_outside_unknown_ratio_min_for_xy_unknown": float(getattr(cfg, "outside_unknown_ratio_min_for_xy_unknown", 0.50)),
+        "voxel_min_effective_range_z_cells_for_known_column": int(getattr(cfg, "min_effective_range_z_cells_for_known_column", 3)),
         "voxel_wall_line_support_enabled": bool(cfg.wall_line_support_enabled),
         "voxel_wall_line_support_min_occupied_z_cells": int(cfg.wall_line_support_min_occupied_z_cells),
         "voxel_wall_line_support_free_exclusion_z_cells": int(cfg.wall_line_support_free_exclusion_z_cells),
@@ -729,6 +1071,16 @@ def build_voxel_roomseg_evidence(
         "voxel_wall_support_reject_navigation_unknown": bool(getattr(cfg, "wall_line_support_reject_navigation_unknown", True)),
         "voxel_frontier_unknown_band_dilation_cells": int(getattr(cfg, "frontier_unknown_band_dilation_cells", 2)),
         "voxel_frontier_free_band_dilation_cells": int(getattr(cfg, "frontier_free_band_dilation_cells", 3)),
+        "voxel_v23_wall_line_support_policy": str(getattr(cfg, "wall_line_support_policy", "seed_and_bridge")),
+        "voxel_v23_free_conflict_support_policy": str(getattr(cfg, "free_conflict_support_policy", "bridge_only")),
+        "voxel_v23_bridge_support_near_strong_wall_cells": int(getattr(cfg, "bridge_support_near_strong_wall_cells", 2)),
+        "voxel_v23_protected_structural_wall_band_cells": int(getattr(cfg, "protected_structural_wall_band_cells", 2)),
+        "voxel_v23_frontier_residual_nav_unknown_dilation_cells": int(getattr(cfg, "frontier_residual_nav_unknown_dilation_cells", 5)),
+        "voxel_v23_frontier_residual_unknown_dilation_cells": int(getattr(cfg, "frontier_residual_unknown_dilation_cells", 3)),
+        "voxel_v23_frontier_residual_free_dilation_cells": int(getattr(cfg, "frontier_residual_free_dilation_cells", 5)),
+        "voxel_v23_frontier_residual_free_boundary_dilation_cells": int(getattr(cfg, "frontier_residual_free_boundary_dilation_cells", 3)),
+        "voxel_v23_frontier_residual_unknown_ratio_min": float(getattr(cfg, "frontier_residual_unknown_ratio_min", 0.25)),
+        "voxel_v23_frontier_residual_observed_ratio_max": float(getattr(cfg, "frontier_residual_observed_ratio_max", 0.35)),
         "voxel_wall_line_support_use_nav_edge_gate": bool(cfg.wall_line_support_use_nav_edge_gate),
         "voxel_wall_line_support_nav_edge_radius_cells": int(cfg.wall_line_support_nav_edge_radius_cells),
         "voxel_wall_line_support_remove_small_area_cells": int(cfg.wall_line_support_remove_small_area_cells),
@@ -742,6 +1094,22 @@ def build_voxel_roomseg_evidence(
         "voxel_free_raw_xy": vertical_free_raw.astype(bool),
         "voxel_wall_raw_xy": wall_ratio_raw.astype(bool),
         "voxel_wall_ratio_raw_xy": wall_ratio_raw.astype(bool),
+        "voxel_sensor_range_count_xy": sensor_range_count_xy.astype(np.uint16),
+        "voxel_sensor_range_ratio_xy": sensor_range_ratio.astype(np.float32),
+        "voxel_sensor_in_range_unknown_count_xy": in_range_unknown_count.astype(np.uint16),
+        "voxel_sensor_outside_range_unknown_count_xy": outside_range_unknown_count.astype(np.uint16),
+        "voxel_in_range_unknown_ratio_xy": in_range_unknown_ratio.astype(np.float32),
+        "voxel_outside_unknown_ratio_xy": outside_unknown_ratio.astype(np.float32),
+        "voxel_generalized_occupied_count_xy": generalized_occupied_count.astype(np.uint16),
+        "voxel_generalized_occupied_ratio_xy": generalized_occupied_ratio.astype(np.float32),
+        "voxel_effective_range_count_xy": effective_range_count.astype(np.uint16),
+        "voxel_wall_generalized_raw_xy": wall_generalized_raw.astype(bool),
+        "voxel_wall_actual_ratio_raw_xy": wall_actual_ratio_raw.astype(bool),
+        "voxel_wall_actual_occupied_requirement_xy": wall_actual_occupied_requirement.astype(bool),
+        "voxel_wall_rejected_by_outside_unknown_xy": wall_rejected_by_outside_unknown.astype(bool),
+        "voxel_wall_from_in_range_unknown_xy": wall_from_in_range_unknown.astype(bool),
+        "voxel_roomseg_nav_obstacle_suppressed_by_vertical_free_xy": roomseg_nav_obstacle_suppressed_by_vertical_free.astype(bool),
+        "voxel_outside_unknown_dominant_xy": outside_unknown_dominant.astype(bool),
         "voxel_structural_wall_seed_xy": wall.astype(bool),
         "voxel_structural_wall_ratio_xy": wall_ratio_raw.astype(bool),
         "voxel_wall_line_support_xy": wall_line_support.astype(bool),
@@ -766,6 +1134,22 @@ def build_voxel_roomseg_evidence(
         "voxel_wall_support_rejected_by_frontier_band_xy": wall_support_frontier_band_rejected.astype(bool),
         "voxel_frontier_unknown_band_xy": frontier_unknown_band.astype(bool),
         "voxel_wall_support_weight_xy": wall_support_weight.astype(np.float32),
+        "voxel_v23_protected_structural_wall_band_xy": protected_structural_wall_band.astype(bool),
+        "voxel_v23_frontier_residual_band_xy": v23_frontier_residual_band.astype(bool),
+        "voxel_v23_nav_unknown_band_xy": v23_nav_unknown_band.astype(bool),
+        "voxel_v23_unknown_dominant_band_xy": v23_unknown_dominant_band.astype(bool),
+        "voxel_v23_free_boundary_band_xy": v23_free_boundary_band.astype(bool),
+        "voxel_strong_structural_support_xy": strong_structural_support.astype(bool),
+        "voxel_bridge_only_support_xy": bridge_only_support.astype(bool),
+        "voxel_forbidden_frontier_residual_support_xy": forbidden_frontier_residual_support.astype(bool),
+        "voxel_forbidden_unknown_boundary_support_xy": forbidden_unknown_boundary_support.astype(bool),
+        "voxel_free_conflict_support_xy": free_conflict_support.astype(bool),
+        "voxel_protected_structural_wall_band_xy": protected_structural_wall_band.astype(bool),
+        "voxel_support_seed_for_projection_xy": support_seed_for_projection.astype(bool),
+        "voxel_support_bridge_for_projection_xy": support_bridge_for_projection.astype(bool),
+        "voxel_support_for_projection_display_xy": support_for_projection_display.astype(bool),
+        "voxel_support_for_step2_target_xy": support_for_step2_target.astype(bool),
+        "voxel_support_for_step2_source_xy": support_for_step2_source.astype(bool),
         "voxel_wall_rejected_by_free_xy": wall_rejected_by_free.astype(bool),
         "voxel_wall_rejected_by_unknown_xy": wall_rejected_by_unknown.astype(bool),
         "voxel_nonstructural_occupied_xy": nonstructural_occupied.astype(bool),
@@ -803,6 +1187,13 @@ def build_voxel_roomseg_evidence(
         "voxel_structural_wall_ratio_cells": int(np.count_nonzero(wall_ratio_raw)),
         "voxel_wall_rejected_by_free_cells": int(np.count_nonzero(wall_rejected_by_free)),
         "voxel_wall_rejected_by_unknown_cells": int(np.count_nonzero(wall_rejected_by_unknown)),
+        "voxel_sensor_range_xy_cells": int(np.count_nonzero(sensor_range_count_xy > 0)),
+        "voxel_in_range_unknown_cells_xy": int(np.count_nonzero(in_range_unknown_count > 0)),
+        "voxel_outside_unknown_dominant_cells": int(np.count_nonzero(outside_unknown_dominant)),
+        "voxel_generalized_wall_raw_cells": int(np.count_nonzero(wall_generalized_raw)),
+        "voxel_wall_from_generalized_unknown_cells": int(np.count_nonzero(wall_from_in_range_unknown)),
+        "voxel_wall_rejected_by_outside_unknown_cells": int(np.count_nonzero(wall_rejected_by_outside_unknown)),
+        "voxel_wall_actual_occupied_requirement_cells": int(np.count_nonzero(wall_actual_occupied_requirement)),
         "voxel_nonstructural_occupied_cells": int(np.count_nonzero(nonstructural_occupied)),
         "voxel_wall_line_support_cells": int(np.count_nonzero(wall_line_support)),
         "voxel_wall_line_support_raw_cells": int(np.count_nonzero(wall_line_support_raw)),
@@ -820,6 +1211,13 @@ def build_voxel_roomseg_evidence(
         "voxel_wall_support_rejected_by_nav_unknown_cells": int(np.count_nonzero(wall_support_nav_unknown_rejected)),
         "voxel_wall_support_rejected_by_frontier_band_cells": int(np.count_nonzero(wall_support_frontier_band_rejected)),
         "voxel_frontier_unknown_band_cells": int(np.count_nonzero(frontier_unknown_band)),
+        "voxel_forbidden_frontier_residual_support_cells": int(np.count_nonzero(forbidden_frontier_residual_support)),
+        "voxel_forbidden_unknown_boundary_support_cells": int(np.count_nonzero(forbidden_unknown_boundary_support)),
+        "voxel_bridge_only_support_cells": int(np.count_nonzero(bridge_only_support)),
+        "voxel_support_seed_for_projection_cells": int(np.count_nonzero(support_seed_for_projection)),
+        "voxel_support_bridge_for_projection_cells": int(np.count_nonzero(support_bridge_for_projection)),
+        "voxel_support_for_step2_target_cells": int(np.count_nonzero(support_for_step2_target)),
+        "voxel_support_for_step2_source_cells": int(np.count_nonzero(support_for_step2_source)),
         "voxel_small_unknown_hole_filled_cells": int(np.count_nonzero(small_unknown_hole_filled)),
         "voxel_wall_support_loose_cells": int(np.count_nonzero(wall_support_loose)),
         "voxel_wall_support_unknown_gated_cells": int(np.count_nonzero(wall_support_unknown_gated)),
@@ -899,6 +1297,47 @@ def build_voxel_roomseg_evidence(
         wall_support_for_projection_xy=wall_support_for_projection.astype(bool),
         wall_support_weight_xy=wall_support_weight.astype(np.float32),
         frontier_unknown_band_xy=frontier_unknown_band.astype(bool),
+        strong_structural_support_xy=strong_structural_support.astype(bool),
+        bridge_only_support_xy=bridge_only_support.astype(bool),
+        forbidden_frontier_residual_support_xy=forbidden_frontier_residual_support.astype(bool),
+        forbidden_unknown_boundary_support_xy=forbidden_unknown_boundary_support.astype(bool),
+        free_conflict_support_xy=free_conflict_support.astype(bool),
+        protected_structural_wall_band_xy=protected_structural_wall_band.astype(bool),
+        support_seed_for_projection_xy=support_seed_for_projection.astype(bool),
+        support_bridge_for_projection_xy=support_bridge_for_projection.astype(bool),
+        support_for_projection_display_xy=support_for_projection_display.astype(bool),
+        support_for_step2_target_xy=support_for_step2_target.astype(bool),
+        support_for_step2_source_xy=support_for_step2_source.astype(bool),
+        wall_support_layers_v23=WallSupportLayersV23(
+            vertical_free=vertical_free.astype(bool),
+            strict_wall=strict_raw_wall.astype(bool),
+            unknown=unknown.astype(bool),
+            occupied_any=occupied_any.astype(bool),
+            occupied_count=occupied_count.astype(np.uint16),
+            free_count=free_count.astype(np.uint16),
+            unknown_count=unknown_count.astype(np.uint16),
+            observed_count=observed_count.astype(np.uint16),
+            occupied_ratio=occupied_ratio.astype(np.float32),
+            unknown_ratio=unknown_ratio.astype(np.float32),
+            observed_ratio=observed_ratio.astype(np.float32),
+            strong_structural_support=strong_structural_support.astype(bool),
+            bridge_only_support=bridge_only_support.astype(bool),
+            forbidden_frontier_residual_support=forbidden_frontier_residual_support.astype(bool),
+            forbidden_unknown_boundary_support=forbidden_unknown_boundary_support.astype(bool),
+            free_conflict_support=free_conflict_support.astype(bool),
+            protected_structural_wall_band=protected_structural_wall_band.astype(bool),
+            support_seed_for_projection=support_seed_for_projection.astype(bool),
+            support_bridge_for_projection=support_bridge_for_projection.astype(bool),
+            support_for_projection_display=support_for_projection_display.astype(bool),
+            support_for_step2_target=support_for_step2_target.astype(bool),
+            support_for_step2_source=support_for_step2_source.astype(bool),
+            debug={
+                "frontier_residual_band_cells": int(np.count_nonzero(v23_frontier_residual_band)),
+                "nav_unknown_band_cells": int(np.count_nonzero(v23_nav_unknown_band)),
+                "unknown_dominant_band_cells": int(np.count_nonzero(v23_unknown_dominant_band)),
+                "free_boundary_band_cells": int(np.count_nonzero(v23_free_boundary_band)),
+            },
+        ),
         debug=debug,
     )
 
@@ -943,11 +1382,13 @@ def voxel_column_debug(
     else:
         idx = np.arange(voxel_grid.z_bin_count, dtype=np.int32)
     states = np.asarray(voxel_grid.state[idx, r, c], dtype=np.uint8)
+    sensor_range_count = np.asarray(getattr(voxel_grid, "sensor_range_count", np.zeros_like(voxel_grid.state, dtype=np.uint8))[idx, r, c], dtype=np.uint8)
     log = np.asarray(voxel_grid.log_odds[idx, r, c], dtype=np.int16)
     z = np.asarray(voxel_grid.z_centers_m[idx], dtype=np.float32)
     active_count = int(states.size)
     classified = classify_voxel_columns_for_roomseg(
         state_active=states.reshape((active_count, 1, 1)),
+        sensor_range_active=sensor_range_count.reshape((active_count, 1, 1)),
         navigation_free_mask=np.zeros((1, 1), dtype=bool),
         navigation_obstacle_mask=np.zeros((1, 1), dtype=bool),
         cfg=cfg,
@@ -961,19 +1402,33 @@ def voxel_column_debug(
     occupied_count = int(scalar("occupied_count"))
     unknown_count = int(scalar("unknown_count"))
     conflict_count = int(scalar("conflict_count"))
+    sensor_range_count_xy = int(scalar("sensor_range_count"))
+    in_range_unknown_count = int(scalar("in_range_unknown_count"))
+    outside_range_unknown_count = int(scalar("outside_range_unknown_count"))
+    generalized_occupied_count = int(scalar("generalized_occupied_count"))
+    effective_range_count = int(scalar("effective_range_count"))
     observed_count = int(scalar("observed_count"))
     free_ratio = float(scalar("free_ratio"))
     occupied_ratio = float(scalar("occupied_ratio"))
     unknown_ratio = float(scalar("unknown_ratio"))
+    sensor_range_ratio = float(scalar("sensor_range_ratio"))
+    in_range_unknown_ratio = float(scalar("in_range_unknown_ratio"))
+    outside_unknown_ratio = float(scalar("outside_unknown_ratio"))
+    generalized_occupied_ratio = float(scalar("generalized_occupied_ratio"))
     observed_ratio = float(scalar("observed_ratio"))
     free_raw = bool(scalar("free_raw"))
     occupied_any = bool(scalar("occupied_any"))
     raw_occupied_wall_support = bool(scalar("raw_occupied_wall_support"))
     wall_ratio_raw = bool(scalar("wall_ratio_raw"))
+    wall_generalized_raw = bool(scalar("wall_generalized_raw"))
+    wall_actual_ratio_raw = bool(scalar("wall_actual_ratio_raw"))
+    wall_actual_occupied_requirement = bool(scalar("wall_actual_occupied_requirement"))
     wall_rejected_by_free = bool(scalar("wall_rejected_by_free"))
     wall_rejected_by_unknown = bool(scalar("wall_rejected_by_unknown"))
+    wall_rejected_by_outside_unknown = bool(scalar("wall_rejected_by_outside_unknown"))
     wall_suppressed_by_free = bool(wall_rejected_by_free)
     unknown_dominant = bool(scalar("unknown_dominant"))
+    outside_unknown_dominant = bool(scalar("outside_unknown_dominant"))
     wall_support_loose = bool(scalar("wall_support_loose"))
     wall_support_unknown_gated = bool(scalar("wall_support_unknown_gated"))
     wall_support_rejected_unknown = bool(scalar("wall_support_rejected_unknown"))
@@ -998,23 +1453,38 @@ def voxel_column_debug(
         "state_codes": [int(v) for v in states.tolist()],
         "state_names": [_state_name(int(v)) for v in states.tolist()],
         "log_odds": [int(v) for v in log.tolist()],
+        "sensor_range_count": [int(v) for v in sensor_range_count.tolist()],
         "free_count_active": int(free_count),
         "occupied_count_active": int(occupied_count),
         "unknown_count_active": int(unknown_count),
         "conflict_count_active": int(conflict_count),
+        "sensor_range_count_active": int(sensor_range_count_xy),
+        "in_range_unknown_count_active": int(in_range_unknown_count),
+        "outside_range_unknown_count_active": int(outside_range_unknown_count),
+        "generalized_occupied_count_active": int(generalized_occupied_count),
+        "effective_range_count_active": int(effective_range_count),
         "observed_count_active": int(observed_count),
         "active_z_bin_count": int(active_count),
         "free_ratio_active": float(free_ratio),
         "occupied_ratio_active": float(occupied_ratio),
         "unknown_ratio_active": float(unknown_ratio),
+        "sensor_range_ratio_active": float(sensor_range_ratio),
+        "in_range_unknown_ratio_active": float(in_range_unknown_ratio),
+        "outside_unknown_ratio_active": float(outside_unknown_ratio),
+        "generalized_occupied_ratio_active": float(generalized_occupied_ratio),
         "observed_ratio_active": float(observed_ratio),
         "free_raw": bool(free_raw),
         "occupied_any": bool(occupied_any),
         "raw_occupied_wall_support": bool(raw_occupied_wall_support),
         "wall_ratio_raw": bool(wall_ratio_raw),
+        "wall_generalized_raw": bool(wall_generalized_raw),
+        "wall_actual_ratio_raw": bool(wall_actual_ratio_raw),
+        "wall_actual_occupied_requirement": bool(wall_actual_occupied_requirement),
         "unknown_dominant": bool(unknown_dominant),
+        "outside_unknown_dominant": bool(outside_unknown_dominant),
         "wall_rejected_by_free": bool(wall_rejected_by_free),
         "wall_rejected_by_unknown": bool(wall_rejected_by_unknown),
+        "wall_rejected_by_outside_unknown": bool(wall_rejected_by_outside_unknown),
         "wall_support_loose": bool(wall_support_loose),
         "wall_support_unknown_gated": bool(wall_support_unknown_gated),
         "wall_support_rejected_unknown": bool(wall_support_rejected_unknown),
@@ -1041,6 +1511,11 @@ def voxel_column_debug(
         "min_observed_z_cells_for_known_column": int(cfg.min_observed_z_cells_for_known_column),
         "wall_occupied_ratio_min_for_xy_wall": float(cfg.wall_occupied_ratio_min_for_xy_wall),
         "wall_min_occupied_z_cells_for_xy_wall": int(cfg.wall_min_occupied_z_cells_for_xy_wall),
+        "wall_generalized_occupied_ratio_min_for_xy_wall": float(cfg.wall_generalized_occupied_ratio_min_for_xy_wall),
+        "wall_min_actual_occupied_z_cells_for_xy_wall": int(cfg.wall_min_actual_occupied_z_cells_for_xy_wall),
+        "sensor_range_count_threshold_for_roomseg": int(cfg.sensor_range_count_threshold_for_roomseg),
+        "outside_unknown_ratio_min_for_xy_unknown": float(cfg.outside_unknown_ratio_min_for_xy_unknown),
+        "min_effective_range_z_cells_for_known_column": int(cfg.min_effective_range_z_cells_for_known_column),
         "wall_line_support_enabled": bool(cfg.wall_line_support_enabled),
         "wall_line_support_min_occupied_z_cells": int(cfg.wall_line_support_min_occupied_z_cells),
         "wall_line_support_free_exclusion_z_cells": int(cfg.wall_line_support_free_exclusion_z_cells),
@@ -1077,6 +1552,40 @@ def _remove_small_true_components(mask: np.ndarray, *, max_area_cells: int, conn
         if (area <= int(max_area_cells)) if remove_leq else (area < int(max_area_cells)):
             out[comp] = False
     return out.astype(bool)
+
+
+def _axis_run_mask(mask: np.ndarray, *, min_run_cells: int) -> np.ndarray:
+    src = np.asarray(mask, dtype=bool)
+    out = np.zeros_like(src, dtype=bool)
+    min_len = max(1, int(min_run_cells))
+    for r in range(src.shape[0]):
+        coords = np.flatnonzero(src[r])
+        _mark_long_1d_runs(out[r], coords, min_len)
+    for c in range(src.shape[1]):
+        coords = np.flatnonzero(src[:, c])
+        col = out[:, c]
+        _mark_long_1d_runs(col, coords, min_len)
+        out[:, c] = col
+    return out.astype(bool)
+
+
+def _mark_long_1d_runs(out_1d: np.ndarray, coords: np.ndarray, min_len: int) -> None:
+    values = np.asarray(coords, dtype=np.int32)
+    if values.size <= 0:
+        return
+    start = int(values[0])
+    prev = int(values[0])
+    for value in values[1:]:
+        current = int(value)
+        if current == prev + 1:
+            prev = current
+            continue
+        if prev - start + 1 >= int(min_len):
+            out_1d[start : prev + 1] = True
+        start = current
+        prev = current
+    if prev - start + 1 >= int(min_len):
+        out_1d[start : prev + 1] = True
 
 
 def _disk(radius: int) -> np.ndarray:

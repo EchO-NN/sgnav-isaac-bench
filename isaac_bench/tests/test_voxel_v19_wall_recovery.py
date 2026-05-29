@@ -85,7 +85,7 @@ def test_sparse_occupied_support_recovers_projected_display_wall() -> None:
     assert int(np.count_nonzero(display)) > int(np.count_nonzero(strict_wall))
 
 
-def test_furniture_like_support_is_rejected_by_side_validation() -> None:
+def test_both_sides_free_support_is_debug_only_not_rejected() -> None:
     shape = (24, 36)
     raw = np.zeros(shape, dtype=bool)
     raw[10, 6:30] = True
@@ -103,8 +103,9 @@ def test_furniture_like_support_is_rejected_by_side_validation() -> None:
     )
 
     assert np.any(result.raw_wall_map)
-    assert not np.any(result.projected_wall_map)
-    assert result.debug["voxel_wall_projection_side_reject_reason_counts"]["projected_wall_both_sides_free_furniture_like"] >= 1
+    assert np.any(result.projected_wall_map)
+    assert result.debug["voxel_wall_projection_side_reject_reason_counts"].get("projected_wall_both_sides_free_furniture_like", 0) == 0
+    assert any(bool(line.debug.get("both_sides_free_like", False)) for line in result.projected_lines)
 
 
 def test_v19_parallel_recovered_walls_remain_separate() -> None:
