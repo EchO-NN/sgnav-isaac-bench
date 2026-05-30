@@ -21,7 +21,7 @@ from isaac_bench.mapping.online_roomseg.separator_candidates import (
     build_step2_separator_candidates_from_extensions,
     fill_noise_wall_gaps_from_runs,
 )
-from isaac_bench.mapping.online_roomseg.topology_tests import TopologyTestConfig, greedily_select_separators
+from isaac_bench.mapping.online_roomseg.topology_tests import TopologyTestConfig, evaluate_candidate, greedily_select_separators
 from isaac_bench.mapping.online_roomseg.utils import conn, dilate, rasterize_line, relabel_compact
 from isaac_bench.mapping.online_roomseg.wall_lines import (
     FilteredWallLine,
@@ -61,6 +61,11 @@ from isaac_bench.mapping.wall_projection import ProjectedWallLine, WallProjectio
 VOXEL_OCCUPANCY_ROOMSEG_BACKEND = "voxel_occupancy_door_wall_v9"
 VOXEL_OCCUPANCY_ROOMSEG_ALGORITHM = "voxel_occupancy_door_wall_v9"
 VOXEL_OCCUPANCY_ROOMSEG_CONTEXT = "voxel_occupancy_door_wall_v9_vlm"
+HARD_TINY_SEPARATOR_REJECT_REASONS = {
+    "reject_split_tiny_side_width_1_to_3_cells",
+    "reject_tiny_side_width",
+    "door_cut_tiny_side",
+}
 
 
 @dataclass
@@ -92,6 +97,26 @@ class PartitionMapBundle:
     partition_unknown: np.ndarray
     removed_by_seed_carve_map: np.ndarray
     debug: dict[str, object]
+
+
+@dataclass
+class SmallRegionMergeEvent:
+    source_label: int
+    target_label: int
+    area_cells: int
+    area_m2: float
+    neighbor_labels: list[int]
+    pass_index: int
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "source_label": int(self.source_label),
+            "target_label": int(self.target_label),
+            "area_cells": int(self.area_cells),
+            "area_m2": float(self.area_m2),
+            "neighbor_labels": [int(label) for label in self.neighbor_labels],
+            "pass_index": int(self.pass_index),
+        }
 
 
 @dataclass
@@ -218,6 +243,82 @@ class StableSeparatorMemory:
         return None if best is None else best[1]
 
 
+def validate_stable_separators_against_current_partition(
+    separator_memory: StableSeparatorMemory | None,
+    stable_separator_map: np.ndarray,
+    *,
+    free_after_step1: np.ndarray,
+    accepted_separator_map: np.ndarray,
+    resolution_m: float,
+    topology_config: TopologyTestConfig,
+) -> tuple[np.ndarray, dict[str, object]]:
+    stable_raw = np.asarray(stable_separator_map, dtype=bool)
+    free = np.asarray(free_after_step1, dtype=bool)
+    accepted = np.asarray(accepted_separator_map, dtype=bool)
+    if stable_raw.shape != free.shape or accepted.shape != free.shape:
+        raise ValueError("stable separator validation maps must share HxW shape")
+    rejected_map = np.zeros_like(free, dtype=bool)
+    kept_map = np.zeros_like(free, dtype=bool)
+    rejected_tracks: list[dict[str, object]] = []
+    if separator_memory is None:
+        return stable_raw.astype(bool), {
+            "voxel_stable_separator_tiny_reject_count": 0,
+            "voxel_stable_separator_tiny_reject_map": rejected_map,
+            "voxel_stable_separator_validation_enabled": False,
+        }
+
+    kept_tracks: list[StableSeparatorTrack] = []
+    current = accepted.copy()
+    for track in list(separator_memory._tracks):
+        track_mask = _cells_to_mask(track.line_cells, free.shape)
+        if not np.any(track_mask):
+            continue
+        candidate = SeparatorCandidate(
+            candidate_id=int(track.track_id),
+            kind="line_extension_corridor_separator",
+            p0_rc=np.asarray(track.p0_rc, dtype=np.float32),
+            p1_rc=np.asarray(track.p1_rc, dtype=np.float32),
+            theta=0.0,
+            length_m=float((max(abs(float(track.p1_rc[0]) - float(track.p0_rc[0])), abs(float(track.p1_rc[1]) - float(track.p0_rc[1]))) + 1.0) * float(resolution_m)),
+            confidence=float(track.confidence),
+            source_segment_ids=[int(track.track_id)],
+        )
+        ok, reason, candidate_map, metrics = evaluate_candidate(
+            candidate,
+            free_clean=free,
+            unknown_clean=np.zeros_like(free, dtype=bool),
+            wall_candidate_clean=np.zeros_like(free, dtype=bool),
+            corridor_skeleton=np.zeros_like(free, dtype=bool),
+            current_separator_map=current,
+            resolution_m=float(resolution_m),
+            config=topology_config,
+        )
+        metrics = {**dict(metrics), "stable_separator_track_id": int(track.track_id)}
+        if (not bool(ok)) and str(reason) in HARD_TINY_SEPARATOR_REJECT_REASONS:
+            rejected_map |= track_mask
+            track.confidence = 0.0
+            rejected_tracks.append(
+                {
+                    "track_id": int(track.track_id),
+                    "reject_reason": str(reason),
+                    "candidate_cells": int(np.count_nonzero(candidate_map)),
+                    "min_side_width_cells": int(metrics.get("min_side_width_cells", metrics.get("topology_min_side_width_cells", 0)) or 0),
+                }
+            )
+            continue
+        kept_tracks.append(track)
+        kept_map |= track_mask
+        current |= track_mask
+    separator_memory._tracks = kept_tracks
+    return kept_map.astype(bool), {
+        "voxel_stable_separator_validation_enabled": True,
+        "voxel_stable_separator_tiny_reject_count": int(len(rejected_tracks)),
+        "voxel_stable_separator_tiny_reject_map": rejected_map.astype(bool),
+        "voxel_stable_separator_tiny_reject_tracks": rejected_tracks,
+        "voxel_stable_step2_separator_cells_after_tiny_reject": int(np.count_nonzero(kept_map)),
+    }
+
+
 @dataclass
 class VoxelStep2TopologyConfig:
     corridor_min_split_area_m2: float = 0.05
@@ -267,6 +368,12 @@ class VoxelOccupancyDoorWallRoomSegConfig:
     separator_memory_min_confidence_to_keep: float = 0.15
     final_connectivity: int = 4
     merge_small_components_enabled: bool = False
+    merge_small_enclosed_single_neighbor_enabled: bool = True
+    merge_small_enclosed_single_neighbor_max_area_m2: float = 1.50
+    merge_small_enclosed_single_neighbor_connectivity: int = 4
+    merge_small_enclosed_single_neighbor_max_passes: int = 3
+    merge_small_enclosed_single_neighbor_forbid_unknown_touch: bool = True
+    merge_small_enclosed_single_neighbor_forbid_multi_neighbor: bool = True
     min_observed_free_cells: int = 1
     min_room_area_m2: float = 0.05
     use_real_wall_as_partition_barrier: bool = True
@@ -345,7 +452,17 @@ class VoxelOccupancyDoorWallRoomSegConfig:
         for src, dst in step2_key_map.items():
             if src in step2:
                 raw[dst] = step2[src]
-        for key in ("use_real_wall_as_partition_barrier", "real_wall_barrier_dilation_cells", "door_seed_wall_carve_radius_cells"):
+        for key in (
+            "use_real_wall_as_partition_barrier",
+            "real_wall_barrier_dilation_cells",
+            "door_seed_wall_carve_radius_cells",
+            "merge_small_enclosed_single_neighbor_enabled",
+            "merge_small_enclosed_single_neighbor_max_area_m2",
+            "merge_small_enclosed_single_neighbor_connectivity",
+            "merge_small_enclosed_single_neighbor_max_passes",
+            "merge_small_enclosed_single_neighbor_forbid_unknown_touch",
+            "merge_small_enclosed_single_neighbor_forbid_multi_neighbor",
+        ):
             if key in voxel_roomseg:
                 raw[key] = voxel_roomseg[key]
         if "voxel_show_wall_diagnostics" in voxel_visualization:
@@ -580,21 +697,48 @@ def run_voxel_occupancy_door_wall_roomseg(
         | np.asarray(evidence.structural_wall_ratio_xy, dtype=bool)
         | projection_seed,
         resolution_m=float(resolution_m),
+        projection_known_domain_map=np.asarray(
+            evidence.projection_known_domain_xy
+            if evidence.projection_known_domain_xy is not None
+            else np.ones(shape, dtype=bool),
+            dtype=bool,
+        ),
+        projection_gap_forbidden_unknown_map=np.asarray(
+            evidence.projection_gap_forbidden_unknown_xy
+            if evidence.projection_gap_forbidden_unknown_xy is not None
+            else evidence.unknown_xy,
+            dtype=bool,
+        ),
         config=cfg.wall_projection,
     )
     anchor_wall_projection = wall_projection
-    projected_wall_map = np.asarray(
+    projected_wall_before_known_clip = np.asarray(
         wall_projection.projected_wall_display_map
         if wall_projection.projected_wall_display_map is not None
         else wall_projection.projected_wall_map,
         dtype=bool,
     )
-    anchor_projected_wall_map = np.asarray(
+    projection_known_domain = np.asarray(
+        evidence.projection_known_domain_xy
+        if evidence.projection_known_domain_xy is not None
+        else np.ones(shape, dtype=bool),
+        dtype=bool,
+    )
+    projection_display_safe_domain = (
+        projection_known_domain
+        | np.asarray(evidence.wall_xy, dtype=bool)
+        | projection_seed
+        | protected_structural_wall_band
+    )
+    projected_wall_map = projected_wall_before_known_clip & projection_display_safe_domain
+    projected_wall_clipped_outside_known_map = projected_wall_before_known_clip & ~projected_wall_map
+    anchor_projected_wall_before_known_clip = np.asarray(
         wall_projection.projected_wall_anchor_map
         if wall_projection.projected_wall_anchor_map is not None
         else projected_wall_map,
         dtype=bool,
     )
+    anchor_projected_wall_map = anchor_projected_wall_before_known_clip & projection_display_safe_domain
     projected_step2_lines = [
         projected_wall_line_to_filtered_wall_line(line, float(resolution_m), line_id=100000 + idx)
         for idx, line in enumerate(getattr(wall_projection, "projected_step2_source_lines", []) or [], start=1)
@@ -656,6 +800,7 @@ def run_voxel_occupancy_door_wall_roomseg(
         ),
     )
     step1_gap_fill_map &= np.asarray(evidence.active_observed_xy, dtype=bool)
+    step1_gap_fill_map &= projection_known_domain
     if bool(cfg.step1_gap_fill_forbidden_on_door):
         step1_gap_fill_map &= ~projection_hard_forbidden_mask
     step1_gap_fill_map &= ~np.asarray(evidence.vertical_free_xy, dtype=bool)
@@ -894,9 +1039,26 @@ def run_voxel_occupancy_door_wall_roomseg(
     _annotate_step2_candidates([*accepted_step2, *rejected_step2])
     if separator_memory is not None and bool(cfg.separator_memory_enabled):
         stable_step2_separator_map, separator_memory_debug = separator_memory.update(accepted_step2, step=int(step), shape=shape)
+        stable_step2_separator_map, stable_separator_validation_debug = validate_stable_separators_against_current_partition(
+            separator_memory,
+            stable_step2_separator_map,
+            free_after_step1=free_after_step1,
+            accepted_separator_map=accepted_step2_map,
+            resolution_m=float(resolution_m),
+            topology_config=topology_cfg,
+        )
+        separator_memory_debug = {**separator_memory_debug, **stable_separator_validation_debug}
+        separator_memory_debug["voxel_separator_memory_track_count"] = int(len(separator_memory._tracks))
+        separator_memory_debug["voxel_stable_step2_separator_cells"] = int(np.count_nonzero(stable_step2_separator_map))
     else:
         stable_step2_separator_map = np.zeros(shape, dtype=bool)
-        separator_memory_debug = {"voxel_separator_memory_enabled": False, "voxel_separator_memory_track_count": 0}
+        separator_memory_debug = {
+            "voxel_separator_memory_enabled": False,
+            "voxel_separator_memory_track_count": 0,
+            "voxel_stable_separator_validation_enabled": False,
+            "voxel_stable_separator_tiny_reject_count": 0,
+            "voxel_stable_separator_tiny_reject_map": np.zeros(shape, dtype=bool),
+        }
     accepted_step2_map = (np.asarray(accepted_step2_map, dtype=bool) | stable_step2_separator_map).astype(bool)
     step2_candidate_map = _rasterize_candidates(all_step2_candidates, shape)
     step2_partition_cut_accepted_map, step2_partition_cut_candidate_from_accepted_map, step2_partition_cut_debug = build_step2_partition_cut_v16(
@@ -919,6 +1081,25 @@ def run_voxel_occupancy_door_wall_roomseg(
     labels[unknown_after_step1] = 0
     labels[~partition_free_for_label] = 0
     final_separator_map = real_wall_barrier_for_partition | door_cut_mask | step2_extension_separator_map
+    labels_before_small_merge = labels.copy()
+    if bool(cfg.merge_small_enclosed_single_neighbor_enabled):
+        labels, small_merge_debug = merge_small_enclosed_single_neighbor_regions(
+            labels,
+            partition_free=partition_free_for_label,
+            partition_unknown=unknown_after_step1,
+            final_separator_map=final_separator_map,
+            resolution_m=float(resolution_m),
+            max_area_m2=float(cfg.merge_small_enclosed_single_neighbor_max_area_m2),
+            connectivity=int(cfg.merge_small_enclosed_single_neighbor_connectivity),
+            max_passes=int(cfg.merge_small_enclosed_single_neighbor_max_passes),
+        )
+    else:
+        small_merge_debug = _small_merge_debug(
+            enabled=False,
+            max_area_m2=float(cfg.merge_small_enclosed_single_neighbor_max_area_m2),
+            merged_map=np.zeros(shape, dtype=bool),
+            events=[],
+        )
 
     boundary_source = np.zeros(shape, dtype=np.uint8)
     boundary_source[real_wall_barrier_for_partition] = 1
@@ -929,6 +1110,8 @@ def run_voxel_occupancy_door_wall_roomseg(
     step2_extension_reject_reason_map, step2_extension_reject_reason_legend = _reason_map_for_extensions(step2_extensions, shape)
     step2_topology_rejected_map = _rasterize_candidates(rejected_step2, shape)
     step2_candidate_reject_reason_map, step2_candidate_reject_reason_legend = _reason_map_for_candidates(rejected_step2, shape)
+    step2_hard_tiny_rejected = [candidate for candidate in rejected_step2 if str(candidate.reject_reason or "") in HARD_TINY_SEPARATOR_REJECT_REASONS]
+    step2_hard_tiny_reject_map = _rasterize_candidates(step2_hard_tiny_rejected, shape)
     step2_intersection_candidate_map = _rasterize_candidates(intersection_candidates, shape)
     step2_stage_maps = Step2StageMaps(
         extension_hits_all_map=step2_layers["all"].astype(bool),
@@ -955,6 +1138,12 @@ def run_voxel_occupancy_door_wall_roomseg(
         "voxel_wall_projected_xy": projected_wall_map,
         "voxel_projected_wall_map": projected_wall_map,
         "voxel_projected_structural_wall_map": projected_wall_map,
+        "voxel_projected_wall_before_known_clip": projected_wall_before_known_clip,
+        "voxel_projected_wall_after_known_clip": projected_wall_map,
+        "voxel_projected_wall_clipped_outside_known_map": projected_wall_clipped_outside_known_map,
+        "voxel_projected_wall_rejected_parallel_valley_map": np.asarray(wall_projection.debug.get("voxel_projected_wall_rejected_parallel_valley_map", np.zeros(shape, dtype=bool)), dtype=bool),
+        "voxel_projected_wall_rejected_unknown_gap_map": np.asarray(wall_projection.debug.get("voxel_projected_wall_rejected_unknown_gap_map", np.zeros(shape, dtype=bool)), dtype=bool),
+        "voxel_projected_wall_rejected_outside_known_gap_map": np.asarray(wall_projection.debug.get("voxel_projected_wall_rejected_outside_known_gap_map", np.zeros(shape, dtype=bool)), dtype=bool),
         "voxel_anchor_projected_wall_map": anchor_projected_wall_map,
         "voxel_unknown_xy": evidence.unknown_xy,
         "voxel_unknown_dominant_xy": np.asarray(evidence.unknown_dominant_xy, dtype=bool),
@@ -986,7 +1175,10 @@ def run_voxel_occupancy_door_wall_roomseg(
         "voxel_support_seed_for_projection_xy": projection_seed,
         "voxel_support_bridge_for_projection_xy": projection_bridge,
         "voxel_support_for_projection_display_xy": projection_input,
-        "voxel_projected_wall_display_map": np.asarray(wall_projection.projected_wall_display_map if wall_projection.projected_wall_display_map is not None else projected_wall_map, dtype=bool),
+        "voxel_projection_known_domain_xy": projection_known_domain,
+        "voxel_projection_outside_known_xy": np.asarray(evidence.projection_outside_known_xy if evidence.projection_outside_known_xy is not None else ~projection_known_domain, dtype=bool),
+        "voxel_projection_gap_forbidden_unknown_xy": np.asarray(evidence.projection_gap_forbidden_unknown_xy if evidence.projection_gap_forbidden_unknown_xy is not None else evidence.unknown_xy, dtype=bool),
+        "voxel_projected_wall_display_map": projected_wall_map,
         "voxel_projected_wall_anchor_map": anchor_projected_wall_map,
         "voxel_projected_wall_step2_source_map": np.asarray(wall_projection.projected_wall_step2_source_map if wall_projection.projected_wall_step2_source_map is not None else projected_wall_map, dtype=bool),
         "voxel_wall_projection_accumulator_h_votes": np.asarray(wall_projection.debug.get("voxel_wall_projection_accumulator_h_votes", np.zeros(shape, dtype=np.float32)), dtype=np.float32),
@@ -1077,6 +1269,7 @@ def run_voxel_occupancy_door_wall_roomseg(
         "voxel_step2_extension_reject_reason_map": step2_extension_reject_reason_map,
         "voxel_step2_separator_candidates_pre_topology_map": step2_stage_maps.separator_candidates_pre_topology_map,
         "voxel_step2_candidate_reject_reason_map": step2_candidate_reject_reason_map,
+        "voxel_step2_hard_tiny_reject_map": step2_hard_tiny_reject_map,
         "voxel_step2_partition_cut_candidate_map": step2_partition_cut_candidate_map,
         "voxel_step2_partition_cut_candidate_from_accepted_map": step2_partition_cut_candidate_from_accepted_map,
         "voxel_step2_partition_cut_accepted_map": step2_extension_separator_map,
@@ -1084,6 +1277,7 @@ def run_voxel_occupancy_door_wall_roomseg(
         "voxel_step2_accepted_separator_map": step2_stage_maps.accepted_separator_map,
         "voxel_step2_extension_separator_map": step2_extension_separator_map,
         "voxel_stable_step2_separator_mask": stable_step2_separator_map,
+        "voxel_stable_separator_tiny_reject_map": np.asarray(separator_memory_debug.get("voxel_stable_separator_tiny_reject_map", np.zeros(shape, dtype=bool)), dtype=bool),
         "voxel_step2_intersection_candidate_map": step2_intersection_candidate_map,
         "voxel_step2_intersection_target_map": intersection_target_map,
         "voxel_step2_rejected_extension_map": step2_layers["rejected"] | step2_topology_rejected_map,
@@ -1091,6 +1285,9 @@ def run_voxel_occupancy_door_wall_roomseg(
         "voxel_partition_free": partition_free,
         "voxel_partition_free_before_label": partition_free_for_label,
         "voxel_final_virtual_separator_map": final_virtual_separator_map,
+        "voxel_labels_before_small_enclosed_merge": labels_before_small_merge,
+        "voxel_labels_after_small_enclosed_merge": labels,
+        "voxel_small_enclosed_merged_region_map": np.asarray(small_merge_debug.get("voxel_small_enclosed_merged_region_map", np.zeros(shape, dtype=bool)), dtype=bool),
         "voxel_final_room_label_map": labels,
         "voxel_room_label_map_visual": labels,
         "voxel_final_separator_map": final_separator_map,
@@ -1132,6 +1329,10 @@ def run_voxel_occupancy_door_wall_roomseg(
         "voxel_wall_projected_cells": int(np.count_nonzero(projected_wall_map)),
         "voxel_projected_structural_wall_cells": int(np.count_nonzero(projected_wall_map)),
         "voxel_display_wall_cells": int(np.count_nonzero(display_wall_map)),
+        "voxel_projected_wall_clipped_outside_known_cells": int(np.count_nonzero(projected_wall_clipped_outside_known_map)),
+        "voxel_projected_wall_parallel_valley_reject_count": int(wall_projection.debug.get("voxel_projected_wall_parallel_valley_reject_count", 0)),
+        "voxel_projected_wall_unknown_gap_reject_count": int(wall_projection.debug.get("voxel_projected_wall_unknown_gap_reject_count", 0)),
+        "voxel_projected_wall_outside_known_gap_reject_count": int(wall_projection.debug.get("voxel_projected_wall_outside_known_gap_reject_count", 0)),
         "voxel_anchor_projected_wall_cells": int(np.count_nonzero(anchor_projected_wall_map)),
         "voxel_door_anchor_wall_cells": int(np.count_nonzero(door_anchor_wall_map)),
         **partition_maps.debug,
@@ -1156,6 +1357,10 @@ def run_voxel_occupancy_door_wall_roomseg(
         "voxel_stable_step2_separator_cells": int(np.count_nonzero(stable_step2_separator_map)),
         "voxel_step2_extension_reject_reason_counts": _extension_reason_counts(step2_extensions),
         "voxel_step2_topology_reject_reason_counts": _candidate_reason_counts(rejected_step2),
+        "voxel_tiny_side_policy": "reject_separator_only_never_delete_region",
+        "voxel_step2_hard_tiny_reject_count": int(len(step2_hard_tiny_rejected)),
+        "voxel_free_cells_before_tiny_reject_audit": int(np.count_nonzero(free_after_step1)),
+        "voxel_free_cells_after_tiny_reject_audit": int(np.count_nonzero(free_after_step1)),
         "voxel_step2_extension_reject_reason_legend": dict(step2_extension_reject_reason_legend),
         "voxel_step2_candidate_reject_reason_legend": dict(step2_candidate_reject_reason_legend),
         "voxel_step2_partition_cut_empty_count": int(step2_partition_cut_empty_count),
@@ -1172,6 +1377,9 @@ def run_voxel_occupancy_door_wall_roomseg(
         "voxel_room_count": _room_count(labels),
         "final_connectivity": int(cfg.final_connectivity),
         "merge_small_components_enabled": bool(cfg.merge_small_components_enabled),
+        "voxel_small_enclosed_merge_enabled": bool(small_merge_debug.get("voxel_small_enclosed_merge_enabled", False)),
+        "voxel_small_enclosed_merge_event_count": int(small_merge_debug.get("voxel_small_enclosed_merge_event_count", 0)),
+        "voxel_small_enclosed_merge_merged_count": int(small_merge_debug.get("voxel_small_enclosed_merge_merged_count", 0)),
         "frontier_source": "voxel_vertical_free",
         "frontier_vertical_free_cells": int(np.count_nonzero(evidence.vertical_free_xy)),
         "frontier_cells_from_vertical_free": int(np.count_nonzero(evidence.vertical_free_xy)),
@@ -1188,7 +1396,7 @@ def run_voxel_occupancy_door_wall_roomseg(
         "source_backend": VOXEL_OCCUPANCY_ROOMSEG_BACKEND,
         "roomseg_backend": VOXEL_OCCUPANCY_ROOMSEG_BACKEND,
         "algorithm": VOXEL_OCCUPANCY_ROOMSEG_ALGORITHM,
-        "variant": "voxel_v26_v25_1_door_step2_corridor_stability",
+        "variant": "voxel_v28_partition_merge_projection_wall_clip",
         "source": VOXEL_OCCUPANCY_ROOMSEG_BACKEND,
         "context_source": VOXEL_OCCUPANCY_ROOMSEG_CONTEXT,
         "room_map_mode": VOXEL_OCCUPANCY_ROOMSEG_CONTEXT,
@@ -1207,10 +1415,15 @@ def run_voxel_occupancy_door_wall_roomseg(
         "voxel_step2_topology_reject_reason_counts": report["voxel_step2_topology_reject_reason_counts"],
         "voxel_step2_partition_cut_empty_count": int(step2_partition_cut_empty_count),
         "voxel_step2_partition_cut_debug": dict(step2_partition_cut_debug),
+        "voxel_tiny_side_policy": "reject_separator_only_never_delete_region",
+        "voxel_step2_hard_tiny_reject_count": int(len(step2_hard_tiny_rejected)),
+        "voxel_free_cells_before_tiny_reject_audit": int(np.count_nonzero(free_after_step1)),
+        "voxel_free_cells_after_tiny_reject_audit": int(np.count_nonzero(free_after_step1)),
         **door_acceptance.debug,
         **separator_memory_debug,
         **corridor_local_debug,
         "voxel_step2_corridor_topology_debug_per_candidate": report["voxel_step2_corridor_topology_debug_per_candidate"],
+        **small_merge_debug,
         **step2_line_pool.debug,
         "separator_report": report,
         "filtered_wall_lines_report": {
@@ -1246,6 +1459,7 @@ def run_voxel_occupancy_door_wall_roomseg(
         **door_acceptance.debug,
         **corridor_local_debug,
         **partition_maps.debug,
+        **small_merge_debug,
         **layers,
         "line_walls": wall_debug,
     }
@@ -1389,6 +1603,120 @@ def _bridge_step2_line_gaps_v16(
             bridged.extend(range(start, end))
             gap_count += 1
     return out, int(gap_count), bridged
+
+
+def merge_small_enclosed_single_neighbor_regions(
+    labels: np.ndarray,
+    *,
+    partition_free: np.ndarray,
+    partition_unknown: np.ndarray,
+    final_separator_map: np.ndarray,
+    resolution_m: float,
+    max_area_m2: float = 1.50,
+    connectivity: int = 4,
+    max_passes: int = 3,
+) -> tuple[np.ndarray, dict[str, object]]:
+    label_map = np.asarray(labels, dtype=np.int32).copy()
+    free = np.asarray(partition_free, dtype=bool)
+    unknown = np.asarray(partition_unknown, dtype=bool)
+    separators = np.asarray(final_separator_map, dtype=bool)
+    if label_map.shape != free.shape or unknown.shape != free.shape or separators.shape != free.shape:
+        raise ValueError("small region merge maps must share HxW shape")
+    structure = conn(4 if int(connectivity) == 4 else 8)
+    max_cells = max(0, int(np.floor(float(max_area_m2) / max(float(resolution_m) ** 2, 1e-9) + 1e-9)))
+    events: list[SmallRegionMergeEvent] = []
+    merged_map = np.zeros_like(label_map, dtype=bool)
+    if max_cells <= 0 or int(max_passes) <= 0:
+        return label_map.astype(np.int32), _small_merge_debug(
+            enabled=True,
+            max_area_m2=float(max_area_m2),
+            merged_map=merged_map,
+            events=events,
+        )
+
+    for pass_index in range(1, int(max_passes) + 1):
+        changed = False
+        for raw_label in sorted(int(v) for v in np.unique(label_map) if int(v) > 0):
+            region = (label_map == int(raw_label)) & free
+            area_cells = int(np.count_nonzero(region))
+            if area_cells <= 0 or area_cells > max_cells:
+                continue
+            ring = ndimage.binary_dilation(region, structure=structure).astype(bool) & ~region
+            if _touches_grid_border(region) or bool(np.any(ring & unknown)):
+                continue
+            neighbor_labels = _neighbor_labels_across_optional_separator(label_map, region, separators, structure)
+            if len(neighbor_labels) != 1:
+                continue
+            target_label = int(neighbor_labels[0])
+            if target_label <= 0 or target_label == int(raw_label):
+                continue
+            label_map[region] = int(target_label)
+            merged_map |= region
+            events.append(
+                SmallRegionMergeEvent(
+                    source_label=int(raw_label),
+                    target_label=int(target_label),
+                    area_cells=int(area_cells),
+                    area_m2=float(area_cells) * float(resolution_m) ** 2,
+                    neighbor_labels=[int(v) for v in neighbor_labels],
+                    pass_index=int(pass_index),
+                )
+            )
+            changed = True
+        if not changed:
+            break
+    return label_map.astype(np.int32), _small_merge_debug(
+        enabled=True,
+        max_area_m2=float(max_area_m2),
+        merged_map=merged_map,
+        events=events,
+    )
+
+
+def _small_merge_debug(
+    *,
+    enabled: bool,
+    max_area_m2: float,
+    merged_map: np.ndarray,
+    events: Sequence[SmallRegionMergeEvent],
+) -> dict[str, object]:
+    return {
+        "voxel_small_enclosed_merge_enabled": bool(enabled),
+        "voxel_small_enclosed_merge_max_area_m2": float(max_area_m2),
+        "voxel_small_enclosed_merged_region_map": np.asarray(merged_map, dtype=bool),
+        "voxel_small_enclosed_merge_event_count": int(len(events)),
+        "voxel_small_enclosed_merge_merged_count": int(len(events)),
+        "voxel_small_enclosed_merge_events": [event.to_dict() for event in events],
+    }
+
+
+def _touches_grid_border(mask: np.ndarray) -> bool:
+    arr = np.asarray(mask, dtype=bool)
+    if not np.any(arr):
+        return False
+    rows, cols = np.nonzero(arr)
+    return bool(
+        int(rows.min()) == 0
+        or int(cols.min()) == 0
+        or int(rows.max()) == arr.shape[0] - 1
+        or int(cols.max()) == arr.shape[1] - 1
+    )
+
+
+def _neighbor_labels_across_optional_separator(
+    labels: np.ndarray,
+    region: np.ndarray,
+    separator_map: np.ndarray,
+    structure: np.ndarray,
+) -> list[int]:
+    label_map = np.asarray(labels, dtype=np.int32)
+    direct_ring = ndimage.binary_dilation(region, structure=structure).astype(bool) & ~region
+    neighbor_values = {int(v) for v in np.unique(label_map[direct_ring]) if int(v) > 0}
+    touched_separator = direct_ring & np.asarray(separator_map, dtype=bool)
+    if np.any(touched_separator):
+        through_separator = ndimage.binary_dilation(touched_separator, structure=structure).astype(bool) & ~region
+        neighbor_values.update(int(v) for v in np.unique(label_map[through_separator]) if int(v) > 0)
+    return sorted(neighbor_values)
 
 
 def _rooms_from_labels(labels: np.ndarray, unknown: np.ndarray, config: RoomSegmentationConfig, step: int, debug: Mapping[str, object]) -> list[RoomMask]:
@@ -1852,11 +2180,18 @@ def _apply_corridor_local_acceptance(
     out_map = np.asarray(accepted_map, dtype=bool).copy()
     locally_accepted = 0
     checked = 0
+    hard_tiny_skipped = 0
     for candidate in rejected:
         mask = candidate.mask(free.shape)
         candidate.debug["corridor_local_acceptance_checked"] = True
         checked += 1
         reason = str(candidate.reject_reason or "")
+        if reason in HARD_TINY_SEPARATOR_REJECT_REASONS:
+            candidate.debug["corridor_local_acceptance_accepted"] = False
+            candidate.debug["corridor_local_acceptance_reason"] = "hard_tiny_reject_not_resurrected"
+            out_rejected.append(candidate)
+            hard_tiny_skipped += 1
+            continue
         length_ok = 0.40 <= float(candidate.length_m) <= 1.60
         no_door = not bool(np.any(mask & door_block))
         crosses_free = bool(np.any(mask & free))
@@ -1881,6 +2216,7 @@ def _apply_corridor_local_acceptance(
     return out_accepted, out_rejected, out_map.astype(bool), {
         "voxel_step2_corridor_local_acceptance_checked_count": int(checked),
         "voxel_step2_corridor_local_acceptance_accepted_count": int(locally_accepted),
+        "voxel_step2_corridor_local_acceptance_hard_tiny_skipped_count": int(hard_tiny_skipped),
     }
 
 

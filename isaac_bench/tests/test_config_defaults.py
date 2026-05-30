@@ -141,6 +141,10 @@ def test_required_sgnav_defaults():
     assert cfg["mapping"]["room_segmentation"]["voxel_wall_projection"]["side_min_structural_ratio"] == 0.08
     assert cfg["mapping"]["room_segmentation"]["voxel_wall_projection"]["min_line_observed_support_cells"] == 3
     assert cfg["mapping"]["room_segmentation"]["voxel_wall_projection"]["keep_accepted_line_cells_even_if_unknown_dominant"] is True
+    assert cfg["mapping"]["room_segmentation"]["voxel_wall_projection"]["projection_clip_to_known_domain"] is True
+    assert cfg["mapping"]["room_segmentation"]["voxel_wall_projection"]["projection_gap_forbid_unknown"] is True
+    assert cfg["mapping"]["room_segmentation"]["voxel_wall_projection"]["projection_gap_forbid_outside_known"] is True
+    assert cfg["mapping"]["room_segmentation"]["voxel_wall_projection"]["projection_forbid_parallel_valley_lines"] is True
     assert cfg["mapping"]["room_segmentation"]["voxel_door"]["seed_method"] == "centroid_ratio"
     assert cfg["mapping"]["room_segmentation"]["voxel_door"]["top_occupied_min_z_m"] == 1.80
     assert cfg["mapping"]["room_segmentation"]["voxel_door"]["min_lower_free_cells"] == 2
@@ -179,6 +183,10 @@ def test_required_sgnav_defaults():
     assert cfg["mapping"]["room_segmentation"]["voxel_door"]["show_candidate_lines_in_debug"] is True
     assert cfg["mapping"]["room_segmentation"]["voxel_roomseg"]["use_real_wall_as_partition_barrier"] is True
     assert cfg["mapping"]["room_segmentation"]["voxel_roomseg"]["real_wall_barrier_dilation_cells"] == 0
+    assert cfg["mapping"]["room_segmentation"]["voxel_roomseg"]["merge_small_enclosed_single_neighbor_enabled"] is True
+    assert cfg["mapping"]["room_segmentation"]["voxel_roomseg"]["merge_small_enclosed_single_neighbor_max_area_m2"] == 1.50
+    assert cfg["mapping"]["room_segmentation"]["voxel_roomseg"]["merge_small_enclosed_single_neighbor_connectivity"] == 4
+    assert cfg["mapping"]["room_segmentation"]["voxel_roomseg"]["merge_small_enclosed_single_neighbor_max_passes"] == 3
     assert cfg["mapping"]["room_segmentation"]["voxel_visualization"]["voxel_show_wall_diagnostics"] is False
     assert cfg["mapping"]["room_segmentation"]["voxel_visualization"]["door_seed_color"] == [0, 80, 255]
     assert cfg["mapping"]["room_segmentation"]["voxel_visualization"]["door_extension_color"] == [0, 255, 70]

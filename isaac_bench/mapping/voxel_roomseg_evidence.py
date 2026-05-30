@@ -216,6 +216,9 @@ class VoxelRoomsegEvidence:
     support_for_projection_display_xy: np.ndarray | None = None
     support_for_step2_target_xy: np.ndarray | None = None
     support_for_step2_source_xy: np.ndarray | None = None
+    projection_known_domain_xy: np.ndarray | None = None
+    projection_outside_known_xy: np.ndarray | None = None
+    projection_gap_forbidden_unknown_xy: np.ndarray | None = None
     wall_support_layers_v23: WallSupportLayersV23 | None = None
     debug: dict[str, object] = field(default_factory=dict)
 
@@ -505,6 +508,20 @@ def classify_voxel_columns_for_roomseg(
             min_free_neighbor_ratio=float(cfg.small_unknown_hole_min_free_neighbor_ratio),
             frontier_mask=frontier,
         )
+    projection_known_domain = (
+        (observed_count > 0)
+        | vertical_free
+        | wall
+        | support_seed_for_projection
+        | support_bridge_for_projection
+    ).astype(bool)
+    projection_outside_known = ~projection_known_domain
+    projection_gap_forbidden_unknown = (
+        unknown
+        & ~wall
+        & ~support_seed_for_projection
+        & ~protected_structural_wall_band
+    ).astype(bool)
     if np.any(vertical_free & wall) or np.any(vertical_free & unknown) or np.any(wall & unknown):
         raise AssertionError("voxel roomseg v19 maps must be mutually exclusive")
     if not np.all(vertical_free | wall | unknown):
@@ -594,6 +611,9 @@ def classify_voxel_columns_for_roomseg(
         "support_for_projection_display": support_for_projection_display.astype(bool),
         "support_for_step2_target": support_for_step2_target.astype(bool),
         "support_for_step2_source": support_for_step2_source.astype(bool),
+        "projection_known_domain": projection_known_domain.astype(bool),
+        "projection_outside_known": projection_outside_known.astype(bool),
+        "projection_gap_forbidden_unknown": projection_gap_forbidden_unknown.astype(bool),
         "promoted_nav_obstacle": promoted_nav_obstacle.astype(bool),
     }
 
@@ -731,6 +751,9 @@ def build_voxel_roomseg_evidence(
                 "voxel_support_for_projection_display_xy": empty,
                 "voxel_support_for_step2_target_xy": empty,
                 "voxel_support_for_step2_source_xy": empty,
+                "voxel_projection_known_domain_xy": empty,
+                "voxel_projection_outside_known_xy": np.ones(shape, dtype=bool),
+                "voxel_projection_gap_forbidden_unknown_xy": np.ones(shape, dtype=bool),
                 "voxel_wall_rejected_by_free_xy": empty,
                 "voxel_wall_rejected_by_unknown_xy": empty,
                 "voxel_nonstructural_occupied_xy": empty,
@@ -778,6 +801,9 @@ def build_voxel_roomseg_evidence(
                 "voxel_support_bridge_for_projection_cells": 0,
                 "voxel_support_for_step2_target_cells": 0,
                 "voxel_support_for_step2_source_cells": 0,
+                "voxel_projection_known_domain_cells": 0,
+                "voxel_projection_outside_known_cells": int(np.prod(shape)),
+                "voxel_projection_gap_forbidden_unknown_cells": int(np.prod(shape)),
                 "voxel_wall_support_rejected_unknown_cells": 0,
                 "voxel_small_unknown_hole_filled_cells": 0,
                 "voxel_wall_occupied_ratio_debug_threshold": float(cfg.wall_occupied_ratio_debug_threshold),
@@ -846,6 +872,9 @@ def build_voxel_roomseg_evidence(
             support_for_projection_display_xy=empty,
             support_for_step2_target_xy=empty,
             support_for_step2_source_xy=empty,
+            projection_known_domain_xy=empty,
+            projection_outside_known_xy=np.ones(shape, dtype=bool),
+            projection_gap_forbidden_unknown_xy=np.ones(shape, dtype=bool),
             wall_support_layers_v23=WallSupportLayersV23(
                 vertical_free=empty,
                 strict_wall=empty,
@@ -971,6 +1000,21 @@ def build_voxel_roomseg_evidence(
     support_for_projection_display = np.asarray(classified.get("support_for_projection_display", wall_support_for_projection), dtype=bool)
     support_for_step2_target = np.asarray(classified.get("support_for_step2_target", strict_raw_wall | support_seed_for_projection), dtype=bool)
     support_for_step2_source = np.asarray(classified.get("support_for_step2_source", support_seed_for_projection), dtype=bool)
+    projection_known_domain = np.asarray(
+        classified.get(
+            "projection_known_domain",
+            active_observed | vertical_free | wall | support_seed_for_projection | support_bridge_for_projection,
+        ),
+        dtype=bool,
+    )
+    projection_outside_known = np.asarray(classified.get("projection_outside_known", ~projection_known_domain), dtype=bool)
+    projection_gap_forbidden_unknown = np.asarray(
+        classified.get(
+            "projection_gap_forbidden_unknown",
+            unknown & ~wall & ~support_seed_for_projection & ~protected_structural_wall_band,
+        ),
+        dtype=bool,
+    )
     v23_frontier_residual_band = np.asarray(classified.get("v23_frontier_residual_band", frontier_unknown_band), dtype=bool)
     v23_nav_unknown_band = np.asarray(classified.get("v23_nav_unknown_band", np.zeros(shape, dtype=bool)), dtype=bool)
     v23_unknown_dominant_band = np.asarray(classified.get("v23_unknown_dominant_band", unknown_dominant), dtype=bool)
@@ -1022,6 +1066,9 @@ def build_voxel_roomseg_evidence(
         "voxel_support_bridge_for_projection_cells": int(np.count_nonzero(support_bridge_for_projection)),
         "voxel_support_for_step2_target_cells": int(np.count_nonzero(support_for_step2_target)),
         "voxel_support_for_step2_source_cells": int(np.count_nonzero(support_for_step2_source)),
+        "voxel_projection_known_domain_cells": int(np.count_nonzero(projection_known_domain)),
+        "voxel_projection_outside_known_cells": int(np.count_nonzero(projection_outside_known)),
+        "voxel_projection_gap_forbidden_unknown_cells": int(np.count_nonzero(projection_gap_forbidden_unknown)),
         "voxel_strict_raw_wall_cells": int(np.count_nonzero(strict_raw_wall)),
         "voxel_unknown_dominant_cells": int(np.count_nonzero(unknown_dominant)),
         "voxel_wall_suppressed_by_free_cells": int(np.count_nonzero(wall_suppressed_by_free)),
@@ -1150,6 +1197,9 @@ def build_voxel_roomseg_evidence(
         "voxel_support_for_projection_display_xy": support_for_projection_display.astype(bool),
         "voxel_support_for_step2_target_xy": support_for_step2_target.astype(bool),
         "voxel_support_for_step2_source_xy": support_for_step2_source.astype(bool),
+        "voxel_projection_known_domain_xy": projection_known_domain.astype(bool),
+        "voxel_projection_outside_known_xy": projection_outside_known.astype(bool),
+        "voxel_projection_gap_forbidden_unknown_xy": projection_gap_forbidden_unknown.astype(bool),
         "voxel_wall_rejected_by_free_xy": wall_rejected_by_free.astype(bool),
         "voxel_wall_rejected_by_unknown_xy": wall_rejected_by_unknown.astype(bool),
         "voxel_nonstructural_occupied_xy": nonstructural_occupied.astype(bool),
@@ -1218,6 +1268,9 @@ def build_voxel_roomseg_evidence(
         "voxel_support_bridge_for_projection_cells": int(np.count_nonzero(support_bridge_for_projection)),
         "voxel_support_for_step2_target_cells": int(np.count_nonzero(support_for_step2_target)),
         "voxel_support_for_step2_source_cells": int(np.count_nonzero(support_for_step2_source)),
+        "voxel_projection_known_domain_cells": int(np.count_nonzero(projection_known_domain)),
+        "voxel_projection_outside_known_cells": int(np.count_nonzero(projection_outside_known)),
+        "voxel_projection_gap_forbidden_unknown_cells": int(np.count_nonzero(projection_gap_forbidden_unknown)),
         "voxel_small_unknown_hole_filled_cells": int(np.count_nonzero(small_unknown_hole_filled)),
         "voxel_wall_support_loose_cells": int(np.count_nonzero(wall_support_loose)),
         "voxel_wall_support_unknown_gated_cells": int(np.count_nonzero(wall_support_unknown_gated)),
@@ -1308,6 +1361,9 @@ def build_voxel_roomseg_evidence(
         support_for_projection_display_xy=support_for_projection_display.astype(bool),
         support_for_step2_target_xy=support_for_step2_target.astype(bool),
         support_for_step2_source_xy=support_for_step2_source.astype(bool),
+        projection_known_domain_xy=projection_known_domain.astype(bool),
+        projection_outside_known_xy=projection_outside_known.astype(bool),
+        projection_gap_forbidden_unknown_xy=projection_gap_forbidden_unknown.astype(bool),
         wall_support_layers_v23=WallSupportLayersV23(
             vertical_free=vertical_free.astype(bool),
             strict_wall=strict_raw_wall.astype(bool),

@@ -57,6 +57,16 @@ class WallProjectionConfig:
     reject_if_no_nonfree_side: bool = True
     min_line_observed_support_cells: int = 3
     keep_accepted_line_cells_even_if_unknown_dominant: bool = True
+    projection_clip_to_known_domain: bool = True
+    projection_gap_forbid_unknown: bool = True
+    projection_gap_forbid_outside_known: bool = True
+    projection_trim_line_ends_to_known: bool = True
+    projection_forbid_parallel_valley_lines: bool = True
+    projection_line_nms_lateral_radius_cells: int = 2
+    projection_valley_min_parallel_peak_cells: int = 3
+    projection_valley_min_peak_separation_cells: int = 3
+    projection_valley_direct_seed_min_cells: int = 2
+    projection_valley_direct_seed_ratio_min: float = 0.05
 
     @classmethod
     def from_mapping(cls, data: Mapping[str, object] | None = None) -> "WallProjectionConfig":
@@ -229,7 +239,14 @@ def project_wall_evidence_to_lines(
                 comp_accepted = True
             if not comp_accepted:
                 rejected_support[cells[:, 0], cells[:, 1]] = True
-    projected = _fill_axis_gaps_in_projected_map(projected, free, forbidden, float(resolution_m), cfg)
+    projected = _fill_axis_gaps_in_projected_map(
+        projected,
+        free,
+        forbidden,
+        float(resolution_m),
+        cfg,
+        projection_gap_forbidden_unknown=unknown_forbidden,
+    )
     rejected_support |= support & ~accepted_support
     debug = _debug_dict(started_at, cfg, raw, projected, accepted_support, rejected_support, unknown_forbidden, lines, reject_counts)
     return ProjectedWallResult(projected, raw.copy(), accepted_support, rejected_support, lines, debug)
@@ -251,6 +268,8 @@ def project_wall_evidence_to_axis_accumulator_lines(
     structural_side_support_map: np.ndarray | None = None,
     door_forbidden_mask: np.ndarray | None,
     resolution_m: float,
+    projection_known_domain_map: np.ndarray | None = None,
+    projection_gap_forbidden_unknown_map: np.ndarray | None = None,
     config: WallProjectionConfig | Mapping[str, object] | None = None,
 ) -> ProjectedWallResult:
     started_at = time.perf_counter()
@@ -292,6 +311,10 @@ def project_wall_evidence_to_axis_accumulator_lines(
     door_forbidden = np.zeros(support.shape, dtype=bool) if door_forbidden_mask is None else np.asarray(door_forbidden_mask, dtype=bool)
     if door_forbidden.shape != support.shape:
         raise ValueError("door_forbidden_mask must match support shape")
+    projection_known_domain = np.ones(support.shape, dtype=bool) if projection_known_domain_map is None else np.asarray(projection_known_domain_map, dtype=bool)
+    projection_gap_forbidden_unknown = unknown.copy() if projection_gap_forbidden_unknown_map is None else np.asarray(projection_gap_forbidden_unknown_map, dtype=bool)
+    if projection_known_domain.shape != support.shape or projection_gap_forbidden_unknown.shape != support.shape:
+        raise ValueError("projection known/unknown maps must match support shape")
     seed_support = seed_support & ~forbidden_residual
     bridge_support = bridge_support & ~forbidden_residual
     support = seed_support | bridge_support
@@ -313,6 +336,10 @@ def project_wall_evidence_to_axis_accumulator_lines(
     rejected_support = np.zeros_like(support, dtype=bool)
     reject_reason_map = np.zeros(support.shape, dtype=np.uint8)
     step2_reject_reason_map = np.zeros(support.shape, dtype=np.uint8)
+    clipped_outside_known_map = np.zeros(support.shape, dtype=bool)
+    rejected_parallel_valley_map = np.zeros(support.shape, dtype=bool)
+    rejected_unknown_gap_map = np.zeros(support.shape, dtype=bool)
+    rejected_outside_known_gap_map = np.zeros(support.shape, dtype=bool)
     reject_counts: Counter[str] = Counter()
     step2_reject_counts: Counter[str] = Counter()
     display_lines: list[ProjectedWallLine] = []
@@ -323,6 +350,7 @@ def project_wall_evidence_to_axis_accumulator_lines(
 
     def consume_axis(axis: str, votes: np.ndarray) -> None:
         nonlocal line_id, display, anchor, step2_source, accepted_support, rejected_support
+        nonlocal clipped_outside_known_map, rejected_parallel_valley_map, rejected_unknown_gap_map, rejected_outside_known_gap_map
         fixed_count = votes.shape[0] if axis == "h" else votes.shape[1]
         for fixed in range(int(fixed_count)):
             if axis == "h" and not np.any(seed_support[int(fixed), :]):
@@ -331,14 +359,63 @@ def project_wall_evidence_to_axis_accumulator_lines(
                 continue
             values = votes[int(fixed), :] if axis == "h" else votes[:, int(fixed)]
             coords = np.flatnonzero(values > 0.0).astype(np.int32)
-            for run in _axis_vote_runs(coords, fixed=int(fixed), axis=axis, free=free, door_forbidden=door_forbidden, resolution_m=float(resolution_m), cfg=cfg, bridge_support=bridge_support):
+            for run in _axis_vote_runs(
+                coords,
+                fixed=int(fixed),
+                axis=axis,
+                free=free,
+                door_forbidden=door_forbidden,
+                resolution_m=float(resolution_m),
+                cfg=cfg,
+                bridge_support=bridge_support,
+                projection_known_domain=projection_known_domain,
+                projection_gap_forbidden_unknown=projection_gap_forbidden_unknown,
+                rejected_unknown_gap_map=rejected_unknown_gap_map,
+                rejected_outside_known_gap_map=rejected_outside_known_gap_map,
+                reject_counts=reject_counts,
+            ):
                 if run.size <= 0:
                     continue
+                raw_line_mask = _axis_line_mask(axis, int(fixed), run, support.shape)
+                if bool(getattr(cfg, "projection_trim_line_ends_to_known", True)):
+                    trimmed = trim_projected_run_to_known_domain(
+                        run,
+                        fixed=int(fixed),
+                        axis=axis,
+                        projection_known_domain=projection_known_domain,
+                        seed_support=seed_support,
+                        bridge_support=bridge_support,
+                        min_seed_cells=max(1, int(getattr(cfg, "min_seed_support_cells_per_projected_line", 3))),
+                        projection_gap_forbidden_unknown=projection_gap_forbidden_unknown,
+                    )
+                    clipped_outside_known_map |= raw_line_mask & ~_axis_line_mask(axis, int(fixed), trimmed, support.shape)
+                    run = trimmed
+                if run.size <= 0:
+                    reject_counts["projected_wall_trimmed_to_empty_known_domain"] += 1
+                    reject_reason_map[raw_line_mask] = _projection_reject_code("projected_wall_trimmed_to_empty_known_domain")
+                    continue
                 line_mask = _axis_line_mask(axis, int(fixed), run, support.shape)
+                if bool(getattr(cfg, "projection_clip_to_known_domain", True)) and np.any(line_mask & ~projection_known_domain):
+                    clipped = line_mask & ~projection_known_domain
+                    clipped_outside_known_map |= clipped
+                    line_mask &= projection_known_domain
+                    run = _coords_from_axis_line_mask(line_mask, axis, int(fixed))
+                    if run.size <= 0:
+                        reject_counts["projected_wall_trimmed_to_empty_known_domain"] += 1
+                        reject_reason_map[raw_line_mask] = _projection_reject_code("projected_wall_trimmed_to_empty_known_domain")
+                        continue
                 if np.any(line_mask & door_forbidden):
                     reject_counts["projected_wall_crosses_door_seed"] += 1
                     reject_reason_map[line_mask] = 4
                     continue
+                valley, valley_debug = is_parallel_valley_projection_line(
+                    axis=axis,
+                    fixed=int(fixed),
+                    run=run,
+                    seed_support=seed_support,
+                    vote_map=votes,
+                    cfg=cfg,
+                )
                 support_weight_sum = float(np.sum(values[run]))
                 projected_cells = int(np.count_nonzero(line_mask))
                 support_ratio = float(support_weight_sum / float(max(1, projected_cells)))
@@ -364,6 +441,8 @@ def project_wall_evidence_to_axis_accumulator_lines(
                 )
                 if reject_reason is None:
                     reject_reason = residual_reject_reason
+                if reject_reason is None and bool(valley) and bool(getattr(cfg, "projection_forbid_parallel_valley_lines", True)):
+                    reject_reason = "projected_wall_between_parallel_walls"
                 line = ProjectedWallLine(
                     line_id=int(line_id),
                     axis=str(axis),
@@ -383,13 +462,15 @@ def project_wall_evidence_to_axis_accumulator_lines(
                     side_nonfree_ratio_a=float(side_metrics.get("side_nonfree_ratio_a", 0.0)),
                     side_nonfree_ratio_b=float(side_metrics.get("side_nonfree_ratio_b", 0.0)),
                     structural_side_score=float(side_metrics.get("structural_side_score", 0.0)),
-                    debug={"support_weight_sum": float(support_weight_sum), **side_metrics, **line_metrics},
+                    debug={"support_weight_sum": float(support_weight_sum), **side_metrics, **line_metrics, **valley_debug},
                 )
                 line_support = line_mask & support
                 if reject_reason is not None:
                     rejected_support |= line_support
                     reject_counts[str(reject_reason)] += 1
                     reject_reason_map[line_mask] = _projection_reject_code(str(reject_reason))
+                    if str(reject_reason) == "projected_wall_between_parallel_walls":
+                        rejected_parallel_valley_map |= line_mask
                     line_id += 1
                     continue
                 accepted_support |= line_support
@@ -455,9 +536,20 @@ def project_wall_evidence_to_axis_accumulator_lines(
             "voxel_wall_projection_bridge_support_map": bridge_support.astype(bool),
             "voxel_wall_projection_forbidden_frontier_residual_map": forbidden_residual.astype(bool),
             "voxel_wall_projection_protected_structural_wall_band": protected_band.astype(bool),
+            "voxel_wall_projection_known_domain_map": projection_known_domain.astype(bool),
+            "voxel_wall_projection_gap_forbidden_unknown_map": projection_gap_forbidden_unknown.astype(bool),
+            "voxel_wall_projection_forbidden_unknown_map": projection_gap_forbidden_unknown.astype(bool),
+            "voxel_projected_wall_clipped_outside_known_map": clipped_outside_known_map.astype(bool),
+            "voxel_projected_wall_rejected_parallel_valley_map": rejected_parallel_valley_map.astype(bool),
+            "voxel_projected_wall_rejected_unknown_gap_map": rejected_unknown_gap_map.astype(bool),
+            "voxel_projected_wall_rejected_outside_known_gap_map": rejected_outside_known_gap_map.astype(bool),
             "voxel_wall_projection_seed_support_cells": int(np.count_nonzero(seed_support)),
             "voxel_wall_projection_bridge_support_cells": int(np.count_nonzero(bridge_support)),
             "voxel_wall_projection_forbidden_frontier_residual_cells": int(np.count_nonzero(forbidden_residual)),
+            "voxel_projected_wall_clipped_outside_known_cells": int(np.count_nonzero(clipped_outside_known_map)),
+            "voxel_projected_wall_parallel_valley_reject_count": int(reject_counts.get("projected_wall_between_parallel_walls", 0)),
+            "voxel_projected_wall_unknown_gap_reject_count": int(reject_counts.get("projected_wall_gap_crosses_unknown", 0)),
+            "voxel_projected_wall_outside_known_gap_reject_count": int(reject_counts.get("projected_wall_gap_outside_known", 0)),
             "voxel_wall_projection_both_sides_free_debug_only": bool(getattr(cfg, "both_sides_free_debug_only", True)),
             "voxel_wall_projection_corridor_neck_source_line_count": int(len(corridor_neck_lines)),
             "voxel_wall_projection_corridor_neck_source_lines": [line.to_dict() for line in corridor_neck_lines[:1024]],
@@ -508,10 +600,17 @@ def _axis_vote_runs(
     resolution_m: float,
     cfg: WallProjectionConfig,
     bridge_support: np.ndarray | None = None,
+    projection_known_domain: np.ndarray | None = None,
+    projection_gap_forbidden_unknown: np.ndarray | None = None,
+    rejected_unknown_gap_map: np.ndarray | None = None,
+    rejected_outside_known_gap_map: np.ndarray | None = None,
+    reject_counts: Counter[str] | None = None,
 ) -> list[np.ndarray]:
     values = np.asarray(coords, dtype=np.int32)
     if values.size == 0:
         return []
+    known = np.ones_like(free, dtype=bool) if projection_known_domain is None else np.asarray(projection_known_domain, dtype=bool)
+    forbidden_unknown = np.zeros_like(free, dtype=bool) if projection_gap_forbidden_unknown is None else np.asarray(projection_gap_forbidden_unknown, dtype=bool)
     max_gap_cells = max(0, int(round(float(cfg.max_fill_gap_m) / max(float(resolution_m), 1e-9))))
     runs: list[list[int]] = [[int(values[0])]]
     for left, right in zip(values[:-1], values[1:]):
@@ -528,12 +627,29 @@ def _axis_vote_runs(
             valid = (rr >= 0) & (rr < free.shape[0]) & (cc >= 0) & (cc < free.shape[1])
             if np.any(valid):
                 blocked = bool(np.any(door_forbidden[rr[valid], cc[valid]]))
+                blocked_unknown = bool(getattr(cfg, "projection_gap_forbid_unknown", True)) and bool(np.any(forbidden_unknown[rr[valid], cc[valid]]))
+                blocked_outside_known = bool(getattr(cfg, "projection_gap_forbid_outside_known", True)) and bool(np.any(~known[rr[valid], cc[valid]]))
                 free_ratio = float(np.count_nonzero(free[rr[valid], cc[valid]])) / float(max(1, int(np.count_nonzero(valid))))
                 bridge_ok = False
                 if bridge_support is not None:
                     bridge = np.asarray(bridge_support, dtype=bool)
                     bridge_ok = bool(bridge.shape == free.shape and np.any(bridge[rr[valid], cc[valid]]))
-                can_fill = (not blocked) and (free_ratio <= max(float(cfg.max_free_gap_ratio), 0.35) or bridge_ok)
+                if blocked_unknown:
+                    if rejected_unknown_gap_map is not None:
+                        rejected_unknown_gap_map[rr[valid], cc[valid]] |= forbidden_unknown[rr[valid], cc[valid]]
+                    if reject_counts is not None:
+                        reject_counts["projected_wall_gap_crosses_unknown"] += 1
+                if blocked_outside_known:
+                    if rejected_outside_known_gap_map is not None:
+                        rejected_outside_known_gap_map[rr[valid], cc[valid]] |= ~known[rr[valid], cc[valid]]
+                    if reject_counts is not None:
+                        reject_counts["projected_wall_gap_outside_known"] += 1
+                can_fill = (
+                    (not blocked)
+                    and (not blocked_unknown)
+                    and (not blocked_outside_known)
+                    and (free_ratio <= max(float(cfg.max_free_gap_ratio), 0.35) or bridge_ok)
+                )
         if gap <= 0:
             pass
         elif can_fill:
@@ -542,6 +658,140 @@ def _axis_vote_runs(
             runs.append([])
         runs[-1].append(int(right))
     return [np.asarray(run, dtype=np.int32) for run in runs if run]
+
+
+def trim_projected_run_to_known_domain(
+    run: np.ndarray,
+    *,
+    fixed: int,
+    axis: str,
+    projection_known_domain: np.ndarray,
+    seed_support: np.ndarray,
+    bridge_support: np.ndarray,
+    min_seed_cells: int,
+    projection_gap_forbidden_unknown: np.ndarray | None = None,
+) -> np.ndarray:
+    values = np.asarray(run, dtype=np.int32)
+    if values.size <= 0:
+        return values
+    known = np.asarray(projection_known_domain, dtype=bool)
+    seed = np.asarray(seed_support, dtype=bool)
+    bridge = np.asarray(bridge_support, dtype=bool)
+    forbidden_unknown = np.zeros_like(known, dtype=bool) if projection_gap_forbidden_unknown is None else np.asarray(projection_gap_forbidden_unknown, dtype=bool)
+    if seed.shape != known.shape or bridge.shape != known.shape or forbidden_unknown.shape != known.shape:
+        raise ValueError("projection trim maps must share HxW shape")
+    rr, cc, valid = _axis_indices(str(axis), int(fixed), values, known.shape)
+    if not np.any(valid):
+        return np.zeros(0, dtype=np.int32)
+    hard_allowed = np.zeros(values.shape, dtype=bool)
+    direct_support = np.zeros(values.shape, dtype=bool)
+    hard_allowed[valid] = known[rr[valid], cc[valid]] & ~forbidden_unknown[rr[valid], cc[valid]]
+    direct_support[valid] = seed[rr[valid], cc[valid]]
+    hard_allowed |= direct_support
+    hard_allowed |= np.asarray([bool(bridge[int(r), int(c)]) if bool(v) else False for r, c, v in zip(rr, cc, valid)], dtype=bool)
+    best = np.zeros(0, dtype=np.int32)
+    start = 0
+    while start < values.size:
+        while start < values.size and not bool(hard_allowed[start]):
+            start += 1
+        end = start
+        while end < values.size and bool(hard_allowed[end]):
+            end += 1
+        if end > start:
+            subrun = values[start:end]
+            sr, sc, sv = _axis_indices(str(axis), int(fixed), subrun, known.shape)
+            seed_cells = int(np.count_nonzero(seed[sr[sv], sc[sv]])) if np.any(sv) else 0
+            if seed_cells >= max(1, int(min_seed_cells)) and subrun.size > best.size:
+                best = subrun
+        start = end + 1
+    return best.astype(np.int32)
+
+
+def is_parallel_valley_projection_line(
+    *,
+    axis: str,
+    fixed: int,
+    run: np.ndarray,
+    seed_support: np.ndarray,
+    vote_map: np.ndarray,
+    cfg: WallProjectionConfig,
+) -> tuple[bool, dict[str, Any]]:
+    values = np.asarray(run, dtype=np.int32)
+    seed = np.asarray(seed_support, dtype=bool)
+    if values.size <= 0:
+        return False, {"parallel_valley_checked": False}
+    rr, cc, valid = _axis_indices(str(axis), int(fixed), values, seed.shape)
+    projected_cells = int(np.count_nonzero(valid))
+    direct_seed_cells = int(np.count_nonzero(seed[rr[valid], cc[valid]])) if projected_cells > 0 else 0
+    direct_seed_ratio = float(direct_seed_cells) / float(max(1, projected_cells))
+    debug: dict[str, Any] = {
+        "parallel_valley_checked": True,
+        "parallel_valley_direct_seed_cells": int(direct_seed_cells),
+        "parallel_valley_direct_seed_ratio": float(direct_seed_ratio),
+    }
+    if direct_seed_cells >= int(getattr(cfg, "projection_valley_direct_seed_min_cells", 2)):
+        return False, debug
+    if direct_seed_ratio >= float(getattr(cfg, "projection_valley_direct_seed_ratio_min", 0.05)):
+        return False, debug
+    radius = max(1, int(getattr(cfg, "projection_line_nms_lateral_radius_cells", 2)))
+    min_peak = max(1, int(getattr(cfg, "projection_valley_min_parallel_peak_cells", 3)))
+    min_sep = max(1, int(getattr(cfg, "projection_valley_min_peak_separation_cells", 3)))
+    lateral_min = max(0, int(fixed) - radius)
+    lateral_max = min(seed.shape[0 if str(axis) == "h" else 1] - 1, int(fixed) + radius)
+    peaks_before: list[tuple[int, int]] = []
+    peaks_after: list[tuple[int, int]] = []
+    for lateral in range(lateral_min, lateral_max + 1):
+        if int(lateral) == int(fixed):
+            continue
+        if str(axis) == "h":
+            valid_coords = values[(values >= 0) & (values < seed.shape[1])]
+            count = int(np.count_nonzero(seed[int(lateral), valid_coords])) if valid_coords.size else 0
+        else:
+            valid_coords = values[(values >= 0) & (values < seed.shape[0])]
+            count = int(np.count_nonzero(seed[valid_coords, int(lateral)])) if valid_coords.size else 0
+        if count < min_peak:
+            continue
+        if int(lateral) < int(fixed):
+            peaks_before.append((int(lateral), int(count)))
+        else:
+            peaks_after.append((int(lateral), int(count)))
+    if not peaks_before or not peaks_after:
+        debug["parallel_valley_peak_before"] = None
+        debug["parallel_valley_peak_after"] = None
+        return False, debug
+    left = max(peaks_before, key=lambda item: item[1])
+    right = max(peaks_after, key=lambda item: item[1])
+    debug["parallel_valley_peak_before"] = [int(left[0]), int(left[1])]
+    debug["parallel_valley_peak_after"] = [int(right[0]), int(right[1])]
+    debug["parallel_valley_peak_separation_cells"] = int(right[0] - left[0])
+    debug["parallel_valley_vote_value"] = float(vote_map[int(fixed), int(values[0])] if str(axis) == "h" and values.size else 0.0)
+    if int(right[0] - left[0]) >= min_sep and int(left[0]) < int(fixed) < int(right[0]):
+        debug["parallel_valley_reject_reason"] = "projected_wall_between_parallel_walls"
+        return True, debug
+    return False, debug
+
+
+def _axis_indices(axis: str, fixed: int, coords: np.ndarray, shape: tuple[int, int]) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    values = np.asarray(coords, dtype=np.int32)
+    if str(axis) == "h":
+        rr = np.full(values.shape, int(fixed), dtype=np.int32)
+        cc = values
+    else:
+        rr = values
+        cc = np.full(values.shape, int(fixed), dtype=np.int32)
+    valid = (rr >= 0) & (rr < int(shape[0])) & (cc >= 0) & (cc < int(shape[1]))
+    return rr, cc, valid
+
+
+def _coords_from_axis_line_mask(mask: np.ndarray, axis: str, fixed: int) -> np.ndarray:
+    arr = np.asarray(mask, dtype=bool)
+    if str(axis) == "h":
+        if int(fixed) < 0 or int(fixed) >= arr.shape[0]:
+            return np.zeros(0, dtype=np.int32)
+        return np.flatnonzero(arr[int(fixed), :]).astype(np.int32)
+    if int(fixed) < 0 or int(fixed) >= arr.shape[1]:
+        return np.zeros(0, dtype=np.int32)
+    return np.flatnonzero(arr[:, int(fixed)]).astype(np.int32)
 
 
 def _axis_line_mask(axis: str, fixed: int, coords: np.ndarray, shape: tuple[int, int]) -> np.ndarray:
@@ -652,6 +902,10 @@ def _projection_reject_code(reason: str) -> int:
         "projected_wall_nav_unknown_edge_line": 14,
         "projected_wall_bridge_only_line": 15,
         "projected_wall_frontier_residual_both_sides_free": 16,
+        "projected_wall_between_parallel_walls": 17,
+        "projected_wall_gap_crosses_unknown": 18,
+        "projected_wall_gap_outside_known": 19,
+        "projected_wall_trimmed_to_empty_known_domain": 20,
         "reject_step2_source_too_short": 21,
         "reject_step2_source_support_ratio_low": 22,
         "reject_step2_source_support_cells_low": 23,
@@ -922,10 +1176,14 @@ def _fill_projected_gaps(
     door_forbidden: np.ndarray,
     resolution_m: float,
     cfg: WallProjectionConfig,
+    projection_known_domain: np.ndarray | None = None,
+    projection_gap_forbidden_unknown: np.ndarray | None = None,
 ) -> np.ndarray:
     values = np.unique(np.asarray(coords, dtype=np.int32))
     if values.size <= 1:
         return values
+    known = np.ones_like(free, dtype=bool) if projection_known_domain is None else np.asarray(projection_known_domain, dtype=bool)
+    forbidden_unknown = np.zeros_like(free, dtype=bool) if projection_gap_forbidden_unknown is None else np.asarray(projection_gap_forbidden_unknown, dtype=bool)
     max_gap_cells = max(0, int(round(float(cfg.max_fill_gap_m) / max(float(resolution_m), 1e-9))))
     out: list[int] = [int(values[0])]
     for left, right in zip(values[:-1], values[1:]):
@@ -944,7 +1202,9 @@ def _fill_projected_gaps(
                 valid = (rr >= 0) & (rr < free.shape[0]) & (cc >= 0) & (cc < free.shape[1])
                 free_ratio = float(np.count_nonzero(free[rr[valid], cc[valid]]) / max(1, int(np.count_nonzero(valid))))
                 blocked = bool(np.any(door_forbidden[rr[valid], cc[valid]]))
-            if free_ratio <= float(cfg.max_free_gap_ratio) and not blocked:
+            blocked_unknown = bool(getattr(cfg, "projection_gap_forbid_unknown", True)) and bool(np.any(forbidden_unknown[rr[valid], cc[valid]]))
+            blocked_outside_known = bool(getattr(cfg, "projection_gap_forbid_outside_known", True)) and bool(np.any(~known[rr[valid], cc[valid]]))
+            if free_ratio <= float(cfg.max_free_gap_ratio) and not blocked and not blocked_unknown and not blocked_outside_known:
                 out.extend(int(v) for v in fill.tolist())
         out.append(int(right))
     return np.asarray(out, dtype=np.int32)
@@ -956,17 +1216,21 @@ def _fill_axis_gaps_in_projected_map(
     door_forbidden: np.ndarray,
     resolution_m: float,
     cfg: WallProjectionConfig,
+    projection_known_domain: np.ndarray | None = None,
+    projection_gap_forbidden_unknown: np.ndarray | None = None,
 ) -> np.ndarray:
     out = np.asarray(projected, dtype=bool).copy()
+    known = np.ones_like(out, dtype=bool) if projection_known_domain is None else np.asarray(projection_known_domain, dtype=bool)
+    forbidden_unknown = np.zeros_like(out, dtype=bool) if projection_gap_forbidden_unknown is None else np.asarray(projection_gap_forbidden_unknown, dtype=bool)
     max_gap_cells = max(0, int(round(float(cfg.max_fill_gap_m) / max(float(resolution_m), 1e-9))))
     if max_gap_cells <= 0:
         return out
     for r in range(out.shape[0]):
         cols = np.flatnonzero(out[r])
-        _fill_1d_line_gaps(out, free, door_forbidden, r, cols, axis="h", max_gap_cells=max_gap_cells, cfg=cfg)
+        _fill_1d_line_gaps(out, free, door_forbidden, r, cols, axis="h", max_gap_cells=max_gap_cells, cfg=cfg, projection_known_domain=known, projection_gap_forbidden_unknown=forbidden_unknown)
     for c in range(out.shape[1]):
         rows = np.flatnonzero(out[:, c])
-        _fill_1d_line_gaps(out, free, door_forbidden, c, rows, axis="v", max_gap_cells=max_gap_cells, cfg=cfg)
+        _fill_1d_line_gaps(out, free, door_forbidden, c, rows, axis="v", max_gap_cells=max_gap_cells, cfg=cfg, projection_known_domain=known, projection_gap_forbidden_unknown=forbidden_unknown)
     return out
 
 
@@ -980,6 +1244,8 @@ def _fill_1d_line_gaps(
     axis: str,
     max_gap_cells: int,
     cfg: WallProjectionConfig,
+    projection_known_domain: np.ndarray | None = None,
+    projection_gap_forbidden_unknown: np.ndarray | None = None,
 ) -> None:
     values = np.asarray(coords, dtype=np.int32)
     if values.size <= 1:
@@ -998,8 +1264,12 @@ def _fill_1d_line_gaps(
         valid = (rr >= 0) & (rr < out.shape[0]) & (cc >= 0) & (cc < out.shape[1])
         if not np.any(valid):
             continue
+        known = np.ones_like(out, dtype=bool) if projection_known_domain is None else np.asarray(projection_known_domain, dtype=bool)
+        forbidden_unknown = np.zeros_like(out, dtype=bool) if projection_gap_forbidden_unknown is None else np.asarray(projection_gap_forbidden_unknown, dtype=bool)
         free_ratio = float(np.count_nonzero(free[rr[valid], cc[valid]]) / max(1, int(np.count_nonzero(valid))))
-        if free_ratio > float(cfg.max_free_gap_ratio) or bool(np.any(door_forbidden[rr[valid], cc[valid]])):
+        blocked_unknown = bool(getattr(cfg, "projection_gap_forbid_unknown", True)) and bool(np.any(forbidden_unknown[rr[valid], cc[valid]]))
+        blocked_outside_known = bool(getattr(cfg, "projection_gap_forbid_outside_known", True)) and bool(np.any(~known[rr[valid], cc[valid]]))
+        if free_ratio > float(cfg.max_free_gap_ratio) or bool(np.any(door_forbidden[rr[valid], cc[valid]])) or blocked_unknown or blocked_outside_known:
             continue
         out[rr[valid], cc[valid]] = True
 

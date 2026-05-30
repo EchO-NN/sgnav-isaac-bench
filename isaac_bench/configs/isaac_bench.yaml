@@ -446,6 +446,16 @@ mapping:
       side_min_structural_ratio: 0.08
       min_line_observed_support_cells: 3
       keep_accepted_line_cells_even_if_unknown_dominant: true
+      projection_clip_to_known_domain: true
+      projection_gap_forbid_unknown: true
+      projection_gap_forbid_outside_known: true
+      projection_trim_line_ends_to_known: true
+      projection_forbid_parallel_valley_lines: true
+      projection_line_nms_lateral_radius_cells: 2
+      projection_valley_min_parallel_peak_cells: 3
+      projection_valley_min_peak_separation_cells: 3
+      projection_valley_direct_seed_min_cells: 2
+      projection_valley_direct_seed_ratio_min: 0.05
     voxel_door:
       enabled: true
       seed_method: centroid_ratio
@@ -557,6 +567,10 @@ mapping:
       use_real_wall_as_partition_barrier: true
       real_wall_barrier_dilation_cells: 0
       door_seed_wall_carve_radius_cells: 2
+      merge_small_enclosed_single_neighbor_enabled: true
+      merge_small_enclosed_single_neighbor_max_area_m2: 1.50
+      merge_small_enclosed_single_neighbor_connectivity: 4
+      merge_small_enclosed_single_neighbor_max_passes: 3
     voxel_step2:
       enable_extension_intersection_fallback: false
       separator_memory_enabled: true

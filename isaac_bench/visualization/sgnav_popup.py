@@ -1654,6 +1654,10 @@ class SGNavPopupVisualizer:
             projected_wall = self._room_debug_array("voxel_wall_projected_xy", shape, bool)
         anchor_projected_wall = self._room_debug_array("voxel_anchor_projected_wall_map", shape, bool)
         rejected_wall_support = self._room_debug_array("voxel_wall_projection_rejected_support_map", shape, bool)
+        projected_wall_clipped = self._room_debug_array("voxel_projected_wall_clipped_outside_known_map", shape, bool)
+        projected_wall_rejected_valley = self._room_debug_array("voxel_projected_wall_rejected_parallel_valley_map", shape, bool)
+        projected_wall_rejected_unknown_gap = self._room_debug_array("voxel_projected_wall_rejected_unknown_gap_map", shape, bool)
+        projected_wall_rejected_outside_gap = self._room_debug_array("voxel_projected_wall_rejected_outside_known_gap_map", shape, bool)
         unknown_dominant = self._room_debug_array("voxel_unknown_dominant_xy", shape, bool)
         unknown_rejected_wall = self._room_debug_array("voxel_wall_support_rejected_unknown_xy", shape, bool)
         unknown_gated_wall = self._room_debug_array("voxel_wall_support_unknown_gated_xy", shape, bool)
@@ -1755,6 +1759,9 @@ class SGNavPopupVisualizer:
             canvas[wall_line_support & ~wall_visual] = (255, 170, 64)
             canvas[nonstructural_occupied & ~wall_visual] = (120, 98, 72)
             canvas[rejected_wall_support] = (255, 142, 45)
+            canvas[projected_wall_clipped] = (130, 120, 100)
+            canvas[projected_wall_rejected_valley] = (120, 120, 140)
+            canvas[projected_wall_rejected_unknown_gap | projected_wall_rejected_outside_gap] = (105, 98, 92)
             canvas[unknown_rejected_wall] = (255, 118, 36)
             canvas[unknown_dominant & ~unknown_rejected_wall] = (74, 70, 92)
             canvas[unknown_gated_wall & ~wall_visual] = (150, 46, 54)
@@ -1966,6 +1973,10 @@ class SGNavPopupVisualizer:
             self._overlay_record("voxel_wall_projected", bool(np.any(projected_wall)), (255, 30, 30), projected_wall_count, "projected structural wall line used by room boundaries and anchors"),
             self._overlay_record("voxel_anchor_projected_wall", bool(show_diag and np.any(anchor_projected_wall)), (255, 156, 42), int(np.count_nonzero(anchor_projected_wall)), "diagnostic relaxed short projected wall anchors for door and step2"),
             self._overlay_record("voxel_wall_projection_rejected_support", bool(show_diag and np.any(rejected_wall_support)), (255, 142, 45), int(np.count_nonzero(rejected_wall_support)), "diagnostic raw wall support rejected by wall projection"),
+            self._overlay_record("voxel_projected_wall_clipped_outside_known", bool(show_diag and np.any(projected_wall_clipped)), (130, 120, 100), int(np.count_nonzero(projected_wall_clipped)), "diagnostic projected wall cells clipped outside known projection domain"),
+            self._overlay_record("voxel_projected_wall_rejected_parallel_valley", bool(show_diag and np.any(projected_wall_rejected_valley)), (120, 120, 140), int(np.count_nonzero(projected_wall_rejected_valley)), "diagnostic projected middle line rejected between parallel wall supports"),
+            self._overlay_record("voxel_projected_wall_rejected_unknown_gap", bool(show_diag and np.any(projected_wall_rejected_unknown_gap)), (105, 98, 92), int(np.count_nonzero(projected_wall_rejected_unknown_gap)), "diagnostic projected wall gap rejected because it crosses unknown"),
+            self._overlay_record("voxel_projected_wall_rejected_outside_known_gap", bool(show_diag and np.any(projected_wall_rejected_outside_gap)), (105, 98, 92), int(np.count_nonzero(projected_wall_rejected_outside_gap)), "diagnostic projected wall gap rejected outside known domain"),
             self._overlay_record("voxel_step1_completed_wall", bool(np.any(step1_completed)), (226, 192, 46), step1_completed_count, "wall map after step1 gap completion"),
             self._overlay_record("voxel_wall_red", True, (255, 30, 30), int(np.count_nonzero(wall_visual)), "default clean red wall display"),
             self._overlay_record("voxel_wall", True, (255, 30, 30), int(np.count_nonzero(wall)), "final voxel wall layer"),
