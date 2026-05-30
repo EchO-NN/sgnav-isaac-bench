@@ -137,6 +137,119 @@ class GridAStarPlanner:
         return self.plan(start, goal).length_m
 
 
+class ClearanceAStarPlanner(GridAStarPlanner):
+    def __init__(
+        self,
+        traversible: np.ndarray,
+        resolution_m: float,
+        occupied: np.ndarray | None = None,
+        allow_diagonal: bool = True,
+        clearance_desired_m: float = 0.25,
+        clearance_weight: float = 3.0,
+        clearance_power: float = 2.0,
+        clearance_hard_min_m: float = 0.0,
+    ):
+        super().__init__(traversible, resolution_m, allow_diagonal=allow_diagonal)
+        self.clearance_desired_m = max(1e-6, float(clearance_desired_m))
+        self.clearance_weight = max(0.0, float(clearance_weight))
+        self.clearance_power = max(0.1, float(clearance_power))
+        self.clearance_hard_min_m = max(0.0, float(clearance_hard_min_m))
+        hard_free = np.asarray(self.traversible, dtype=bool)
+        if occupied is not None:
+            hard_free = hard_free & ~np.asarray(occupied, dtype=bool)
+        self.clearance_m = _distance_transform_clearance_m(hard_free, self.resolution_m)
+
+    def clearance_penalty(self, cell: GridCell) -> float:
+        if not self.inside(cell):
+            return float("inf")
+        d = float(self.clearance_m[int(cell[0]), int(cell[1])])
+        if self.clearance_hard_min_m > 0.0 and d < self.clearance_hard_min_m:
+            return float("inf")
+        deficit = max(0.0, self.clearance_desired_m - d) / self.clearance_desired_m
+        if deficit <= 0.0 or self.clearance_weight <= 0.0:
+            return 0.0
+        return float(self.clearance_weight * (deficit ** self.clearance_power))
+
+    def plan(self, start: GridCell, goal: Union[GridCell, Iterable[GridCell]]) -> AStarResult:
+        start_free = self.snap_to_free((int(start[0]), int(start[1])))
+        goals = self._goal_set(goal)
+        if start_free is None or not goals:
+            return AStarResult([], float("inf"), None)
+        if start_free in goals:
+            return AStarResult([start_free], 0.0, start_free)
+
+        goal_list = list(goals)
+        open_heap: List[Tuple[float, int, GridCell]] = []
+        seq = 0
+        heapq.heappush(open_heap, (self._heuristic(start_free, goal_list, self.resolution_m), seq, start_free))
+        came_from: Dict[GridCell, GridCell] = {}
+        g_score: Dict[GridCell, float] = {start_free: 0.0}
+        closed: set[GridCell] = set()
+
+        reached: Optional[GridCell] = None
+        while open_heap:
+            _, _, current = heapq.heappop(open_heap)
+            if current in closed:
+                continue
+            if current in goals:
+                reached = current
+                break
+            closed.add(current)
+
+            for dr, dc, step_cost in self.neighbors:
+                nbr = (current[0] + dr, current[1] + dc)
+                if not self.can_step(current, dr, dc) or nbr in closed:
+                    continue
+                penalty = self.clearance_penalty(nbr)
+                if not math.isfinite(penalty):
+                    continue
+                tentative = g_score[current] + step_cost * (1.0 + penalty)
+                if tentative >= g_score.get(nbr, float("inf")):
+                    continue
+                came_from[nbr] = current
+                g_score[nbr] = tentative
+                seq += 1
+                f_score = tentative + self._heuristic(nbr, goal_list, self.resolution_m)
+                heapq.heappush(open_heap, (f_score, seq, nbr))
+
+        if reached is None:
+            return AStarResult([], float("inf"), None)
+
+        path = [reached]
+        while path[-1] != start_free:
+            path.append(came_from[path[-1]])
+        path.reverse()
+        return AStarResult(path, g_score[reached], reached)
+
+
+def _distance_transform_clearance_m(traversible: np.ndarray, resolution_m: float) -> np.ndarray:
+    free = np.asarray(traversible, dtype=bool)
+    try:
+        from scipy import ndimage
+
+        return ndimage.distance_transform_edt(free).astype(np.float32) * float(resolution_m)
+    except Exception:
+        dist = np.full(free.shape, np.inf, dtype=np.float32)
+        queue: list[GridCell] = []
+        h, w = free.shape
+        for r in range(h):
+            for c in range(w):
+                if not free[r, c]:
+                    dist[r, c] = 0.0
+                    queue.append((r, c))
+        if not queue:
+            return np.full(free.shape, max(h, w) * float(resolution_m), dtype=np.float32)
+        head = 0
+        while head < len(queue):
+            r, c = queue[head]
+            head += 1
+            for nr, nc in ((r - 1, c), (r + 1, c), (r, c - 1), (r, c + 1)):
+                if 0 <= nr < h and 0 <= nc < w and dist[nr, nc] > dist[r, c] + float(resolution_m):
+                    dist[nr, nc] = dist[r, c] + float(resolution_m)
+                    queue.append((nr, nc))
+        return dist
+
+
 def astar_distance_map(traversible: np.ndarray, start: GridCell, resolution_m: float, allow_diagonal: bool = True) -> np.ndarray:
     planner = GridAStarPlanner(traversible, resolution_m, allow_diagonal=allow_diagonal)
     start_free = planner.snap_to_free(start)

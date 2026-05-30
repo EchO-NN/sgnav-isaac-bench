@@ -31,6 +31,18 @@ def _seed_result(shape: tuple[int, int], components: list[list[tuple[int, int]]]
     )
 
 
+def _legacy_completion_config(**overrides: object) -> VoxelDoorDetectorConfig:
+    data = {
+        "min_seed_cells_for_accepted_extension": 1,
+        "min_seed_line_length_cells_for_accepted_extension": 1,
+        "min_seed_elongation_for_direction": 1.0,
+        "accepted_orientation_mode": "legacy",
+        "local_free_neck_orientation_debug_only": False,
+    }
+    data.update(overrides)
+    return VoxelDoorDetectorConfig(**data)
+
+
 def test_one_seed_one_wall_completion_generates_partition_cut() -> None:
     shape = (18, 24)
     seed = _seed_result(shape, [[(9, 12)]])
@@ -46,7 +58,7 @@ def test_one_seed_one_wall_completion_generates_partition_cut() -> None:
         anchor_wall_map=anchors,
         unknown_map=np.zeros(shape, dtype=bool),
         resolution_m=0.10,
-        config=VoxelDoorDetectorConfig(
+        config=_legacy_completion_config(
             wall_anchor_radius_cells=0,
             seed_cluster_morph_close_radius_cells=0,
             partition_topology_enabled=False,
@@ -73,7 +85,7 @@ def test_seed_pair_bridge_supports_two_offset_seed_blobs_without_wall_anchor() -
         anchor_wall_map=np.zeros(shape, dtype=bool),
         unknown_map=np.zeros(shape, dtype=bool),
         resolution_m=0.10,
-        config=VoxelDoorDetectorConfig(
+        config=_legacy_completion_config(
             wall_anchor_radius_cells=0,
             seed_cluster_morph_close_radius_cells=0,
             seed_cluster_merge_distance_cells=0,
@@ -105,7 +117,7 @@ def test_topology_no_gain_is_warning_by_default_for_geometry_valid_door_cut() ->
         anchor_wall_map=anchors,
         unknown_map=np.zeros(shape, dtype=bool),
         resolution_m=0.10,
-        config=VoxelDoorDetectorConfig(wall_anchor_radius_cells=0),
+        config=_legacy_completion_config(wall_anchor_radius_cells=0),
     )
 
     assert np.any(result.door_cut_mask_for_partition)

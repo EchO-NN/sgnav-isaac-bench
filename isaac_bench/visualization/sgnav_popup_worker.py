@@ -57,7 +57,7 @@ def main(argv: List[str] | None = None) -> int:
                 break
         except Exception as exc:
             print("[sgnav-viz-worker] frame update failed: %s" % exc, file=sys.stderr, flush=True)
-            break
+            continue
     try:
         cv2.destroyWindow(args.window_name)
     except Exception:

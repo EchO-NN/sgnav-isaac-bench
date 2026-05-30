@@ -79,7 +79,7 @@ def test_raw_support_overlap_does_not_remove_partition_free_or_become_anchor() -
     assert bundle.debug["voxel_partition_maps_stage"] == "v19_wall_recovery_partition_sources"
 
 
-def test_door_seed_carves_partition_wall_but_not_anchor_support() -> None:
+def test_raw_door_seed_does_not_carve_partition_wall() -> None:
     shape = (8, 9)
     evidence = _evidence(shape)
     door_seed = np.zeros(shape, dtype=bool)
@@ -99,8 +99,38 @@ def test_door_seed_carves_partition_wall_but_not_anchor_support() -> None:
 
     assert bundle.wall_anchor_support_map[2, 4]
     assert bundle.door_anchor_wall_map[2, 4]
+    assert bundle.partition_real_wall_map[2, 4]
+    assert not bundle.removed_by_seed_carve_map[2, 4]
+    assert bundle.debug["voxel_raw_seed_carve_disabled"] is True
+    assert bundle.debug["voxel_raw_seed_carve_cells_legacy_would_remove"] >= 1
+
+
+def test_accepted_door_cut_carves_partition_wall_but_not_anchor_support() -> None:
+    shape = (8, 9)
+    evidence = _evidence(shape)
+    door_seed = np.zeros(shape, dtype=bool)
+    door_seed[2, 4] = True
+    accepted_cut = np.zeros(shape, dtype=bool)
+    accepted_cut[2, 4] = True
+    cfg = VoxelOccupancyDoorWallRoomSegConfig(door_seed_wall_carve_radius_cells=0)
+    bundle = build_voxel_partition_maps(
+        evidence=evidence,
+        door_seed_mask=door_seed,
+        wall_carve_mask=accepted_cut,
+        strict_raw_wall=evidence.strict_raw_wall_xy,
+        projected_wall_map=np.zeros(shape, dtype=bool),
+        anchor_projected_wall_map=np.zeros(shape, dtype=bool),
+        filtered_line_map=np.zeros(shape, dtype=bool),
+        extension_seed_line_map=np.zeros(shape, dtype=bool),
+        step1_gap_fill_map=np.zeros(shape, dtype=bool),
+        cfg=cfg,
+    )
+
+    assert bundle.wall_anchor_support_map[2, 4]
+    assert bundle.door_anchor_wall_map[2, 4]
     assert not bundle.partition_real_wall_map[2, 4]
     assert bundle.removed_by_seed_carve_map[2, 4]
+    assert bundle.debug["voxel_wall_carve_accepted_door_cells"] == 1
 
 
 def test_extension_seed_line_not_partition_wall() -> None:

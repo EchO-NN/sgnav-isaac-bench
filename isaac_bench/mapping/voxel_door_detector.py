@@ -92,6 +92,17 @@ class VoxelDoorDetectorConfig:
     seed_cluster_max_width_m: float = 1.80
     seed_cluster_min_shared_anchor_score: float = 0.0
     completion_orientation_mode: str = "pca_plus_axis_plus_wall_pair"
+    min_seed_cells_for_accepted_extension: int = 3
+    min_seed_line_length_cells_for_accepted_extension: int = 3
+    min_seed_elongation_for_direction: float = 1.6
+    max_seed_line_residual_cells_for_direction: float = 1.25
+    accepted_orientation_mode: str = "seed_major_only"
+    allow_axis_orientation_if_aligned_with_seed: bool = True
+    axis_orientation_max_angle_to_seed_deg: float = 15.0
+    allow_wall_pair_orientation_if_aligned_with_seed: bool = True
+    wall_pair_orientation_max_angle_to_seed_deg: float = 20.0
+    local_free_neck_orientation_debug_only: bool = True
+    single_seed_completion_debug_only: bool = True
     allow_diagonal_orientation_candidates: bool = False
     infer_orientation_from_wall_pairs: bool = True
     infer_orientation_from_local_free_neck: bool = True
@@ -130,13 +141,13 @@ class VoxelDoorDetectorConfig:
     min_geometry_cut_cells: int = 1
     door_memory_enabled: bool = True
     door_memory_initial_confidence: float = 1.0
-    door_memory_match_iou_min: float = 0.20
-    door_memory_match_distance_cells: int = 3
+    door_memory_match_iou_min: float = 0.05
+    door_memory_match_distance_cells: int = 6
     door_memory_match_angle_deg: float = 20.0
-    door_memory_decay_per_update: float = 0.10
+    door_memory_decay_per_update: float = 0.02
     door_memory_confirm_increment: float = 0.35
-    door_memory_min_confidence_to_keep: float = 0.25
-    door_memory_ttl_updates: int = 8
+    door_memory_min_confidence_to_keep: float = 0.15
+    door_memory_ttl_updates: int = 30
     show_candidate_lines_in_debug: bool = True
 
     @classmethod
@@ -922,6 +933,47 @@ def complete_voxel_doors_from_seeds(
                         "seed_group_id": int(group.group_id),
                         "seed_group_kind": str(group.group_kind),
                         "source_cluster_ids": [int(v) for v in group.source_cluster_ids],
+                    },
+                )
+            )
+            cid += 1
+            continue
+        extensible_ok, extensible_reason, extensible_debug = is_seed_group_extensible(group, cfg, resolution_m=float(resolution_m))
+        if not bool(extensible_ok):
+            candidate = _rejected_candidate(cid, int(group.group_id), list(group.seed_cells), str(extensible_reason or "seed_group_not_extensible"))
+            candidate.debug.update(
+                {
+                    "cluster_id": int(group.group_id),
+                    "seed_group_id": int(group.group_id),
+                    "seed_group_kind": str(group.group_kind),
+                    "source_cluster_ids": [int(v) for v in group.source_cluster_ids],
+                    "component_ids": [int(v) for v in group.component_ids],
+                    "completion_mode": DOOR_COMPLETION_REJECTED,
+                    "visual_accepted": False,
+                    "partition_accepted": False,
+                    "partition_topology_accepted": False,
+                    "reject_reason_visual": str(extensible_reason or "seed_group_not_extensible"),
+                    "reject_reason_partition": "visual_rejected",
+                    "reject_reason_topology": "visual_rejected",
+                    **extensible_debug,
+                }
+            )
+            selected_candidates.append(candidate)
+            all_trial_candidates.append(candidate)
+            trial_groups.append(
+                DoorTrialCandidateGroup(
+                    cluster_id=int(group.group_id),
+                    component_ids=[int(v) for v in group.component_ids],
+                    trials=[candidate],
+                    selected_candidate_id=int(candidate.candidate_id),
+                    selected_reason=str(extensible_reason or "seed_group_not_extensible"),
+                    debug={
+                        "trial_count": 1,
+                        "selected_score": 0.0,
+                        "seed_group_id": int(group.group_id),
+                        "seed_group_kind": str(group.group_kind),
+                        "source_cluster_ids": [int(v) for v in group.source_cluster_ids],
+                        **extensible_debug,
                     },
                 )
             )
@@ -2088,35 +2140,63 @@ def _expanded_bboxes_intersect(a: tuple[int, int, int, int], b: tuple[int, int, 
 
 
 def _door_orientation_candidates(
-    cluster: DoorSeedCluster,
+    cluster: DoorSeedCluster | DoorSeedGroup,
     cfg: VoxelDoorDetectorConfig,
     *,
     wall_clean: np.ndarray | None = None,
     free_clean: np.ndarray | None = None,
 ) -> list[tuple[str, np.ndarray]]:
     candidates: list[tuple[str, np.ndarray]] = []
-    mode = str(cfg.completion_orientation_mode or "pca_plus_axis").strip().lower()
-    if "pca" in mode and len(cluster.seed_cells) >= 2:
-        candidates.append(("pca", np.asarray(cluster.major_dir_rc, dtype=np.float32)))
-    if "axis" in mode or not candidates:
-        candidates.extend(
-            [
-                ("axis_h", np.asarray([0.0, 1.0], dtype=np.float32)),
-                ("axis_v", np.asarray([1.0, 0.0], dtype=np.float32)),
-            ]
-        )
-    if bool(cfg.allow_diagonal_orientation_candidates) or "diagonal" in mode:
-        scale = float(1.0 / np.sqrt(2.0))
-        candidates.extend(
-            [
-                ("diag_down", np.asarray([scale, scale], dtype=np.float32)),
-                ("diag_up", np.asarray([scale, -scale], dtype=np.float32)),
-            ]
-        )
-    if bool(getattr(cfg, "infer_orientation_from_wall_pairs", True)) and wall_clean is not None:
-        candidates.extend(_infer_directions_from_nearby_wall_pairs(cluster, np.asarray(wall_clean, dtype=bool)))
-    if bool(getattr(cfg, "infer_orientation_from_local_free_neck", True)) and free_clean is not None:
-        candidates.extend(_infer_directions_from_local_free_neck(cluster, np.asarray(free_clean, dtype=bool)))
+    mode = str(getattr(cfg, "accepted_orientation_mode", "seed_major_only") or "seed_major_only").strip().lower()
+    seed_major = _unit(np.asarray(cluster.major_dir_rc, dtype=np.float32))
+    if seed_major is not None:
+        candidates.append(("seed_major", seed_major.astype(np.float32)))
+
+    if bool(getattr(cfg, "allow_axis_orientation_if_aligned_with_seed", True)) and seed_major is not None:
+        axis = _nearest_axis(seed_major)
+        angle = _unsigned_angle_deg(axis, seed_major)
+        if angle <= float(getattr(cfg, "axis_orientation_max_angle_to_seed_deg", 15.0)):
+            candidates.append(("axis_snapped_from_seed_major", axis.astype(np.float32)))
+
+    if (
+        bool(getattr(cfg, "allow_wall_pair_orientation_if_aligned_with_seed", True))
+        and bool(getattr(cfg, "infer_orientation_from_wall_pairs", True))
+        and wall_clean is not None
+        and seed_major is not None
+    ):
+        for source, vec in _infer_directions_from_nearby_wall_pairs(cluster, np.asarray(wall_clean, dtype=bool)):
+            unit = _unit(vec)
+            if unit is not None and _unsigned_angle_deg(unit, seed_major) <= float(getattr(cfg, "wall_pair_orientation_max_angle_to_seed_deg", 20.0)):
+                candidates.append(("wall_pair_aligned_with_seed", unit.astype(np.float32)))
+
+    if (
+        not bool(getattr(cfg, "local_free_neck_orientation_debug_only", True))
+        and bool(getattr(cfg, "infer_orientation_from_local_free_neck", True))
+        and free_clean is not None
+        and seed_major is not None
+    ):
+        for source, vec in _infer_directions_from_local_free_neck(cluster, np.asarray(free_clean, dtype=bool)):
+            unit = _unit(vec)
+            if unit is not None and _unsigned_angle_deg(unit, seed_major) <= float(getattr(cfg, "wall_pair_orientation_max_angle_to_seed_deg", 20.0)):
+                candidates.append((source, unit.astype(np.float32)))
+
+    if "legacy" in mode:
+        legacy_mode = str(cfg.completion_orientation_mode or "pca_plus_axis").strip().lower()
+        if "axis" in legacy_mode:
+            candidates.extend(
+                [
+                    ("axis_h_legacy", np.asarray([0.0, 1.0], dtype=np.float32)),
+                    ("axis_v_legacy", np.asarray([1.0, 0.0], dtype=np.float32)),
+                ]
+            )
+        if bool(cfg.allow_diagonal_orientation_candidates) or "diagonal" in legacy_mode:
+            scale = float(1.0 / np.sqrt(2.0))
+            candidates.extend(
+                [
+                    ("diag_down_legacy", np.asarray([scale, scale], dtype=np.float32)),
+                    ("diag_up_legacy", np.asarray([scale, -scale], dtype=np.float32)),
+                ]
+            )
     out: list[tuple[str, np.ndarray]] = []
     seen: list[np.ndarray] = []
     for source, vec in candidates:
@@ -2129,6 +2209,65 @@ def _door_orientation_candidates(
         seen.append(unit)
         out.append((source, unit.astype(np.float32)))
     return out
+
+
+def is_seed_group_extensible(group: DoorSeedGroup, cfg: VoxelDoorDetectorConfig, *, resolution_m: float) -> tuple[bool, str | None, dict[str, object]]:
+    seed_count = int(len(group.seed_cells))
+    length_cells = float(group.length_m) / max(float(resolution_m), 1e-9)
+    thickness_cells = max(1.0, float(group.thickness_m) / max(float(resolution_m), 1e-9))
+    elongation = float(length_cells / max(thickness_cells, 1e-6))
+    residual = float(group.line_fit_residual_cells)
+    debug = {
+        "seed_group_extensible_checked": True,
+        "seed_group_seed_count": int(seed_count),
+        "seed_group_line_length_cells": float(length_cells),
+        "seed_group_elongation": float(elongation),
+        "seed_group_line_fit_residual_cells": float(residual),
+        "min_seed_cells_for_accepted_extension": int(getattr(cfg, "min_seed_cells_for_accepted_extension", 3)),
+        "min_seed_line_length_cells_for_accepted_extension": int(getattr(cfg, "min_seed_line_length_cells_for_accepted_extension", 3)),
+        "min_seed_elongation_for_direction": float(getattr(cfg, "min_seed_elongation_for_direction", 1.6)),
+        "max_seed_line_residual_cells_for_direction": float(getattr(cfg, "max_seed_line_residual_cells_for_direction", 1.25)),
+    }
+    if seed_count < int(getattr(cfg, "min_seed_cells_for_accepted_extension", 3)):
+        debug["seed_group_extensible_reason"] = "seed_group_too_few_cells_for_extension"
+        return False, "seed_group_too_few_cells_for_extension", debug
+    if length_cells + 1e-6 < float(getattr(cfg, "min_seed_line_length_cells_for_accepted_extension", 3)):
+        debug["seed_group_extensible_reason"] = "seed_group_line_too_short_for_extension"
+        return False, "seed_group_line_too_short_for_extension", debug
+    if elongation + 1e-6 < float(getattr(cfg, "min_seed_elongation_for_direction", 1.6)):
+        debug["seed_group_extensible_reason"] = "seed_group_orientation_ambiguous"
+        return False, "seed_group_orientation_ambiguous", debug
+    if residual > float(getattr(cfg, "max_seed_line_residual_cells_for_direction", 1.25)) + 1e-6:
+        debug["seed_group_extensible_reason"] = "seed_group_not_line_like"
+        return False, "seed_group_not_line_like", debug
+    debug["seed_group_extensible_reason"] = None
+    return True, None, debug
+
+
+def _unit(vec: np.ndarray) -> np.ndarray | None:
+    arr = np.asarray(vec, dtype=np.float32).reshape(2)
+    norm = float(np.linalg.norm(arr))
+    if norm <= 1e-6:
+        return None
+    return (arr / norm).astype(np.float32)
+
+
+def _nearest_axis(vec: np.ndarray) -> np.ndarray:
+    unit = _unit(vec)
+    if unit is None:
+        return np.asarray([0.0, 1.0], dtype=np.float32)
+    if abs(float(unit[0])) >= abs(float(unit[1])):
+        return np.asarray([1.0, 0.0], dtype=np.float32) * (1.0 if float(unit[0]) >= 0.0 else -1.0)
+    return np.asarray([0.0, 1.0], dtype=np.float32) * (1.0 if float(unit[1]) >= 0.0 else -1.0)
+
+
+def _unsigned_angle_deg(a: np.ndarray, b: np.ndarray) -> float:
+    au = _unit(a)
+    bu = _unit(b)
+    if au is None or bu is None:
+        return 180.0
+    dot = min(1.0, max(-1.0, abs(float(np.dot(au, bu)))))
+    return float(np.degrees(np.arccos(dot)))
 
 
 def _infer_directions_from_nearby_wall_pairs(cluster: DoorSeedCluster, wall_clean: np.ndarray) -> list[tuple[str, np.ndarray]]:

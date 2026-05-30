@@ -87,6 +87,36 @@ class NavigationProjection:
 
 
 @dataclass
+class NavigationProjectionConfig:
+    obstacle_z_min_m: float = 0.20
+    obstacle_z_max_m: float = 0.90
+    free_z_min_m: float = 0.10
+    free_z_max_m: float = 0.90
+    min_free_voxels: int = 1
+    occupied_any_voxel_wins: bool = True
+    occupied_use_endpoint_hysteresis: bool = True
+    occupied_endpoint_count_threshold: int = 1
+    occupied_endpoint_decay_per_free_ray: int = 1
+    occupied_endpoint_increment: int = 2
+    occupied_endpoint_xy_splat_radius_cells: int = 1
+    occupied_endpoint_z_splat_radius_cells: int = 0
+    occupied_close_radius_cells: int = 1
+    occupied_fill_small_holes_max_area_cells: int = 4
+    occupied_priority_over_free: bool = True
+    unknown_preserve_when_no_observation: bool = True
+    debug_navigation_projection_layers: bool = True
+
+    @classmethod
+    def from_mapping(cls, data: Mapping[str, object] | None = None, **overrides: object) -> "NavigationProjectionConfig":
+        raw = dict(data or {})
+        for key, value in overrides.items():
+            if value is not None:
+                raw[key] = value
+        fields = {name for name in cls.__dataclass_fields__}
+        return cls(**{key: raw[key] for key in raw if key in fields})
+
+
+@dataclass
 class VoxelIntegrationStats:
     depth_rays_integrated: int = 0
     skipped_empty_rays: int = 0
@@ -569,41 +599,134 @@ class VoxelOccupancyGrid3D:
         free_z_min_m: float = 0.10,
         free_z_max_m: float = 0.90,
         min_free_voxels: int = 1,
+        nav_endpoint_count_xy: np.ndarray | None = None,
+        config: NavigationProjectionConfig | Mapping[str, object] | None = None,
+        occupied_any_voxel_wins: bool = True,
+        occupied_use_endpoint_hysteresis: bool = True,
+        occupied_endpoint_count_threshold: int = 1,
+        occupied_endpoint_decay_per_free_ray: int = 1,
+        occupied_endpoint_increment: int = 2,
+        occupied_endpoint_xy_splat_radius_cells: int = 1,
+        occupied_endpoint_z_splat_radius_cells: int = 0,
+        occupied_close_radius_cells: int = 1,
+        occupied_fill_small_holes_max_area_cells: int = 4,
+        occupied_priority_over_free: bool = True,
+        unknown_preserve_when_no_observation: bool = True,
+        debug_navigation_projection_layers: bool = True,
     ) -> NavigationProjection:
         started_at = time.perf_counter()
-        occ_idx = self.active_z_indices(z_min_m=float(obstacle_z_min_m), z_max_m=float(obstacle_z_max_m))
-        free_idx = self.active_z_indices(z_min_m=float(free_z_min_m), z_max_m=float(free_z_max_m))
+        cfg = (
+            config
+            if isinstance(config, NavigationProjectionConfig)
+            else NavigationProjectionConfig.from_mapping(
+                config,
+                obstacle_z_min_m=obstacle_z_min_m,
+                obstacle_z_max_m=obstacle_z_max_m,
+                free_z_min_m=free_z_min_m,
+                free_z_max_m=free_z_max_m,
+                min_free_voxels=min_free_voxels,
+                occupied_any_voxel_wins=occupied_any_voxel_wins,
+                occupied_use_endpoint_hysteresis=occupied_use_endpoint_hysteresis,
+                occupied_endpoint_count_threshold=occupied_endpoint_count_threshold,
+                occupied_endpoint_decay_per_free_ray=occupied_endpoint_decay_per_free_ray,
+                occupied_endpoint_increment=occupied_endpoint_increment,
+                occupied_endpoint_xy_splat_radius_cells=occupied_endpoint_xy_splat_radius_cells,
+                occupied_endpoint_z_splat_radius_cells=occupied_endpoint_z_splat_radius_cells,
+                occupied_close_radius_cells=occupied_close_radius_cells,
+                occupied_fill_small_holes_max_area_cells=occupied_fill_small_holes_max_area_cells,
+                occupied_priority_over_free=occupied_priority_over_free,
+                unknown_preserve_when_no_observation=unknown_preserve_when_no_observation,
+                debug_navigation_projection_layers=debug_navigation_projection_layers,
+            )
+        )
+        occ_idx = self.active_z_indices(z_min_m=float(cfg.obstacle_z_min_m), z_max_m=float(cfg.obstacle_z_max_m))
+        free_idx = self.active_z_indices(z_min_m=float(cfg.free_z_min_m), z_max_m=float(cfg.free_z_max_m))
         union_idx = np.unique(np.concatenate([occ_idx, free_idx])).astype(np.int32) if occ_idx.size or free_idx.size else np.asarray([], dtype=np.int32)
-        if occ_idx.size:
-            occupied = np.any(self.state[occ_idx] == int(VOXEL_OCCUPIED), axis=0)
+        if occ_idx.size and bool(cfg.occupied_any_voxel_wins):
+            occupied_from_voxel = np.any(self.state[occ_idx] == int(VOXEL_OCCUPIED), axis=0)
         else:
-            occupied = np.zeros(self.shape, dtype=bool)
+            occupied_from_voxel = np.zeros(self.shape, dtype=bool)
         if free_idx.size:
             free_count = np.sum(self.state[free_idx] == int(VOXEL_FREE), axis=0)
-            free = free_count >= max(1, int(min_free_voxels))
+            free_raw = free_count >= max(1, int(cfg.min_free_voxels))
         else:
             free_count = np.zeros(self.shape, dtype=np.int16)
-            free = np.zeros(self.shape, dtype=bool)
-        free = np.asarray(free, dtype=bool) & ~occupied
-        if union_idx.size:
-            observed = np.any(self.state[union_idx] != int(VOXEL_UNKNOWN), axis=0)
+            free_raw = np.zeros(self.shape, dtype=bool)
+        if nav_endpoint_count_xy is not None and bool(cfg.occupied_use_endpoint_hysteresis):
+            endpoint_count = np.asarray(nav_endpoint_count_xy)
+            if endpoint_count.shape != self.shape:
+                raise ValueError("nav_endpoint_count_xy shape %s does not match grid shape %s" % (endpoint_count.shape, self.shape))
+            occupied_from_endpoint = endpoint_count.astype(np.uint16) >= max(1, int(cfg.occupied_endpoint_count_threshold))
         else:
-            observed = np.zeros(self.shape, dtype=bool)
+            occupied_from_endpoint = np.zeros(self.shape, dtype=bool)
+        occupied_raw = np.asarray(occupied_from_voxel | occupied_from_endpoint, dtype=bool)
+        occupied_closed = occupied_raw
+        if int(cfg.occupied_close_radius_cells) > 0:
+            occupied_closed = _binary_close_disk(occupied_closed, int(cfg.occupied_close_radius_cells))
+        hole_filled_mask = np.zeros(self.shape, dtype=bool)
+        if int(cfg.occupied_fill_small_holes_max_area_cells) > 0:
+            occupied_closed, hole_filled_mask = _fill_small_false_holes(
+                occupied_closed,
+                max_area_cells=int(cfg.occupied_fill_small_holes_max_area_cells),
+            )
+        occupied = np.asarray(occupied_closed, dtype=bool)
+        free_suppressed_by_occupied = np.asarray(free_raw, dtype=bool) & occupied
+        if bool(cfg.occupied_priority_over_free):
+            free = np.asarray(free_raw, dtype=bool) & ~occupied
+        else:
+            free = np.asarray(free_raw, dtype=bool)
+            occupied = occupied & ~free
+        if union_idx.size:
+            observed_from_voxel = np.any(self.state[union_idx] != int(VOXEL_UNKNOWN), axis=0)
+        else:
+            observed_from_voxel = np.zeros(self.shape, dtype=bool)
+        observed = np.asarray(observed_from_voxel | free | occupied, dtype=bool)
         unknown = ~observed
+        free &= ~unknown
+        occupied &= ~unknown
         debug = {
-            "voxel_nav_obstacle_z_min_m": float(obstacle_z_min_m),
-            "voxel_nav_obstacle_z_max_m": float(obstacle_z_max_m),
-            "voxel_nav_free_z_min_m": float(free_z_min_m),
-            "voxel_nav_free_z_max_m": float(free_z_max_m),
-            "voxel_nav_min_free_voxels": int(min_free_voxels),
+            "voxel_nav_obstacle_z_min_m": float(cfg.obstacle_z_min_m),
+            "voxel_nav_obstacle_z_max_m": float(cfg.obstacle_z_max_m),
+            "voxel_nav_free_z_min_m": float(cfg.free_z_min_m),
+            "voxel_nav_free_z_max_m": float(cfg.free_z_max_m),
+            "voxel_nav_min_free_voxels": int(cfg.min_free_voxels),
+            "voxel_nav_occupied_any_voxel_wins": bool(cfg.occupied_any_voxel_wins),
+            "voxel_nav_occupied_use_endpoint_hysteresis": bool(cfg.occupied_use_endpoint_hysteresis),
+            "voxel_nav_occupied_endpoint_count_threshold": int(cfg.occupied_endpoint_count_threshold),
+            "voxel_nav_occupied_endpoint_decay_per_free_ray": int(cfg.occupied_endpoint_decay_per_free_ray),
+            "voxel_nav_occupied_endpoint_increment": int(cfg.occupied_endpoint_increment),
+            "voxel_nav_occupied_endpoint_xy_splat_radius_cells": int(cfg.occupied_endpoint_xy_splat_radius_cells),
+            "voxel_nav_occupied_close_radius_cells": int(cfg.occupied_close_radius_cells),
+            "voxel_nav_occupied_fill_small_holes_max_area_cells": int(cfg.occupied_fill_small_holes_max_area_cells),
             "voxel_nav_obstacle_z_bins": int(occ_idx.size),
             "voxel_nav_free_z_bins": int(free_idx.size),
             "voxel_nav_free_cells": int(np.count_nonzero(free)),
             "voxel_nav_occupied_cells": int(np.count_nonzero(occupied)),
+            "voxel_nav_occupied_from_voxel_cells": int(np.count_nonzero(occupied_from_voxel)),
+            "voxel_nav_occupied_from_endpoint_cells": int(np.count_nonzero(occupied_from_endpoint)),
+            "voxel_nav_occupied_raw_cells": int(np.count_nonzero(occupied_raw)),
+            "voxel_nav_occupied_closed_cells": int(np.count_nonzero(occupied_closed)),
+            "voxel_nav_free_raw_cells": int(np.count_nonzero(free_raw)),
+            "voxel_nav_free_suppressed_by_occupied_cells": int(np.count_nonzero(free_suppressed_by_occupied)),
+            "voxel_nav_occupied_hole_filled_cells": int(np.count_nonzero(hole_filled_mask)),
             "voxel_nav_observed_cells": int(np.count_nonzero(observed)),
             "voxel_nav_unknown_cells": int(np.count_nonzero(unknown)),
             "voxel_project_navigation_ms": float((time.perf_counter() - started_at) * 1000.0),
         }
+        if bool(cfg.debug_navigation_projection_layers):
+            debug.update(
+                {
+                    "voxel_nav_occupied_from_voxel_xy": occupied_from_voxel.astype(bool),
+                    "voxel_nav_occupied_from_endpoint_xy": occupied_from_endpoint.astype(bool),
+                    "voxel_nav_occupied_raw_xy": occupied_raw.astype(bool),
+                    "voxel_nav_occupied_closed_xy": occupied_closed.astype(bool),
+                    "voxel_nav_free_raw_xy": np.asarray(free_raw, dtype=bool),
+                    "voxel_nav_free_suppressed_by_occupied_xy": free_suppressed_by_occupied.astype(bool),
+                    "voxel_nav_final_free_xy": free.astype(bool),
+                    "voxel_nav_final_occupied_xy": occupied.astype(bool),
+                    "voxel_nav_final_unknown_xy": unknown.astype(bool),
+                }
+            )
         self.last_navigation_debug = dict(debug)
         return NavigationProjection(
             free=free.astype(bool),
@@ -641,7 +764,7 @@ class VoxelOccupancyGrid3D:
             "voxel_sensor_range_behind_endpoint_margin_m": float(getattr(self.config, "sensor_range_behind_endpoint_margin_m", 0.0)),
         }
         debug.update(self.last_integration_stats.to_dict())
-        debug.update(dict(self.last_navigation_debug))
+        debug.update({key: value for key, value in dict(self.last_navigation_debug).items() if not isinstance(value, np.ndarray)})
         return debug
 
     def _add_logodds(self, voxels: Iterable[Sequence[int]], delta: int) -> int:
@@ -763,3 +886,94 @@ class VoxelOccupancyGrid3D:
             cell[axis] += int(step[axis])
             t_max[axis] += t_delta[axis]
         return out
+
+
+def _disk_structure(radius_cells: int) -> np.ndarray:
+    radius = max(0, int(radius_cells))
+    yy, xx = np.ogrid[-radius : radius + 1, -radius : radius + 1]
+    return ((yy * yy + xx * xx) <= radius * radius).astype(bool)
+
+
+def _binary_close_disk(mask: np.ndarray, radius_cells: int) -> np.ndarray:
+    src = np.asarray(mask, dtype=bool)
+    radius = max(0, int(radius_cells))
+    if radius <= 0 or not np.any(src):
+        return src.copy()
+    try:
+        from scipy import ndimage
+
+        return ndimage.binary_closing(src, structure=_disk_structure(radius)).astype(bool)
+    except Exception:
+        dilated = _dilate_bool(src, radius)
+        return ~_dilate_bool(~dilated, radius)
+
+
+def _fill_small_false_holes(mask: np.ndarray, *, max_area_cells: int) -> tuple[np.ndarray, np.ndarray]:
+    src = np.asarray(mask, dtype=bool)
+    max_area = max(0, int(max_area_cells))
+    filled = src.copy()
+    filled_mask = np.zeros(src.shape, dtype=bool)
+    if max_area <= 0 or not np.any(~src):
+        return filled, filled_mask
+    try:
+        from scipy import ndimage
+
+        labels, count = ndimage.label(~src)
+        for label in range(1, int(count) + 1):
+            component = labels == label
+            area = int(np.count_nonzero(component))
+            if area == 0 or area > max_area:
+                continue
+            rows, cols = np.nonzero(component)
+            if int(rows.min()) == 0 or int(cols.min()) == 0 or int(rows.max()) == src.shape[0] - 1 or int(cols.max()) == src.shape[1] - 1:
+                continue
+            filled[component] = True
+            filled_mask[component] = True
+        return filled, filled_mask
+    except Exception:
+        visited = np.zeros(src.shape, dtype=bool)
+        h, w = src.shape
+        inv = ~src
+        for row in range(h):
+            for col in range(w):
+                if visited[row, col] or not inv[row, col]:
+                    continue
+                stack = [(row, col)]
+                visited[row, col] = True
+                cells: list[tuple[int, int]] = []
+                touches_border = False
+                while stack:
+                    rr, cc = stack.pop()
+                    cells.append((rr, cc))
+                    touches_border = touches_border or rr == 0 or cc == 0 or rr == h - 1 or cc == w - 1
+                    for nr, nc in ((rr - 1, cc), (rr + 1, cc), (rr, cc - 1), (rr, cc + 1)):
+                        if 0 <= nr < h and 0 <= nc < w and not visited[nr, nc] and inv[nr, nc]:
+                            visited[nr, nc] = True
+                            stack.append((nr, nc))
+                if not touches_border and len(cells) <= max_area:
+                    for rr, cc in cells:
+                        filled[rr, cc] = True
+                        filled_mask[rr, cc] = True
+        return filled, filled_mask
+
+
+def _dilate_bool(mask: np.ndarray, radius_cells: int) -> np.ndarray:
+    src = np.asarray(mask, dtype=bool)
+    radius = max(0, int(radius_cells))
+    if radius <= 0 or not np.any(src):
+        return src.copy()
+    out = src.copy()
+    rows, cols = np.nonzero(src)
+    h, w = src.shape
+    offsets = [
+        (dr, dc)
+        for dr in range(-radius, radius + 1)
+        for dc in range(-radius, radius + 1)
+        if dr * dr + dc * dc <= radius * radius
+    ]
+    for row, col in zip(rows, cols):
+        for dr, dc in offsets:
+            rr, cc = int(row + dr), int(col + dc)
+            if 0 <= rr < h and 0 <= cc < w:
+                out[rr, cc] = True
+    return out

@@ -34,8 +34,9 @@ def test_v19_default_orientation_does_not_add_unconditional_diagonals() -> None:
 
     sources = [source for source, _vec in _door_orientation_candidates(cluster, VoxelDoorDetectorConfig())]
 
-    assert "axis_h" in sources
-    assert "axis_v" in sources
+    assert sources == ["seed_major"]
+    assert "axis_h" not in sources
+    assert "axis_v" not in sources
     assert "diag_down" not in sources
     assert "diag_up" not in sources
 

@@ -90,11 +90,28 @@ def test_required_sgnav_defaults():
     assert cfg["mapping"]["room_segmentation"]["voxel_roomseg_evidence"]["wall_line_support_nav_edge_radius_cells"] == 3
     assert cfg["mapping"]["room_segmentation"]["voxel_roomseg_evidence"]["wall_line_support_free_boundary_radius_cells"] == 3
     assert cfg["mapping"]["room_segmentation"]["voxel_roomseg_evidence"]["wall_line_support_remove_small_area_cells"] == 3
+    assert cfg["mapping"]["room_segmentation"]["voxel_navigation_blind_zone"]["enabled"] is True
+    assert cfg["mapping"]["room_segmentation"]["voxel_navigation_blind_zone"]["force_initial_blind_zone_free"] is True
     assert cfg["mapping"]["room_segmentation"]["voxel_navigation_blind_zone"]["initial_blind_zone_radius_m"] == 0.80
     assert cfg["mapping"]["room_segmentation"]["voxel_navigation_blind_zone"]["initial_blind_zone_steps"] == 60
-    assert cfg["mapping"]["room_segmentation"]["voxel_navigation_blind_zone"]["current_footprint_radius_m"] == 0.35
+    assert cfg["mapping"]["room_segmentation"]["voxel_navigation_blind_zone"]["force_current_footprint_free"] is True
+    assert cfg["mapping"]["room_segmentation"]["voxel_navigation_blind_zone"]["current_footprint_radius_m"] == 0.14
+    assert cfg["mapping"]["room_segmentation"]["voxel_navigation_blind_zone"]["current_footprint_extra_margin_m"] == 0.0
+    assert cfg["mapping"]["room_segmentation"]["voxel_navigation_blind_zone"]["current_footprint_clear_dynamic_occupied"] is True
+    assert cfg["mapping"]["room_segmentation"]["voxel_navigation_blind_zone"]["current_footprint_preserve_static_structural"] is True
+    assert cfg["mapping"]["room_segmentation"]["voxel_navigation_blind_zone"]["current_footprint_ignore_dynamic_voxel_occupied_columns"] is True
     assert cfg["mapping"]["room_segmentation"]["voxel_navigation_blind_zone"]["free_z_max_m"] == 0.90
     assert cfg["mapping"]["room_segmentation"]["voxel_navigation_blind_zone"]["write_to_voxel_grid"] is True
+    assert cfg["mapping"]["room_segmentation"]["voxel_navigation_blind_zone"]["write_to_grid"] is True
+    assert cfg["mapping"]["room_segmentation"]["voxel_navigation_blind_zone"]["preserve_occupied_cells"] is True
+    assert cfg["mapping"]["room_segmentation"]["voxel_navigation_blind_zone"]["preserve_static_structural_cells"] is True
+    assert cfg["mapping"]["room_segmentation"]["voxel_navigation_blind_zone"]["preserve_voxel_occupied_columns"] is True
+    assert cfg["mapping"]["room_segmentation"]["voxel_navigation_projection"]["occupied_any_voxel_wins"] is True
+    assert cfg["mapping"]["room_segmentation"]["voxel_navigation_projection"]["occupied_use_endpoint_hysteresis"] is True
+    assert cfg["mapping"]["room_segmentation"]["voxel_navigation_projection"]["occupied_endpoint_increment"] == 2
+    assert cfg["mapping"]["room_segmentation"]["voxel_navigation_projection"]["occupied_endpoint_xy_splat_radius_cells"] == 1
+    assert cfg["mapping"]["room_segmentation"]["voxel_navigation_projection"]["occupied_close_radius_cells"] == 1
+    assert cfg["mapping"]["room_segmentation"]["voxel_navigation_projection"]["occupied_fill_small_holes_max_area_cells"] == 4
     assert cfg["mapping"]["room_segmentation"]["voxel_wall_projection"]["enabled"] is True
     assert cfg["mapping"]["room_segmentation"]["voxel_wall_projection"]["projection_band_cells"] == 2
     assert cfg["mapping"]["room_segmentation"]["voxel_wall_projection"]["min_projected_line_length_m"] == 0.35
@@ -245,6 +262,14 @@ def test_required_sgnav_defaults():
     assert cfg["visualization"]["show_gt_goal_cells"] is False
     assert cfg["visualization"]["show_room_proposals"] is True
     assert cfg["isaac"]["perception_every_steps"] == 1
+    assert cfg["astar"]["runtime_planning_clearance_m"] == 0.02
+    assert cfg["astar"]["clearance_cost_enabled"] is True
+    assert cfg["astar"]["clearance_desired_m"] == 0.25
+    assert cfg["astar"]["clearance_hard_min_m"] == 0.0
+    assert cfg["astar"]["clearance_weight"] == 3.0
+    assert cfg["astar"]["goal_min_clearance_m"] == 0.18
+    assert cfg["astar"]["lookahead_collision_check_enabled"] is True
+    assert cfg["astar"]["lookahead_min_clearance_m"] == 0.14
 
 
 def test_open_vocab_detector_forces_every_frame_perception():

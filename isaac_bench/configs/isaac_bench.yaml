@@ -202,6 +202,9 @@ mapping:
       policy: at_frontier_arrival
       freeze_during_navigation: true
       debug_force_update: false
+      update_on_target_invalidated: false
+      update_on_no_active_path: false
+      update_on_no_progress: false
     source_grid: online_depth_observed
     proposal_mode: vertical_free_gap_closure
     depth:
@@ -298,17 +301,39 @@ mapping:
       free_z_min_m: 0.10
       free_z_max_m: 0.90
       min_free_voxels: 1
+      occupied_any_voxel_wins: true
+      occupied_use_endpoint_hysteresis: true
+      occupied_endpoint_count_threshold: 1
+      occupied_endpoint_decay_per_free_ray: 1
+      occupied_endpoint_increment: 2
+      occupied_endpoint_xy_splat_radius_cells: 1
+      occupied_endpoint_z_splat_radius_cells: 0
+      occupied_close_radius_cells: 1
+      occupied_fill_small_holes_max_area_cells: 4
+      occupied_priority_over_free: true
+      unknown_preserve_when_no_observation: true
+      debug_navigation_projection_layers: true
     voxel_navigation_blind_zone:
       enabled: true
       force_initial_blind_zone_free: true
       initial_blind_zone_radius_m: 0.80
       initial_blind_zone_steps: 60
       force_current_footprint_free: true
-      current_footprint_radius_m: 0.35
+      current_footprint_radius_m: 0.14
+      current_footprint_extra_margin_m: 0.00
+      current_footprint_clear_dynamic_occupied: true
+      current_footprint_preserve_static_structural: true
+      current_footprint_preserve_roomseg_static_wall: true
+      current_footprint_preserve_voxel_hard_static_wall: true
+      current_footprint_ignore_dynamic_voxel_occupied_columns: true
       write_to_voxel_grid: true
+      write_to_grid: true
       free_z_min_m: 0.10
       free_z_max_m: 0.90
       free_all_bins_in_range: true
+      preserve_occupied_cells: true
+      preserve_static_structural_cells: true
+      preserve_voxel_occupied_columns: true
     voxel_roomseg_evidence:
       enabled: true
       active_z_min_m: 0.10
@@ -471,6 +496,17 @@ mapping:
       seed_cluster_max_width_m: 1.80
       seed_cluster_min_shared_anchor_score: 0.0
       completion_orientation_mode: pca_plus_axis_plus_wall_pair
+      min_seed_cells_for_accepted_extension: 3
+      min_seed_line_length_cells_for_accepted_extension: 3
+      min_seed_elongation_for_direction: 1.6
+      max_seed_line_residual_cells_for_direction: 1.25
+      accepted_orientation_mode: seed_major_only
+      allow_axis_orientation_if_aligned_with_seed: true
+      axis_orientation_max_angle_to_seed_deg: 15.0
+      allow_wall_pair_orientation_if_aligned_with_seed: true
+      wall_pair_orientation_max_angle_to_seed_deg: 20.0
+      local_free_neck_orientation_debug_only: true
+      single_seed_completion_debug_only: true
       allow_diagonal_orientation_candidates: false
       infer_orientation_from_wall_pairs: true
       infer_orientation_from_local_free_neck: true
@@ -509,18 +545,24 @@ mapping:
       min_geometry_cut_cells: 1
       door_memory_enabled: true
       door_memory_initial_confidence: 1.0
-      door_memory_match_iou_min: 0.20
-      door_memory_match_distance_cells: 3
+      door_memory_match_iou_min: 0.05
+      door_memory_match_distance_cells: 6
       door_memory_match_angle_deg: 20.0
-      door_memory_decay_per_update: 0.10
+      door_memory_decay_per_update: 0.02
       door_memory_confirm_increment: 0.35
-      door_memory_min_confidence_to_keep: 0.25
-      door_memory_ttl_updates: 8
+      door_memory_min_confidence_to_keep: 0.15
+      door_memory_ttl_updates: 30
       show_candidate_lines_in_debug: true
     voxel_roomseg:
       use_real_wall_as_partition_barrier: true
       real_wall_barrier_dilation_cells: 0
       door_seed_wall_carve_radius_cells: 2
+    voxel_step2:
+      enable_extension_intersection_fallback: false
+      separator_memory_enabled: true
+      separator_memory_ttl_updates: 30
+      separator_memory_decay_per_update: 0.02
+      separator_memory_min_confidence_to_keep: 0.15
     voxel_visualization:
       voxel_show_wall_diagnostics: false
       door_seed_color: [0, 80, 255]
@@ -1265,7 +1307,19 @@ astar:
   goal_tolerance_m: 0.20
   waypoint_lookahead_m: 0.15
   replan_every_steps: 5
-  runtime_planning_clearance_m: 0.30
+  runtime_planning_clearance_m: 0.02
+  clearance_cost_enabled: true
+  clearance_desired_m: 0.25
+  clearance_hard_min_m: 0.00
+  clearance_weight: 3.0
+  clearance_power: 2.0
+  goal_min_clearance_m: 0.18
+  goal_search_radius_m: 0.35
+  collision_checked_smoothing_enabled: true
+  smoothing_min_clearance_m: 0.14
+  smoothing_max_skip_cells: 8
+  lookahead_collision_check_enabled: true
+  lookahead_min_clearance_m: 0.14
   stuck_timeout_steps: 30
 
 nav2:

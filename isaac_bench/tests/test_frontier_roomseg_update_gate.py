@@ -20,6 +20,16 @@ def test_frontier_roomseg_update_gate_freezes_during_navigation() -> None:
     assert reason == "cached_during_navigation"
 
     update, reason = should_update_roomseg_frontiers(step=11, has_current_path=False, gate_state=gate, target_invalidated=True)
+    assert update is False
+    assert reason == "target_invalidated_cached"
+
+    update, reason = should_update_roomseg_frontiers(
+        step=11,
+        has_current_path=False,
+        gate_state=gate,
+        target_invalidated=True,
+        update_on_target_invalidated=True,
+    )
     assert update is True
     assert reason == "target_invalidated"
 

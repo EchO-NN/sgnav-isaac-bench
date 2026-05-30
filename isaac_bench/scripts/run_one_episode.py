@@ -84,7 +84,7 @@ from isaac_bench.graph.room_semantics import (
 from isaac_bench.metrics.episode_logger import JsonlEpisodeLogger, make_jsonable
 from isaac_bench.metrics.evaluator import EpisodeEvaluator
 from isaac_bench.metrics.result_schema import BenchmarkAssetError, complete_result_row, validate_strict_benchmark_assets
-from isaac_bench.navigation.astar import GridAStarPlanner, astar_distance_map
+from isaac_bench.navigation.astar import ClearanceAStarPlanner, GridAStarPlanner, astar_distance_map
 from isaac_bench.navigation.frontier_commitment import FrontierCommitmentManager
 from isaac_bench.navigation.waypoint_follower import HolonomicWaypointFollower
 from isaac_bench.perception.detection_types import (
@@ -122,8 +122,12 @@ def should_update_roomseg_frontiers(
     freeze_during_navigation: bool = True,
     target_reached: bool = False,
     target_invalidated: bool = False,
+    no_active_path: bool = False,
     no_progress: bool = False,
     debug_force: bool = False,
+    update_on_target_invalidated: bool = False,
+    update_on_no_active_path: bool = False,
+    update_on_no_progress: bool = False,
 ) -> tuple[bool, str]:
     _ = step
     normalized_policy = str(policy or "always").strip().lower()
@@ -135,12 +139,18 @@ def should_update_roomseg_frontiers(
         return True, "initial"
     if bool(target_reached):
         return True, "target_reached"
-    if bool(target_invalidated):
+    if bool(target_invalidated) and bool(update_on_target_invalidated):
         return True, "target_invalidated"
-    if bool(no_progress):
+    if bool(target_invalidated):
+        return False, "target_invalidated_cached"
+    if bool(no_progress) and bool(update_on_no_progress):
         return True, "no_progress"
-    if not bool(has_current_path):
+    if bool(no_progress):
+        return False, "no_progress_cached"
+    if (bool(no_active_path) or not bool(has_current_path)) and bool(update_on_no_active_path):
         return True, "no_active_path"
+    if bool(no_active_path) or not bool(has_current_path):
+        return False, "no_active_path_cached"
     return False, "cached_during_navigation"
 
 
@@ -446,6 +456,34 @@ def apply_dynamic_astar_edge_clearance(
         if 0 <= rr < out.shape[0] and 0 <= cc < out.shape[1] and bool(np.asarray(traversible, dtype=bool)[rr, cc]):
             out[rr, cc] = True
     return out
+
+
+def clearance_map_m(traversible: np.ndarray, resolution_m: float) -> np.ndarray:
+    free = np.asarray(traversible, dtype=bool)
+    try:
+        from scipy import ndimage
+
+        return ndimage.distance_transform_edt(free).astype(np.float32) * float(resolution_m)
+    except Exception:
+        planner = ClearanceAStarPlanner(free, resolution_m, allow_diagonal=True)
+        return np.asarray(planner.clearance_m, dtype=np.float32)
+
+
+def make_runtime_nav_planner(args, traversible: np.ndarray, occupancy: np.ndarray, resolution_m: float):
+    if bool(getattr(args, "astar_clearance_cost_enabled", False)):
+        planner = ClearanceAStarPlanner(
+            traversible,
+            resolution_m,
+            occupied=occupancy,
+            allow_diagonal=bool(getattr(args, "astar_allow_diagonal", True)),
+            clearance_desired_m=float(getattr(args, "astar_clearance_desired_m", 0.25)),
+            clearance_weight=float(getattr(args, "astar_clearance_weight", 3.0)),
+            clearance_power=float(getattr(args, "astar_clearance_power", 2.0)),
+            clearance_hard_min_m=float(getattr(args, "astar_clearance_hard_min_m", 0.0)),
+        )
+        return planner, np.asarray(planner.clearance_m, dtype=np.float32), True
+    planner = GridAStarPlanner(traversible, resolution_m, allow_diagonal=bool(getattr(args, "astar_allow_diagonal", True)))
+    return planner, clearance_map_m(traversible, resolution_m), False
 
 
 def _disk_dilate_bool(mask: np.ndarray, radius_cells: int) -> np.ndarray:
@@ -833,6 +871,142 @@ def planning_target_cells_within_radius(
                 if key not in candidates or rank < candidates[key]:
                     candidates[key] = rank
     return [cell for cell, _rank in sorted(candidates.items(), key=lambda item: item[1])]
+
+
+def filter_goal_cells_by_clearance(
+    goal_cells: Iterable[Tuple[int, int]],
+    traversible: np.ndarray,
+    clearance_m: np.ndarray,
+    *,
+    min_clearance_m: float,
+    search_radius_cells: int,
+) -> List[Tuple[int, int]]:
+    cells = [tuple(int(v) for v in cell) for cell in goal_cells]
+    if not cells:
+        return []
+    nav = np.asarray(traversible, dtype=bool)
+    clearance = np.asarray(clearance_m, dtype=np.float32)
+    h, w = nav.shape
+    min_clearance = max(0.0, float(min_clearance_m))
+    radius = max(0, int(search_radius_cells))
+    out: list[Tuple[int, int]] = []
+    seen: set[Tuple[int, int]] = set()
+    for row, col in cells:
+        if 0 <= row < h and 0 <= col < w and bool(nav[row, col]) and float(clearance[row, col]) >= min_clearance:
+            candidate = (int(row), int(col))
+        else:
+            best_cell = None
+            best_rank = None
+            for dr in range(-radius, radius + 1):
+                for dc in range(-radius, radius + 1):
+                    if dr * dr + dc * dc > radius * radius:
+                        continue
+                    rr, cc = int(row + dr), int(col + dc)
+                    if rr < 0 or rr >= h or cc < 0 or cc >= w or not bool(nav[rr, cc]):
+                        continue
+                    clear = float(clearance[rr, cc])
+                    if clear < min_clearance:
+                        continue
+                    rank = (-clear, int(dr * dr + dc * dc), int(abs(dr) + abs(dc)))
+                    if best_rank is None or rank < best_rank:
+                        best_rank = rank
+                        best_cell = (rr, cc)
+            candidate = best_cell if best_cell is not None else (int(row), int(col))
+        if candidate not in seen:
+            seen.add(candidate)
+            out.append(candidate)
+    return out
+
+
+def path_clearance_debug(path: Sequence[Tuple[int, int]], clearance_m: np.ndarray, robot_radius_m: float) -> dict[str, object]:
+    if not path:
+        return {
+            "astar_path_min_clearance_m": None,
+            "astar_path_mean_clearance_m": None,
+            "astar_path_too_close_cells": 0,
+        }
+    clearance = np.asarray(clearance_m, dtype=np.float32)
+    values: list[float] = []
+    too_close = 0
+    h, w = clearance.shape
+    for row, col in path:
+        rr, cc = int(row), int(col)
+        if 0 <= rr < h and 0 <= cc < w:
+            value = float(clearance[rr, cc])
+            values.append(value)
+            if value < float(robot_radius_m):
+                too_close += 1
+    if not values:
+        return {
+            "astar_path_min_clearance_m": None,
+            "astar_path_mean_clearance_m": None,
+            "astar_path_too_close_cells": 0,
+        }
+    out: dict[str, object] = {
+        "astar_path_min_clearance_m": float(min(values)),
+        "astar_path_mean_clearance_m": float(sum(values) / len(values)),
+        "astar_path_too_close_cells": int(too_close),
+    }
+    if float(out["astar_path_min_clearance_m"]) < float(robot_radius_m):
+        out["astar_path_warning"] = "astar_path_below_robot_radius_clearance"
+    return out
+
+
+def segment_is_clear_world(
+    start_xy: Tuple[float, float],
+    end_xy: Tuple[float, float],
+    traversible: np.ndarray,
+    clearance_m: np.ndarray,
+    map_info: MapInfo,
+    min_clearance_m: float,
+) -> bool:
+    nav = np.asarray(traversible, dtype=bool)
+    clearance = np.asarray(clearance_m, dtype=np.float32)
+    dx = float(end_xy[0]) - float(start_xy[0])
+    dy = float(end_xy[1]) - float(start_xy[1])
+    step_m = max(0.02, float(map_info.resolution_m) * 0.5)
+    samples = max(1, int(math.ceil(math.hypot(dx, dy) / step_m)))
+    h, w = nav.shape
+    for idx in range(samples + 1):
+        t = float(idx) / float(samples)
+        x = float(start_xy[0]) + dx * t
+        y = float(start_xy[1]) + dy * t
+        row, col = world_xy_to_grid(x, y, map_info)
+        if row < 0 or row >= h or col < 0 or col >= w or not bool(nav[row, col]):
+            return False
+        if float(clearance[row, col]) < float(min_clearance_m):
+            return False
+    return True
+
+
+def collision_checked_path_world(
+    pose: Sequence[float],
+    path_cells: Sequence[Tuple[int, int]],
+    map_info: MapInfo,
+    traversible: np.ndarray,
+    clearance_m: np.ndarray,
+    *,
+    lookahead_m: float,
+    min_clearance_m: float,
+    max_skip_cells: int,
+) -> List[Tuple[float, float]]:
+    candidates = list(path_cells[1 : min(len(path_cells), max(2, int(max_skip_cells) + 2))])
+    if not candidates:
+        return []
+    start_xy = (float(pose[0]), float(pose[1]))
+    fallback: list[Tuple[float, float]] = []
+    for idx, cell in enumerate(candidates):
+        target = grid_to_world_xy(int(cell[0]), int(cell[1]), map_info)
+        if not fallback:
+            fallback = [target]
+        if math.hypot(float(target[0]) - start_xy[0], float(target[1]) - start_xy[1]) < float(lookahead_m) and idx < len(candidates) - 1:
+            continue
+        if segment_is_clear_world(start_xy, target, traversible, clearance_m, map_info, float(min_clearance_m)):
+            tail = path_cells[1 + idx + 1 : min(len(path_cells), 20)]
+            return [target] + path_cells_to_world(tail, map_info)
+    if fallback and segment_is_clear_world(start_xy, fallback[0], traversible, clearance_m, map_info, float(min_clearance_m)):
+        return fallback
+    return []
 
 
 @dataclass
@@ -1257,6 +1431,46 @@ def pose_is_grid_safe(
     return True
 
 
+def pose_swept_is_grid_safe(
+    pose: Tuple[float, float, float, float],
+    cmd: Tuple[float, float, float],
+    dt: float,
+    navigable: np.ndarray,
+    map_info: MapInfo,
+    camera_forward_offset_m: float = 0.0,
+    sample_step_m: float | None = None,
+) -> bool:
+    start = tuple(float(v) for v in pose)
+    end = predict_kinematic_pose(start, cmd, float(dt))
+    dx = float(end[0]) - float(start[0])
+    dy = float(end[1]) - float(start[1])
+    dyaw = float(end[3]) - float(start[3])
+    while dyaw > math.pi:
+        dyaw -= 2.0 * math.pi
+    while dyaw < -math.pi:
+        dyaw += 2.0 * math.pi
+    step_m = float(sample_step_m) if sample_step_m is not None else max(0.02, float(map_info.resolution_m) * 0.5)
+    linear_steps = int(math.ceil(math.hypot(dx, dy) / max(step_m, 1e-6)))
+    angular_steps = int(math.ceil(abs(dyaw) / math.radians(6.0)))
+    samples = max(1, linear_steps, angular_steps)
+    for idx in range(samples + 1):
+        t = float(idx) / float(samples)
+        yaw = float(start[3]) + dyaw * t
+        while yaw > math.pi:
+            yaw -= 2.0 * math.pi
+        while yaw < -math.pi:
+            yaw += 2.0 * math.pi
+        interp = (
+            float(start[0]) + dx * t,
+            float(start[1]) + dy * t,
+            float(start[2]),
+            yaw,
+        )
+        if not pose_is_grid_safe(interp, navigable, map_info, camera_forward_offset_m):
+            return False
+    return True
+
+
 def guard_kinematic_cmd(
     pose: Tuple[float, float, float, float],
     cmd: Tuple[float, float, float],
@@ -1267,13 +1481,13 @@ def guard_kinematic_cmd(
 ) -> Tuple[Tuple[float, float, float], bool]:
     for scale in (1.0, 0.75, 0.5, 0.25, 0.125, 0.0625):
         scaled = (float(cmd[0]) * scale, float(cmd[1]) * scale, float(cmd[2]))
-        if pose_is_grid_safe(predict_kinematic_pose(pose, scaled, dt), navigable, map_info, camera_forward_offset_m):
+        if pose_swept_is_grid_safe(pose, scaled, dt, navigable, map_info, camera_forward_offset_m):
             return scaled, False
     rotate_only = (0.0, 0.0, float(cmd[2]))
-    if abs(rotate_only[2]) > 1e-6 and pose_is_grid_safe(predict_kinematic_pose(pose, rotate_only, dt), navigable, map_info, camera_forward_offset_m):
+    if abs(rotate_only[2]) > 1e-6 and pose_swept_is_grid_safe(pose, rotate_only, dt, navigable, map_info, camera_forward_offset_m):
         return rotate_only, False
     stopped = (0.0, 0.0, 0.0)
-    if pose_is_grid_safe(predict_kinematic_pose(pose, stopped, dt), navigable, map_info, camera_forward_offset_m):
+    if pose_swept_is_grid_safe(pose, stopped, dt, navigable, map_info, camera_forward_offset_m):
         return stopped, True
     return stopped, True
 
@@ -2125,7 +2339,12 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
             )
             record_mapping_timing("astar_clearance_ms", (time.perf_counter() - clearance_started_at) * 1000.0)
             planner_init_started_at = time.perf_counter()
-            nav_planner_local = GridAStarPlanner(astar_navigable_local, dynamic_map_info.resolution_m, allow_diagonal=True)
+            nav_planner_local, astar_clearance_m_local, astar_used_clearance_cost_local = make_runtime_nav_planner(
+                args,
+                astar_navigable_local,
+                occupancy_local,
+                dynamic_map_info.resolution_m,
+            )
             record_mapping_timing("planner_init_ms", (time.perf_counter() - planner_init_started_at) * 1000.0)
             if current_grid_local is None:
                 recovery_started_at = time.perf_counter()
@@ -2157,7 +2376,12 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
                 )
                 record_mapping_timing("astar_clearance_ms", (time.perf_counter() - clearance_started_at) * 1000.0)
                 planner_init_started_at = time.perf_counter()
-                nav_planner_local = GridAStarPlanner(astar_navigable_local, dynamic_map_info.resolution_m, allow_diagonal=True)
+                nav_planner_local, astar_clearance_m_local, astar_used_clearance_cost_local = make_runtime_nav_planner(
+                    args,
+                    astar_navigable_local,
+                    occupancy_local,
+                    dynamic_map_info.resolution_m,
+                )
                 record_mapping_timing("planner_init_ms", (time.perf_counter() - planner_init_started_at) * 1000.0)
             last_dynamic_occupancy = occupancy_local
             last_dynamic_free = free_local
@@ -2177,7 +2401,23 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
                 "base_nav_planner": base_nav_planner_local,
                 "nav_planner": nav_planner_local,
                 "current_grid": current_grid_local,
+                "astar_clearance_m": astar_clearance_m_local,
+                "astar_used_clearance_cost": bool(astar_used_clearance_cost_local),
+                "astar_clearance_desired_m": float(getattr(args, "astar_clearance_desired_m", 0.25)),
             }
+
+        def runtime_navigation_debug_layers(map_state_local: Mapping[str, object]) -> dict[str, object]:
+            debug = mapper.navigation_debug_layers()
+            clearance = map_state_local.get("astar_clearance_m")
+            if isinstance(clearance, np.ndarray):
+                clearance_arr = np.asarray(clearance, dtype=np.float32)
+                debug["astar_clearance_m"] = clearance_arr.copy()
+                debug["astar_clearance_low_cells"] = clearance_arr < float(getattr(args, "lookahead_min_clearance_m", 0.14))
+                finite = clearance_arr[np.isfinite(clearance_arr)]
+                debug["astar_clearance_min_m"] = None if finite.size == 0 else float(np.min(finite))
+            debug["astar_clearance_desired_m"] = float(getattr(args, "astar_clearance_desired_m", 0.25))
+            debug["astar_used_clearance_cost"] = bool(map_state_local.get("astar_used_clearance_cost", False))
+            return debug
 
         def run_detector_update(
             current_obs: dict,
@@ -2398,7 +2638,10 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
             last_room_context_result = result
             last_room_masks = list(result.room_masks)
             room_semantic_labels = dict(result.room_semantic_labels)
-            last_room_segmentation_debug = dict(result.room_segmentation_debug)
+            last_room_segmentation_debug = {
+                **dict(result.room_segmentation_debug),
+                **runtime_navigation_debug_layers(map_state),
+            }
             last_room_semantics_debug = dict(result.room_semantics_debug)
             last_room_context_metadata = result.metadata(full_order=False)
             setattr(scenegraph, "room_context_debug", dict(last_room_context_metadata))
@@ -2705,6 +2948,12 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
             if current_grid is None:
                 failure_reason = "agent_off_navigable_map"
                 break
+            last_room_segmentation_debug = {
+                **dict(last_room_segmentation_debug),
+                **runtime_navigation_debug_layers(map_state),
+            }
+            if viz is not None:
+                viz.set_room_context(last_room_masks, room_semantic_labels, last_room_segmentation_debug)
             metric_grid = metric_planner.snap_to_free(world_xy_to_grid(float(pose[0]), float(pose[1]), static_map_info))
             if metric_grid is None:
                 failure_reason = "agent_off_static_metric_map"
@@ -2792,7 +3041,11 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
                 policy=str(getattr(args, "roomseg_frontier_update_policy", "at_frontier_arrival")),
                 freeze_during_navigation=bool(getattr(args, "freeze_roomseg_and_frontiers_during_navigation", True)),
                 target_invalidated=bool(needs_replan and not current_path and roomseg_frontier_update_gate.initialized),
+                no_active_path=bool(not current_path),
                 debug_force=bool(getattr(args, "force_roomseg_frontier_update", False)),
+                update_on_target_invalidated=bool(getattr(args, "roomseg_frontier_update_on_target_invalidated", False)),
+                update_on_no_active_path=bool(getattr(args, "roomseg_frontier_update_on_no_active_path", False)),
+                update_on_no_progress=bool(getattr(args, "roomseg_frontier_update_on_no_progress", False)),
             )
             if needs_replan and not update_roomseg_frontiers and current_path:
                 needs_replan = False
@@ -2808,14 +3061,18 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
                 }
 
             if needs_replan:
-                mark_roomseg_frontier_gate_update(roomseg_frontier_update_gate, step=int(step), reason=roomseg_frontier_update_reason)
+                if update_roomseg_frontiers:
+                    mark_roomseg_frontier_gate_update(roomseg_frontier_update_gate, step=int(step), reason=roomseg_frontier_update_reason)
+                else:
+                    mark_roomseg_frontier_gate_skip(roomseg_frontier_update_gate, reason=roomseg_frontier_update_reason)
                 planning_started_at = time.perf_counter()
                 llm_requests_before = total_llm_requests()
                 astar_traversible = np.asarray(map_state.get("astar_navigable", navigable), dtype=bool)
                 frontier_traversible = navigable.astype(bool)
                 room_context_result = None
                 roomseg_context_needed = (
-                    room_segmenter is not None
+                    update_roomseg_frontiers
+                    and room_segmenter is not None
                     and (
                         str(getattr(args, "frontier_source", "navigation")).strip().lower()
                         in {"vertical_free", "height_profile_vertical_free", "voxel_vertical_free"}
@@ -2843,12 +3100,12 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
                 last_room_segmentation_debug = {
                     **dict(last_room_segmentation_debug),
                     **dict(frontier_source_metadata),
-                    "roomseg_frontier_update_due": True,
+                    "roomseg_frontier_update_due": bool(update_roomseg_frontiers),
                     "roomseg_frontier_update_reason": roomseg_frontier_update_reason,
                     "roomseg_frontier_update_policy": str(getattr(args, "roomseg_frontier_update_policy", "at_frontier_arrival")),
                     "roomseg_frontier_last_update_step": int(roomseg_frontier_update_gate.last_update_step),
                     "roomseg_frontier_last_update_reason": roomseg_frontier_update_gate.last_update_reason,
-                    "frontiers_frozen_during_navigation": False,
+                    "frontiers_frozen_during_navigation": not bool(update_roomseg_frontiers),
                 }
                 distance_traversible = frontier_traversible.copy()
                 rr, cc = int(current_grid[0]), int(current_grid[1])
@@ -3347,6 +3604,28 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
                             "frontier_planning_goal_cells_count": int(len(radius_goals)),
                             "frontier_planning_goal_radius_m": float(args.frontier_commit_reached_radius_m),
                         }
+                astar_clearance_for_goals = map_state.get("astar_clearance_m")
+                if not isinstance(astar_clearance_for_goals, np.ndarray):
+                    astar_clearance_for_goals = clearance_map_m(astar_traversible, dynamic_map_info.resolution_m)
+                clearance_goals = filter_goal_cells_by_clearance(
+                    planning_goals,
+                    astar_traversible,
+                    np.asarray(astar_clearance_for_goals, dtype=np.float32),
+                    min_clearance_m=float(getattr(args, "astar_goal_min_clearance_m", 0.18)),
+                    search_radius_cells=int(
+                        math.ceil(float(getattr(args, "astar_goal_search_radius_m", 0.35)) / max(float(dynamic_map_info.resolution_m), 1e-6))
+                    ),
+                )
+                if clearance_goals:
+                    nav_decision.metadata = {
+                        **dict(nav_decision.metadata or {}),
+                        "astar_goal_clearance_filter_enabled": True,
+                        "astar_goal_min_clearance_m": float(getattr(args, "astar_goal_min_clearance_m", 0.18)),
+                        "astar_goal_search_radius_m": float(getattr(args, "astar_goal_search_radius_m", 0.35)),
+                        "astar_goal_cells_before_clearance_filter": int(len(planning_goals)),
+                        "astar_goal_cells_after_clearance_filter": int(len(clearance_goals)),
+                    }
+                    planning_goals = clearance_goals
                 result = nav_planner.plan(current_grid, planning_goals)
                 if not result.path:
                     if paper_mode and nav_decision.mode == "frontier":
@@ -3439,6 +3718,27 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
                         )
                         last_roomseg_snapshot_frontier_key = snapshot_key
                 current_path = result.path
+                astar_clearance_for_path = map_state.get("astar_clearance_m")
+                if not isinstance(astar_clearance_for_path, np.ndarray):
+                    astar_clearance_for_path = clearance_map_m(astar_traversible, dynamic_map_info.resolution_m)
+                path_debug = path_clearance_debug(
+                    current_path,
+                    np.asarray(astar_clearance_for_path, dtype=np.float32),
+                    float(args.robot_radius_m),
+                )
+                map_state.update(path_debug)
+                last_room_segmentation_debug = {
+                    **dict(last_room_segmentation_debug),
+                    **path_debug,
+                    "astar_used_clearance_cost": bool(map_state.get("astar_used_clearance_cost", False)),
+                    "astar_clearance_desired_m": float(getattr(args, "astar_clearance_desired_m", 0.25)),
+                }
+                if last_nav_decision is not None:
+                    last_nav_decision.metadata = {
+                        **dict(last_nav_decision.metadata or {}),
+                        **path_debug,
+                        "astar_used_clearance_cost": bool(map_state.get("astar_used_clearance_cost", False)),
+                    }
                 full_path.extend(result.path)
                 record_latency("planning", planning_started_at)
                 if total_llm_requests() > llm_requests_before:
@@ -3578,7 +3878,25 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
                     )
                     continue
 
-            path_world = path_cells_to_world(current_path[1: min(len(current_path), 20)], dynamic_map_info)
+            if bool(getattr(args, "lookahead_collision_check_enabled", True)):
+                astar_clearance_for_lookahead = map_state.get("astar_clearance_m")
+                if not isinstance(astar_clearance_for_lookahead, np.ndarray):
+                    astar_clearance_for_lookahead = clearance_map_m(
+                        np.asarray(map_state.get("astar_navigable", navigable), dtype=bool),
+                        dynamic_map_info.resolution_m,
+                    )
+                path_world = collision_checked_path_world(
+                    pose,
+                    current_path,
+                    dynamic_map_info,
+                    np.asarray(map_state.get("astar_navigable", navigable), dtype=bool),
+                    np.asarray(astar_clearance_for_lookahead, dtype=np.float32),
+                    lookahead_m=float(getattr(args, "lookahead_m", 0.15)),
+                    min_clearance_m=float(getattr(args, "lookahead_min_clearance_m", 0.14)),
+                    max_skip_cells=int(getattr(args, "smoothing_max_skip_cells", 8)),
+                )
+            else:
+                path_world = path_cells_to_world(current_path[1: min(len(current_path), 20)], dynamic_map_info)
             if not path_world:
                 if evaluator.final_distance_to_goal <= success_distance:
                     gt_success_region_reached = True
@@ -3695,7 +4013,7 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
                 tuple(float(v) for v in pose),
                 cmd,
                 float(args.control_dt),
-                navigable,
+                np.asarray(map_state.get("astar_navigable", navigable), dtype=bool),
                 dynamic_map_info,
                 float(args.camera_forward_offset_m),
             )
@@ -3891,6 +4209,12 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
         row["online_free_cells"] = int(np.count_nonzero(last_dynamic_navigable))
         row["online_astar_extra_clearance_m"] = float(args.runtime_planning_clearance_m)
         row["online_astar_clearance_source"] = "raw_occupied"
+        row["online_astar_clearance_cost_enabled"] = bool(getattr(args, "astar_clearance_cost_enabled", False))
+        row["online_astar_clearance_desired_m"] = float(getattr(args, "astar_clearance_desired_m", 0.25))
+        row["online_astar_goal_min_clearance_m"] = float(getattr(args, "astar_goal_min_clearance_m", 0.18))
+        row["online_astar_path_min_clearance_m"] = map_state.get("astar_path_min_clearance_m") if isinstance(locals().get("map_state"), dict) else None
+        row["online_astar_path_mean_clearance_m"] = map_state.get("astar_path_mean_clearance_m") if isinstance(locals().get("map_state"), dict) else None
+        row["online_astar_path_too_close_cells"] = map_state.get("astar_path_too_close_cells") if isinstance(locals().get("map_state"), dict) else None
         row["online_astar_free_cells"] = int(np.count_nonzero(last_dynamic_astar_navigable))
         row["online_occupied_cells"] = int(np.count_nonzero(last_dynamic_occupancy))
         row["online_mapper_debug"] = dict(getattr(mapper, "last_debug_stats", {}))
@@ -4318,6 +4642,18 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--debug-graph-dump", "--debug_graph_dump", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--debug-graph-dump-dir", "--debug_graph_dump_dir", default=None)
     parser.add_argument("--runtime-planning-clearance-m", type=float, default=None)
+    parser.add_argument("--astar-clearance-cost-enabled", "--astar_clearance_cost_enabled", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--astar-clearance-desired-m", "--astar_clearance_desired_m", type=float, default=None)
+    parser.add_argument("--astar-clearance-hard-min-m", "--astar_clearance_hard_min_m", type=float, default=None)
+    parser.add_argument("--astar-clearance-weight", "--astar_clearance_weight", type=float, default=None)
+    parser.add_argument("--astar-clearance-power", "--astar_clearance_power", type=float, default=None)
+    parser.add_argument("--astar-goal-min-clearance-m", "--astar_goal_min_clearance_m", type=float, default=None)
+    parser.add_argument("--astar-goal-search-radius-m", "--astar_goal_search_radius_m", type=float, default=None)
+    parser.add_argument("--collision-checked-smoothing-enabled", "--collision_checked_smoothing_enabled", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--smoothing-min-clearance-m", "--smoothing_min_clearance_m", type=float, default=None)
+    parser.add_argument("--smoothing-max-skip-cells", "--smoothing_max_skip_cells", type=int, default=None)
+    parser.add_argument("--lookahead-collision-check-enabled", "--lookahead_collision_check_enabled", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--lookahead-min-clearance-m", "--lookahead_min_clearance_m", type=float, default=None)
     parser.add_argument("--candidate-min-detector-hits", type=int, default=None)
     parser.add_argument("--candidate-start-min-confidence", type=float, default=None)
     parser.add_argument("--candidate-start-min-hits", "--candidate_start_min_hits", type=int, default=None)
@@ -4811,6 +5147,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     args.roomseg_frontier_update_policy = str(roomseg_frontier_update_cfg.get("policy", "at_frontier_arrival"))
     args.freeze_roomseg_and_frontiers_during_navigation = bool(roomseg_frontier_update_cfg.get("freeze_during_navigation", True))
     args.force_roomseg_frontier_update = bool(roomseg_frontier_update_cfg.get("debug_force_update", False))
+    args.roomseg_frontier_update_on_target_invalidated = bool(roomseg_frontier_update_cfg.get("update_on_target_invalidated", False))
+    args.roomseg_frontier_update_on_no_active_path = bool(roomseg_frontier_update_cfg.get("update_on_no_active_path", False))
+    args.roomseg_frontier_update_on_no_progress = bool(roomseg_frontier_update_cfg.get("update_on_no_progress", False))
     room_semantics_cfg = dict(get_nested(cfg, "room_semantics", {}) or {})
     for key in (
         "use_premerge_labels_for_open_plan_merge",
@@ -4888,6 +5227,66 @@ def main(argv: Optional[List[str]] = None) -> int:
     )
     args.debug_graph_dump_dir = str(args.debug_graph_dump_dir or get_nested(cfg, "sgnav.debug_graph_dump_dir", "debug/graphs"))
     args.runtime_planning_clearance_m = float(args.runtime_planning_clearance_m if args.runtime_planning_clearance_m is not None else get_nested(cfg, "astar.runtime_planning_clearance_m", 0.0))
+    args.astar_clearance_cost_enabled = bool(
+        args.astar_clearance_cost_enabled
+        if args.astar_clearance_cost_enabled is not None
+        else get_nested(cfg, "astar.clearance_cost_enabled", False)
+    )
+    args.astar_clearance_desired_m = float(
+        args.astar_clearance_desired_m
+        if args.astar_clearance_desired_m is not None
+        else get_nested(cfg, "astar.clearance_desired_m", 0.25)
+    )
+    args.astar_clearance_hard_min_m = float(
+        args.astar_clearance_hard_min_m
+        if args.astar_clearance_hard_min_m is not None
+        else get_nested(cfg, "astar.clearance_hard_min_m", 0.0)
+    )
+    args.astar_clearance_weight = float(
+        args.astar_clearance_weight
+        if args.astar_clearance_weight is not None
+        else get_nested(cfg, "astar.clearance_weight", 3.0)
+    )
+    args.astar_clearance_power = float(
+        args.astar_clearance_power
+        if args.astar_clearance_power is not None
+        else get_nested(cfg, "astar.clearance_power", 2.0)
+    )
+    args.astar_goal_min_clearance_m = float(
+        args.astar_goal_min_clearance_m
+        if args.astar_goal_min_clearance_m is not None
+        else get_nested(cfg, "astar.goal_min_clearance_m", 0.18)
+    )
+    args.astar_goal_search_radius_m = float(
+        args.astar_goal_search_radius_m
+        if args.astar_goal_search_radius_m is not None
+        else get_nested(cfg, "astar.goal_search_radius_m", 0.35)
+    )
+    args.collision_checked_smoothing_enabled = bool(
+        args.collision_checked_smoothing_enabled
+        if args.collision_checked_smoothing_enabled is not None
+        else get_nested(cfg, "astar.collision_checked_smoothing_enabled", True)
+    )
+    args.smoothing_min_clearance_m = float(
+        args.smoothing_min_clearance_m
+        if args.smoothing_min_clearance_m is not None
+        else get_nested(cfg, "astar.smoothing_min_clearance_m", 0.14)
+    )
+    args.smoothing_max_skip_cells = int(
+        args.smoothing_max_skip_cells
+        if args.smoothing_max_skip_cells is not None
+        else get_nested(cfg, "astar.smoothing_max_skip_cells", 8)
+    )
+    args.lookahead_collision_check_enabled = bool(
+        args.lookahead_collision_check_enabled
+        if args.lookahead_collision_check_enabled is not None
+        else get_nested(cfg, "astar.lookahead_collision_check_enabled", True)
+    )
+    args.lookahead_min_clearance_m = float(
+        args.lookahead_min_clearance_m
+        if args.lookahead_min_clearance_m is not None
+        else get_nested(cfg, "astar.lookahead_min_clearance_m", 0.14)
+    )
     args.candidate_min_detector_hits = int(args.candidate_min_detector_hits if args.candidate_min_detector_hits is not None else get_nested(cfg, "sgnav.candidate_min_detector_hits", 2))
     args.candidate_start_min_confidence = max(
         float(args.candidate_start_min_confidence if args.candidate_start_min_confidence is not None else get_nested(cfg, "sgnav.candidate_start_min_confidence", MIN_VALID_DETECTION_CONFIDENCE)),

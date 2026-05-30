@@ -13,6 +13,7 @@ from isaac_bench.mapping.grid_map import OnlineGridMap
 from isaac_bench.mapping.height_column_profile import HeightColumnProfileConfig, HeightColumnProfileMap
 from isaac_bench.mapping.voxel_occupancy_grid import (
     NavigationProjection,
+    VOXEL_OCCUPIED,
     VoxelOccupancyGrid3D,
     VoxelOccupancyGridConfig,
 )
@@ -92,6 +93,11 @@ class OnlineMapper:
         self.roomseg_static_structural_occupied = np.zeros_like(self.grid.free, dtype=np.uint8)
         self.depth_free_mask = np.zeros_like(self.grid.free, dtype=np.uint8)
         self.depth_obstacle_endpoint_count = np.zeros_like(self.grid.free, dtype=np.uint16)
+        self.voxel_nav_occupied_endpoint_count = np.zeros_like(self.grid.free, dtype=np.uint16)
+        self.voxel_nav_free_ray_count = np.zeros_like(self.grid.free, dtype=np.uint16)
+        self.voxel_nav_endpoint_decay_debug: dict[str, object] = {}
+        self.current_pose_navigation_override_mask = np.zeros_like(self.grid.free, dtype=bool)
+        self.last_current_footprint_override_debug: dict[str, object] = {}
         self._obstacle_endpoint_evidence_increment = 2
         self._free_ray_obstacle_endpoint_decay = 1
         self.last_inflated_occupied = np.zeros_like(self.grid.free, dtype=bool)
@@ -112,6 +118,18 @@ class OnlineMapper:
             "free_z_min_m": float(nav_cfg.get("free_z_min_m", 0.10)),
             "free_z_max_m": float(nav_cfg.get("free_z_max_m", self.obstacle_max_height_m)),
             "min_free_voxels": int(nav_cfg.get("min_free_voxels", 1)),
+            "occupied_any_voxel_wins": bool(nav_cfg.get("occupied_any_voxel_wins", True)),
+            "occupied_use_endpoint_hysteresis": bool(nav_cfg.get("occupied_use_endpoint_hysteresis", True)),
+            "occupied_endpoint_count_threshold": int(nav_cfg.get("occupied_endpoint_count_threshold", 1)),
+            "occupied_endpoint_decay_per_free_ray": int(nav_cfg.get("occupied_endpoint_decay_per_free_ray", 1)),
+            "occupied_endpoint_increment": int(nav_cfg.get("occupied_endpoint_increment", 2)),
+            "occupied_endpoint_xy_splat_radius_cells": int(nav_cfg.get("occupied_endpoint_xy_splat_radius_cells", 1)),
+            "occupied_endpoint_z_splat_radius_cells": int(nav_cfg.get("occupied_endpoint_z_splat_radius_cells", 0)),
+            "occupied_close_radius_cells": int(nav_cfg.get("occupied_close_radius_cells", 1)),
+            "occupied_fill_small_holes_max_area_cells": int(nav_cfg.get("occupied_fill_small_holes_max_area_cells", 4)),
+            "occupied_priority_over_free": bool(nav_cfg.get("occupied_priority_over_free", True)),
+            "unknown_preserve_when_no_observation": bool(nav_cfg.get("unknown_preserve_when_no_observation", True)),
+            "debug_navigation_projection_layers": bool(nav_cfg.get("debug_navigation_projection_layers", True)),
         }
         self.voxel_grid_drives_navigation = bool(self.voxel_grid_config.voxel_grid_drives_navigation)
         self.voxel_grid = VoxelOccupancyGrid3D.zeros(self.grid.free.shape, self.grid.map_info, self.voxel_grid_config)
@@ -123,11 +141,21 @@ class OnlineMapper:
             "initial_blind_zone_radius_m": float(blind_cfg.get("initial_blind_zone_radius_m", 0.80)),
             "initial_blind_zone_steps": int(blind_cfg.get("initial_blind_zone_steps", 60)),
             "force_current_footprint_free": bool(blind_cfg.get("force_current_footprint_free", True)),
-            "current_footprint_radius_m": float(blind_cfg.get("current_footprint_radius_m", 0.35)),
+            "current_footprint_radius_m": float(blind_cfg.get("current_footprint_radius_m", 0.14)),
+            "current_footprint_extra_margin_m": float(blind_cfg.get("current_footprint_extra_margin_m", 0.0)),
+            "current_footprint_clear_dynamic_occupied": bool(blind_cfg.get("current_footprint_clear_dynamic_occupied", True)),
+            "current_footprint_preserve_static_structural": bool(blind_cfg.get("current_footprint_preserve_static_structural", True)),
+            "current_footprint_preserve_roomseg_static_wall": bool(blind_cfg.get("current_footprint_preserve_roomseg_static_wall", True)),
+            "current_footprint_preserve_voxel_hard_static_wall": bool(blind_cfg.get("current_footprint_preserve_voxel_hard_static_wall", True)),
+            "current_footprint_ignore_dynamic_voxel_occupied_columns": bool(blind_cfg.get("current_footprint_ignore_dynamic_voxel_occupied_columns", True)),
             "write_to_voxel_grid": bool(blind_cfg.get("write_to_voxel_grid", True)),
+            "write_to_grid": bool(blind_cfg.get("write_to_grid", True)),
             "free_z_min_m": float(blind_cfg.get("free_z_min_m", 0.10)),
             "free_z_max_m": float(blind_cfg.get("free_z_max_m", 0.90)),
             "free_all_bins_in_range": bool(blind_cfg.get("free_all_bins_in_range", True)),
+            "preserve_occupied_cells": bool(blind_cfg.get("preserve_occupied_cells", True)),
+            "preserve_static_structural_cells": bool(blind_cfg.get("preserve_static_structural_cells", True)),
+            "preserve_voxel_occupied_columns": bool(blind_cfg.get("preserve_voxel_occupied_columns", True)),
         }
         self._initial_blind_zone_center_world_xy: tuple[float, float] | None = None
         self._update_step_index = 0
@@ -165,6 +193,11 @@ class OnlineMapper:
         self.roomseg_static_structural_occupied = np.zeros_like(self.grid.free, dtype=np.uint8)
         self.depth_free_mask = np.zeros_like(self.grid.free, dtype=np.uint8)
         self.depth_obstacle_endpoint_count = np.zeros_like(self.grid.free, dtype=np.uint16)
+        self.voxel_nav_occupied_endpoint_count = np.zeros_like(self.grid.free, dtype=np.uint16)
+        self.voxel_nav_free_ray_count = np.zeros_like(self.grid.free, dtype=np.uint16)
+        self.voxel_nav_endpoint_decay_debug = {}
+        self.current_pose_navigation_override_mask = np.zeros_like(self.grid.free, dtype=bool)
+        self.last_current_footprint_override_debug = {}
         self.last_inflated_occupied = np.zeros_like(self.grid.free, dtype=bool)
         self.vertical_profile = VerticalProfileMap.zeros(self.grid.free.shape)
         self.voxel_grid = VoxelOccupancyGrid3D.zeros(self.grid.free.shape, self.grid.map_info, self.voxel_grid_config)
@@ -191,6 +224,8 @@ class OnlineMapper:
         total_started_at = time.perf_counter()
         timings: dict[str, float] = {}
         stage_started_at = total_started_at
+        self.current_pose_navigation_override_mask[:, :] = False
+        self.last_current_footprint_override_debug = {}
         depth_arr = np.asarray(depth, dtype=np.float32)
         if depth_arr.ndim == 3:
             depth_arr = depth_arr[:, :, 0]
@@ -281,6 +316,8 @@ class OnlineMapper:
         in_bounds_depth = valid_depth[in_bounds]
         rows_cols = rows_cols[in_bounds]
         rel_z = rel_z[in_bounds]
+        if bool(self.voxel_grid_config.enabled):
+            self._mark_voxel_navigation_endpoint_evidence(rows_cols, rel_z)
         if bool(self.height_profile_config.enabled) or bool(self.voxel_grid_config.enabled):
             self.last_ceiling_height_estimate = self.ceiling_height_estimator.update(rel_z, rows_cols)
         if bool(self.height_profile_config.enabled):
@@ -320,8 +357,6 @@ class OnlineMapper:
                 write_to_grid=False,
             )
             timings["voxel_blind_zone_voxel_ms"] = _elapsed_ms(blind_started_at)
-            voxel_nav_projection = self.voxel_grid.project_navigation(**self.voxel_navigation_projection_config)
-            self.last_voxel_navigation_projection = voxel_nav_projection
         else:
             self.last_voxel_navigation_projection = None
             self.last_voxel_blind_zone_debug = {}
@@ -390,6 +425,8 @@ class OnlineMapper:
 
         stage_started_at = time.perf_counter()
         free_unique = _unique_flat_array(ray_result.free_flat)
+        if bool(self.voxel_grid_config.enabled):
+            self._decay_voxel_navigation_endpoint_evidence(free_unique)
         free_protected_by_obstacle_endpoint = 0
         stale_obstacle_endpoint_cells_cleared = 0
         if free_unique.size:
@@ -426,6 +463,12 @@ class OnlineMapper:
             self.grid.free[rows, cols] = 0
             self.grid.occupied[rows, cols] = 1
             self.grid.observed[rows, cols] = 1
+        if bool(self.voxel_grid_config.enabled):
+            voxel_nav_projection = self.voxel_grid.project_navigation(
+                **self.voxel_navigation_projection_config,
+                nav_endpoint_count_xy=self.voxel_nav_occupied_endpoint_count,
+            )
+            self.last_voxel_navigation_projection = voxel_nav_projection
         if bool(self.voxel_grid_config.enabled) and bool(self.voxel_grid_drives_navigation) and voxel_nav_projection is not None:
             self.grid.free[:, :] = np.asarray(voxel_nav_projection.free, dtype=np.uint8)
             self.grid.occupied[:, :] = np.asarray(voxel_nav_projection.occupied, dtype=np.uint8)
@@ -748,6 +791,10 @@ class OnlineMapper:
             free = self.grid.free.astype(bool)
         else:
             free = np.ones_like(occupied, dtype=bool)
+        if np.any(self.current_pose_navigation_override_mask):
+            override = np.asarray(self.current_pose_navigation_override_mask, dtype=bool)
+            occupied = np.asarray(occupied, dtype=bool) & ~override
+            free = np.asarray(free, dtype=bool) | override
         return free & ~occupied
 
     def inflated_occupied(self) -> np.ndarray:
@@ -775,6 +822,10 @@ class OnlineMapper:
             "voxel_blind_zone_free_z_max_m": float(cfg.get("free_z_max_m", 0.90)),
             "voxel_blind_zone_active_this_frame": False,
             "voxel_blind_zone_changed_voxels": 0,
+            "voxel_blind_zone_skipped_occupied_cells": 0,
+            "current_pose_navigation_override_cells": 0,
+            "current_pose_dynamic_occupied_cleared_cells": 0,
+            "current_pose_static_wall_preserved_cells": 0,
         }
         if not bool(cfg.get("enabled", True)):
             return out
@@ -794,12 +845,16 @@ class OnlineMapper:
                     max(0.0, float(cfg.get("initial_blind_zone_radius_m", 0.60))),
                 )
             )
-        if bool(cfg.get("force_current_footprint_free", True)):
+        if bool(cfg.get("force_current_footprint_free", False)):
             requests.append(
                 (
                     "current",
                     (float(base_pose_world[0]), float(base_pose_world[1])),
-                    max(0.0, float(cfg.get("current_footprint_radius_m", 0.25))),
+                    max(
+                        0.0,
+                        float(cfg.get("current_footprint_radius_m", 0.25))
+                        + float(cfg.get("current_footprint_extra_margin_m", 0.0)),
+                    ),
                 )
             )
 
@@ -808,20 +863,14 @@ class OnlineMapper:
         changed_chunks: list[np.ndarray] = []
         initial_cells = 0
         current_cells = 0
+        skipped_occupied_cells = 0
+        current_dynamic_occupied_cleared = 0
+        current_static_wall_preserved = 0
         for reason, center_xy, radius_m in requests:
             rows, cols = self._disk_cells_for_world_xy(center_xy, radius_m)
             if rows.size == 0:
                 continue
-            if write_to_grid:
-                self.grid.free[rows, cols] = 1
-                self.grid.occupied[rows, cols] = 0
-                self.grid.observed[rows, cols] = 1
-                self.depth_free_mask[rows, cols] = 1
-            total_grid_cells += int(rows.size)
-            if reason == "initial":
-                initial_cells += int(rows.size)
-            else:
-                current_cells += int(rows.size)
+            z_idx = np.zeros(0, dtype=np.int32)
             if write_to_voxel and bool(cfg.get("write_to_voxel_grid", True)) and bool(self.voxel_grid_config.enabled):
                 z_idx = self.voxel_grid.active_z_indices(
                     z_min_m=float(cfg.get("free_z_min_m", 0.10)),
@@ -829,6 +878,47 @@ class OnlineMapper:
                 )
                 if not bool(cfg.get("free_all_bins_in_range", True)) and z_idx.size:
                     z_idx = z_idx[:1]
+            if reason == "current" and bool(cfg.get("current_footprint_clear_dynamic_occupied", True)):
+                keep = np.ones(int(rows.size), dtype=bool)
+                static_blocked = np.zeros(int(rows.size), dtype=bool)
+                if bool(cfg.get("current_footprint_preserve_static_structural", True)) or bool(
+                    cfg.get("current_footprint_preserve_roomseg_static_wall", True)
+                ):
+                    static_blocked |= self.roomseg_static_structural_occupied[rows, cols].astype(bool)
+                if (
+                    z_idx.size
+                    and bool(cfg.get("current_footprint_preserve_voxel_hard_static_wall", True))
+                    and not bool(cfg.get("current_footprint_ignore_dynamic_voxel_occupied_columns", True))
+                    and bool(self.voxel_grid_config.enabled)
+                ):
+                    z = np.asarray(z_idx, dtype=np.int64).reshape(-1)
+                    voxel_occupied = np.any(self.voxel_grid.state[z[:, None], rows[None, :], cols[None, :]] == int(VOXEL_OCCUPIED), axis=0)
+                    static_blocked |= voxel_occupied
+                keep &= ~static_blocked
+                current_static_wall_preserved += int(np.count_nonzero(static_blocked))
+            else:
+                keep = self._free_override_keep_mask(rows, cols, z_idx=z_idx)
+            skipped_occupied_cells += int(rows.size - int(np.count_nonzero(keep)))
+            if not np.any(keep):
+                continue
+            rows = rows[keep]
+            cols = cols[keep]
+            if write_to_grid and bool(cfg.get("write_to_grid", True)):
+                if reason == "current":
+                    occupied_before = self.grid.occupied[rows, cols].astype(bool)
+                    current_dynamic_occupied_cleared += int(np.count_nonzero(occupied_before))
+                self.grid.free[rows, cols] = 1
+                self.grid.occupied[rows, cols] = 0
+                self.grid.observed[rows, cols] = 1
+                self.depth_free_mask[rows, cols] = 1
+                if reason == "current":
+                    self.current_pose_navigation_override_mask[rows, cols] = True
+            total_grid_cells += int(rows.size)
+            if reason == "initial":
+                initial_cells += int(rows.size)
+            else:
+                current_cells += int(rows.size)
+            if write_to_voxel and bool(cfg.get("write_to_voxel_grid", True)) and bool(self.voxel_grid_config.enabled):
                 if z_idx.size:
                     voxels = np.empty((int(z_idx.size) * int(rows.size), 3), dtype=np.int32)
                     voxels[:, 0] = np.repeat(z_idx.astype(np.int32), int(rows.size))
@@ -850,13 +940,41 @@ class OnlineMapper:
                 "voxel_blind_zone_grid_cells": int(total_grid_cells),
                 "voxel_blind_zone_written_voxels": int(total_voxels),
                 "voxel_blind_zone_changed_voxels": int(changed_all.size),
+                "voxel_blind_zone_skipped_occupied_cells": int(skipped_occupied_cells),
                 "voxel_blind_zone_active_this_frame": bool(total_grid_cells > 0 or total_voxels > 0),
                 "voxel_initial_blind_zone_radius_m": float(cfg.get("initial_blind_zone_radius_m", 0.80)),
                 "voxel_current_footprint_radius_m": float(cfg.get("current_footprint_radius_m", 0.35)),
+                "voxel_current_footprint_extra_margin_m": float(cfg.get("current_footprint_extra_margin_m", 0.0)),
                 "voxel_initial_blind_zone_steps": int(cfg.get("initial_blind_zone_steps", 60)),
+                "current_pose_navigation_override_cells": int(np.count_nonzero(self.current_pose_navigation_override_mask)),
+                "current_pose_dynamic_occupied_cleared_cells": int(current_dynamic_occupied_cleared),
+                "current_pose_static_wall_preserved_cells": int(current_static_wall_preserved),
             }
         )
+        self.last_current_footprint_override_debug = {
+            "current_pose_navigation_override_cells": int(np.count_nonzero(self.current_pose_navigation_override_mask)),
+            "current_pose_dynamic_occupied_cleared_cells": int(current_dynamic_occupied_cleared),
+            "current_pose_static_wall_preserved_cells": int(current_static_wall_preserved),
+        }
         return out
+
+    def _free_override_keep_mask(self, rows: np.ndarray, cols: np.ndarray, *, z_idx: np.ndarray | None = None) -> np.ndarray:
+        keep = np.ones(int(rows.size), dtype=bool)
+        cfg = self.voxel_navigation_blind_zone_config
+        if bool(cfg.get("preserve_occupied_cells", True)):
+            keep &= self.grid.occupied[rows, cols].astype(bool) == 0
+        if bool(cfg.get("preserve_static_structural_cells", True)):
+            keep &= self.roomseg_static_structural_occupied[rows, cols].astype(bool) == 0
+        if (
+            z_idx is not None
+            and int(np.asarray(z_idx).size) > 0
+            and bool(cfg.get("preserve_voxel_occupied_columns", True))
+            and bool(self.voxel_grid_config.enabled)
+        ):
+            z = np.asarray(z_idx, dtype=np.int64).reshape(-1)
+            voxel_occupied = np.any(self.voxel_grid.state[z[:, None], rows[None, :], cols[None, :]] == int(VOXEL_OCCUPIED), axis=0)
+            keep &= ~voxel_occupied
+        return keep
 
     def _disk_cells_for_world_xy(self, center_world_xy: tuple[float, float], radius_m: float) -> tuple[np.ndarray, np.ndarray]:
         center = self.grid.world_to_grid(float(center_world_xy[0]), float(center_world_xy[1]))
@@ -872,14 +990,40 @@ class OnlineMapper:
             return np.zeros(0, dtype=np.int32), np.zeros(0, dtype=np.int32)
         return np.asarray(rows, dtype=np.int32), np.asarray(cols, dtype=np.int32)
 
-    def _mark_robot_footprint_free(self, base_pose_world: Tuple[float, float, float, float]) -> None:
+    def _mark_robot_footprint_free(
+        self,
+        base_pose_world: Tuple[float, float, float, float],
+        *,
+        clear_dynamic_occupied: bool = True,
+    ) -> None:
+        cfg = self.voxel_navigation_blind_zone_config
+        clear_dynamic = bool(clear_dynamic_occupied) and bool(cfg.get("current_footprint_clear_dynamic_occupied", True))
+        preserve_static = bool(cfg.get("current_footprint_preserve_static_structural", True)) or bool(
+            cfg.get("current_footprint_preserve_roomseg_static_wall", True)
+        )
         radius_cells = max(1, self._robot_footprint_radius_cells())
         center = self.grid.world_to_grid(float(base_pose_world[0]), float(base_pose_world[1]))
         profile_cells: List[Tuple[int, int]] = []
+        dynamic_cleared = 0
+        static_preserved = 0
         for dr, dc in _disk_offsets(radius_cells):
             row, col = int(center[0] + dr), int(center[1] + dc)
-            self._set_free_cell(row, col, mark_mask=self.depth_free_mask)
-            if 0 <= row < self.grid.map_info.height and 0 <= col < self.grid.map_info.width:
+            if not (0 <= row < self.grid.map_info.height and 0 <= col < self.grid.map_info.width):
+                continue
+            if preserve_static and bool(self.roomseg_static_structural_occupied[row, col]):
+                static_preserved += 1
+                continue
+            if clear_dynamic and bool(self.grid.occupied[row, col]):
+                dynamic_cleared += 1
+            marked = self._set_free_cell(
+                row,
+                col,
+                mark_mask=self.depth_free_mask,
+                clear_occupied=clear_dynamic,
+                preserve_occupied=False,
+            )
+            if marked and 0 <= row < self.grid.map_info.height and 0 <= col < self.grid.map_info.width:
+                self.current_pose_navigation_override_mask[row, col] = True
                 profile_cells.append((row, col))
         if profile_cells:
             free_z = min(
@@ -887,15 +1031,41 @@ class OnlineMapper:
                 max(float(self.vertical_profile_free_min_height_m), float(self.vertical_profile_free_max_height_m) - 1e-3),
             )
             self.vertical_profile.mark_free_ray_cells(profile_cells, rel_z_m=free_z)
+        previous = dict(self.last_current_footprint_override_debug)
+        previous.update(
+            {
+                "current_pose_navigation_override_cells": int(np.count_nonzero(self.current_pose_navigation_override_mask)),
+                "current_pose_dynamic_occupied_cleared_cells": int(previous.get("current_pose_dynamic_occupied_cleared_cells", 0) or 0)
+                + int(dynamic_cleared),
+                "current_pose_static_wall_preserved_cells": int(previous.get("current_pose_static_wall_preserved_cells", 0) or 0)
+                + int(static_preserved),
+            }
+        )
+        self.last_current_footprint_override_debug = previous
 
-    def _set_free_cell(self, row: int, col: int, mark_mask: np.ndarray | None = None) -> None:
+    def _set_free_cell(
+        self,
+        row: int,
+        col: int,
+        mark_mask: np.ndarray | None = None,
+        *,
+        clear_occupied: bool = True,
+        preserve_occupied: bool = False,
+    ) -> bool:
         if 0 <= int(row) < self.grid.map_info.height and 0 <= int(col) < self.grid.map_info.width:
             rr, cc = int(row), int(col)
+            if preserve_occupied and (
+                bool(self.grid.occupied[rr, cc]) or bool(self.roomseg_static_structural_occupied[rr, cc])
+            ):
+                return False
             self.grid.free[rr, cc] = 1
-            self.grid.occupied[rr, cc] = 0
+            if bool(clear_occupied):
+                self.grid.occupied[rr, cc] = 0
             self.grid.observed[rr, cc] = 1
             if mark_mask is not None:
                 mark_mask[rr, cc] = 1
+            return True
+        return False
 
     def _set_occupied_cell(self, row: int, col: int) -> None:
         if 0 <= int(row) < self.grid.map_info.height and 0 <= int(col) < self.grid.map_info.width:
@@ -961,6 +1131,34 @@ class OnlineMapper:
                 else float(self.last_ceiling_height_estimate.height_m)
             ),
         }
+
+    def navigation_debug_layers(self) -> dict[str, object]:
+        debug: dict[str, object] = {}
+        projection_debug = dict(getattr(self.voxel_grid, "last_navigation_debug", {}) or {})
+        for key in (
+            "voxel_nav_occupied_from_voxel_xy",
+            "voxel_nav_occupied_from_endpoint_xy",
+            "voxel_nav_occupied_raw_xy",
+            "voxel_nav_occupied_closed_xy",
+            "voxel_nav_free_raw_xy",
+            "voxel_nav_free_suppressed_by_occupied_xy",
+            "voxel_nav_final_free_xy",
+            "voxel_nav_final_occupied_xy",
+            "voxel_nav_final_unknown_xy",
+        ):
+            value = projection_debug.get(key)
+            if isinstance(value, np.ndarray):
+                debug[key] = np.asarray(value).copy()
+        for key, value in projection_debug.items():
+            if not isinstance(value, np.ndarray):
+                debug[key] = value
+        debug.update(dict(self.voxel_nav_endpoint_decay_debug))
+        debug.update(dict(self.last_current_footprint_override_debug))
+        debug["voxel_nav_occupied_endpoint_count_xy"] = np.asarray(self.voxel_nav_occupied_endpoint_count, dtype=np.uint16).copy()
+        debug["voxel_nav_free_ray_count_xy"] = np.asarray(self.voxel_nav_free_ray_count, dtype=np.uint16).copy()
+        debug["current_pose_navigation_override_mask"] = np.asarray(self.current_pose_navigation_override_mask, dtype=bool).copy()
+        debug["current_pose_navigation_override_cells"] = int(np.count_nonzero(self.current_pose_navigation_override_mask))
+        return debug
 
     def _mark_roomseg_ray_covered_flat(self, flat_values: List[int]) -> None:
         h, w = self.grid.occupied.shape
@@ -1108,6 +1306,87 @@ class OnlineMapper:
             raise ValueError("resolution_m must be positive")
         return int(math.ceil(max(0.0, self.robot_radius_m) / self.resolution_m))
 
+    def _mark_voxel_navigation_endpoint_evidence(self, rows_cols: np.ndarray, rel_z: np.ndarray) -> None:
+        cfg = self.voxel_navigation_projection_config
+        if not bool(cfg.get("occupied_use_endpoint_hysteresis", True)):
+            self.voxel_nav_endpoint_decay_debug = {
+                "voxel_nav_endpoint_hysteresis_enabled": False,
+                "voxel_nav_endpoint_incremented_cells": 0,
+            }
+            return
+        rc = np.asarray(rows_cols, dtype=np.int32)
+        z = np.asarray(rel_z, dtype=np.float32).reshape(-1)
+        if rc.size == 0 or z.size == 0:
+            self.voxel_nav_endpoint_decay_debug = {
+                "voxel_nav_endpoint_hysteresis_enabled": True,
+                "voxel_nav_endpoint_incremented_cells": 0,
+            }
+            return
+        mask = (z >= float(cfg.get("obstacle_z_min_m", self.obstacle_min_height_m))) & (
+            z <= float(cfg.get("obstacle_z_max_m", self.obstacle_max_height_m))
+        )
+        if not np.any(mask):
+            self.voxel_nav_endpoint_decay_debug = {
+                "voxel_nav_endpoint_hysteresis_enabled": True,
+                "voxel_nav_endpoint_incremented_cells": 0,
+            }
+            return
+        splatted = _splat_rows_cols(
+            rc[mask],
+            radius_cells=int(cfg.get("occupied_endpoint_xy_splat_radius_cells", 1)),
+            shape=self.grid.free.shape,
+        )
+        if splatted.size == 0:
+            incremented = 0
+        else:
+            width = int(self.grid.map_info.width)
+            flat = np.unique(splatted[:, 0].astype(np.int64) * width + splatted[:, 1].astype(np.int64))
+            counts = self.voxel_nav_occupied_endpoint_count.reshape(-1).astype(np.uint32)
+            inc = max(1, int(cfg.get("occupied_endpoint_increment", 2)))
+            counts[flat] = np.minimum(counts[flat] + inc, int(np.iinfo(np.uint16).max))
+            self.voxel_nav_occupied_endpoint_count.reshape(-1)[:] = counts.astype(np.uint16)
+            incremented = int(flat.size)
+        self.voxel_nav_endpoint_decay_debug = {
+            "voxel_nav_endpoint_hysteresis_enabled": True,
+            "voxel_nav_endpoint_incremented_cells": int(incremented),
+            "voxel_nav_endpoint_increment": int(cfg.get("occupied_endpoint_increment", 2)),
+            "voxel_nav_endpoint_xy_splat_radius_cells": int(cfg.get("occupied_endpoint_xy_splat_radius_cells", 1)),
+        }
+
+    def _decay_voxel_navigation_endpoint_evidence(self, free_flat: np.ndarray) -> None:
+        cfg = self.voxel_navigation_projection_config
+        free_unique = _unique_flat_array(free_flat)
+        decayed_cells = 0
+        stale_cleared = 0
+        if free_unique.size and bool(cfg.get("occupied_use_endpoint_hysteresis", True)):
+            total_cells = int(self.grid.map_info.height) * int(self.grid.map_info.width)
+            free_unique = free_unique[(free_unique >= 0) & (free_unique < total_cells)]
+            if free_unique.size:
+                counts = self.voxel_nav_occupied_endpoint_count.reshape(-1)
+                free_ray_counts = self.voxel_nav_free_ray_count.reshape(-1).astype(np.uint32)
+                free_ray_counts[free_unique] = np.minimum(free_ray_counts[free_unique] + 1, int(np.iinfo(np.uint16).max))
+                self.voxel_nav_free_ray_count.reshape(-1)[:] = free_ray_counts.astype(np.uint16)
+                protected = counts[free_unique] > 0
+                if np.any(protected):
+                    protected_flat = free_unique[protected]
+                    before = counts[protected_flat].astype(np.int32)
+                    decayed = np.maximum(before - max(1, int(cfg.get("occupied_endpoint_decay_per_free_ray", 1))), 0).astype(np.uint16)
+                    counts[protected_flat] = decayed
+                    decayed_cells = int(protected_flat.size)
+                    stale_cleared = int(np.count_nonzero(decayed == 0))
+        previous = dict(self.voxel_nav_endpoint_decay_debug)
+        previous.update(
+            {
+                "voxel_nav_endpoint_decayed_cells": int(decayed_cells),
+                "voxel_nav_endpoint_stale_cells_cleared": int(stale_cleared),
+                "voxel_nav_endpoint_decay_per_free_ray": int(cfg.get("occupied_endpoint_decay_per_free_ray", 1)),
+                "voxel_nav_endpoint_count_cells": int(np.count_nonzero(self.voxel_nav_occupied_endpoint_count)),
+                "voxel_nav_endpoint_count_sum": int(np.sum(self.voxel_nav_occupied_endpoint_count, dtype=np.uint64)),
+                "voxel_nav_free_ray_count_cells": int(np.count_nonzero(self.voxel_nav_free_ray_count)),
+            }
+        )
+        self.voxel_nav_endpoint_decay_debug = previous
+
     def _splat_cells(
         self,
         rows_cols: np.ndarray,
@@ -1205,6 +1484,11 @@ class OnlineMapper:
             "free_ray_obstacle_endpoint_decay": int(self._free_ray_obstacle_endpoint_decay),
             "depth_obstacle_endpoint_cells": int(np.count_nonzero(self.depth_obstacle_endpoint_count)),
             "depth_obstacle_endpoint_count_sum": int(np.sum(self.depth_obstacle_endpoint_count, dtype=np.uint64)),
+            "voxel_nav_endpoint_count_cells": int(np.count_nonzero(self.voxel_nav_occupied_endpoint_count)),
+            "voxel_nav_endpoint_count_sum": int(np.sum(self.voxel_nav_occupied_endpoint_count, dtype=np.uint64)),
+            "voxel_nav_free_ray_count_cells": int(np.count_nonzero(self.voxel_nav_free_ray_count)),
+            **dict(self.voxel_nav_endpoint_decay_debug),
+            **dict(self.last_current_footprint_override_debug),
             "obstacle_splat_cells": int(occupied_endpoint_cells),
             "free_splat_cells": int(free_ray_cells),
             "image_bands": {
@@ -1544,6 +1828,30 @@ def _disk_offsets(radius_cells: int) -> List[Tuple[int, int]]:
         for dc in range(-rr, rr + 1):
             if dr * dr + dc * dc <= rr * rr:
                 out.append((dr, dc))
+    return out
+
+
+def _splat_rows_cols(rows_cols: np.ndarray, *, radius_cells: int, shape: tuple[int, int]) -> np.ndarray:
+    rc = np.asarray(rows_cols, dtype=np.int32).reshape(-1, 2)
+    if rc.size == 0:
+        return np.zeros((0, 2), dtype=np.int32)
+    radius = max(0, int(radius_cells))
+    h, w = int(shape[0]), int(shape[1])
+    chunks: list[np.ndarray] = []
+    for dr, dc in _disk_offsets(radius):
+        out = rc.copy()
+        out[:, 0] += int(dr)
+        out[:, 1] += int(dc)
+        valid = (out[:, 0] >= 0) & (out[:, 0] < h) & (out[:, 1] >= 0) & (out[:, 1] < w)
+        if np.any(valid):
+            chunks.append(out[valid])
+    if not chunks:
+        return np.zeros((0, 2), dtype=np.int32)
+    merged = np.concatenate(chunks, axis=0)
+    flat = np.unique(merged[:, 0].astype(np.int64) * w + merged[:, 1].astype(np.int64))
+    out = np.empty((int(flat.size), 2), dtype=np.int32)
+    out[:, 0] = (flat // w).astype(np.int32)
+    out[:, 1] = (flat % w).astype(np.int32)
     return out
 
 

@@ -30,6 +30,18 @@ def _seed_result(shape: tuple[int, int], cells: list[tuple[int, int]]) -> VoxelD
     )
 
 
+def _legacy_completion_config(**overrides: object) -> VoxelDoorDetectorConfig:
+    data = {
+        "min_seed_cells_for_accepted_extension": 1,
+        "min_seed_line_length_cells_for_accepted_extension": 1,
+        "min_seed_elongation_for_direction": 1.0,
+        "accepted_orientation_mode": "legacy",
+        "local_free_neck_orientation_debug_only": False,
+    }
+    data.update(overrides)
+    return VoxelDoorDetectorConfig(**data)
+
+
 def test_door_visual_line_does_not_become_partition_without_topology_gain() -> None:
     shape = (20, 28)
     seed = _seed_result(shape, [(10, 13), (10, 14)])
@@ -48,7 +60,7 @@ def test_door_visual_line_does_not_become_partition_without_topology_gain() -> N
         anchor_wall_map=anchors,
         unknown_map=np.zeros(shape, dtype=bool),
         resolution_m=0.10,
-        config=VoxelDoorDetectorConfig(wall_anchor_radius_cells=0, partition_topology_reject_mode="reject"),
+        config=_legacy_completion_config(wall_anchor_radius_cells=0, partition_topology_reject_mode="reject"),
     )
 
     assert not np.any(result.debug["voxel_door_centerline_visual_mask"])
@@ -75,7 +87,7 @@ def test_valid_door_cut_must_split_partition_free() -> None:
         anchor_wall_map=anchors,
         unknown_map=np.zeros(shape, dtype=bool),
         resolution_m=0.10,
-        config=VoxelDoorDetectorConfig(wall_anchor_radius_cells=0, seed_cluster_morph_close_radius_cells=0),
+        config=_legacy_completion_config(wall_anchor_radius_cells=0, seed_cluster_morph_close_radius_cells=0),
         real_wall_barrier_map=anchors,
     )
 

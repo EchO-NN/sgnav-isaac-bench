@@ -25,6 +25,18 @@ def _seed_result(shape: tuple[int, int], components: list[list[tuple[int, int]]]
     )
 
 
+def _legacy_completion_config(**overrides: object) -> VoxelDoorDetectorConfig:
+    data = {
+        "min_seed_cells_for_accepted_extension": 1,
+        "min_seed_line_length_cells_for_accepted_extension": 1,
+        "min_seed_elongation_for_direction": 1.0,
+        "accepted_orientation_mode": "legacy",
+        "local_free_neck_orientation_debug_only": False,
+    }
+    data.update(overrides)
+    return VoxelDoorDetectorConfig(**data)
+
+
 def test_v16_seed_cluster_without_wall_still_outputs_extension_attempts() -> None:
     shape = (21, 21)
     seed = _seed_result(shape, [[(10, 10)]])
@@ -36,7 +48,7 @@ def test_v16_seed_cluster_without_wall_still_outputs_extension_attempts() -> Non
         anchor_wall_map=np.zeros(shape, dtype=bool),
         unknown_map=np.zeros(shape, dtype=bool),
         resolution_m=0.10,
-        config=VoxelDoorDetectorConfig(seed_cluster_morph_close_radius_cells=0),
+        config=_legacy_completion_config(seed_cluster_morph_close_radius_cells=0),
     )
 
     assert result.debug["voxel_door_seed_cluster_count"] == 1
@@ -63,7 +75,7 @@ def test_v16_two_wall_seed_has_visual_and_partition_cut_maps() -> None:
         anchor_wall_map=anchors,
         unknown_map=np.zeros(shape, dtype=bool),
         resolution_m=0.10,
-        config=VoxelDoorDetectorConfig(wall_anchor_radius_cells=0, seed_cluster_morph_close_radius_cells=0),
+        config=_legacy_completion_config(wall_anchor_radius_cells=0, seed_cluster_morph_close_radius_cells=0),
         real_wall_barrier_map=anchors,
     )
 
@@ -91,7 +103,7 @@ def test_v16_visual_only_door_keeps_partition_reject_auditable() -> None:
         anchor_wall_map=anchors,
         unknown_map=np.zeros(shape, dtype=bool),
         resolution_m=0.10,
-        config=VoxelDoorDetectorConfig(wall_anchor_radius_cells=0, partition_topology_reject_mode="reject"),
+        config=_legacy_completion_config(wall_anchor_radius_cells=0, partition_topology_reject_mode="reject"),
     )
 
     assert not np.any(result.door_centerline_visual_mask)
@@ -122,7 +134,7 @@ def test_v16_split_seed_clusters_do_not_hard_reject_visual_crossing_other_seed()
         anchor_wall_map=anchors,
         unknown_map=np.zeros(shape, dtype=bool),
         resolution_m=0.10,
-        config=VoxelDoorDetectorConfig(wall_anchor_radius_cells=0, seed_cluster_merge_distance_cells=0, partition_topology_enabled=False),
+        config=_legacy_completion_config(wall_anchor_radius_cells=0, seed_cluster_merge_distance_cells=0, partition_topology_enabled=False),
         real_wall_barrier_map=anchors,
     )
 

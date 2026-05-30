@@ -25,6 +25,18 @@ def _seed_result(shape: tuple[int, int], components: list[list[tuple[int, int]]]
     )
 
 
+def _legacy_completion_config(**overrides: object) -> VoxelDoorDetectorConfig:
+    data = {
+        "min_seed_cells_for_accepted_extension": 1,
+        "min_seed_line_length_cells_for_accepted_extension": 1,
+        "min_seed_elongation_for_direction": 1.0,
+        "accepted_orientation_mode": "legacy",
+        "local_free_neck_orientation_debug_only": False,
+    }
+    data.update(overrides)
+    return VoxelDoorDetectorConfig(**data)
+
+
 def test_same_physical_door_seed_fragments_merge_before_completion() -> None:
     shape = (24, 32)
     seed = _seed_result(shape, [[(12, 12), (12, 13)], [(12, 18), (12, 19)]])
@@ -40,7 +52,7 @@ def test_same_physical_door_seed_fragments_merge_before_completion() -> None:
         anchor_wall_map=anchors,
         unknown_map=np.zeros(shape, dtype=bool),
         resolution_m=0.10,
-        config=VoxelDoorDetectorConfig(seed_cluster_merge_distance_cells=6, seed_cluster_morph_close_radius_cells=2, partition_topology_enabled=False),
+        config=_legacy_completion_config(seed_cluster_merge_distance_cells=6, seed_cluster_morph_close_radius_cells=2, partition_topology_enabled=False),
     )
 
     assert result.debug["voxel_door_seed_component_count"] == 2
@@ -68,7 +80,7 @@ def test_door_visual_line_drawn_even_when_partition_cut_empty() -> None:
         anchor_wall_map=anchors,
         unknown_map=np.zeros(shape, dtype=bool),
         resolution_m=0.10,
-        config=VoxelDoorDetectorConfig(partition_topology_reject_mode="reject"),
+        config=_legacy_completion_config(partition_topology_reject_mode="reject"),
     )
 
     assert result.debug["voxel_door_visual_accepted_count"] == 1
@@ -99,7 +111,7 @@ def test_door_unknown_ratio_does_not_count_real_wall_as_unknown() -> None:
         unknown_map=np.zeros(shape, dtype=bool),
         real_wall_barrier_map=real_wall,
         resolution_m=0.10,
-        config=VoxelDoorDetectorConfig(partition_topology_enabled=False),
+        config=_legacy_completion_config(partition_topology_enabled=False),
     )
 
     candidate = next(item for item in result.candidates if item.accepted)

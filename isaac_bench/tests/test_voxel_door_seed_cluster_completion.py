@@ -25,6 +25,18 @@ def _seed_result(shape: tuple[int, int], components: list[list[tuple[int, int]]]
     )
 
 
+def _legacy_completion_config(**overrides: object) -> VoxelDoorDetectorConfig:
+    data = {
+        "min_seed_cells_for_accepted_extension": 1,
+        "min_seed_line_length_cells_for_accepted_extension": 1,
+        "min_seed_elongation_for_direction": 1.0,
+        "accepted_orientation_mode": "legacy",
+        "local_free_neck_orientation_debug_only": False,
+    }
+    data.update(overrides)
+    return VoxelDoorDetectorConfig(**data)
+
+
 def test_split_same_door_seed_components_complete_as_one_cluster() -> None:
     shape = (24, 28)
     seed_result = _seed_result(shape, [[(12, 10), (12, 11)], [(12, 14), (12, 15)]])
@@ -41,7 +53,7 @@ def test_split_same_door_seed_components_complete_as_one_cluster() -> None:
         anchor_wall_map=anchor_wall,
         unknown_map=np.zeros(shape, dtype=bool),
         resolution_m=0.10,
-        config=VoxelDoorDetectorConfig(wall_anchor_radius_cells=0, seed_cluster_merge_distance_cells=3, partition_topology_enabled=False),
+        config=_legacy_completion_config(wall_anchor_radius_cells=0, seed_cluster_merge_distance_cells=3, partition_topology_enabled=False),
         real_wall_barrier_map=anchor_wall,
     )
 
@@ -74,7 +86,7 @@ def test_different_door_clusters_that_cross_are_still_rejected() -> None:
         anchor_wall_map=anchor_wall,
         unknown_map=np.zeros(shape, dtype=bool),
         resolution_m=0.10,
-        config=VoxelDoorDetectorConfig(wall_anchor_radius_cells=0, seed_cluster_merge_distance_cells=0, partition_topology_enabled=False),
+        config=_legacy_completion_config(wall_anchor_radius_cells=0, seed_cluster_merge_distance_cells=0, partition_topology_enabled=False),
         real_wall_barrier_map=anchor_wall,
     )
 

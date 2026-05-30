@@ -29,6 +29,18 @@ def _seed_result(shape: tuple[int, int], cells: list[tuple[int, int]]) -> VoxelD
     )
 
 
+def _legacy_completion_config(**overrides: object) -> VoxelDoorDetectorConfig:
+    data = {
+        "min_seed_cells_for_accepted_extension": 1,
+        "min_seed_line_length_cells_for_accepted_extension": 1,
+        "min_seed_elongation_for_direction": 1.0,
+        "accepted_orientation_mode": "legacy",
+        "local_free_neck_orientation_debug_only": False,
+    }
+    data.update(overrides)
+    return VoxelDoorDetectorConfig(**data)
+
+
 def test_stable_door_memory_keeps_last_valid_cut_after_candidate_disappears() -> None:
     shape = (18, 26)
     seed = _seed_result(shape, [(8, 12), (9, 12)])
@@ -37,7 +49,7 @@ def test_stable_door_memory_keeps_last_valid_cut_after_candidate_disappears() ->
     anchors = np.zeros(shape, dtype=bool)
     anchors[3, 12] = True
     anchors[14, 12] = True
-    cfg = VoxelDoorDetectorConfig(wall_anchor_radius_cells=0, seed_cluster_morph_close_radius_cells=0)
+    cfg = _legacy_completion_config(wall_anchor_radius_cells=0, seed_cluster_morph_close_radius_cells=0)
     completion = complete_voxel_doors_from_seeds(
         seed_result=seed,
         free_map=free,
