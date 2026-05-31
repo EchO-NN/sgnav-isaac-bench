@@ -58,9 +58,11 @@ from isaac_bench.mapping.voxel_roomseg_evidence import (
 from isaac_bench.mapping.wall_projection import ProjectedWallLine, WallProjectionConfig, project_wall_evidence_to_axis_accumulator_lines
 
 
-VOXEL_OCCUPANCY_ROOMSEG_BACKEND = "voxel_occupancy_door_wall_v9"
-VOXEL_OCCUPANCY_ROOMSEG_ALGORITHM = "voxel_occupancy_door_wall_v9"
-VOXEL_OCCUPANCY_ROOMSEG_CONTEXT = "voxel_occupancy_door_wall_v9_vlm"
+VOXEL_OCCUPANCY_ROOMSEG_BACKEND = "voxel_occupancy_door_wall_v29"
+VOXEL_OCCUPANCY_ROOMSEG_ALGORITHM = "voxel_occupancy_door_wall_v29"
+VOXEL_OCCUPANCY_ROOMSEG_CONTEXT = "voxel_occupancy_door_wall_v29_vlm"
+VOXEL_OCCUPANCY_ROOMSEG_LEGACY_BACKENDS = {"voxel_occupancy_door_wall_v9"}
+VOXEL_OCCUPANCY_ROOMSEG_LEGACY_CONTEXTS = {"voxel_occupancy_door_wall_v9_vlm"}
 
 
 @dataclass
@@ -706,6 +708,8 @@ def run_voxel_occupancy_door_wall_roomseg(
     )
     current_door_visual_mask = np.asarray(door_completion.door_centerline_visual_mask, dtype=bool)
     current_door_cut_mask = np.asarray(door_completion.door_cut_mask_for_partition, dtype=bool)
+    current_geometry_warning_cut_mask = np.asarray(door_completion.door_geometry_warning_cut_mask, dtype=bool)
+    current_topology_effective_cut_mask = np.asarray(door_completion.door_topology_effective_cut_mask, dtype=bool)
     if door_memory is not None:
         door_memory_result = door_memory.update(door_completion.candidates, step=int(step), shape=shape)
         stable_door_cut_mask = np.asarray(door_memory_result.stable_door_cut_mask, dtype=bool)
@@ -726,7 +730,7 @@ def run_voxel_occupancy_door_wall_roomseg(
     accepted_door_visual_mask = current_accepted_visual_mask | stable_door_visual_mask
     cluster_map = np.asarray(door_completion.debug.get("voxel_door_seed_cluster_map", np.zeros(shape, dtype=np.int32)), dtype=np.int32)
     current_accepted_seed_mask = accepted_seed_mask_from_candidates(door_completion.candidates, cluster_map, shape) & door_seed_mask
-    step2_door_reject_mask = current_accepted_visual_mask | current_accepted_cut_mask | stable_door_visual_mask | stable_door_cut_mask
+    step2_door_reject_mask = current_topology_effective_cut_mask | stable_door_cut_mask
     wall_carve_mask = current_accepted_cut_mask | stable_door_cut_mask
     door_acceptance = DoorAcceptanceMasks(
         raw_seed_mask=door_seed_mask,
@@ -740,6 +744,7 @@ def run_voxel_occupancy_door_wall_roomseg(
         projection_hard_forbidden_mask=projection_hard_forbidden_mask,
         debug={
             "voxel_door_acceptance_policy": "v26_raw_seed_debug_only",
+            "voxel_door_acceptance_policy_v29": "topology_effective_cut_only",
             "voxel_raw_seed_not_step2_block": True,
             "voxel_raw_seed_not_wall_carve": True,
             "voxel_raw_seed_not_projection_hard_forbidden": True,
@@ -747,6 +752,11 @@ def run_voxel_occupancy_door_wall_roomseg(
             "voxel_step2_block_raw_seed_removed": True,
             "voxel_step2_block_raw_seed_removed_cells": int(np.count_nonzero(door_seed_mask & ~step2_door_reject_mask)),
             "voxel_step2_block_cells": int(np.count_nonzero(step2_door_reject_mask)),
+            "voxel_step2_block_topology_effective_door_only": True,
+            "voxel_step2_door_block_topology_effective_cells": int(np.count_nonzero(step2_door_reject_mask)),
+            "voxel_step2_raw_seed_not_blocking_cells": int(np.count_nonzero(door_seed_mask & ~step2_door_reject_mask)),
+            "voxel_step2_raw_seed_would_have_blocked_cells": int(np.count_nonzero(door_seed_mask & ~step2_door_reject_mask)),
+            "voxel_step2_raw_seed_not_blocking_mask": (door_seed_mask & ~step2_door_reject_mask).astype(bool),
             "voxel_wall_carve_accepted_door_cells": int(np.count_nonzero(wall_carve_mask)),
         },
     )
@@ -785,7 +795,7 @@ def run_voxel_occupancy_door_wall_roomseg(
         resolution_m=float(resolution_m),
         target_wall_override=partition_maps.step2_target_wall_map,
     )
-    accepted_seed_for_partition = current_accepted_seed_mask
+    accepted_seed_for_partition = np.zeros_like(current_accepted_seed_mask, dtype=bool)
 
     line_cfg = replace(
         cfg.line_extension,
@@ -912,7 +922,7 @@ def run_voxel_occupancy_door_wall_roomseg(
     step2_partition_cut_candidate_map = step2_candidate_map.astype(bool)
     step2_extension_separator_map = (step2_partition_cut_accepted_map & base_partition_free) | (stable_step2_separator_map & base_partition_free)
     final_virtual_separator_map = door_cut_mask | step2_extension_separator_map
-    partition_free_for_label = (base_partition_free | accepted_seed_for_partition) & ~final_virtual_separator_map
+    partition_free_for_label = base_partition_free & ~final_virtual_separator_map
     partition_free = partition_free_for_label.copy()
     labels, _count = ndimage.label(partition_free, structure=conn(int(cfg.final_connectivity)))
     labels = relabel_compact(labels.astype(np.int32))
@@ -1033,7 +1043,9 @@ def run_voxel_occupancy_door_wall_roomseg(
         "voxel_extension_seed_wall_line_mask": extension_seed_line_map,
         "voxel_wall_base_map": wall_base_pre_step1,
         "voxel_door_seed_mask": door_seed_mask,
+        "voxel_door_raw_seed_mask": door_seed_mask,
         "voxel_door_seed_component_map": door_seed_result.door_seed_component_map,
+        "voxel_door_extensible_seed_group_mask": np.asarray(door_completion.debug.get("voxel_door_extensible_seed_group_mask", np.zeros(shape, dtype=bool)), dtype=bool),
         "voxel_door_extension_attempt_all_mask": door_completion.door_extension_attempt_all_mask,
         "voxel_door_extension_attempt_selected_mask": np.asarray(door_completion.debug.get("voxel_door_extension_attempt_selected_mask", np.zeros(shape, dtype=bool)), dtype=bool),
         "voxel_door_extension_attempt_rejected_mask": door_completion.door_extension_attempt_rejected_mask,
@@ -1044,12 +1056,17 @@ def run_voxel_occupancy_door_wall_roomseg(
         "voxel_door_centerline_visual_mask": door_visual_mask,
         "voxel_door_current_centerline_visual_mask": current_door_visual_mask,
         "voxel_door_visual_only_mask": np.asarray(door_completion.debug.get("voxel_door_visual_only_mask", np.zeros(shape, dtype=bool)), dtype=bool),
+        "voxel_door_geometry_warning_cut_mask": (current_geometry_warning_cut_mask | np.asarray(door_completion.debug.get("voxel_door_geometry_warning_cut_mask", np.zeros(shape, dtype=bool)), dtype=bool)).astype(bool),
+        "voxel_door_topology_effective_cut_mask": (current_topology_effective_cut_mask | stable_door_cut_mask).astype(bool),
         "voxel_door_partition_cut_candidate_mask": door_completion.door_partition_cut_candidate_mask,
         "voxel_door_partition_cut_accepted_mask": door_cut_mask,
         "voxel_door_current_cut_mask": current_door_cut_mask,
         "voxel_stable_door_cut_mask": stable_door_cut_mask,
         "voxel_stable_door_visual_mask": stable_door_visual_mask,
         "voxel_final_door_cut_mask": door_cut_mask,
+        "voxel_door_final_cut_mask": door_cut_mask,
+        "voxel_door_wall_attachment_reject_map": np.asarray(door_completion.debug.get("voxel_door_wall_attachment_reject_map", np.zeros(shape, dtype=np.uint8)), dtype=np.uint8),
+        "voxel_door_raw_seed_conflict_ignored_map": np.asarray(door_completion.debug.get("voxel_door_raw_seed_conflict_ignored_map", np.zeros(shape, dtype=bool)), dtype=bool),
         "voxel_door_partition_cut_rejected_mask": np.asarray(door_completion.debug.get("voxel_door_partition_cut_rejected_mask", np.zeros(shape, dtype=bool)), dtype=bool),
         "voxel_door_partition_reject_reason_map": np.asarray(door_completion.debug.get("voxel_door_partition_reject_reason_map", np.zeros(shape, dtype=np.uint8)), dtype=np.uint8),
         "voxel_door_reject_reason_map": door_completion.door_reject_reason_map,
@@ -1071,6 +1088,7 @@ def run_voxel_occupancy_door_wall_roomseg(
         "voxel_step2_target_wall_map": step2_line_pool.target_wall_map,
         "voxel_step2_target_source_map": step2_line_pool.target_source_map,
         "voxel_step2_door_reject_mask": step2_door_reject_mask,
+        "voxel_step2_raw_seed_not_blocking_mask": np.asarray(door_acceptance.debug.get("voxel_step2_raw_seed_not_blocking_mask", np.zeros(shape, dtype=bool)), dtype=bool),
         "voxel_step2_extension_candidate_map": step2_layers["all"],
         "voxel_step2_extension_hits_all_map": step2_stage_maps.extension_hits_all_map,
         "voxel_step2_extension_hits_pre_topology_map": step2_stage_maps.extension_hits_pre_topology_map,
@@ -1090,6 +1108,7 @@ def run_voxel_occupancy_door_wall_roomseg(
         "voxel_boundary_source_map": boundary_source,
         "voxel_partition_free": partition_free,
         "voxel_partition_free_before_label": partition_free_for_label,
+        "partition_free_for_label": partition_free_for_label,
         "voxel_final_virtual_separator_map": final_virtual_separator_map,
         "voxel_final_room_label_map": labels,
         "voxel_room_label_map_visual": labels,
@@ -1140,7 +1159,12 @@ def run_voxel_occupancy_door_wall_roomseg(
         "voxel_door_partition_accepted_count": int(door_completion.debug.get("voxel_door_partition_accepted_count", 0)),
         "voxel_door_current_cut_cells": int(np.count_nonzero(current_door_cut_mask)),
         "voxel_stable_door_cut_cells": int(np.count_nonzero(stable_door_cut_mask)),
+        "voxel_door_topology_effective_cells": int(np.count_nonzero(current_topology_effective_cut_mask | stable_door_cut_mask)),
+        "voxel_door_geometry_warning_cells": int(np.count_nonzero(current_geometry_warning_cut_mask)),
         "voxel_final_door_cut_cells": int(np.count_nonzero(door_cut_mask)),
+        "voxel_seed_not_added_to_partition_free": True,
+        "voxel_legacy_seed_free_injection_would_add_cells": int(np.count_nonzero(current_accepted_seed_mask)),
+        "voxel_legacy_seed_free_injection_overlap_cut_cells": int(np.count_nonzero(current_accepted_seed_mask & door_cut_mask)),
         **door_memory_debug,
         "voxel_door_rejected_count": int(door_completion.debug.get("voxel_door_rejected_count", 0)),
         "voxel_real_wall_barrier_cells": int(np.count_nonzero(real_wall_barrier_for_partition)),
@@ -1162,6 +1186,10 @@ def run_voxel_occupancy_door_wall_roomseg(
         "voxel_step2_partition_cut_candidate_cells": int(np.count_nonzero(step2_partition_cut_candidate_map)),
         "voxel_step2_partition_cut_accepted_cells": int(np.count_nonzero(step2_extension_separator_map)),
         "voxel_step2_partition_cut_debug": dict(step2_partition_cut_debug),
+        "voxel_step2_fallback_unblocked_by_raw_seed": True,
+        "voxel_step2_block_topology_effective_door_only": True,
+        "voxel_step2_door_block_topology_effective_cells": int(np.count_nonzero(step2_door_reject_mask)),
+        "voxel_step2_raw_seed_not_blocking_cells": int(np.count_nonzero(door_seed_mask & ~step2_door_reject_mask)),
         "voxel_step2_reject_reason_counts": _extension_and_candidate_reasons(step2_extensions, rejected_step2),
         "voxel_step2_candidate_debug_list": [candidate.to_dict() for candidate in [*accepted_step2, *rejected_step2]],
         "voxel_step2_corridor_topology_debug_per_candidate": [
@@ -1188,7 +1216,7 @@ def run_voxel_occupancy_door_wall_roomseg(
         "source_backend": VOXEL_OCCUPANCY_ROOMSEG_BACKEND,
         "roomseg_backend": VOXEL_OCCUPANCY_ROOMSEG_BACKEND,
         "algorithm": VOXEL_OCCUPANCY_ROOMSEG_ALGORITHM,
-        "variant": "voxel_v26_v25_1_door_step2_corridor_stability",
+        "variant": "voxel_v29_door_seed_partition_fix",
         "source": VOXEL_OCCUPANCY_ROOMSEG_BACKEND,
         "context_source": VOXEL_OCCUPANCY_ROOMSEG_CONTEXT,
         "room_map_mode": VOXEL_OCCUPANCY_ROOMSEG_CONTEXT,
@@ -1200,6 +1228,14 @@ def run_voxel_occupancy_door_wall_roomseg(
         "resolution_m": float(resolution_m),
         "voxel_room_count": _room_count(labels),
         "room_count": _room_count(labels),
+        "voxel_seed_not_added_to_partition_free": True,
+        "voxel_legacy_seed_free_injection_would_add_cells": int(np.count_nonzero(current_accepted_seed_mask)),
+        "voxel_legacy_seed_free_injection_overlap_cut_cells": int(np.count_nonzero(current_accepted_seed_mask & door_cut_mask)),
+        "voxel_step2_fallback_unblocked_by_raw_seed": True,
+        "voxel_step2_block_topology_effective_door_only": True,
+        "voxel_step2_door_block_topology_effective_cells": int(np.count_nonzero(step2_door_reject_mask)),
+        "voxel_step2_raw_seed_not_blocking_cells": int(np.count_nonzero(door_seed_mask & ~step2_door_reject_mask)),
+        "voxel_step2_raw_seed_would_have_blocked_cells": int(np.count_nonzero(door_seed_mask & ~step2_door_reject_mask)),
         "merge_small_components_enabled": bool(cfg.merge_small_components_enabled),
         "voxel_show_wall_diagnostics": bool(cfg.voxel_show_wall_diagnostics),
         "voxel_step2_reject_reason_counts": report["voxel_step2_reject_reason_counts"],
@@ -1454,7 +1490,7 @@ def accepted_seed_mask_from_candidates(candidates: Sequence[VoxelDoorCompletionR
         debug = getattr(candidate, "debug", None)
         if not isinstance(debug, Mapping):
             continue
-        if bool(debug.get("partition_accepted", False)) or bool(debug.get("visual_accepted", False)):
+        if bool(debug.get("partition_accepted", False)) or bool(debug.get("partition_topology_effective", False)):
             raw_id = debug.get("seed_group_id", debug.get("cluster_id", None))
             try:
                 cluster_id = int(raw_id)

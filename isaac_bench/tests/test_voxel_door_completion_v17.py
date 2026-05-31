@@ -100,7 +100,7 @@ def test_seed_pair_bridge_supports_two_offset_seed_blobs_without_wall_anchor() -
     assert np.any(result.door_cut_mask_for_partition)
 
 
-def test_topology_no_gain_is_warning_by_default_for_geometry_valid_door_cut() -> None:
+def test_topology_no_gain_is_visual_only_for_geometry_valid_door_cut() -> None:
     shape = (20, 28)
     seed = _seed_result(shape, [[(10, 13), (10, 14)]])
     visual_free = np.zeros(shape, dtype=bool)
@@ -120,9 +120,12 @@ def test_topology_no_gain_is_warning_by_default_for_geometry_valid_door_cut() ->
         config=_legacy_completion_config(wall_anchor_radius_cells=0),
     )
 
-    assert np.any(result.door_cut_mask_for_partition)
+    assert not np.any(result.door_cut_mask_for_partition)
+    assert np.any(result.door_visual_only_mask)
+    assert np.any(result.debug["voxel_door_geometry_warning_cut_mask"])
     candidate = next(item for item in result.candidates if item.accepted)
-    assert candidate.debug["partition_accepted"] is True
+    assert candidate.debug["partition_geometry_accepted"] is True
+    assert candidate.debug["partition_accepted"] is False
     assert candidate.debug["partition_topology_accepted"] is False
     assert candidate.debug["door_topology_warning"] is True
     assert np.any(result.debug["voxel_door_topology_warning_cut_mask"])

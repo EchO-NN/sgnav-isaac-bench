@@ -8,7 +8,7 @@ PYTHON_BIN="${PYTHON_BIN:-/home/echo/miniforge3/envs/sgnav-isaac/bin/python}"
 DATASET_ROOT="${DATASET_ROOT:-/home/echo/InteriorAgent}"
 PREPROCESSED_DIR="${PREPROCESSED_DIR:-data/interioragent_preprocessed_radius005}"
 EPISODE_DIR="${EPISODE_DIR:-data/interioragent_episodes/radius005_all_scenes}"
-RUN_ROOT="${RUN_ROOT:-data/isaac_bench_runs/radius005_voxel_v9_all_scenes}"
+RUN_ROOT="${RUN_ROOT:-data/isaac_bench_runs/radius005_voxel_v29_all_scenes}"
 SCENE_GLOB="${SCENE_GLOB:-kujiale_*}"
 ROOMSEG_SNAPSHOT_MAX_SAVES="${ROOMSEG_SNAPSHOT_MAX_SAVES:-100000}"
 CONTINUE_ON_ERROR="${CONTINUE_ON_ERROR:-1}"
@@ -68,7 +68,7 @@ while IFS= read -r episode_file; do
   echo "[all-scenes] ($run_index) running $scene_id"
 
   cat > "$scene_run_dir/command.txt" <<EOF
-./scripts/run_sgnav_isaac_env.sh isaac_bench/scripts/run_one_episode.py --config isaac_bench/configs/isaac_bench.yaml --episode-file "$episode_file" --episode-index 0 --sim-backend isaac --planner astar --detector none --segmenter none --no-llm-enabled --no-vllm-frontier-scoring --no-vllm-image-scoring --frontier-selection-mode random --frontier-source voxel_vertical_free --room-map-mode voxel_occupancy_door_wall_v9_vlm --roomseg-backend voxel_occupancy_door_wall_v9 --no-strict-benchmark --allow-debug-fallbacks --explore-until-no-frontiers --max-control-steps 5000 --robot-radius-m 0.05 --sgnav-viz --sgnav-viz-every-steps 1 --save-roomseg-snapshots --roomseg-snapshot-dir "$snapshot_dir" --roomseg-snapshot-max-saves "$ROOMSEG_SNAPSHOT_MAX_SAVES" --save-roomseg-voxel-evidence --output "$scene_run_dir/results.jsonl"
+./scripts/run_sgnav_isaac_env.sh isaac_bench/scripts/run_one_episode.py --config isaac_bench/configs/isaac_bench.yaml --episode-file "$episode_file" --episode-index 0 --sim-backend isaac --planner astar --detector none --segmenter none --no-llm-enabled --no-vllm-frontier-scoring --no-vllm-image-scoring --frontier-selection-mode random --frontier-source voxel_vertical_free --room-map-mode voxel_occupancy_door_wall_v29_vlm --roomseg-backend voxel_occupancy_door_wall_v29 --no-strict-benchmark --allow-debug-fallbacks --explore-until-no-frontiers --max-control-steps 5000 --robot-radius-m 0.05 --sgnav-viz --sgnav-viz-every-steps 1 --save-roomseg-snapshots --roomseg-snapshot-dir "$snapshot_dir" --roomseg-snapshot-max-saves "$ROOMSEG_SNAPSHOT_MAX_SAVES" --save-roomseg-voxel-evidence --output "$scene_run_dir/results.jsonl"
 EOF
 
   if ./scripts/run_sgnav_isaac_env.sh isaac_bench/scripts/run_one_episode.py \
@@ -84,8 +84,8 @@ EOF
     --no-vllm-image-scoring \
     --frontier-selection-mode random \
     --frontier-source voxel_vertical_free \
-    --room-map-mode voxel_occupancy_door_wall_v9_vlm \
-    --roomseg-backend voxel_occupancy_door_wall_v9 \
+    --room-map-mode voxel_occupancy_door_wall_v29_vlm \
+    --roomseg-backend voxel_occupancy_door_wall_v29 \
     --no-strict-benchmark \
     --allow-debug-fallbacks \
     --explore-until-no-frontiers \

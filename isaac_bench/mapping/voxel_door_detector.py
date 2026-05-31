@@ -37,6 +37,7 @@ DOOR_ANCHOR_SOURCE_NAMES = {
 DOOR_COMPLETION_MIDDLE_SEED_TWO_WALL = "middle_seed_two_wall"
 DOOR_COMPLETION_SEED_PAIR_BRIDGE = "seed_pair_bridge"
 DOOR_COMPLETION_ONE_SEED_ONE_WALL = "one_seed_one_wall"
+DOOR_COMPLETION_STRONG_SEED_CENTERLINE = "strong_seed_centerline"
 DOOR_COMPLETION_VISUAL_ONLY = "visual_only"
 DOOR_COMPLETION_REJECTED = "rejected"
 
@@ -140,6 +141,12 @@ class VoxelDoorDetectorConfig:
     door_partition_accept_mode: str = "geometry_first"
     partition_topology_reject_mode: str = "warn_only"
     min_geometry_cut_cells: int = 1
+    door_wall_attachment_max_endpoint_gap_cells: int = 1
+    enable_strong_seed_centerline_fallback: bool = True
+    strong_seed_centerline_min_cells: int = 4
+    strong_seed_centerline_min_length_cells: int = 3
+    strong_seed_centerline_min_elongation: float = 1.6
+    strong_seed_centerline_max_residual_cells: float = 1.25
     door_memory_enabled: bool = True
     door_memory_initial_confidence: float = 1.0
     door_memory_match_iou_min: float = 0.05
@@ -244,10 +251,14 @@ class VoxelDoorLineCandidate:
             "anchor_b_source",
             "visual_line_cells",
             "partition_cut_cells",
+            "partition_geometry_accepted",
+            "partition_topology_effective",
             "visual_accepted",
             "partition_accepted",
             "partition_topology_accepted",
             "reject_reason_topology",
+            "door_wall_attached",
+            "door_wall_attachment_reject_reason",
             "door_topology_accepted",
             "door_topology_reject_reason",
             "door_topology_before_components",
@@ -332,8 +343,8 @@ class DoorExtensionTrial:
             partition_cut_accepted_cells=list(candidate.door_cut_cells),
             partition_status=str(debug.get("partition_status", "accepted" if debug.get("partition_accepted") else debug.get("reject_reason_partition", "rejected"))),
             partition_accepted=bool(debug.get("partition_accepted", False)),
-            topology_status=str(debug.get("door_topology_reject_reason") or ("accepted" if debug.get("door_topology_accepted") else "not_run")),
-            topology_accepted=bool(debug.get("door_topology_accepted", False)),
+            topology_status=str(debug.get("reject_reason_topology") or debug.get("door_topology_reject_reason") or ("accepted" if debug.get("partition_topology_effective") else "not_run")),
+            topology_accepted=bool(debug.get("partition_topology_effective", debug.get("door_topology_accepted", False))),
             topology_before_components=int(debug.get("door_topology_before_components", 0) or 0),
             topology_after_components=int(debug.get("door_topology_after_components", 0) or 0),
             topology_touched_labels=[int(v) for v in debug.get("door_topology_touched_labels", [])],
@@ -535,12 +546,34 @@ class DoorTopologyValidationResult:
 
 
 @dataclass
+class DoorAttachmentValidation:
+    attached: bool
+    left_attached: bool
+    right_attached: bool
+    left_gap_cells: int
+    right_gap_cells: int
+    reject_reason: str | None
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "door_wall_attached": bool(self.attached),
+            "door_wall_left_attached": bool(self.left_attached),
+            "door_wall_right_attached": bool(self.right_attached),
+            "door_wall_left_gap_cells": int(self.left_gap_cells),
+            "door_wall_right_gap_cells": int(self.right_gap_cells),
+            "door_wall_attachment_reject_reason": self.reject_reason,
+        }
+
+
+@dataclass
 class VoxelDoorCompletionResult:
     door_seed_mask: np.ndarray
     door_extension_attempt_all_mask: np.ndarray
     door_extension_attempt_rejected_mask: np.ndarray
     door_centerline_visual_mask: np.ndarray
     door_visual_only_mask: np.ndarray
+    door_geometry_warning_cut_mask: np.ndarray
+    door_topology_effective_cut_mask: np.ndarray
     door_partition_cut_candidate_mask: np.ndarray
     door_cut_mask_for_partition: np.ndarray
     door_centerline_candidate_mask: np.ndarray
@@ -1070,7 +1103,7 @@ def complete_voxel_doors_from_seeds(
             )
             cid += 1
 
-    _batch_reject_conflicting_doors(selected_candidates, seed, shape, cfg)
+    conflict_debug = _batch_reject_conflicting_doors(selected_candidates, seed, shape, cfg)
     trial_candidate_mask = np.zeros(shape, dtype=bool)
     trial_rejected_mask = np.zeros(shape, dtype=bool)
     selected_candidate_mask = np.zeros(shape, dtype=bool)
@@ -1080,9 +1113,11 @@ def complete_voxel_doors_from_seeds(
     visual_all_mask = np.zeros(shape, dtype=bool)
     visual_partition_mask = np.zeros(shape, dtype=bool)
     visual_only_mask = np.zeros(shape, dtype=bool)
+    geometry_warning_cut_mask = np.zeros(shape, dtype=bool)
     partition_mask = np.zeros(shape, dtype=bool)
     topology_accepted_cut_mask = np.zeros(shape, dtype=bool)
     topology_warning_cut_mask = np.zeros(shape, dtype=bool)
+    wall_attachment_reject_map = np.zeros(shape, dtype=np.uint8)
     rejected_mask = np.zeros(shape, dtype=bool)
     rejected_reason_map = np.zeros(shape, dtype=np.uint8)
     for candidate in all_trial_candidates:
@@ -1109,13 +1144,18 @@ def complete_voxel_doors_from_seeds(
             if bool(candidate.debug.get("partition_accepted", bool(candidate.door_cut_cells))):
                 visual_partition_mask |= visual
                 partition_mask |= cut
-                if bool(candidate.debug.get("partition_topology_accepted", False)):
+                if bool(candidate.debug.get("partition_topology_effective", candidate.debug.get("partition_topology_accepted", False))):
                     topology_accepted_cut_mask |= cut
                 elif bool(candidate.debug.get("door_topology_warning", False)):
                     topology_warning_cut_mask |= cut
             else:
                 visual_only_mask |= visual
                 cand_cut = _cells_to_mask([tuple(v) for v in candidate.debug.get("partition_cut_candidate_cells", [])], shape)  # type: ignore[arg-type]
+                if bool(candidate.debug.get("partition_geometry_accepted", False)):
+                    geometry_cells = _cells_to_mask(candidate.door_cut_cells or [tuple(v) for v in candidate.debug.get("partition_cut_candidate_cells", [])], shape)  # type: ignore[arg-type]
+                    geometry_warning_cut_mask |= geometry_cells
+                    topology_warning_cut_mask |= geometry_cells
+                    wall_attachment_reject_map[geometry_cells] = _door_reject_code(str(candidate.debug.get("door_wall_attachment_reject_reason") or "door_cut_not_wall_attached"))
                 partition_rejected_mask |= cand_cut
                 partition_reject_reason_map[cand_cut] = _door_reject_code(str(candidate.debug.get("reject_reason_partition") or candidate.debug.get("reject_reason_topology") or "partition_rejected"))
         else:
@@ -1146,6 +1186,10 @@ def complete_voxel_doors_from_seeds(
             if candidate.accepted and bool(candidate.debug.get("partition_accepted", False))
         )
     )
+    extensible_seed_group_mask = np.zeros(shape, dtype=bool)
+    for group in seed_groups:
+        if bool(group.accepted_for_completion):
+            extensible_seed_group_mask |= np.asarray(group.mask, dtype=bool)
     cluster_reason_counts = Counter(str(cluster.reject_reason) for cluster in clusters if not bool(cluster.accepted_for_completion) and cluster.reject_reason is not None)
     debug = {
         "voxel_door_completion_ms": float(completion_ms),
@@ -1167,9 +1211,13 @@ def complete_voxel_doors_from_seeds(
         "voxel_door_centerline_mask": partition_mask.astype(bool),
         "voxel_door_cut_mask": partition_mask.astype(bool),
         "voxel_door_partition_cut_accepted_mask": partition_mask.astype(bool),
-        "voxel_door_geometry_accepted_cut_mask": partition_mask.astype(bool),
+        "voxel_door_geometry_accepted_cut_mask": (partition_mask | geometry_warning_cut_mask).astype(bool),
+        "voxel_door_geometry_warning_cut_mask": geometry_warning_cut_mask.astype(bool),
+        "voxel_door_topology_effective_cut_mask": topology_accepted_cut_mask.astype(bool),
+        "voxel_door_final_cut_mask": partition_mask.astype(bool),
         "voxel_door_topology_accepted_cut_mask": topology_accepted_cut_mask.astype(bool),
         "voxel_door_topology_warning_cut_mask": topology_warning_cut_mask.astype(bool),
+        "voxel_door_wall_attachment_reject_map": wall_attachment_reject_map.astype(np.uint8),
         "voxel_accepted_door_centerline_mask": visual_partition_mask.astype(bool),
         "voxel_rejected_door_centerline_mask": rejected_mask.astype(bool),
         "voxel_door_candidates": [candidate.to_dict() for candidate in selected_candidates],
@@ -1207,6 +1255,9 @@ def complete_voxel_doors_from_seeds(
         "voxel_door_visual_accepted_count": int(visual_count),
         "voxel_door_partition_accepted_count": int(partition_count),
         "voxel_door_accepted_count": int(partition_count),
+        "voxel_door_topology_effective_cells": int(np.count_nonzero(topology_accepted_cut_mask)),
+        "voxel_door_final_cut_cells": int(np.count_nonzero(partition_mask)),
+        "voxel_door_geometry_warning_cells": int(np.count_nonzero(geometry_warning_cut_mask)),
         "voxel_door_rejected_count": int(sum(1 for candidate in selected_candidates if not candidate.accepted)),
         "voxel_door_visual_only_cells": int(np.count_nonzero(visual_only_mask)),
         "voxel_door_green_default_cells": int(np.count_nonzero(visual_partition_mask | partition_mask)),
@@ -1214,12 +1265,15 @@ def complete_voxel_doors_from_seeds(
         "voxel_door_anchor_source_map": source_map.astype(np.uint8),
         "voxel_door_anchor_source_counts": source_counts,
         "voxel_door_seed_mask": seed.astype(bool),
+        "voxel_door_raw_seed_mask": seed.astype(bool),
+        "voxel_door_extensible_seed_group_mask": extensible_seed_group_mask.astype(bool),
         "voxel_door_seed_cluster_map": cluster_map.astype(np.int32),
         "voxel_door_seed_clusters": [cluster.to_dict() for cluster in clusters],
         "voxel_door_seed_cluster_count": int(len(clusters)),
         **seed_group_debug,
         "voxel_door_seed_component_count": int(labels.max()) if labels.size else 0,
         "voxel_door_provisional_accepted_visual_mask": visual_all_mask.astype(bool),
+        **conflict_debug,
         **cluster_debug,
     }
     return VoxelDoorCompletionResult(
@@ -1228,6 +1282,8 @@ def complete_voxel_doors_from_seeds(
         door_extension_attempt_rejected_mask=trial_rejected_mask.astype(bool),
         door_centerline_visual_mask=visual_partition_mask.astype(bool),
         door_visual_only_mask=visual_only_mask.astype(bool),
+        door_geometry_warning_cut_mask=geometry_warning_cut_mask.astype(bool),
+        door_topology_effective_cut_mask=topology_accepted_cut_mask.astype(bool),
         door_partition_cut_candidate_mask=partition_candidate_mask.astype(bool),
         door_cut_mask_for_partition=partition_mask.astype(bool),
         door_centerline_candidate_mask=trial_candidate_mask.astype(bool),
@@ -2384,6 +2440,11 @@ def _door_reject_code(reason: str) -> int:
         "door_inner_wall_ratio_too_high": 8,
         "door_inner_free_or_seed_ratio_too_low": 9,
         "door_extension_total_too_long": 10,
+        "door_cut_not_wall_attached": 11,
+        "door_cut_no_topology_gain": 12,
+        "visual_only_not_partition": 13,
+        "door_partition_intersects_stable_other_door": 14,
+        "raw_seed_conflict_ignored": 15,
     }
     return int(values.get(str(reason), 255))
 
@@ -2515,6 +2576,17 @@ def _candidate_from_seed_component(
         full_cells = _sort_cells_along_direction(seed_centerline, center, major)
         visual_status = "completed_seed_pair_bridge"
         completion_mode = DOOR_COMPLETION_SEED_PAIR_BRIDGE
+    elif _strong_seed_centerline_fallback_ok(
+        seed_cells=seed_cells,
+        seed_centerline=seed_centerline,
+        residual_max=float(residual_max),
+        thickness_m=float(thickness_m),
+        resolution_m=float(resolution_m),
+        cfg=cfg,
+    ):
+        full_cells = _sort_cells_along_direction(seed_cells, center, major)
+        visual_status = "completed_strong_seed_centerline"
+        completion_mode = DOOR_COMPLETION_STRONG_SEED_CENTERLINE
     else:
         candidate = _rejected_candidate(candidate_id, component_id, seed_cells, "door_line_does_not_hit_wall_anchor", center, major)
         candidate.seed_projected_centerline_cells = seed_centerline
@@ -2566,6 +2638,11 @@ def _candidate_from_seed_component(
     )
     partition_mask = cut_result.mask
     partition_cells = list(cut_result.cut_cells)
+    seed_on_line_mask = same_seed_mask & visual_mask
+    partition_seed_on_line_cells = [(int(r), int(c)) for r, c in zip(*np.nonzero(seed_on_line_mask))]
+    if partition_seed_on_line_cells:
+        partition_mask = np.asarray(partition_mask, dtype=bool) | seed_on_line_mask
+        partition_cells = sorted({(int(r), int(c)) for r, c in [*partition_cells, *partition_seed_on_line_cells]})
     inner = full_cells[1:-1] if len(full_cells) > 2 else full_cells
     inner_unknown_ratio = _ratio(inner, unknown_clean)
     inner_wall_ratio = _ratio(inner, real_wall & ~own_seed)
@@ -2619,6 +2696,10 @@ def _candidate_from_seed_component(
         partition_reject_reason = "door_partition_cut_empty"
         partition_cells = []
         partition_mask = np.zeros_like(partition_mask, dtype=bool)
+    geometry_reject_reason = partition_reject_reason
+    geometry_partition_accepted = partition_reject_reason is None
+    geometry_partition_cells = list(partition_cells)
+    geometry_partition_mask = _cells_to_mask(geometry_partition_cells, free_clean.shape)
     topology = DoorTopologyValidationResult(
         topology_accepted=False,
         reject_reason="partition_basic_rejected" if partition_reject_reason is not None else None,
@@ -2629,9 +2710,9 @@ def _candidate_from_seed_component(
         side_component_areas=[],
         side_component_widths_cells=[],
     )
-    if partition_reject_reason is None and bool(getattr(cfg, "partition_topology_enabled", True)):
+    if geometry_partition_accepted and bool(getattr(cfg, "partition_topology_enabled", True)):
         topology = validate_door_partition_cut_topology(
-            door_cut_mask=partition_mask,
+            door_cut_mask=geometry_partition_mask,
             base_partition_free=np.asarray(partition_free_clean, dtype=bool),
             accepted_seed_mask=same_seed_mask,
             partition_real_wall_map=real_wall,
@@ -2642,16 +2723,9 @@ def _candidate_from_seed_component(
             allow_anchor_closure_without_global_gain=bool(getattr(cfg, "partition_topology_allow_anchor_closure_without_global_gain", True)),
             allow_neck_cut_without_global_gain=bool(getattr(cfg, "partition_topology_allow_neck_cut_without_global_gain", True)),
             touches_two_anchors=bool(anchor_a is not None and anchor_b is not None),
-            seed_overlap=bool(np.any(partition_mask & same_seed_mask)),
+            seed_overlap=bool(np.any(geometry_partition_mask & same_seed_mask)),
         )
-        if not bool(topology.topology_accepted):
-            topology_reason = str(topology.reject_reason or "door_cut_no_topology_gain")
-            reject_mode = str(getattr(cfg, "partition_topology_reject_mode", "warn_only") or "warn_only").strip().lower()
-            if reject_mode == "reject":
-                partition_reject_reason = topology_reason
-                partition_cells = []
-                partition_mask = np.zeros_like(partition_mask, dtype=bool)
-    elif partition_reject_reason is None:
+    elif geometry_partition_accepted:
         topology = DoorTopologyValidationResult(
             topology_accepted=True,
             reject_reason=None,
@@ -2662,8 +2736,30 @@ def _candidate_from_seed_component(
             side_component_areas=[],
             side_component_widths_cells=[],
         )
-    topology_warning = bool(partition_reject_reason is None and not bool(topology.topology_accepted))
-    topology_warning_reason = None if not topology_warning else str(topology.reject_reason or "door_cut_no_topology_gain")
+    attachment = validate_door_cut_wall_attachment(
+        cut_mask=geometry_partition_mask,
+        full_line_cells=full_cells,
+        real_wall_barrier=real_wall,
+        seed_mask=same_seed_mask,
+        max_endpoint_gap_cells=int(getattr(cfg, "door_wall_attachment_max_endpoint_gap_cells", 1)),
+    )
+    topology_gain_effective = bool(topology.topology_accepted) and (
+        int(topology.after_components) > int(topology.before_components)
+        or int(topology.new_component_count) > 0
+        or not bool(getattr(cfg, "partition_topology_enabled", True))
+    )
+    partition_topology_effective = bool(geometry_partition_accepted and (topology_gain_effective or bool(attachment.attached)))
+    final_partition_reject_reason = geometry_reject_reason
+    if geometry_partition_accepted and not partition_topology_effective:
+        final_partition_reject_reason = str(topology.reject_reason or attachment.reject_reason or "door_cut_no_topology_gain")
+        partition_cells = []
+        partition_mask = np.zeros_like(partition_mask, dtype=bool)
+    elif partition_topology_effective:
+        final_partition_reject_reason = None
+        partition_cells = list(geometry_partition_cells)
+        partition_mask = geometry_partition_mask.copy()
+    topology_warning = bool(geometry_partition_accepted and not partition_topology_effective)
+    topology_warning_reason = None if not topology_warning else str(final_partition_reject_reason or "door_cut_no_topology_gain")
     anchor_score = 1.0 if anchor_a is not None and anchor_b is not None else (0.80 if anchor_a is not None or anchor_b is not None else 0.65)
     seed_line_mask = dilate(visual_mask, 1)
     seed_coverage_score = _ratio(seed_cells, seed_line_mask)
@@ -2724,6 +2820,8 @@ def _candidate_from_seed_component(
             "partition_cut_cells": int(len(partition_cells)),
             "visual_line_mask_cell_count": int(np.count_nonzero(visual_mask)),
             "partition_cut_mask_cell_count": int(np.count_nonzero(partition_mask)),
+            "partition_geometry_cut_cells": int(len(geometry_partition_cells)),
+            "partition_geometry_cut_mask_cell_count": int(np.count_nonzero(geometry_partition_mask)),
             "partition_cut_candidate_cells": [[int(r), int(c)] for r, c in cut_result.cut_cells],
             "walk_a_cells": [[int(r), int(c)] for r, c in extension_a],
             "walk_b_cells": [[int(r), int(c)] for r, c in extension_b],
@@ -2732,19 +2830,25 @@ def _candidate_from_seed_component(
             "walk_crossed_other_seed_cluster": bool(walk_a.hit_other_seed_cells or walk_b.hit_other_seed_cells),
             "walk_crossed_other_seed_cluster_cells": [[int(r), int(c)] for r, c in [*walk_a.hit_other_seed_cells, *walk_b.hit_other_seed_cells][:64]],
             "visual_status": str(visual_status),
-            "partition_status": "accepted" if partition_reject_reason is None else partition_reject_reason,
+            "partition_status": "accepted" if final_partition_reject_reason is None else final_partition_reject_reason,
+            "partition_geometry_status": "accepted" if geometry_reject_reason is None else geometry_reject_reason,
+            "door_partition_seed_on_line_cells": int(len(partition_seed_on_line_cells)),
             **cut_result.debug,
             **topology.to_dict(),
+            **attachment.to_dict(),
             "visual_accepted": visual_reject_reason is None,
-            "partition_accepted": partition_reject_reason is None,
-            "partition_accepted_by_geometry_first": bool(partition_reject_reason is None and topology_warning),
+            "partition_geometry_accepted": bool(geometry_partition_accepted),
+            "partition_topology_effective": bool(partition_topology_effective),
+            "partition_accepted": final_partition_reject_reason is None,
+            "partition_accepted_by_geometry_first": False,
             "partition_topology_reject_mode": str(getattr(cfg, "partition_topology_reject_mode", "warn_only")),
             "door_topology_warning": bool(topology_warning),
             "door_topology_warning_reason": topology_warning_reason,
-            "partition_topology_accepted": bool(topology.topology_accepted),
+            "partition_topology_accepted": bool(partition_topology_effective),
             "reject_reason_visual": visual_reject_reason,
-            "reject_reason_partition": partition_reject_reason,
-            "reject_reason_topology": None if bool(topology.topology_accepted) else topology.reject_reason,
+            "reject_reason_partition": final_partition_reject_reason,
+            "reject_reason_geometry_partition": geometry_reject_reason,
+            "reject_reason_topology": None if bool(partition_topology_effective) else final_partition_reject_reason,
         },
     )
 
@@ -2808,6 +2912,30 @@ def validate_door_line_local_neck(
     if max_open_free_m > max(0.80, float(max_width) * 0.75):
         return False, "door_line_crosses_large_open_free", debug
     return True, None, debug
+
+
+def _strong_seed_centerline_fallback_ok(
+    *,
+    seed_cells: Sequence[tuple[int, int]],
+    seed_centerline: Sequence[tuple[int, int]],
+    residual_max: float,
+    thickness_m: float,
+    resolution_m: float,
+    cfg: VoxelDoorDetectorConfig,
+) -> bool:
+    if not bool(getattr(cfg, "enable_strong_seed_centerline_fallback", True)):
+        return False
+    if len(seed_cells) < int(getattr(cfg, "strong_seed_centerline_min_cells", 4)):
+        return False
+    if len(seed_centerline) < int(getattr(cfg, "strong_seed_centerline_min_length_cells", 3)):
+        return False
+    thickness_cells = max(1.0, float(thickness_m) / max(float(resolution_m), 1e-9))
+    elongation = float(len(seed_centerline)) / float(thickness_cells)
+    if elongation + 1e-9 < float(getattr(cfg, "strong_seed_centerline_min_elongation", 1.6)):
+        return False
+    if float(residual_max) > float(getattr(cfg, "strong_seed_centerline_max_residual_cells", 1.25)):
+        return False
+    return True
 
 
 def _walk_to_wall(
@@ -2900,36 +3028,25 @@ def _batch_reject_conflicting_doors(
     all_seed_mask: np.ndarray,
     shape: tuple[int, int],
     cfg: VoxelDoorDetectorConfig,
-) -> None:
+) -> dict[str, object]:
+    raw_seed_conflict_ignored_map = np.zeros(shape, dtype=bool)
     provisional = [item for item in candidates if item.accepted]
     if not provisional:
-        return
+        return {
+            "voxel_door_conflict_policy": "accepted_or_stable_doors_only_not_raw_seed",
+            "voxel_door_raw_seed_conflict_ignored_map": raw_seed_conflict_ignored_map,
+            "voxel_door_raw_seed_conflict_ignored_cells": 0,
+            "voxel_door_partition_reject_raw_seed_conflict_count": 0,
+        }
     line_masks = {item.candidate_id: _cells_to_mask(item.door_cut_cells, shape) for item in provisional}
-    endpoint_masks: dict[int, np.ndarray] = {}
-    for item in provisional:
-        mask = np.zeros(shape, dtype=bool)
-        for endpoint in (item.wall_anchor_a, item.wall_anchor_b):
-            if endpoint is None:
-                continue
-            r, c = int(endpoint[0]), int(endpoint[1])
-            if 0 <= r < shape[0] and 0 <= c < shape[1]:
-                mask[r, c] = True
-        endpoint_masks[item.candidate_id] = dilate(mask, int(cfg.conflict_dilation_cells))
     for item in provisional:
         own_seed = _cells_to_mask(item.seed_cells, shape)
-        other_seed = all_seed_mask & ~own_seed
-        if bool(cfg.reject_if_intersects_other_door) and bool(item.debug.get("partition_accepted", False)) and np.any(line_masks[item.candidate_id] & other_seed):
-            item.debug["partition_accepted"] = False
-            item.debug["partition_topology_accepted"] = False
-            item.debug["reject_reason_partition"] = "partition_intersects_other_door_seed"
-            item.debug["reject_reason_topology"] = "partition_intersects_other_door_seed"
-            item.door_cut_cells = []
-        if bool(cfg.reject_if_endpoint_is_other_door) and bool(item.debug.get("partition_accepted", False)) and np.any(endpoint_masks[item.candidate_id] & other_seed):
-            item.debug["partition_accepted"] = False
-            item.debug["partition_topology_accepted"] = False
-            item.debug["reject_reason_partition"] = "partition_endpoint_is_other_door_seed"
-            item.debug["reject_reason_topology"] = "partition_endpoint_is_other_door_seed"
-            item.door_cut_cells = []
+        same_door_seed_band = dilate(own_seed, max(0, int(getattr(cfg, "seed_cluster_merge_distance_cells", 0))))
+        visual = _cells_to_mask(item.extended_centerline_cells or item.door_cut_cells or item.seed_projected_centerline_cells, shape)
+        ignored = visual & np.asarray(all_seed_mask, dtype=bool) & ~same_door_seed_band
+        raw_seed_conflict_ignored_map |= ignored
+        item.debug["raw_seed_conflict_ignored_cells"] = int(np.count_nonzero(ignored))
+        item.debug["voxel_door_conflict_policy"] = "accepted_or_stable_doors_only_not_raw_seed"
     provisional = [item for item in candidates if item.accepted and bool(item.debug.get("partition_accepted", False))]
     for idx, a in enumerate(provisional):
         for b in provisional[idx + 1 :]:
@@ -2959,6 +3076,12 @@ def _batch_reject_conflicting_doors(
                 b.debug["partition_topology_accepted"] = False
                 b.debug["reject_reason_partition"] = "partition_intersects_other_door_candidate"
                 b.debug["reject_reason_topology"] = "partition_intersects_other_door_candidate"
+    return {
+        "voxel_door_conflict_policy": "accepted_or_stable_doors_only_not_raw_seed",
+        "voxel_door_raw_seed_conflict_ignored_map": raw_seed_conflict_ignored_map.astype(bool),
+        "voxel_door_raw_seed_conflict_ignored_cells": int(np.count_nonzero(raw_seed_conflict_ignored_map)),
+        "voxel_door_partition_reject_raw_seed_conflict_count": 0,
+    }
 
 
 def _infer_single_seed_direction(
@@ -3152,7 +3275,7 @@ def validate_door_partition_cut_topology(
         raise ValueError("door topology maps must share one HxW shape")
     if not np.any(cut):
         return DoorTopologyValidationResult(False, "door_partition_cut_empty", 0, 0, [], 0, [], [])
-    before_free_global = (base | seed) & ~wall
+    before_free_global = base & ~wall
     before_labels_global, before_n_global = ndimage.label(before_free_global, structure=conn(int(connectivity)))
     after_free_global = before_free_global & ~cut
     _after_labels_global, after_n_global = ndimage.label(after_free_global, structure=conn(int(connectivity)))
@@ -3217,6 +3340,62 @@ def _door_side_area_and_width_cells(mask: np.ndarray) -> tuple[int, float]:
     # Thin but long corridors should not fail door validation just because one
     # cross-section is one cell wide in a synthetic or partially observed map.
     return int(rows.size), float(max(row_span, col_span))
+
+
+def validate_door_cut_wall_attachment(
+    *,
+    cut_mask: np.ndarray,
+    full_line_cells: Sequence[tuple[int, int]],
+    real_wall_barrier: np.ndarray,
+    seed_mask: np.ndarray,
+    max_endpoint_gap_cells: int = 1,
+) -> DoorAttachmentValidation:
+    cut = np.asarray(cut_mask, dtype=bool)
+    wall = np.asarray(real_wall_barrier, dtype=bool)
+    seed = np.asarray(seed_mask, dtype=bool)
+    if cut.shape != wall.shape or seed.shape != wall.shape:
+        raise ValueError("door attachment masks must share one HxW shape")
+    ordered = [(int(r), int(c)) for r, c in full_line_cells if 0 <= int(r) < cut.shape[0] and 0 <= int(c) < cut.shape[1]]
+    if not ordered or not np.any(cut):
+        return DoorAttachmentValidation(False, False, False, 10**9, 10**9, "door_cut_empty")
+    cut_indices = [idx for idx, (r, c) in enumerate(ordered) if bool(cut[r, c])]
+    if not cut_indices:
+        return DoorAttachmentValidation(False, False, False, 10**9, 10**9, "door_cut_empty")
+    lo, hi = int(min(cut_indices)), int(max(cut_indices))
+    left_gap = _line_gap_to_wall(ordered, lo, -1, wall)
+    right_gap = _line_gap_to_wall(ordered, hi, 1, wall)
+    max_gap = max(0, int(max_endpoint_gap_cells))
+    left_attached = int(left_gap) <= max_gap
+    right_attached = int(right_gap) <= max_gap
+    neck_cells = ordered[lo : hi + 1]
+    neck_mask = _cells_to_mask(neck_cells, cut.shape)
+    neck_has_seed_or_cut = bool(np.any(neck_mask & (seed | cut)))
+    attached = bool(left_attached and right_attached and neck_has_seed_or_cut)
+    reason = None
+    if not neck_has_seed_or_cut:
+        reason = "door_cut_no_seed_or_free_neck"
+    elif not left_attached or not right_attached:
+        reason = "door_cut_not_wall_attached"
+    return DoorAttachmentValidation(
+        attached=attached,
+        left_attached=bool(left_attached),
+        right_attached=bool(right_attached),
+        left_gap_cells=int(left_gap),
+        right_gap_cells=int(right_gap),
+        reject_reason=reason,
+    )
+
+
+def _line_gap_to_wall(ordered: Sequence[tuple[int, int]], start_idx: int, direction: int, wall: np.ndarray) -> int:
+    gap = 0
+    idx = int(start_idx)
+    while 0 <= idx < len(ordered):
+        r, c = ordered[idx]
+        if bool(wall[int(r), int(c)]):
+            return int(gap)
+        idx += int(direction)
+        gap += 1
+    return 10**9
 
 
 def _mask_bbox(mask: np.ndarray, shape: tuple[int, int]) -> tuple[int, int, int, int]:

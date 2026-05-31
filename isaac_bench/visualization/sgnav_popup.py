@@ -1584,7 +1584,7 @@ class SGNavPopupVisualizer:
                 "source_grid",
             )
         ).lower()
-        if "voxel_occupancy_door_wall_v9" in backend_text or "voxel_vertical_free" in backend_text:
+        if "voxel_occupancy_door_wall_v29" in backend_text or "voxel_occupancy_door_wall_v9" in backend_text or "voxel_vertical_free" in backend_text:
             return True
         if "voxel" in backend_text:
             return True
@@ -1686,6 +1686,10 @@ class SGNavPopupVisualizer:
         door_visual_only = self._room_debug_array("voxel_door_visual_only_mask", shape, bool)
         if not np.any(door_visual_only):
             door_visual_only = door_visual_all & ~door_visual & ~self._room_debug_array("voxel_door_cut_mask", shape, bool)
+        door_geometry_warning = self._room_debug_array("voxel_door_geometry_warning_cut_mask", shape, bool)
+        door_topology_effective = self._room_debug_array("voxel_door_topology_effective_cut_mask", shape, bool)
+        if not np.any(door_topology_effective):
+            door_topology_effective = self._room_debug_array("voxel_door_final_cut_mask", shape, bool)
         door_partition_candidate = self._room_debug_array("voxel_door_partition_cut_candidate_mask", shape, bool)
         door_partition_rejected = self._room_debug_array("voxel_door_partition_cut_rejected_mask", shape, bool)
         door_topology_warning = self._room_debug_array("voxel_door_topology_warning_cut_mask", shape, bool)
@@ -1772,7 +1776,8 @@ class SGNavPopupVisualizer:
             canvas[door_partition_candidate & ~door_cut] = (170, 220, 80)
             canvas[door_partition_rejected & ~door_cut] = (255, 100, 50)
             canvas[door_topology_warning & ~door_cut] = (255, 205, 70)
-            canvas[door_visual_only & ~door_cut] = (120, 220, 140)
+            canvas[door_visual_only & ~door_cut] = (255, 145, 45)
+            canvas[door_geometry_warning & ~door_cut] = (255, 168, 55)
             canvas[rejected] = (130, 112, 118)
         canvas[step1] = (245, 215, 55)
         canvas[step2] = (220, 60, 255)
@@ -1825,6 +1830,7 @@ class SGNavPopupVisualizer:
             door_extensible_seed_count = int(np.count_nonzero(extensible_door_seed))
             door_visual_count = int(np.count_nonzero(door_visual_all))
             door_visual_only_count = int(np.count_nonzero(door_visual_only))
+            door_topology_count = int(np.count_nonzero(door_topology_effective))
             door_cut_candidate_count = int(np.count_nonzero(door_partition_candidate))
             door_cut_count = int(np.count_nonzero(door_cut))
             door_cluster_count = int(self._room_segmentation_debug.get("voxel_door_seed_cluster_count", 0) or 0)
@@ -1852,14 +1858,17 @@ class SGNavPopupVisualizer:
                 step2_hit_count,
                 step2_accepted_count,
             )
-            title_b = "seed_raw=%d seed_ext=%d current_door=%d stable_door=%d stable_s2=%d free=%d update=%s" % (
+            raw_seed_not_blocking = int(bool(self._room_segmentation_debug.get("voxel_step2_block_topology_effective_door_only", False)))
+            seed_not_in_free = int(bool(self._room_segmentation_debug.get("voxel_seed_not_added_to_partition_free", False)))
+            title_b = "seed_raw=%d seed_extensible=%d door_visual_only=%d door_topology=%d door_final_cut=%d stable_s2=%d raw_seed_not_blocking_step2=%d seed_not_in_partition_free=%d" % (
                 door_seed_count,
                 door_extensible_seed_count,
+                door_visual_only_count,
+                door_topology_count,
                 door_cut_count,
-                stable_count,
                 stable_step2_count,
-                int(np.count_nonzero(vertical_free)),
-                update_reason,
+                raw_seed_not_blocking,
+                seed_not_in_free,
             )
             door_reject_counts = self._room_segmentation_debug.get("voxel_door_reject_reason_counts", {})
             door_partition_reject_counts = self._room_segmentation_debug.get("voxel_door_partition_reject_reason_counts", {})

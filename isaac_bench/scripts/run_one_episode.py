@@ -73,6 +73,8 @@ from isaac_bench.mapping.vertical_free_gap_closure_roomseg import (
 from isaac_bench.mapping.voxel_occupancy_door_wall_roomseg import (
     VOXEL_OCCUPANCY_ROOMSEG_BACKEND,
     VOXEL_OCCUPANCY_ROOMSEG_CONTEXT,
+    VOXEL_OCCUPANCY_ROOMSEG_LEGACY_BACKENDS,
+    VOXEL_OCCUPANCY_ROOMSEG_LEGACY_CONTEXTS,
     VoxelOccupancyDoorWallRoomSegConfig,
     VoxelOccupancyDoorWallRoomSegmenter,
 )
@@ -1869,6 +1871,8 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
     elif room_map_mode in {
         VOXEL_OCCUPANCY_ROOMSEG_BACKEND,
         VOXEL_OCCUPANCY_ROOMSEG_CONTEXT,
+        *VOXEL_OCCUPANCY_ROOMSEG_LEGACY_BACKENDS,
+        *VOXEL_OCCUPANCY_ROOMSEG_LEGACY_CONTEXTS,
         "voxel_occupancy_door_wall",
         "voxel_occupancy_door_wall_vlm",
     }:
@@ -1876,8 +1880,12 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
             getattr(args, "room_segmentation_config", {}).get("backend", VOXEL_OCCUPANCY_ROOMSEG_BACKEND)
             or VOXEL_OCCUPANCY_ROOMSEG_BACKEND
         ).strip().lower()
-        if roomseg_backend != VOXEL_OCCUPANCY_ROOMSEG_BACKEND:
-            raise ValueError("voxel_occupancy_door_wall_v9 room_map_mode requires --roomseg-backend %s" % VOXEL_OCCUPANCY_ROOMSEG_BACKEND)
+        allowed_voxel_backends = {VOXEL_OCCUPANCY_ROOMSEG_BACKEND, *VOXEL_OCCUPANCY_ROOMSEG_LEGACY_BACKENDS}
+        if roomseg_backend not in allowed_voxel_backends:
+            raise ValueError(
+                "voxel_occupancy_door_wall_v29 room_map_mode requires --roomseg-backend in %s"
+                % sorted(allowed_voxel_backends)
+            )
         voxel_cfg = VoxelOccupancyDoorWallRoomSegConfig.from_mapping(
             getattr(args, "room_segmentation_config", {}),
             resolution_m=float(dynamic_map_info.resolution_m),
@@ -4628,6 +4636,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             VERTICAL_FREE_GAP_CLOSURE_BACKEND,
             HEIGHT_PROFILE_DOOR_WALL_V8_BACKEND,
             VOXEL_OCCUPANCY_ROOMSEG_BACKEND,
+            *sorted(VOXEL_OCCUPANCY_ROOMSEG_LEGACY_BACKENDS),
         ],
     )
     parser.add_argument("--debug-rose2-source", action=argparse.BooleanOptionalAction, default=None)

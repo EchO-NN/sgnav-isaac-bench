@@ -166,12 +166,12 @@ mapping:
   frontier_allow_near_fallback: false
   frontier_debug_dump: false
   frontier_debug_dir: data/debug_frontier
-  room_map_mode: voxel_occupancy_door_wall_v9_vlm
+  room_map_mode: voxel_occupancy_door_wall_v29_vlm
   strict_no_oracle_rooms: true
   room_segmentation:
     enabled: true
-    algorithm: voxel_occupancy_door_wall_v9
-    backend: voxel_occupancy_door_wall_v9
+    algorithm: voxel_occupancy_door_wall_v29
+    backend: voxel_occupancy_door_wall_v29
     source_mode: declutter_reconstruct_external
     legacy_watershed_allowed: debug_only
     local_rose2_lite_allowed: debug_only
@@ -544,6 +544,12 @@ mapping:
       door_partition_accept_mode: geometry_first
       partition_topology_reject_mode: warn_only
       min_geometry_cut_cells: 1
+      door_wall_attachment_max_endpoint_gap_cells: 1
+      enable_strong_seed_centerline_fallback: true
+      strong_seed_centerline_min_cells: 4
+      strong_seed_centerline_min_length_cells: 3
+      strong_seed_centerline_min_elongation: 1.6
+      strong_seed_centerline_max_residual_cells: 1.25
       door_memory_enabled: true
       door_memory_initial_confidence: 1.0
       door_memory_match_iou_min: 0.05
@@ -1228,7 +1234,7 @@ sgnav:
     long_edge_geometric_pruning: true
     group_nodes: true
     room_nodes:
-      source: voxel_occupancy_door_wall_v9_vlm
+      source: voxel_occupancy_door_wall_v29_vlm
       use_dataset_room_labels_in_metric: false
       strict_no_oracle_rooms: true
       room_label_backend: vlm

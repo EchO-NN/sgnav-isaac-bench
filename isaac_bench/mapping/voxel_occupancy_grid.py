@@ -739,7 +739,7 @@ class VoxelOccupancyGrid3D:
     def to_debug_dict(self) -> dict[str, object]:
         z_count, height, width = self.state.shape
         debug = {
-            "voxel_backend": "voxel_occupancy_door_wall_v9",
+            "voxel_backend": "voxel_occupancy_door_wall_v29",
             "voxel_grid_enabled": bool(self.config.enabled),
             "voxel_grid_shape_zyx": [int(z_count), int(height), int(width)],
             "voxel_z_min_m": float(self.z_min_m),

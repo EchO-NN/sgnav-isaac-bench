@@ -20,8 +20,8 @@ from isaac_bench.mapping.online_roomseg.online_room_segmenter import (
 
 HEIGHT_PROFILE_DOOR_WALL_V8_BACKEND = "height_profile_door_wall_v8"
 HEIGHT_PROFILE_DOOR_WALL_V8_CONTEXT = "height_profile_door_wall_v8_vlm"
-VOXEL_OCCUPANCY_ROOMSEG_BACKEND = "voxel_occupancy_door_wall_v9"
-VOXEL_OCCUPANCY_ROOMSEG_CONTEXT = "voxel_occupancy_door_wall_v9_vlm"
+VOXEL_OCCUPANCY_ROOMSEG_BACKEND = "voxel_occupancy_door_wall_v29"
+VOXEL_OCCUPANCY_ROOMSEG_CONTEXT = "voxel_occupancy_door_wall_v29_vlm"
 
 
 def __getattr__(name: str):
