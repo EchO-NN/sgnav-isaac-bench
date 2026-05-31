@@ -151,7 +151,8 @@ def test_required_sgnav_defaults():
     assert cfg["mapping"]["room_segmentation"]["voxel_door"]["vectorized_seed_classification"] is True
     assert cfg["mapping"]["room_segmentation"]["voxel_door"]["inner_unknown_ratio_max"] == 0.20
     assert cfg["mapping"]["room_segmentation"]["voxel_door"]["max_component_thickness_m"] == 0.45
-    assert cfg["mapping"]["room_segmentation"]["voxel_door"]["extend_max_m"] == 1.80
+    assert cfg["mapping"]["room_segmentation"]["voxel_door"]["extend_max_m"] == 1.60
+    assert cfg["mapping"]["room_segmentation"]["voxel_door"]["partition_cut_max_total_extension_m"] == 1.60
     assert cfg["mapping"]["room_segmentation"]["voxel_door"]["wall_anchor_radius_cells"] == 3
     assert cfg["mapping"]["room_segmentation"]["voxel_door"]["seed_cluster_morph_close_radius_cells"] == 2
     assert cfg["mapping"]["room_segmentation"]["voxel_door"]["seed_cluster_merge_distance_cells"] == 8

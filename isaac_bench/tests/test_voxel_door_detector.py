@@ -151,6 +151,80 @@ def test_seed_door_acceptance_does_not_require_width_limit_by_default() -> None:
     assert result.candidates[0].reject_reason is None
 
 
+def test_partition_cut_acceptance_ignores_visual_width_limit_when_extension_is_bounded() -> None:
+    grid = _grid(shape=(24, 70))
+    for col in range(20, 51):
+        _write_door_column(grid, 10, col)
+    free = np.zeros(grid.shape, dtype=bool)
+    free[10, 18:55] = True
+    wall = np.zeros(grid.shape, dtype=bool)
+    wall[10, 18] = True
+    wall[10, 54] = True
+    unknown = np.zeros(grid.shape, dtype=bool)
+
+    result = detect_voxel_doors(
+        voxel_grid=grid,
+        free_map=free,
+        wall_map=wall,
+        unknown_map=unknown,
+        resolution_m=0.10,
+        config=VoxelDoorDetectorConfig(
+            visual_width_max_m=0.60,
+            partition_cut_max_total_extension_m=1.60,
+            partition_topology_enabled=False,
+        ),
+    )
+
+    candidate = result.candidates[0]
+    assert int(result.debug["voxel_door_accepted_count"]) == 1
+    assert candidate.width_m > 1.60
+    assert candidate.reject_reason is None
+    assert candidate.debug["partition_accepted"] is True
+    assert candidate.debug["door_partition_width_limit_enforced"] is False
+    assert candidate.debug["door_extension_total_m"] <= 1.60
+    limit_cells = {tuple(cell) for cell in candidate.debug["door_extension_limit_cells"]}
+    assert not any(20 <= col <= 50 for _row, col in limit_cells)
+    assert candidate.debug["door_extension_limit_excludes_seed_cells"] is True
+
+
+def test_partition_cut_rejects_total_extension_over_limit() -> None:
+    grid = _grid(shape=(24, 70))
+    for col in range(30, 32):
+        _write_door_column(grid, 10, col)
+    free = np.zeros(grid.shape, dtype=bool)
+    free[10, 10:56] = True
+    wall = np.zeros(grid.shape, dtype=bool)
+    wall[10, 10] = True
+    wall[10, 55] = True
+    unknown = np.zeros(grid.shape, dtype=bool)
+
+    result = detect_voxel_doors(
+        voxel_grid=grid,
+        free_map=free,
+        wall_map=wall,
+        unknown_map=unknown,
+        resolution_m=0.10,
+        config=VoxelDoorDetectorConfig(
+            visual_width_max_m=10.0,
+            one_seed_one_wall_visual_width_max_m=10.0,
+            seed_pair_bridge_visual_width_max_m=10.0,
+            extend_max_m=5.0,
+            partition_cut_max_total_extension_m=1.60,
+            seed_cluster_max_width_m=10.0,
+            min_seed_cells_for_accepted_extension=1,
+            min_seed_line_length_cells_for_accepted_extension=1,
+            min_seed_elongation_for_direction=1.0,
+            partition_topology_enabled=False,
+        ),
+    )
+
+    candidate = result.candidates[0]
+    assert int(result.debug["voxel_door_accepted_count"]) == 0
+    assert candidate.reject_reason == "door_extension_total_too_long"
+    assert candidate.debug["door_extension_total_m"] > 1.60
+    assert not np.any(result.door_cut_mask)
+
+
 def test_seed_door_width_limit_can_still_be_enforced_for_compatibility() -> None:
     grid = _grid(shape=(24, 60))
     for col in range(20, 51):

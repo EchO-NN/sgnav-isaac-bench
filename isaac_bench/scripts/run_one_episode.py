@@ -414,6 +414,34 @@ def _roomseg_debug_for_layer_dump(room_debug: Mapping[str, object], room_segment
     return debug
 
 
+def _roomseg_voxel_snapshot_arrays(mapper: object) -> dict[str, np.ndarray]:
+    if not hasattr(mapper, "roomseg_voxel_evidence"):
+        return {}
+    evidence = getattr(mapper, "roomseg_voxel_evidence")()
+    state = np.asarray(evidence.get("state"), dtype=np.uint8)
+    if state.ndim != 3:
+        return {}
+    z_min = float(evidence.get("z_min_m", 0.0))
+    z_res = float(evidence.get("z_resolution_m", 1.0))
+    z_centers = z_min + (np.arange(state.shape[0], dtype=np.float32) + 0.5) * z_res
+
+    def scalar(value: object, default: float = np.nan) -> np.ndarray:
+        if value is None:
+            return np.asarray(default, dtype=np.float32)
+        return np.asarray(float(value), dtype=np.float32)
+
+    return {
+        "voxel_occupancy_state_zyx": state,
+        "voxel_occupancy_z_centers_m": z_centers.astype(np.float32),
+        "voxel_occupancy_z_min_m": scalar(evidence.get("z_min_m")),
+        "voxel_occupancy_z_max_m": scalar(evidence.get("z_max_m")),
+        "voxel_occupancy_z_resolution_m": scalar(evidence.get("z_resolution_m")),
+        "voxel_occupancy_active_z_min_m": scalar(evidence.get("active_z_min_m")),
+        "voxel_occupancy_active_z_max_m": scalar(evidence.get("active_z_max_m")),
+        "voxel_occupancy_ceiling_height_estimate_m": scalar(evidence.get("ceiling_height_estimate_m")),
+    }
+
+
 def apply_episode_planning_clearance(
     scene_dir: Path,
     map_info: MapInfo,
@@ -2594,6 +2622,11 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
         ) -> dict | None:
             if not bool(getattr(args, "save_roomseg_snapshots", False)):
                 return None
+            voxel_snapshot_arrays = (
+                _roomseg_voxel_snapshot_arrays(mapper)
+                if bool(getattr(args, "save_roomseg_voxel_evidence", False))
+                else None
+            )
             return save_roomseg_layer_dump(
                 out_dir=str(getattr(args, "roomseg_snapshot_dir", "result/roomseg_snapshots")),
                 step=int(step_idx),
@@ -2614,6 +2647,7 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
                 save_layers_png=False,
                 save_navigation_room_masks_png=True,
                 npz_keys=ROOMSEG_SNAPSHOT_ARRAY_KEYS,
+                extra_npz_arrays=voxel_snapshot_arrays,
                 include_selected_frontier_sector=False,
             )
 
@@ -4561,6 +4595,12 @@ def main(argv: Optional[List[str]] = None) -> int:
         action="store_true",
         default=None,
         help="Save lightweight per-roomseg npz, summary, and unlabeled navigation mask images without enabling debug layer dumps.",
+    )
+    parser.add_argument(
+        "--save-roomseg-voxel-evidence",
+        action="store_true",
+        default=False,
+        help="When saving roomseg snapshots, also store the full 3D voxel occupancy state and z metadata in each snapshot npz.",
     )
     parser.add_argument("--debug-roomseg-dir", default=None)
     parser.add_argument("--roomseg-debug-dir", dest="debug_roomseg_dir", default=None)

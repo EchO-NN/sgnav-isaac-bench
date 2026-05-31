@@ -41,7 +41,7 @@ def test_v19_default_orientation_does_not_add_unconditional_diagonals() -> None:
     assert "diag_up" not in sources
 
 
-def test_v19_door_neck_rejects_long_flying_line() -> None:
+def test_v19_door_neck_rejects_unsupported_diagonal_flying_line_without_width_gate() -> None:
     shape = (32, 32)
     line = [(i, i) for i in range(4, 25)]
     seed = np.zeros(shape, dtype=bool)
@@ -62,7 +62,8 @@ def test_v19_door_neck_rejects_long_flying_line() -> None:
     )
 
     assert not ok
-    assert reason == "door_line_too_long"
+    assert reason == "door_diagonal_without_support"
+    assert debug["door_line_width_limit_enforced"] is False
     assert debug["door_line_max_width_m"] == 1.80
 
 

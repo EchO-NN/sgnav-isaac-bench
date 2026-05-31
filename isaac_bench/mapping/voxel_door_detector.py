@@ -73,7 +73,8 @@ class VoxelDoorDetectorConfig:
     door_width_min_m: float = 0.35
     door_width_max_m: float = 1.60
     enforce_seed_door_width_limits: bool = False
-    extend_max_m: float = 1.80
+    extend_max_m: float = 1.60
+    partition_cut_max_total_extension_m: float = 1.60
     wall_anchor_radius_cells: int = 3
     wall_anchor_min_cells: int = 1
     cut_thickness_cells: int = 1
@@ -2382,6 +2383,7 @@ def _door_reject_code(reason: str) -> int:
         "door_inner_unknown_ratio_too_high": 7,
         "door_inner_wall_ratio_too_high": 8,
         "door_inner_free_or_seed_ratio_too_low": 9,
+        "door_extension_total_too_long": 10,
     }
     return int(values.get(str(reason), 255))
 
@@ -2569,16 +2571,17 @@ def _candidate_from_seed_component(
     inner_wall_ratio = _ratio(inner, real_wall & ~own_seed)
     inner_free_or_seed_ratio = _ratio(inner, free_clean | own_seed)
     visual_reject_reason = None
-    if bool(cfg.enforce_seed_door_width_limits) and (width_m < float(cfg.door_width_min_m) or width_m > float(cfg.door_width_max_m)):
+    extension_a_limit_cells = _extension_cells_outside_seed(extension_a, same_seed_mask) if anchor_a is not None else []
+    extension_b_limit_cells = _extension_cells_outside_seed(extension_b, same_seed_mask) if anchor_b is not None else []
+    extension_total_limit_cells = list(dict.fromkeys([*extension_a_limit_cells, *extension_b_limit_cells]))
+    extension_a_m = float(len(extension_a_limit_cells) * resolution_m)
+    extension_b_m = float(len(extension_b_limit_cells) * resolution_m)
+    extension_total_m = float(len(extension_total_limit_cells) * resolution_m)
+    max_total_extension_m = float(getattr(cfg, "partition_cut_max_total_extension_m", cfg.extend_max_m))
+    if extension_total_m > max_total_extension_m + 1e-9:
+        visual_reject_reason = "door_extension_total_too_long"
+    elif bool(cfg.enforce_seed_door_width_limits) and (width_m < float(cfg.door_width_min_m) or width_m > float(cfg.door_width_max_m)):
         visual_reject_reason = "door_width_out_of_range"
-    elif width_m < float(cfg.visual_width_min_m):
-        visual_reject_reason = "door_visual_width_out_of_range"
-    elif completion_mode == DOOR_COMPLETION_ONE_SEED_ONE_WALL and width_m > float(getattr(cfg, "one_seed_one_wall_visual_width_max_m", cfg.visual_width_max_m)) + 1e-9:
-        visual_reject_reason = "door_one_seed_line_too_long"
-    elif completion_mode == DOOR_COMPLETION_SEED_PAIR_BRIDGE and width_m > float(getattr(cfg, "seed_pair_bridge_visual_width_max_m", cfg.visual_width_max_m)) + 1e-9:
-        visual_reject_reason = "door_seed_pair_line_too_long"
-    elif width_m > float(cfg.visual_width_max_m) + 1e-9:
-        visual_reject_reason = "door_visual_width_out_of_range"
     elif "diag" in str(orientation_source) and not (anchor_a is not None and anchor_b is not None):
         visual_reject_reason = "door_diagonal_without_support"
     if visual_reject_reason is None:
@@ -2710,6 +2713,13 @@ def _candidate_from_seed_component(
             "anchor_b_source_code": int(source_b),
             "visual_line_cells": int(len(full_cells)),
             "door_width_max_m": float(cfg.door_width_max_m),
+            "door_partition_width_limit_enforced": bool(cfg.enforce_seed_door_width_limits),
+            "door_extension_a_m": float(extension_a_m),
+            "door_extension_b_m": float(extension_b_m),
+            "door_extension_total_m": float(extension_total_m),
+            "door_extension_limit_cells": [[int(r), int(c)] for r, c in extension_total_limit_cells[:128]],
+            "door_extension_limit_excludes_seed_cells": True,
+            "door_partition_cut_max_total_extension_m": float(max_total_extension_m),
             "door_line_local_neck_debug": neck_debug,
             "partition_cut_cells": int(len(partition_cells)),
             "visual_line_mask_cell_count": int(np.count_nonzero(visual_mask)),
@@ -2769,13 +2779,12 @@ def validate_door_line_local_neck(
         "door_line_local_neck_checked": True,
         "door_line_width_m": float(width_m),
         "door_line_max_width_m": float(max_width),
+        "door_line_width_limit_enforced": False,
         "completion_mode": str(completion_mode),
         "orientation_source": str(orientation_source),
     }
     if not cells:
         return False, "door_line_empty", debug
-    if width_m > max_width + 1e-9:
-        return False, "door_line_too_long", debug
     seed_overlap = bool(np.any(line & dilate(seed, max(1, int(getattr(cfg, "partition_cut_seed_dilation_cells", 1))))))
     debug["door_line_seed_overlap"] = bool(seed_overlap)
     if not seed_overlap:
@@ -2869,6 +2878,21 @@ def _walk_to_wall(
             return DoorAnchorWalkResult(None, cells, "too_much_unknown", DOOR_ANCHOR_NONE, other_seed_hits, unknown_hits, wall_hits, "too_much_unknown")
         unknown_run = 0
     return DoorAnchorWalkResult(None, cells, "extend_max_without_wall", DOOR_ANCHOR_NONE, other_seed_hits, unknown_hits, wall_hits, "extend_max_without_wall")
+
+
+def _extension_cells_outside_seed(cells: Sequence[tuple[int, int]], seed_mask: np.ndarray) -> list[tuple[int, int]]:
+    seed = np.asarray(seed_mask, dtype=bool)
+    out: list[tuple[int, int]] = []
+    seen: set[tuple[int, int]] = set()
+    for rr, cc in cells:
+        r, c = int(rr), int(cc)
+        if not (0 <= r < seed.shape[0] and 0 <= c < seed.shape[1]):
+            continue
+        if bool(seed[r, c]) or (r, c) in seen:
+            continue
+        seen.add((r, c))
+        out.append((r, c))
+    return out
 
 
 def _batch_reject_conflicting_doors(

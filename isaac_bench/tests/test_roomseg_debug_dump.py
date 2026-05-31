@@ -95,3 +95,41 @@ def test_roomseg_snapshot_writes_lightweight_outputs_only(tmp_path):
     saved = np.load(paths["npz"])
     assert set(saved.files).issubset(set(ROOMSEG_SNAPSHOT_ARRAY_KEYS))
     assert "final_room_label_map" in saved.files
+
+
+def test_roomseg_snapshot_can_include_3d_voxel_evidence(tmp_path):
+    shape = (8, 8)
+    labels = np.zeros(shape, dtype=np.int32)
+    labels[1:5, 1:5] = 1
+    nav = labels > 0
+    voxel_state = np.zeros((4, *shape), dtype=np.uint8)
+    voxel_state[1, 2, 3] = 2
+
+    result = save_roomseg_layer_dump(
+        out_dir=tmp_path,
+        step=10,
+        room_debug={
+            "navigation_free_room_domain": nav,
+            "vertical_free_room_domain": nav,
+            "final_room_label_map": labels,
+        },
+        occupancy_map=~nav,
+        observed_free_mask=nav,
+        obstacle_mask=~nav,
+        unknown_mask=np.zeros(shape, dtype=bool),
+        save_png=False,
+        save_overlay_png=False,
+        save_layers_png=False,
+        save_navigation_room_masks_png=True,
+        npz_keys=ROOMSEG_SNAPSHOT_ARRAY_KEYS,
+        extra_npz_arrays={
+            "voxel_occupancy_state_zyx": voxel_state,
+            "voxel_occupancy_z_resolution_m": np.asarray(0.05, dtype=np.float32),
+        },
+    )
+
+    saved = np.load(result["paths"]["npz"])
+    assert saved["voxel_occupancy_state_zyx"].shape == voxel_state.shape
+    assert int(saved["voxel_occupancy_state_zyx"][1, 2, 3]) == 2
+    summary = json.loads(Path(result["paths"]["summary_json"]).read_text(encoding="utf-8"))
+    assert summary["extra_npz_arrays"]["voxel_occupancy_state_zyx"]["shape"] == [4, 8, 8]

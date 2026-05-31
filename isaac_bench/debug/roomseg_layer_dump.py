@@ -301,6 +301,7 @@ def save_roomseg_layer_dump(
     save_layers_png: Optional[bool] = None,
     save_navigation_room_masks_png: Optional[bool] = None,
     npz_keys: Optional[Sequence[str]] = None,
+    extra_npz_arrays: Optional[Mapping[str, object]] = None,
     include_selected_frontier_sector: bool = True,
 ) -> dict:
     out = Path(out_dir)
@@ -331,7 +332,17 @@ def save_roomseg_layer_dump(
             npz_arrays = arrays
         else:
             npz_arrays = {str(key): arrays[str(key)] for key in npz_keys if str(key) in arrays}
+        for key, value in dict(extra_npz_arrays or {}).items():
+            npz_arrays[str(key)] = np.asarray(value)
         np.savez_compressed(paths["npz"], **npz_arrays)
+        if extra_npz_arrays:
+            summary["extra_npz_arrays"] = {
+                str(key): {
+                    "shape": [int(v) for v in np.asarray(value).shape],
+                    "dtype": str(np.asarray(value).dtype),
+                }
+                for key, value in dict(extra_npz_arrays).items()
+            }
     if bool(save_summary_json):
         Path(paths["summary_json"]).write_text(json.dumps(_json_ready(summary), ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     overlay_enabled = bool(save_png) if save_overlay_png is None else bool(save_overlay_png)

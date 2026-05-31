@@ -477,7 +477,8 @@ mapping:
       door_width_min_m: 0.35
       door_width_max_m: 1.60
       enforce_seed_door_width_limits: false
-      extend_max_m: 1.80
+      extend_max_m: 1.60
+      partition_cut_max_total_extension_m: 1.60
       wall_anchor_radius_cells: 3
       wall_anchor_min_cells: 1
       inner_unknown_ratio_max: 0.20
