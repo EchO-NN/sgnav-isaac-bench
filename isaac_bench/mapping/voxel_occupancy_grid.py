@@ -32,6 +32,25 @@ class VoxelOccupancyGridConfig:
     cuda_ray_step_voxels: float = 1.00
     cuda_max_samples_per_ray: int = 320
     cuda_keep_logodds_on_device: bool = True
+    cpu_numba_threads: int = 28
+    cpu_numba_threads_mode: str = "auto"
+    cpu_numba_autotune_candidates: tuple[int, ...] = (2, 4, 8, 14, 28)
+    cpu_numba_autotune_repeat: int = 2
+    cpu_numba_autotune_rays: int = 30000
+    cpu_numba_autotune_cache_path: str = "debug/voxel_cpu_numba_autotune.json"
+    cpu_numba_autotune_metric: str = "integrate_ms"
+    cpu_numba_chunk_rays: int = 131072
+    cpu_numba_use_bincount_updates: bool = True
+    cpu_numba_max_samples_per_ray: int = 320
+    cpu_numba_preallocate_buffers: bool = True
+    cpu_numba_skip_per_ray_unique_if_step_voxels_ge_1: bool = True
+    cpu_numba_strict_required: bool = True
+    cpu_numba_fail_if_thread_count_below: int = 2
+    cpu_numba_report_threading_layer: bool = True
+    cpu_numba_event_block_size: int = 4096
+    cpu_numba_event_chunk_count_multiplier: int = 4
+    cpu_numba_inline_state_refresh: bool = True
+    cpu_numba_disable_changed_flatnonzero: bool = True
     python_debug_backend_allowed: bool = False
     depth_stride_px: int = 2
     depth_min_m: float = 0.20
@@ -57,7 +76,8 @@ class VoxelOccupancyGridConfig:
     sensor_range_mark_endpoint_column_enabled: bool = True
     sensor_range_endpoint_column_xy_radius_cells: int = 0
     sensor_range_mark_active_z_only: bool = True
-    sensor_range_mark_ray_samples_enabled: bool = True
+    sensor_range_mark_ray_samples_enabled: bool = False
+    sensor_range_mark_ray_samples_for_debug: bool = False
     sensor_range_behind_endpoint_margin_m: float = 0.00
     sensor_range_count_decay_per_update: int = 0
 
@@ -73,6 +93,12 @@ class VoxelOccupancyGridConfig:
         for key, value in overrides.items():
             if value is not None:
                 raw[key] = value
+        if "cpu_numba_autotune_candidates" in raw:
+            value = raw["cpu_numba_autotune_candidates"]
+            if isinstance(value, str):
+                raw["cpu_numba_autotune_candidates"] = tuple(int(v.strip()) for v in value.split(",") if v.strip())
+            else:
+                raw["cpu_numba_autotune_candidates"] = tuple(int(v) for v in value)
         fields = {name for name in cls.__dataclass_fields__}
         return cls(**{key: raw[key] for key in raw if key in fields})
 
@@ -104,7 +130,7 @@ class NavigationProjectionConfig:
     occupied_fill_small_holes_max_area_cells: int = 4
     occupied_priority_over_free: bool = True
     unknown_preserve_when_no_observation: bool = True
-    debug_navigation_projection_layers: bool = True
+    debug_navigation_projection_layers: bool = False
 
     @classmethod
     def from_mapping(cls, data: Mapping[str, object] | None = None, **overrides: object) -> "NavigationProjectionConfig":
@@ -135,6 +161,50 @@ class VoxelIntegrationStats:
     cuda_max_samples_per_ray: int = 0
     sensor_range_update_count: int = 0
     sensor_range_decay_applied: int = 0
+    voxel_integrate_backend_thread_count: int = 0
+    voxel_integrate_backend_effective_thread_count: int = 0
+    voxel_integrate_numba_requested_thread_count: int = 0
+    voxel_integrate_numba_threading_layer: str = "unknown"
+    voxel_integrate_numba_threads_mode: str = "manual"
+    voxel_integrate_numba_autotune_ms: float = 0.0
+    voxel_integrate_sample_kernel_ms: float = 0.0
+    voxel_integrate_bincount_free_ms: float = 0.0
+    voxel_integrate_bincount_occ_ms: float = 0.0
+    voxel_integrate_bincount_sensor_ms: float = 0.0
+    voxel_integrate_apply_logodds_ms: float = 0.0
+    voxel_integrate_endpoint_column_ms: float = 0.0
+    voxel_integrate_buffer_alloc_ms: float = 0.0
+    voxel_integrate_total_samples: int = 0
+    voxel_integrate_total_unique_free_voxels: int = 0
+    voxel_integrate_total_unique_occ_voxels: int = 0
+    voxel_integrate_total_unique_sensor_voxels: int = 0
+    voxel_integrate_total_sensor_events: int = 0
+    voxel_integrate_total_occ_events: int = 0
+    voxel_integrate_pass1_ms: float = 0.0
+    voxel_integrate_event_prefix_ms: float = 0.0
+    voxel_integrate_pass2_ms: float = 0.0
+    voxel_integrate_event_bucket_ms: float = 0.0
+    voxel_integrate_point_filter_ms: float = 0.0
+    voxel_integrate_world_to_voxel_ms: float = 0.0
+    voxel_integrate_count_kernel_ms: float = 0.0
+    voxel_integrate_prefix_ms: float = 0.0
+    voxel_integrate_write_events_ms: float = 0.0
+    voxel_integrate_bucket_free_ms: float = 0.0
+    voxel_integrate_bucket_occ_ms: float = 0.0
+    voxel_integrate_bucket_sensor_ms: float = 0.0
+    voxel_integrate_apply_sensor_ms: float = 0.0
+    voxel_integrate_changed_extract_ms: float = 0.0
+    voxel_integrate_changed_scan_ms: float = 0.0
+    voxel_integrate_refresh_state_ms: float = 0.0
+    voxel_integrate_projection_ms: float = 0.0
+    voxel_integrate_free_event_count: int = 0
+    voxel_integrate_occ_event_count: int = 0
+    voxel_integrate_sensor_event_count: int = 0
+    voxel_integrate_changed_flag_count: int = 0
+    voxel_integrate_touched_block_count: int = 0
+    voxel_integrate_num_blocks: int = 0
+    voxel_numba_threading_layer: str = "unknown"
+    voxel_numba_requested_unavailable: bool = False
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -156,6 +226,50 @@ class VoxelIntegrationStats:
             "voxel_cuda_max_samples_per_ray": int(self.cuda_max_samples_per_ray),
             "voxel_sensor_range_update_count": int(self.sensor_range_update_count),
             "voxel_sensor_range_decay_applied": int(self.sensor_range_decay_applied),
+            "voxel_integrate_backend_thread_count": int(self.voxel_integrate_backend_thread_count),
+            "voxel_integrate_backend_effective_thread_count": int(self.voxel_integrate_backend_effective_thread_count),
+            "voxel_integrate_numba_requested_thread_count": int(self.voxel_integrate_numba_requested_thread_count),
+            "voxel_integrate_numba_threading_layer": str(self.voxel_integrate_numba_threading_layer),
+            "voxel_integrate_numba_threads_mode": str(self.voxel_integrate_numba_threads_mode),
+            "voxel_integrate_numba_autotune_ms": float(self.voxel_integrate_numba_autotune_ms),
+            "voxel_integrate_sample_kernel_ms": float(self.voxel_integrate_sample_kernel_ms),
+            "voxel_integrate_bincount_free_ms": float(self.voxel_integrate_bincount_free_ms),
+            "voxel_integrate_bincount_occ_ms": float(self.voxel_integrate_bincount_occ_ms),
+            "voxel_integrate_bincount_sensor_ms": float(self.voxel_integrate_bincount_sensor_ms),
+            "voxel_integrate_apply_logodds_ms": float(self.voxel_integrate_apply_logodds_ms),
+            "voxel_integrate_endpoint_column_ms": float(self.voxel_integrate_endpoint_column_ms),
+            "voxel_integrate_buffer_alloc_ms": float(self.voxel_integrate_buffer_alloc_ms),
+            "voxel_integrate_total_samples": int(self.voxel_integrate_total_samples),
+            "voxel_integrate_total_unique_free_voxels": int(self.voxel_integrate_total_unique_free_voxels),
+            "voxel_integrate_total_unique_occ_voxels": int(self.voxel_integrate_total_unique_occ_voxels),
+            "voxel_integrate_total_unique_sensor_voxels": int(self.voxel_integrate_total_unique_sensor_voxels),
+            "voxel_integrate_total_sensor_events": int(self.voxel_integrate_total_sensor_events),
+            "voxel_integrate_total_occ_events": int(self.voxel_integrate_total_occ_events),
+            "voxel_integrate_pass1_ms": float(self.voxel_integrate_pass1_ms),
+            "voxel_integrate_event_prefix_ms": float(self.voxel_integrate_event_prefix_ms),
+            "voxel_integrate_pass2_ms": float(self.voxel_integrate_pass2_ms),
+            "voxel_integrate_event_bucket_ms": float(self.voxel_integrate_event_bucket_ms),
+            "voxel_integrate_point_filter_ms": float(self.voxel_integrate_point_filter_ms),
+            "voxel_integrate_world_to_voxel_ms": float(self.voxel_integrate_world_to_voxel_ms),
+            "voxel_integrate_count_kernel_ms": float(self.voxel_integrate_count_kernel_ms),
+            "voxel_integrate_prefix_ms": float(self.voxel_integrate_prefix_ms),
+            "voxel_integrate_write_events_ms": float(self.voxel_integrate_write_events_ms),
+            "voxel_integrate_bucket_free_ms": float(self.voxel_integrate_bucket_free_ms),
+            "voxel_integrate_bucket_occ_ms": float(self.voxel_integrate_bucket_occ_ms),
+            "voxel_integrate_bucket_sensor_ms": float(self.voxel_integrate_bucket_sensor_ms),
+            "voxel_integrate_apply_sensor_ms": float(self.voxel_integrate_apply_sensor_ms),
+            "voxel_integrate_changed_extract_ms": float(self.voxel_integrate_changed_extract_ms),
+            "voxel_integrate_changed_scan_ms": float(self.voxel_integrate_changed_scan_ms),
+            "voxel_integrate_refresh_state_ms": float(self.voxel_integrate_refresh_state_ms),
+            "voxel_integrate_projection_ms": float(self.voxel_integrate_projection_ms),
+            "voxel_integrate_free_event_count": int(self.voxel_integrate_free_event_count),
+            "voxel_integrate_occ_event_count": int(self.voxel_integrate_occ_event_count),
+            "voxel_integrate_sensor_event_count": int(self.voxel_integrate_sensor_event_count),
+            "voxel_integrate_changed_flag_count": int(self.voxel_integrate_changed_flag_count),
+            "voxel_integrate_touched_block_count": int(self.voxel_integrate_touched_block_count),
+            "voxel_integrate_num_blocks": int(self.voxel_integrate_num_blocks),
+            "voxel_numba_threading_layer": str(self.voxel_numba_threading_layer),
+            "voxel_numba_requested_unavailable": bool(self.voxel_numba_requested_unavailable),
         }
 
 
@@ -309,7 +423,17 @@ class VoxelOccupancyGrid3D:
                 floor_z=float(floor_z),
                 valid_mask=valid,
             )
-        elif backend in {"cpu_vectorized", "cpu_numba"}:
+        elif backend == "cpu_numba":
+            from isaac_bench.mapping.voxel_cpu_numba_backend import VoxelCpuNumbaBackend
+
+            stats = VoxelCpuNumbaBackend.integrate(
+                self,
+                camera_origin_world=camera_origin_world,
+                points_world=points,
+                floor_z=float(floor_z),
+                valid_mask=valid,
+            )
+        elif backend == "cpu_vectorized":
             from isaac_bench.mapping.voxel_cpu_fast_backend import VoxelCpuVectorizedBackend
 
             stats = VoxelCpuVectorizedBackend.integrate(
@@ -318,7 +442,7 @@ class VoxelOccupancyGrid3D:
                 points_world=points,
                 floor_z=float(floor_z),
                 valid_mask=valid,
-                backend_name=backend,
+                backend_name="cpu_vectorized",
             )
         elif backend == "python_debug":
             if not bool(self.config.python_debug_backend_allowed):
@@ -351,7 +475,7 @@ class VoxelOccupancyGrid3D:
             except Exception:
                 pass
             try:
-                from isaac_bench.mapping.voxel_cpu_fast_backend import numba_available
+                from isaac_bench.mapping.voxel_cpu_numba_backend import numba_available
 
                 if numba_available():
                     return "cpu_numba"
@@ -365,10 +489,6 @@ class VoxelOccupancyGrid3D:
                 raise RuntimeError("cuda_torch voxel backend requested but torch CUDA is unavailable")
             return requested
         if requested == "cpu_numba":
-            from isaac_bench.mapping.voxel_cpu_fast_backend import numba_available
-
-            if not numba_available():
-                return "cpu_vectorized"
             return requested
         return requested
 
@@ -642,23 +762,45 @@ class VoxelOccupancyGrid3D:
         occ_idx = self.active_z_indices(z_min_m=float(cfg.obstacle_z_min_m), z_max_m=float(cfg.obstacle_z_max_m))
         free_idx = self.active_z_indices(z_min_m=float(cfg.free_z_min_m), z_max_m=float(cfg.free_z_max_m))
         union_idx = np.unique(np.concatenate([occ_idx, free_idx])).astype(np.int32) if occ_idx.size or free_idx.size else np.asarray([], dtype=np.int32)
-        if occ_idx.size and bool(cfg.occupied_any_voxel_wins):
-            occupied_from_voxel = np.any(self.state[occ_idx] == int(VOXEL_OCCUPIED), axis=0)
-        else:
-            occupied_from_voxel = np.zeros(self.shape, dtype=bool)
-        if free_idx.size:
-            free_count = np.sum(self.state[free_idx] == int(VOXEL_FREE), axis=0)
-            free_raw = free_count >= max(1, int(cfg.min_free_voxels))
-        else:
-            free_count = np.zeros(self.shape, dtype=np.int16)
-            free_raw = np.zeros(self.shape, dtype=bool)
-        if nav_endpoint_count_xy is not None and bool(cfg.occupied_use_endpoint_hysteresis):
+        projection_backend = "numpy"
+        if nav_endpoint_count_xy is not None:
             endpoint_count = np.asarray(nav_endpoint_count_xy)
             if endpoint_count.shape != self.shape:
                 raise ValueError("nav_endpoint_count_xy shape %s does not match grid shape %s" % (endpoint_count.shape, self.shape))
-            occupied_from_endpoint = endpoint_count.astype(np.uint16) >= max(1, int(cfg.occupied_endpoint_count_threshold))
         else:
-            occupied_from_endpoint = np.zeros(self.shape, dtype=bool)
+            endpoint_count = None
+        try:
+            from isaac_bench.mapping.voxel_projection_numba import project_navigation_columns
+
+            occupied_from_voxel, occupied_from_endpoint, free_raw, observed_from_voxel = project_navigation_columns(
+                self.state,
+                endpoint_count,
+                occ_z_indices=occ_idx,
+                free_z_indices=free_idx,
+                endpoint_threshold=int(cfg.occupied_endpoint_count_threshold),
+                min_free_voxels=int(cfg.min_free_voxels),
+                occupied_any_voxel_wins=bool(cfg.occupied_any_voxel_wins),
+                occupied_use_endpoint_hysteresis=bool(cfg.occupied_use_endpoint_hysteresis),
+            )
+            projection_backend = "numba_column"
+        except Exception:
+            if occ_idx.size and bool(cfg.occupied_any_voxel_wins):
+                occupied_from_voxel = np.any(self.state[occ_idx] == int(VOXEL_OCCUPIED), axis=0)
+            else:
+                occupied_from_voxel = np.zeros(self.shape, dtype=bool)
+            if free_idx.size:
+                free_count = np.sum(self.state[free_idx] == int(VOXEL_FREE), axis=0)
+                free_raw = free_count >= max(1, int(cfg.min_free_voxels))
+            else:
+                free_raw = np.zeros(self.shape, dtype=bool)
+            if endpoint_count is not None and bool(cfg.occupied_use_endpoint_hysteresis):
+                occupied_from_endpoint = endpoint_count.astype(np.uint16) >= max(1, int(cfg.occupied_endpoint_count_threshold))
+            else:
+                occupied_from_endpoint = np.zeros(self.shape, dtype=bool)
+            if union_idx.size:
+                observed_from_voxel = np.any(self.state[union_idx] != int(VOXEL_UNKNOWN), axis=0)
+            else:
+                observed_from_voxel = np.zeros(self.shape, dtype=bool)
         occupied_raw = np.asarray(occupied_from_voxel | occupied_from_endpoint, dtype=bool)
         occupied_closed = occupied_raw
         if int(cfg.occupied_close_radius_cells) > 0:
@@ -676,10 +818,6 @@ class VoxelOccupancyGrid3D:
         else:
             free = np.asarray(free_raw, dtype=bool)
             occupied = occupied & ~free
-        if union_idx.size:
-            observed_from_voxel = np.any(self.state[union_idx] != int(VOXEL_UNKNOWN), axis=0)
-        else:
-            observed_from_voxel = np.zeros(self.shape, dtype=bool)
         observed = np.asarray(observed_from_voxel | free | occupied, dtype=bool)
         unknown = ~observed
         free &= ~unknown
@@ -711,6 +849,7 @@ class VoxelOccupancyGrid3D:
             "voxel_nav_occupied_hole_filled_cells": int(np.count_nonzero(hole_filled_mask)),
             "voxel_nav_observed_cells": int(np.count_nonzero(observed)),
             "voxel_nav_unknown_cells": int(np.count_nonzero(unknown)),
+            "voxel_project_navigation_backend": str(projection_backend),
             "voxel_project_navigation_ms": float((time.perf_counter() - started_at) * 1000.0),
         }
         if bool(cfg.debug_navigation_projection_layers):
@@ -739,7 +878,7 @@ class VoxelOccupancyGrid3D:
     def to_debug_dict(self) -> dict[str, object]:
         z_count, height, width = self.state.shape
         debug = {
-            "voxel_backend": "voxel_occupancy_door_wall_v29",
+            "voxel_backend": "voxel_occupancy_door_wall_v33",
             "voxel_grid_enabled": bool(self.config.enabled),
             "voxel_grid_shape_zyx": [int(z_count), int(height), int(width)],
             "voxel_z_min_m": float(self.z_min_m),

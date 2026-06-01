@@ -974,6 +974,18 @@ class SGNavPopupVisualizer:
             frontier_count = int(sum(len(getattr(frontier, "cells", [])) for frontier in frontiers))
             backend = str(self._room_segmentation_debug.get("voxel_integration_backend", self._room_segmentation_debug.get("integration_backend", "unknown")))
             integrate_ms = self._room_segmentation_debug.get("voxel_integrate_total_ms")
+            threads = int(self._room_segmentation_debug.get("voxel_integrate_backend_effective_thread_count", self._room_segmentation_debug.get("voxel_integrate_backend_thread_count", 0)) or 0)
+            requested_threads = int(self._room_segmentation_debug.get("voxel_integrate_numba_requested_thread_count", threads) or threads)
+            threads_mode = str(self._room_segmentation_debug.get("voxel_integrate_numba_threads_mode", "manual"))
+            pass1_ms = float(self._room_segmentation_debug.get("voxel_integrate_pass1_ms", 0.0) or 0.0)
+            pass2_ms = float(self._room_segmentation_debug.get("voxel_integrate_pass2_ms", 0.0) or 0.0)
+            bucket_ms = float(self._room_segmentation_debug.get("voxel_integrate_event_bucket_ms", 0.0) or 0.0)
+            bucket_free_ms = float(self._room_segmentation_debug.get("voxel_integrate_bucket_free_ms", 0.0) or 0.0)
+            bucket_occ_ms = float(self._room_segmentation_debug.get("voxel_integrate_bucket_occ_ms", 0.0) or 0.0)
+            bucket_sensor_ms = float(self._room_segmentation_debug.get("voxel_integrate_bucket_sensor_ms", 0.0) or 0.0)
+            apply_ms = float(self._room_segmentation_debug.get("voxel_integrate_apply_logodds_ms", 0.0) or 0.0)
+            sensor_ms = float(self._room_segmentation_debug.get("voxel_integrate_apply_sensor_ms", 0.0) or 0.0)
+            fallback = bool(self._room_segmentation_debug.get("voxel_numba_requested_unavailable", False))
             try:
                 integrate_text = "%.1fms" % float(integrate_ms)
             except (TypeError, ValueError):
@@ -983,18 +995,26 @@ class SGNavPopupVisualizer:
                 clearance_text = "%.2f" % float(clearance_min)
             except (TypeError, ValueError):
                 clearance_text = "NA"
-            title = "nav voxel | free=%d occ=%d unk=%d frontier=%d occ_vox=%d occ_ep=%d supp=%d cur=%d path_clear=%s backend=%s %s zoom %.1fx" % (
+            title = "nav voxel | free=%d occ=%d unk=%d frontier=%d path_clear=%s backend=%s%s th=%d/%d %s total=%s p1/p2=%.1f/%.1f bucket=%.1f f/o/s=%.1f/%.1f/%.1f apply=%.1f sens=%.1f zoom %.1fx" % (
                 int(np.count_nonzero(nav & obs)),
                 int(np.count_nonzero(occupancy.astype(bool))),
                 nav_unknown,
                 frontier_count,
-                int(self._room_segmentation_debug.get("voxel_nav_occupied_from_voxel_cells", 0) or 0),
-                int(self._room_segmentation_debug.get("voxel_nav_occupied_from_endpoint_cells", 0) or 0),
-                int(self._room_segmentation_debug.get("voxel_nav_free_suppressed_by_occupied_cells", 0) or 0),
-                int(self._room_segmentation_debug.get("current_pose_navigation_override_cells", 0) or 0),
                 clearance_text,
                 backend,
+                " fallback=true" if fallback else "",
+                threads,
+                requested_threads,
+                threads_mode,
                 integrate_text,
+                pass1_ms,
+                pass2_ms,
+                bucket_ms,
+                bucket_free_ms,
+                bucket_occ_ms,
+                bucket_sensor_ms,
+                apply_ms,
+                sensor_ms,
                 zoom,
             )
         else:
@@ -1668,6 +1688,9 @@ class SGNavPopupVisualizer:
         extensible_door_seed = self._room_debug_array("voxel_extensible_door_seed_group_mask", shape, bool)
         nonextensible_door_seed = self._room_debug_array("voxel_nonextensible_door_seed_mask", shape, bool)
         step2_block = self._room_debug_array("voxel_step2_block_mask", shape, bool)
+        door_primitive = self._room_debug_array("voxel_door_seed_line_primitive_mask", shape, bool)
+        door_extensible_primitive = self._room_debug_array("voxel_door_extensible_primitive_mask", shape, bool)
+        door_rejected_primitive = self._room_debug_array("voxel_door_rejected_primitive_mask", shape, bool)
         door_attempt = self._room_debug_array("voxel_door_extension_attempt_all_mask", shape, bool)
         if not np.any(door_attempt):
             door_attempt = self._room_debug_array("voxel_door_trial_candidate_lines_map", shape, bool)
@@ -1788,6 +1811,7 @@ class SGNavPopupVisualizer:
             canvas[door_geometry_only & ~door_cut] = (255, 168, 55)
             canvas[door_attachment_only & ~door_cut] = (255, 112, 55)
             canvas[door_not_closed & ~door_cut] = (210, 95, 70)
+            canvas[door_rejected_primitive & ~door_cut] = (190, 140, 80)
             canvas[rejected] = (130, 112, 118)
         canvas[step1] = (245, 215, 55)
         canvas[step2] = (220, 60, 255)
@@ -1798,6 +1822,8 @@ class SGNavPopupVisualizer:
         canvas[door_topology_effective] = (90, 255, 70)
         canvas[door_cut] = (90, 255, 70)
         canvas[stable_door_cut] = (255, 95, 190)
+        canvas[door_primitive & ~door_extensible_primitive & ~door_cut] = (35, 115, 255)
+        canvas[door_extensible_primitive & ~door_cut] = (0, 205, 255)
         canvas[extensible_door_seed] = (50, 125, 255)
         canvas[door_seed] = (0, 80, 255)
         canvas[frontier] = (0, 235, 255)
@@ -1840,6 +1866,8 @@ class SGNavPopupVisualizer:
             door_seed_count = int(np.count_nonzero(door_seed))
             door_green_count = int(np.count_nonzero(door_visual))
             door_extensible_seed_count = int(np.count_nonzero(extensible_door_seed))
+            door_primitive_count = int(self._room_segmentation_debug.get("voxel_door_line_primitive_count", np.count_nonzero(door_primitive)) or 0)
+            door_extensible_primitive_count = int(self._room_segmentation_debug.get("voxel_door_extensible_primitive_count", np.count_nonzero(door_extensible_primitive)) or 0)
             door_visual_count = int(np.count_nonzero(door_visual_all))
             door_visual_only_count = int(np.count_nonzero(door_visual_only))
             door_topology_count = int(np.count_nonzero(door_topology_effective))
@@ -1861,13 +1889,15 @@ class SGNavPopupVisualizer:
             stable_step2_count = int(np.count_nonzero(stable_step2))
             warning_count = int(np.count_nonzero(door_topology_warning))
             update_reason = str(self._room_segmentation_debug.get("roomseg_frontier_update_reason", "NA"))
-            title_a = "voxel v30 | seed_raw=%d ext=%d visual=%d verified=%d stable=%d visual_only=%d step2_acc=%d" % (
+            title_a = "voxel v32 | raw_seed=%d seed_cc=%d seed_clusters=%d line_prim=%d ext_prim=%d trials=%d topo_cut=%d stable_door=%d step2_acc=%d" % (
                 door_seed_count,
-                door_extensible_seed_count,
-                door_visual_count,
+                int(self._room_segmentation_debug.get("voxel_door_seed_component_count", 0) or 0),
+                door_cluster_count,
+                door_primitive_count,
+                door_extensible_primitive_count,
+                door_trial_count,
                 door_topology_count,
                 stable_count,
-                door_visual_only_count,
                 step2_accepted_count,
             )
             raw_seed_not_blocking = int(bool(self._room_segmentation_debug.get("voxel_step2_block_topology_effective_door_only", False)))
@@ -1893,12 +1923,13 @@ class SGNavPopupVisualizer:
             door_reject_text = _top_reason_text(door_counts)
             step2_reject_text = _top_reason_text(step2_reject_counts)
             if show_diag:
-                title_b = "%s | vis=%d visual_only=%d cut=%d rooms=%d reject=%s step2_reject=%s" % (
+                title_b = "%s | visual=%d visual_only=%d cut=%d rooms=%d seed_rej=%s partition_rej=%s step2_rej=%s" % (
                     title_b,
                     door_visual_count,
                     door_visual_only_count,
                     door_cut_count,
                     int(len([v for v in np.unique(labels) if int(v) > 0])),
+                    _top_reason_text(self._room_segmentation_debug.get("voxel_door_seed_reject_reason_counts", {})),
                     door_reject_text,
                     step2_reject_text,
                 )
@@ -1940,6 +1971,9 @@ class SGNavPopupVisualizer:
                 door_seed_cells=int(np.count_nonzero(door_seed)),
                 extensible_door_seed_cells=int(np.count_nonzero(extensible_door_seed)),
                 nonextensible_door_seed_cells=int(np.count_nonzero(nonextensible_door_seed)),
+                door_seed_line_primitive_cells=int(np.count_nonzero(door_primitive)),
+                door_extensible_primitive_cells=int(np.count_nonzero(door_extensible_primitive)),
+                door_rejected_primitive_cells=int(np.count_nonzero(door_rejected_primitive)),
                 step2_block_cells=int(np.count_nonzero(step2_block)),
                 door_attempt_cells=int(np.count_nonzero(door_attempt)),
                 door_attempt_rejected_cells=int(np.count_nonzero(door_attempt_rejected)),
@@ -1995,6 +2029,9 @@ class SGNavPopupVisualizer:
             self._overlay_record("voxel_conflict", bool(show_diag and np.any(conflict)), (255, 126, 45), int(np.count_nonzero(conflict)), "diagnostic xy cells with simultaneous vertical-free and strict-wall evidence"),
             self._overlay_record("voxel_unknown", True, (26, 28, 34), int(np.count_nonzero(unknown)), "voxel unknown cells preserved as unknown"),
             self._overlay_record("voxel_door_seed", bool(np.any(door_seed)), (0, 80, 255), int(np.count_nonzero(door_seed)), "door seed cells from per-xy voxel z-pattern detection"),
+            self._overlay_record("voxel_door_seed_line_primitive", bool(np.any(door_primitive)), (0, 205, 255), int(np.count_nonzero(door_primitive)), "v32 line primitives extracted from raw door seed before extension"),
+            self._overlay_record("voxel_door_extensible_primitive", bool(np.any(door_extensible_primitive)), (0, 205, 255), int(np.count_nonzero(door_extensible_primitive)), "v32 accepted seed line primitives eligible for door extension"),
+            self._overlay_record("voxel_door_rejected_primitive", bool(show_diag and np.any(door_rejected_primitive)), (190, 140, 80), int(np.count_nonzero(door_rejected_primitive)), "diagnostic v32 seed line primitives rejected before extension"),
             self._overlay_record("voxel_extensible_door_seed", bool(show_diag and np.any(extensible_door_seed)), (50, 125, 255), int(np.count_nonzero(extensible_door_seed)), "diagnostic v26 seed groups that passed accepted-extension gating"),
             self._overlay_record("voxel_nonextensible_door_seed", bool(show_diag and np.any(nonextensible_door_seed)), (0, 55, 150), int(np.count_nonzero(nonextensible_door_seed)), "diagnostic raw door seed kept as evidence only and not used to block Step2"),
             self._overlay_record("voxel_step2_block_mask", bool(show_diag and np.any(step2_block)), (78, 210, 118), int(np.count_nonzero(step2_block)), "accepted or stable doors that may block Step2; raw seed is excluded"),

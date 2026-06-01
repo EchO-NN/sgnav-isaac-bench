@@ -87,14 +87,47 @@ class VoxelDoorDetectorConfig:
     reject_if_endpoint_is_other_door: bool = True
     conflict_dilation_cells: int = 1
     vectorized_seed_classification: bool = True
-    seed_cluster_morph_close_radius_cells: int = 2
-    seed_cluster_merge_distance_cells: int = 8
+    seed_cluster_morph_close_radius_cells: int = 1
+    seed_cluster_merge_distance_cells: int = 4
     seed_cluster_collinear_angle_deg: float = 25.0
-    seed_cluster_max_perpendicular_gap_cells: int = 4
-    seed_cluster_max_along_gap_cells: int = 16
+    seed_cluster_max_perpendicular_gap_cells: int = 2
+    seed_cluster_max_along_gap_cells: int = 12
     seed_cluster_max_width_m: float = 1.80
     seed_cluster_min_shared_anchor_score: float = 0.0
+    seed_component_connectivity: int = 8
+    raw_seed_min_component_cells_for_display: int = 1
+    primitive_min_seed_cells: int = 3
+    primitive_min_length_cells: int = 3
+    primitive_max_thickness_cells: int = 3
+    primitive_max_residual_cells: float = 1.75
+    primitive_min_elongation: float = 1.4
+    primitive_max_along_gap_cells: float = 2.0
+    enable_seed_blob_line_decomposition: bool = True
+    primitive_extraction_method: str = "ransac_then_split"
+    ransac_num_trials: int = 64
+    ransac_inlier_residual_cells: float = 1.5
+    ransac_min_inliers: int = 3
+    max_primitives_per_cluster: int = 4
+    remove_inliers_after_primitive: bool = True
+    seed_pair_max_along_gap_cells: int = 12
+    seed_pair_max_axis_angle_deg: float = 25.0
     completion_orientation_mode: str = "pca_plus_axis_plus_wall_pair"
+    accepted_orientation_source: str = "seed_primitive_only"
+    allow_axis_hv_for_accepted: bool = False
+    allow_wall_pair_axis_for_accepted: bool = False
+    allow_local_free_neck_axis_for_accepted: bool = False
+    allow_axis_hv_for_debug_trials: bool = True
+    allow_wall_pair_axis_for_debug_trials: bool = True
+    allow_local_free_neck_axis_for_debug_trials: bool = True
+    raw_seed_blocks_step2: bool = False
+    visual_only_door_blocks_step2: bool = False
+    geometry_warning_door_blocks_step2: bool = False
+    topology_effective_door_blocks_step2: bool = True
+    show_raw_seed: bool = True
+    show_seed_line_primitives: bool = True
+    show_rejected_primitives_in_diagnostic: bool = True
+    show_visual_only_door_in_diagnostic: bool = True
+    default_green_only_topology_effective: bool = True
     min_seed_cells_for_accepted_extension: int = 3
     min_seed_line_length_cells_for_accepted_extension: int = 3
     min_seed_elongation_for_direction: float = 1.6
@@ -148,6 +181,9 @@ class VoxelDoorDetectorConfig:
     min_geometry_cut_cells: int = 1
     door_wall_attachment_max_endpoint_gap_cells: int = 1
     enable_strong_seed_centerline_fallback: bool = True
+    strong_seed_min_cells: int = 6
+    strong_seed_max_thickness_cells: int = 5
+    strong_seed_allow_topology_test_without_two_anchors: bool = True
     strong_seed_centerline_min_cells: int = 4
     strong_seed_centerline_min_length_cells: int = 3
     strong_seed_centerline_min_elongation: float = 1.6
@@ -502,6 +538,57 @@ class DoorSeedGroup:
 
 
 @dataclass
+class DoorSeedLinePrimitive:
+    primitive_id: int
+    source_cluster_id: int
+    source_group_id: int
+    source_component_ids: list[int]
+    cells: list[tuple[int, int]]
+    center_rc: tuple[float, float]
+    major_dir_rc: tuple[float, float]
+    minor_dir_rc: tuple[float, float]
+    length_cells: float
+    thickness_cells: float
+    residual_cells: float
+    elongation: float
+    seed_count: int
+    bbox_rc: tuple[int, int, int, int]
+    along_min: float
+    along_max: float
+    max_along_gap_cells: float
+    contiguous_segment_count: int
+    accepted_for_extension: bool
+    reject_reason: str | None
+    extraction_method: str
+    debug: dict[str, object] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "primitive_id": int(self.primitive_id),
+            "source_cluster_id": int(self.source_cluster_id),
+            "source_group_id": int(self.source_group_id),
+            "source_component_ids": [int(v) for v in self.source_component_ids],
+            "seed_count": int(self.seed_count),
+            "bbox": [int(v) for v in self.bbox_rc],
+            "center_rc": [float(self.center_rc[0]), float(self.center_rc[1])],
+            "major_dir_rc": [float(self.major_dir_rc[0]), float(self.major_dir_rc[1])],
+            "minor_dir_rc": [float(self.minor_dir_rc[0]), float(self.minor_dir_rc[1])],
+            "length_cells": float(self.length_cells),
+            "thickness_cells": float(self.thickness_cells),
+            "residual_cells": float(self.residual_cells),
+            "elongation": float(self.elongation),
+            "along_min": float(self.along_min),
+            "along_max": float(self.along_max),
+            "max_along_gap_cells": float(self.max_along_gap_cells),
+            "contiguous_segment_count": int(self.contiguous_segment_count),
+            "accepted_for_extension": bool(self.accepted_for_extension),
+            "reject_reason": self.reject_reason,
+            "extraction_method": str(self.extraction_method),
+            "debug": _jsonable(self.debug),
+        }
+
+
+@dataclass
 class DoorCompletionStageMaps:
     seed_mask: np.ndarray
     seed_cluster_map: np.ndarray
@@ -675,6 +762,52 @@ class StableDoorTrack:
             "contradiction_count": int(self.contradiction_count),
         }
 
+    @classmethod
+    def from_dict(cls, data: Mapping[str, object]) -> "StableDoorTrack":
+        def rc_float(value: object, default: tuple[float, float]) -> tuple[float, float]:
+            if isinstance(value, Sequence) and not isinstance(value, (str, bytes)) and len(value) >= 2:
+                return (float(value[0]), float(value[1]))  # type: ignore[index]
+            return default
+
+        def rc_int_or_none(value: object) -> tuple[int, int] | None:
+            if value is None:
+                return None
+            if isinstance(value, Sequence) and not isinstance(value, (str, bytes)) and len(value) >= 2:
+                return (int(value[0]), int(value[1]))  # type: ignore[index]
+            return None
+
+        def cells(value: object) -> list[tuple[int, int]]:
+            out: list[tuple[int, int]] = []
+            if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+                for item in value:
+                    if isinstance(item, Sequence) and not isinstance(item, (str, bytes)) and len(item) >= 2:
+                        out.append((int(item[0]), int(item[1])))  # type: ignore[index]
+            return out
+
+        return cls(
+            track_id=int(data.get("track_id", 0) or 0),
+            first_seen_step=int(data.get("first_seen_step", -1) or -1),
+            last_seen_step=int(data.get("last_seen_step", -1) or -1),
+            confidence=float(data.get("confidence", 0.0) or 0.0),
+            center_rc=rc_float(data.get("center_rc"), (0.0, 0.0)),
+            major_dir_rc=rc_float(data.get("major_dir_rc"), (0.0, 1.0)),
+            cut_cells=cells(data.get("cut_cells", [])),
+            visual_cells=cells(data.get("visual_cells", [])),
+            stable_seed_cells=cells(data.get("stable_seed_cells", [])),
+            anchor_a_rc=rc_int_or_none(data.get("anchor_a_rc")),
+            anchor_b_rc=rc_int_or_none(data.get("anchor_b_rc")),
+            best_score=float(data.get("best_score", 0.0) or 0.0),
+            last_verified_step=int(data.get("last_verified_step", -1) or -1),
+            last_weak_refresh_step=int(data.get("last_weak_refresh_step", -1) or -1),
+            last_observed_step=int(data.get("last_observed_step", -1) or -1),
+            not_observed_updates=int(data.get("not_observed_updates", 0) or 0),
+            geometry_locked=bool(data.get("geometry_locked", True)),
+            source_candidate_ids=[int(v) for v in (data.get("source_candidate_ids", []) or [])],  # type: ignore[union-attr]
+            update_count=int(data.get("update_count", 1) or 1),
+            missed_updates=int(data.get("missed_updates", 0) or 0),
+            contradiction_count=int(data.get("contradiction_count", 0) or 0),
+        )
+
 
 @dataclass
 class StableDoorMemoryResult:
@@ -694,6 +827,38 @@ class VoxelDoorMemory:
     def reset(self) -> None:
         self._tracks.clear()
         self._next_track_id = 1
+
+    def to_state_dict(self) -> dict[str, object]:
+        return {
+            "schema_version": 1,
+            "next_track_id": int(self._next_track_id),
+            "config": _jsonable(dict(getattr(self.config, "__dict__", {}) or {})),
+            "tracks": [track.to_dict() for track in self._tracks],
+        }
+
+    @classmethod
+    def from_state_dict(
+        cls,
+        state: Mapping[str, object] | None,
+        config: VoxelDoorDetectorConfig | Mapping[str, object] | None = None,
+    ) -> "VoxelDoorMemory":
+        mem = cls(config=config)
+        raw = dict(state or {})
+        mem._next_track_id = int(raw.get("next_track_id", 1) or 1)
+        tracks = raw.get("tracks", []) or []
+        mem._tracks = [
+            StableDoorTrack.from_dict(item)
+            for item in tracks
+            if isinstance(item, Mapping)
+        ]
+        if mem._tracks:
+            mem._next_track_id = max(int(mem._next_track_id), 1 + max(int(track.track_id) for track in mem._tracks))
+        return mem
+
+    def load_state_dict(self, state: Mapping[str, object] | None) -> None:
+        restored = VoxelDoorMemory.from_state_dict(state, config=self.config)
+        self._next_track_id = restored._next_track_id
+        self._tracks = restored._tracks
 
     def update(
         self,
@@ -1319,10 +1484,34 @@ def complete_voxel_doors_from_seeds(
     selected_candidates: list[VoxelDoorLineCandidate] = []
     all_trial_candidates: list[VoxelDoorLineCandidate] = []
     trial_groups: list[DoorTrialCandidateGroup] = []
+    all_primitives: list[DoorSeedLinePrimitive] = []
+    primitives_by_group: dict[int, list[DoorSeedLinePrimitive]] = {}
+    primitive_id = 1
+    for group in seed_groups:
+        primitives = extract_seed_line_primitives_from_group(
+            group,
+            primitive_id_start=int(primitive_id),
+            shape=shape,
+            resolution_m=float(resolution_m),
+            cfg=cfg,
+        )
+        primitives_by_group[int(group.group_id)] = primitives
+        all_primitives.extend(primitives)
+        primitive_id += int(len(primitives))
     cid = 1
     for group in seed_groups:
-        if not bool(group.accepted_for_completion):
-            candidate = _rejected_candidate(cid, int(group.group_id), list(group.seed_cells), str(group.reject_reason or "seed_group_rejected"))
+        group_primitives = primitives_by_group.get(int(group.group_id), [])
+        accepted_primitives = [primitive for primitive in group_primitives if bool(primitive.accepted_for_extension)]
+        _extensible_ok, extensible_reason, extensible_debug = is_seed_group_extensible(group, cfg, resolution_m=float(resolution_m))
+        if not accepted_primitives:
+            primitive_reason_counts = Counter(str(primitive.reject_reason or "accepted") for primitive in group_primitives if not bool(primitive.accepted_for_extension))
+            selected_reason = str(
+                group.reject_reason
+                or extensible_reason
+                or next((primitive.reject_reason for primitive in group_primitives if primitive.reject_reason), None)
+                or "no_seed_line_primitive"
+            )
+            candidate = _rejected_candidate(cid, int(group.group_id), list(group.seed_cells), selected_reason)
             candidate.debug.update(
                 {
                     "cluster_id": int(group.group_id),
@@ -1334,48 +1523,14 @@ def complete_voxel_doors_from_seeds(
                     "visual_accepted": False,
                     "partition_accepted": False,
                     "partition_topology_accepted": False,
-                    "reject_reason_visual": str(group.reject_reason or "seed_group_rejected"),
+                    "reject_reason_visual": selected_reason,
                     "reject_reason_partition": "visual_rejected",
                     "reject_reason_topology": "visual_rejected",
-                }
-            )
-            selected_candidates.append(candidate)
-            all_trial_candidates.append(candidate)
-            trial_groups.append(
-                DoorTrialCandidateGroup(
-                    cluster_id=int(group.group_id),
-                    component_ids=[int(v) for v in group.component_ids],
-                    trials=[candidate],
-                    selected_candidate_id=int(candidate.candidate_id),
-                    selected_reason=str(group.reject_reason or "seed_group_rejected"),
-                    debug={
-                        "trial_count": 1,
-                        "selected_score": 0.0,
-                        "seed_group_id": int(group.group_id),
-                        "seed_group_kind": str(group.group_kind),
-                        "source_cluster_ids": [int(v) for v in group.source_cluster_ids],
-                    },
-                )
-            )
-            cid += 1
-            continue
-        extensible_ok, extensible_reason, extensible_debug = is_seed_group_extensible(group, cfg, resolution_m=float(resolution_m))
-        if not bool(extensible_ok):
-            candidate = _rejected_candidate(cid, int(group.group_id), list(group.seed_cells), str(extensible_reason or "seed_group_not_extensible"))
-            candidate.debug.update(
-                {
-                    "cluster_id": int(group.group_id),
-                    "seed_group_id": int(group.group_id),
-                    "seed_group_kind": str(group.group_kind),
-                    "source_cluster_ids": [int(v) for v in group.source_cluster_ids],
-                    "component_ids": [int(v) for v in group.component_ids],
-                    "completion_mode": DOOR_COMPLETION_REJECTED,
-                    "visual_accepted": False,
-                    "partition_accepted": False,
-                    "partition_topology_accepted": False,
-                    "reject_reason_visual": str(extensible_reason or "seed_group_not_extensible"),
-                    "reject_reason_partition": "visual_rejected",
-                    "reject_reason_topology": "visual_rejected",
+                    "primitive_extraction_attempted_before_reject": True,
+                    "primitive_count_for_group": int(len(group_primitives)),
+                    "accepted_primitive_count_for_group": 0,
+                    "primitive_reject_reason_counts": dict(primitive_reason_counts),
+                    "voxel_v32_seed_line_primitive_completion": True,
                     **extensible_debug,
                 }
             )
@@ -1387,13 +1542,16 @@ def complete_voxel_doors_from_seeds(
                     component_ids=[int(v) for v in group.component_ids],
                     trials=[candidate],
                     selected_candidate_id=int(candidate.candidate_id),
-                    selected_reason=str(extensible_reason or "seed_group_not_extensible"),
+                    selected_reason=selected_reason,
                     debug={
                         "trial_count": 1,
                         "selected_score": 0.0,
                         "seed_group_id": int(group.group_id),
                         "seed_group_kind": str(group.group_kind),
                         "source_cluster_ids": [int(v) for v in group.source_cluster_ids],
+                        "primitive_count_for_group": int(len(group_primitives)),
+                        "accepted_primitive_count_for_group": 0,
+                        "primitive_reject_reason_counts": dict(primitive_reason_counts),
                         **extensible_debug,
                     },
                 )
@@ -1402,13 +1560,19 @@ def complete_voxel_doors_from_seeds(
             continue
 
         trial_candidates = []
-        for orientation_source, major in _door_orientation_candidates(group, cfg, wall_clean=wall, free_clean=free):
-            mode_hint = DOOR_COMPLETION_SEED_PAIR_BRIDGE if str(group.group_kind) == "seed_pair_bridge" else None
+        for primitive in accepted_primitives:
+            primitive_mask = _cells_to_mask(primitive.cells, shape)
+            mode_hint = DOOR_COMPLETION_SEED_PAIR_BRIDGE if str(primitive.extraction_method) == "seed_pair_bridge" else None
+            orientation_source = (
+                "seed_major"
+                if str(primitive.extraction_method) in {"direct_pca", "fallback_centerline"}
+                else "seed_primitive_%s" % str(primitive.extraction_method)
+            )
             candidate = _candidate_from_seed_component(
                 candidate_id=cid,
-                component_id=int(group.group_id),
-                seed_cells=list(group.seed_cells),
-                seed_component_mask=group.mask,
+                component_id=int(primitive.primitive_id),
+                seed_cells=list(primitive.cells),
+                seed_component_mask=primitive_mask,
                 all_seed_mask=seed,
                 free_clean=free,
                 partition_free_clean=partition_free,
@@ -1419,14 +1583,27 @@ def complete_voxel_doors_from_seeds(
                 cfg=cfg,
                 wall_anchor_source_map=source_map,
                 same_cluster_mask=group.mask,
-                forced_major=major,
+                forced_major=np.asarray(primitive.major_dir_rc, dtype=np.float32),
                 orientation_source=orientation_source,
-                cluster_id=int(group.group_id),
+                cluster_id=int(primitive.source_cluster_id),
                 seed_group_id=int(group.group_id),
                 seed_group_kind=str(group.group_kind),
                 source_cluster_ids=list(group.source_cluster_ids),
-                component_ids=list(group.component_ids),
+                component_ids=list(primitive.source_component_ids),
                 mode_hint=mode_hint,
+            )
+            candidate.debug.update(
+                {
+                    "primitive_id": int(primitive.primitive_id),
+                    "source_primitive_id": int(primitive.primitive_id),
+                    "primitive_extraction_method": str(primitive.extraction_method),
+                    "seed_line_primitive": primitive.to_dict(),
+                    "accepted_orientation_source": str(getattr(cfg, "accepted_orientation_source", "seed_primitive_only")),
+                    "axis_hv_for_accepted_disabled": not bool(getattr(cfg, "allow_axis_hv_for_accepted", False)),
+                    "wall_pair_axis_for_accepted_disabled": not bool(getattr(cfg, "allow_wall_pair_axis_for_accepted", False)),
+                    "local_free_neck_axis_for_accepted_disabled": not bool(getattr(cfg, "allow_local_free_neck_axis_for_accepted", False)),
+                    "voxel_v32_seed_line_primitive_completion": True,
+                }
             )
             trial_candidates.append(candidate)
             all_trial_candidates.append(candidate)
@@ -1460,6 +1637,9 @@ def complete_voxel_doors_from_seeds(
                         "seed_group_id": int(group.group_id),
                         "seed_group_kind": str(group.group_kind),
                         "source_cluster_ids": [int(v) for v in group.source_cluster_ids],
+                        "primitive_count_for_group": int(len(group_primitives)),
+                        "accepted_primitive_count_for_group": int(len(accepted_primitives)),
+                        "selected_primitive_id": int(selected.debug.get("primitive_id", 0) or 0),
                     },
                 )
             )
@@ -1502,6 +1682,20 @@ def complete_voxel_doors_from_seeds(
             cid += 1
 
     conflict_debug = _batch_reject_conflicting_doors(selected_candidates, seed, shape, cfg)
+    primitive_id_map = np.zeros(shape, dtype=np.int32)
+    primitive_mask = np.zeros(shape, dtype=bool)
+    extensible_primitive_mask = np.zeros(shape, dtype=bool)
+    rejected_primitive_mask = np.zeros(shape, dtype=bool)
+    primitive_reject_reason_map = np.zeros(shape, dtype=np.uint8)
+    for primitive in all_primitives:
+        mask = _cells_to_mask(primitive.cells, shape)
+        primitive_mask |= mask
+        primitive_id_map[(mask) & (primitive_id_map == 0)] = int(primitive.primitive_id)
+        if bool(primitive.accepted_for_extension):
+            extensible_primitive_mask |= mask
+        else:
+            rejected_primitive_mask |= mask
+            primitive_reject_reason_map[mask] = _door_reject_code(str(primitive.reject_reason or "primitive_rejected"))
     trial_candidate_mask = np.zeros(shape, dtype=bool)
     trial_rejected_mask = np.zeros(shape, dtype=bool)
     selected_candidate_mask = np.zeros(shape, dtype=bool)
@@ -1597,13 +1791,17 @@ def complete_voxel_doors_from_seeds(
         )
     )
     extensible_seed_group_mask = np.zeros(shape, dtype=bool)
-    for group in seed_groups:
-        if bool(group.accepted_for_completion):
-            extensible_seed_group_mask |= np.asarray(group.mask, dtype=bool)
+    for primitive in all_primitives:
+        if bool(primitive.accepted_for_extension):
+            extensible_seed_group_mask |= _cells_to_mask(primitive.cells, shape)
     cluster_reason_counts = Counter(str(cluster.reject_reason) for cluster in clusters if not bool(cluster.accepted_for_completion) and cluster.reject_reason is not None)
+    primitive_reason_counts = Counter(str(primitive.reject_reason) for primitive in all_primitives if not bool(primitive.accepted_for_extension) and primitive.reject_reason is not None)
+    extension_reason_counts = Counter(str(candidate.debug.get("reject_reason_visual") or candidate.reject_reason) for candidate in all_trial_candidates if not bool(candidate.accepted))
     debug = {
         "voxel_door_completion_ms": float(completion_ms),
+        "voxel_v32_seed_line_primitive_completion": True,
         "voxel_door_extension_attempt_all_mask": trial_candidate_mask.astype(bool),
+        "voxel_door_extension_trials_map": trial_candidate_mask.astype(bool),
         "voxel_door_extension_attempt_selected_mask": selected_candidate_mask.astype(bool),
         "voxel_door_extension_attempt_rejected_mask": trial_rejected_mask.astype(bool),
         "voxel_door_extension_attempt_reason_map": rejected_reason_map.astype(np.uint8),
@@ -1614,10 +1812,13 @@ def complete_voxel_doors_from_seeds(
         "voxel_door_centerline_visual_mask": visual_partition_mask.astype(bool),
         "voxel_door_visual_only_mask": visual_only_mask.astype(bool),
         "voxel_door_partition_cut_candidate_mask": partition_candidate_mask.astype(bool),
+        "voxel_door_partition_cut_mask": partition_mask.astype(bool),
         "voxel_door_partition_cut_rejected_mask": partition_rejected_mask.astype(bool),
         "voxel_door_partition_reject_reason_map": partition_reject_reason_map.astype(np.uint8),
+        "voxel_door_partition_reject_reason_id_map": partition_reject_reason_map.astype(np.uint8),
         "voxel_door_rejected_lines_map": rejected_mask.astype(bool),
         "voxel_door_rejected_by_reason_map": rejected_reason_map.astype(np.uint8),
+        "voxel_door_extension_reject_reason_id_map": rejected_reason_map.astype(np.uint8),
         "voxel_door_centerline_mask": partition_mask.astype(bool),
         "voxel_door_cut_mask": partition_mask.astype(bool),
         "voxel_door_partition_cut_accepted_mask": partition_mask.astype(bool),
@@ -1640,6 +1841,7 @@ def complete_voxel_doors_from_seeds(
         "voxel_door_trial_candidate_groups": [group.to_dict() for group in trial_groups],
         "voxel_door_reject_reason_counts": dict(reason_counts),
         "voxel_door_trial_reject_reason_counts": dict(trial_reason_counts),
+        "voxel_door_extension_reject_reason_counts": dict(extension_reason_counts),
         "voxel_door_completion_mode_counts": dict(completion_mode_counts),
         "voxel_door_candidate_mode_counts": dict(trial_mode_counts),
         "voxel_door_candidate_orientation_counts": dict(orientation_counts),
@@ -1660,12 +1862,14 @@ def complete_voxel_doors_from_seeds(
         ),
         "voxel_door_cluster_reject_reason_counts": dict(cluster_reason_counts),
         "voxel_door_seed_cluster_reject_reason_counts": dict(cluster_reason_counts),
+        "voxel_door_primitive_reject_reason_counts": dict(primitive_reason_counts),
         "voxel_door_visual_reject_reason_counts": dict(reason_counts),
         "voxel_door_partition_reject_reason_counts": dict(partition_reason_counts),
         "voxel_door_topology_reject_reason_counts": dict(topology_reason_counts),
         "voxel_door_topology_debug_per_candidate": [DoorExtensionTrial.from_candidate(candidate).to_dict() for candidate in selected_candidates],
         "voxel_door_candidate_count": int(len(selected_candidates)),
         "voxel_door_trial_candidate_count": int(len(all_trial_candidates)),
+        "voxel_door_extension_trial_count": int(len(all_trial_candidates)),
         "voxel_door_selected_candidate_count": int(len(selected_candidates)),
         "voxel_door_visual_accepted_count": int(visual_count),
         "voxel_door_partition_accepted_count": int(partition_count),
@@ -1682,6 +1886,18 @@ def complete_voxel_doors_from_seeds(
         "voxel_door_anchor_source_counts": source_counts,
         "voxel_door_seed_mask": seed.astype(bool),
         "voxel_door_raw_seed_mask": seed.astype(bool),
+        "voxel_door_raw_seed_cells": int(np.count_nonzero(seed)),
+        "voxel_door_seed_component_id_map": labels.astype(np.int32),
+        "voxel_door_seed_cluster_id_map": cluster_map.astype(np.int32),
+        "voxel_door_seed_reject_reason_id_map": np.asarray(seed_result.door_seed_reject_reason_map, dtype=np.uint8),
+        "voxel_door_seed_line_primitive_id_map": primitive_id_map.astype(np.int32),
+        "voxel_door_seed_line_primitive_mask": primitive_mask.astype(bool),
+        "voxel_door_extensible_primitive_mask": extensible_primitive_mask.astype(bool),
+        "voxel_door_rejected_primitive_mask": rejected_primitive_mask.astype(bool),
+        "voxel_door_primitive_reject_reason_map": primitive_reject_reason_map.astype(np.uint8),
+        "voxel_door_line_primitives": [primitive.to_dict() for primitive in all_primitives],
+        "voxel_door_line_primitive_count": int(len(all_primitives)),
+        "voxel_door_extensible_primitive_count": int(sum(1 for primitive in all_primitives if primitive.accepted_for_extension)),
         "voxel_door_extensible_seed_group_mask": extensible_seed_group_mask.astype(bool),
         "voxel_door_seed_cluster_map": cluster_map.astype(np.int32),
         "voxel_door_seed_clusters": [cluster.to_dict() for cluster in clusters],
@@ -2758,6 +2974,342 @@ def is_seed_group_extensible(group: DoorSeedGroup, cfg: VoxelDoorDetectorConfig,
         return False, "seed_group_not_line_like", debug
     debug["seed_group_extensible_reason"] = None
     return True, None, debug
+
+
+def extract_seed_line_primitives_from_group(
+    group: DoorSeedGroup,
+    *,
+    primitive_id_start: int,
+    shape: tuple[int, int],
+    resolution_m: float,
+    cfg: VoxelDoorDetectorConfig,
+) -> list[DoorSeedLinePrimitive]:
+    primitives: list[DoorSeedLinePrimitive] = []
+    pid = int(primitive_id_start)
+    if str(group.group_kind) == "seed_pair_bridge":
+        primitives.append(
+            _build_seed_line_primitive(
+                pid,
+                group,
+                list(group.seed_cells),
+                shape=shape,
+                resolution_m=float(resolution_m),
+                cfg=cfg,
+                extraction_method="seed_pair_bridge",
+                forced_major=np.asarray(group.major_dir_rc, dtype=np.float32),
+                force_accept=len(group.seed_cells)
+                >= min(int(getattr(cfg, "primitive_min_seed_cells", 3)), int(getattr(cfg, "min_seed_cells_for_accepted_extension", 3))),
+            )
+        )
+        return primitives
+
+    direct = _build_seed_line_primitive(
+        pid,
+        group,
+        list(group.seed_cells),
+        shape=shape,
+        resolution_m=float(resolution_m),
+        cfg=cfg,
+        extraction_method="direct_pca",
+    )
+    primitives.append(direct)
+    pid += 1
+    if bool(direct.accepted_for_extension):
+        return primitives
+    if len(group.component_ids) >= 2 and str(direct.reject_reason) == "primitive_along_gap_too_large":
+        primitives.append(
+            _build_seed_line_primitive(
+                pid,
+                group,
+                list(group.seed_cells),
+                shape=shape,
+                resolution_m=float(resolution_m),
+                cfg=cfg,
+                extraction_method="seed_pair_bridge",
+                forced_major=np.asarray(group.major_dir_rc, dtype=np.float32),
+                force_accept=len(group.seed_cells)
+                >= min(int(getattr(cfg, "primitive_min_seed_cells", 3)), int(getattr(cfg, "min_seed_cells_for_accepted_extension", 3))),
+            )
+        )
+        pid += 1
+        if bool(primitives[-1].accepted_for_extension):
+            return primitives
+
+    if bool(getattr(cfg, "enable_seed_blob_line_decomposition", True)):
+        for cells in _extract_ransac_seed_line_segments(group.seed_cells, group_id=int(group.group_id), cfg=cfg):
+            primitive = _build_seed_line_primitive(
+                pid,
+                group,
+                cells,
+                shape=shape,
+                resolution_m=float(resolution_m),
+                cfg=cfg,
+                extraction_method="ransac_blob",
+            )
+            primitives.append(primitive)
+            pid += 1
+            if len([item for item in primitives if item.extraction_method == "ransac_blob"]) >= int(getattr(cfg, "max_primitives_per_cluster", 4)):
+                break
+
+    if not any(bool(item.accepted_for_extension) for item in primitives):
+        fallback = _build_seed_line_primitive(
+            pid,
+            group,
+            list(group.seed_cells),
+            shape=shape,
+            resolution_m=float(resolution_m),
+            cfg=cfg,
+            extraction_method="fallback_centerline",
+            force_accept=_strong_seed_group_fallback_ok(group, cfg, resolution_m=float(resolution_m)),
+        )
+        if bool(fallback.accepted_for_extension) or len(group.seed_cells) >= int(getattr(cfg, "strong_seed_min_cells", 6)):
+            primitives.append(fallback)
+    return primitives
+
+
+def _build_seed_line_primitive(
+    primitive_id: int,
+    group: DoorSeedGroup,
+    cells: Sequence[tuple[int, int]],
+    *,
+    shape: tuple[int, int],
+    resolution_m: float,
+    cfg: VoxelDoorDetectorConfig,
+    extraction_method: str,
+    forced_major: np.ndarray | None = None,
+    force_accept: bool = False,
+) -> DoorSeedLinePrimitive:
+    clean_cells = sorted({(int(r), int(c)) for r, c in cells if 0 <= int(r) < shape[0] and 0 <= int(c) < shape[1]})
+    center, major, minor, residual, thickness_m, length_m, bbox = _fit_seed_cells(clean_cells, shape, float(resolution_m))
+    if forced_major is not None:
+        unit = _unit(np.asarray(forced_major, dtype=np.float32))
+        if unit is not None:
+            major = unit.astype(np.float32)
+            minor = np.asarray([-major[1], major[0]], dtype=np.float32)
+            pts = np.asarray(clean_cells, dtype=np.float32)
+            if pts.size:
+                rel = pts - center[None, :]
+                residual_values = np.abs(np.dot(rel, minor))
+                along_values = np.dot(rel, major)
+                residual = float(np.max(residual_values)) if residual_values.size else 0.0
+                thickness_m = float((2.0 * residual + 1.0) * float(resolution_m))
+                length_m = float((float(np.max(along_values)) - float(np.min(along_values)) + 1.0) * float(resolution_m)) if along_values.size else float(resolution_m)
+    seed_count = int(len(clean_cells))
+    thickness_cells = max(1.0, float(thickness_m) / max(float(resolution_m), 1e-9))
+    length_cells = float(length_m) / max(float(resolution_m), 1e-9)
+    elongation = float(length_cells / max(thickness_cells, 1e-6))
+    along_min, along_max, max_gap, segment_count = _primitive_along_stats(clean_cells, center, major, cfg)
+    reject_reason = _primitive_reject_reason(
+        seed_count=seed_count,
+        length_cells=length_cells,
+        thickness_cells=thickness_cells,
+        residual_cells=float(residual),
+        elongation=elongation,
+        max_gap=max_gap,
+        cfg=cfg,
+    )
+    accepted = bool(force_accept or reject_reason is None)
+    if bool(force_accept):
+        reject_reason = None
+    return DoorSeedLinePrimitive(
+        primitive_id=int(primitive_id),
+        source_cluster_id=int(group.source_cluster_ids[0] if group.source_cluster_ids else group.group_id),
+        source_group_id=int(group.group_id),
+        source_component_ids=[int(v) for v in group.component_ids],
+        cells=clean_cells,
+        center_rc=(float(center[0]), float(center[1])),
+        major_dir_rc=(float(major[0]), float(major[1])),
+        minor_dir_rc=(float(minor[0]), float(minor[1])),
+        length_cells=float(length_cells),
+        thickness_cells=float(thickness_cells),
+        residual_cells=float(residual),
+        elongation=float(elongation),
+        seed_count=int(seed_count),
+        bbox_rc=bbox,
+        along_min=float(along_min),
+        along_max=float(along_max),
+        max_along_gap_cells=float(max_gap),
+        contiguous_segment_count=int(segment_count),
+        accepted_for_extension=accepted,
+        reject_reason=reject_reason,
+        extraction_method=str(extraction_method),
+        debug={
+            "source_group_kind": str(group.group_kind),
+            "source_group_reject_reason": group.reject_reason,
+            "force_accept": bool(force_accept),
+        },
+    )
+
+
+def _primitive_reject_reason(
+    *,
+    seed_count: int,
+    length_cells: float,
+    thickness_cells: float,
+    residual_cells: float,
+    elongation: float,
+    max_gap: float,
+    cfg: VoxelDoorDetectorConfig,
+) -> str | None:
+    min_seed_cells = min(int(getattr(cfg, "primitive_min_seed_cells", 3)), int(getattr(cfg, "min_seed_cells_for_accepted_extension", 3)))
+    min_length_cells = min(float(getattr(cfg, "primitive_min_length_cells", 3)), float(getattr(cfg, "min_seed_line_length_cells_for_accepted_extension", 3)))
+    min_elongation = min(float(getattr(cfg, "primitive_min_elongation", 1.4)), float(getattr(cfg, "min_seed_elongation_for_direction", 1.6)))
+    max_residual = max(float(getattr(cfg, "primitive_max_residual_cells", 1.75)), float(getattr(cfg, "max_seed_line_residual_cells_for_direction", 1.25)))
+    if int(seed_count) < int(min_seed_cells):
+        return "primitive_too_few_seed_cells"
+    if float(length_cells) + 1e-6 < float(min_length_cells):
+        return "primitive_line_too_short"
+    if float(thickness_cells) > float(getattr(cfg, "primitive_max_thickness_cells", 3)) + 1e-6:
+        return "primitive_too_thick"
+    if float(residual_cells) > float(max_residual) + 1e-6:
+        return "primitive_residual_too_high"
+    if float(elongation) + 1e-6 < float(min_elongation):
+        return "primitive_elongation_too_low"
+    if float(max_gap) > float(getattr(cfg, "primitive_max_along_gap_cells", 2.0)) + 1e-6:
+        return "primitive_along_gap_too_large"
+    return None
+
+
+def _primitive_along_stats(
+    cells: Sequence[tuple[int, int]],
+    center: np.ndarray,
+    major: np.ndarray,
+    cfg: VoxelDoorDetectorConfig,
+) -> tuple[float, float, float, int]:
+    if not cells:
+        return 0.0, 0.0, 0.0, 0
+    pts = np.asarray(cells, dtype=np.float32)
+    along = np.sort(np.dot(pts - np.asarray(center, dtype=np.float32)[None, :], np.asarray(major, dtype=np.float32)))
+    if along.size <= 1:
+        return float(along[0]), float(along[0]), 0.0, 1
+    gaps = np.diff(along)
+    max_gap = float(np.max(gaps)) if gaps.size else 0.0
+    segment_count = int(1 + np.count_nonzero(gaps > float(getattr(cfg, "primitive_max_along_gap_cells", 2.0)) + 1e-6))
+    return float(along[0]), float(along[-1]), max_gap, segment_count
+
+
+def _extract_ransac_seed_line_segments(
+    cells: Sequence[tuple[int, int]],
+    *,
+    group_id: int,
+    cfg: VoxelDoorDetectorConfig,
+) -> list[list[tuple[int, int]]]:
+    remaining = sorted({(int(r), int(c)) for r, c in cells})
+    segments_out: list[list[tuple[int, int]]] = []
+    max_primitives = max(0, int(getattr(cfg, "max_primitives_per_cluster", 4)))
+    for _ in range(max_primitives):
+        if len(remaining) < int(getattr(cfg, "ransac_min_inliers", 3)):
+            break
+        best = _best_ransac_line(remaining, group_id=int(group_id), cfg=cfg)
+        if best is None:
+            break
+        center, major, inliers = best
+        if len(inliers) < int(getattr(cfg, "ransac_min_inliers", 3)):
+            break
+        segments = _split_cells_by_along_gap(inliers, center, major, max_gap=float(getattr(cfg, "primitive_max_along_gap_cells", 2.0)))
+        any_segment = False
+        for segment in segments:
+            if len(segment) >= int(getattr(cfg, "ransac_min_inliers", 3)):
+                segments_out.append(segment)
+                any_segment = True
+        if not any_segment:
+            break
+        if bool(getattr(cfg, "remove_inliers_after_primitive", True)):
+            remove = set(inliers)
+            remaining = [cell for cell in remaining if cell not in remove]
+        else:
+            break
+    return segments_out
+
+
+def _best_ransac_line(
+    cells: Sequence[tuple[int, int]],
+    *,
+    group_id: int,
+    cfg: VoxelDoorDetectorConfig,
+) -> tuple[np.ndarray, np.ndarray, list[tuple[int, int]]] | None:
+    pts = np.asarray(cells, dtype=np.float32)
+    if pts.shape[0] < 2:
+        return None
+    rng = np.random.default_rng(1009 + int(group_id))
+    pair_count = min(max(1, int(getattr(cfg, "ransac_num_trials", 64))), max(1, pts.shape[0] * (pts.shape[0] - 1) // 2))
+    pairs: list[tuple[int, int]] = []
+    if pts.shape[0] <= 32:
+        for i in range(pts.shape[0]):
+            for j in range(i + 1, pts.shape[0]):
+                pairs.append((i, j))
+        if len(pairs) > pair_count:
+            indices = rng.choice(len(pairs), size=pair_count, replace=False)
+            pairs = [pairs[int(i)] for i in indices]
+    else:
+        seen: set[tuple[int, int]] = set()
+        while len(pairs) < pair_count:
+            i, j = rng.choice(pts.shape[0], size=2, replace=False).tolist()
+            pair = (min(int(i), int(j)), max(int(i), int(j)))
+            if pair not in seen:
+                seen.add(pair)
+                pairs.append(pair)
+    best_score = -1e9
+    best_result: tuple[np.ndarray, np.ndarray, list[tuple[int, int]]] | None = None
+    residual_limit = float(getattr(cfg, "ransac_inlier_residual_cells", 1.5))
+    for i, j in pairs:
+        p0 = pts[int(i)]
+        p1 = pts[int(j)]
+        delta = p1 - p0
+        norm = float(np.linalg.norm(delta))
+        if norm < 2.0:
+            continue
+        major = (delta / norm).astype(np.float32)
+        minor = np.asarray([-major[1], major[0]], dtype=np.float32)
+        residual = np.abs(np.dot(pts - p0[None, :], minor))
+        inlier_idx = np.flatnonzero(residual <= residual_limit)
+        if inlier_idx.size < int(getattr(cfg, "ransac_min_inliers", 3)):
+            continue
+        inlier_pts = pts[inlier_idx]
+        along = np.dot(inlier_pts - p0[None, :], major)
+        length = float(np.max(along) - np.min(along) + 1.0) if along.size else 0.0
+        residual_mean = float(np.mean(residual[inlier_idx])) if inlier_idx.size else residual_limit
+        score = float(inlier_idx.size + 0.3 * length - 0.5 * residual_mean)
+        if score > best_score:
+            best_score = score
+            center = np.mean(inlier_pts, axis=0).astype(np.float32)
+            best_result = (center, major.astype(np.float32), [tuple(map(int, cells[int(idx)])) for idx in inlier_idx])
+    return best_result
+
+
+def _split_cells_by_along_gap(
+    cells: Sequence[tuple[int, int]],
+    center: np.ndarray,
+    major: np.ndarray,
+    *,
+    max_gap: float,
+) -> list[list[tuple[int, int]]]:
+    if not cells:
+        return []
+    pts = np.asarray(cells, dtype=np.float32)
+    along = np.dot(pts - np.asarray(center, dtype=np.float32)[None, :], np.asarray(major, dtype=np.float32))
+    order = np.argsort(along)
+    segments: list[list[tuple[int, int]]] = []
+    current: list[tuple[int, int]] = [tuple(map(int, cells[int(order[0])]))]
+    for prev_idx, idx in zip(order[:-1], order[1:]):
+        if float(along[int(idx)] - along[int(prev_idx)]) > float(max_gap) + 1e-6:
+            segments.append(current)
+            current = []
+        current.append(tuple(map(int, cells[int(idx)])))
+    if current:
+        segments.append(current)
+    return segments
+
+
+def _strong_seed_group_fallback_ok(group: DoorSeedGroup, cfg: VoxelDoorDetectorConfig, *, resolution_m: float) -> bool:
+    if not bool(getattr(cfg, "enable_strong_seed_centerline_fallback", True)):
+        return False
+    if len(group.seed_cells) < int(getattr(cfg, "strong_seed_min_cells", getattr(cfg, "strong_seed_centerline_min_cells", 4))):
+        return False
+    thickness_cells = max(1.0, float(group.thickness_m) / max(float(resolution_m), 1e-9))
+    if thickness_cells > float(getattr(cfg, "strong_seed_max_thickness_cells", 5)) + 1e-6:
+        return False
+    return True
 
 
 def _unit(vec: np.ndarray) -> np.ndarray | None:
@@ -3984,12 +4536,15 @@ def validate_door_partition_small_known_side(
     resolution_m: float,
     cfg: VoxelDoorDetectorConfig,
 ) -> tuple[bool, dict[str, object]]:
-    enabled = bool(getattr(cfg, "partition_reject_small_known_side_enabled", True))
+    topology_enabled = bool(getattr(cfg, "partition_topology_enabled", True))
+    enabled = bool(getattr(cfg, "partition_reject_small_known_side_enabled", True)) and bool(topology_enabled)
     area_threshold = float(getattr(cfg, "partition_small_known_side_area_m2", 2.0))
     unknown_threshold = float(getattr(cfg, "partition_small_known_side_unknown_ratio_max", 0.20))
     dilation_cells = max(1, int(getattr(cfg, "partition_small_known_side_boundary_dilation_cells", 1)))
     debug: dict[str, object] = {
         "partition_small_known_side_gate_enabled": bool(enabled),
+        "partition_small_known_side_requires_topology": True,
+        "partition_small_known_side_topology_enabled": bool(topology_enabled),
         "partition_small_known_side_area_threshold_m2": float(area_threshold),
         "partition_small_known_side_unknown_ratio_threshold": float(unknown_threshold),
         "partition_small_known_side_boundary_dilation_cells": int(dilation_cells),
@@ -4003,6 +4558,8 @@ def validate_door_partition_small_known_side(
         raise ValueError("door small-known-side maps must share one HxW shape")
     if not enabled or area_threshold <= 0.0 or not np.any(cut):
         debug["partition_small_known_side_rejected"] = False
+        if not bool(topology_enabled):
+            debug["partition_small_known_side_skip_reason"] = "partition_topology_disabled"
         return False, debug
 
     before = free & ~wall

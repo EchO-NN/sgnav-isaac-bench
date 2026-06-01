@@ -175,6 +175,7 @@ def test_step2_extension_rejects_split_with_side_width_1_to_3_cells():
         min_new_component_area_cells=1,
         min_new_component_width_m=0.0,
         reject_if_side_width_cells_leq=3,
+        reject_small_known_side_for_line_extensions=False,
         separator=SeparatorAnchorConfig(require_two_anchors=False),
     )
 

@@ -198,10 +198,10 @@ def test_config_defaults_match_benchmark_contract():
     assert cfg["nearfield_static_map"]["enabled"] is False
     assert cfg["mapping"]["frontier_allow_near_fallback"] is False
     assert cfg["mapping"]["frontier_min_distance_m"] == 1.0
-    assert cfg["mapping"]["room_map_mode"] == "voxel_occupancy_door_wall_v29_vlm"
+    assert cfg["mapping"]["room_map_mode"] == "voxel_occupancy_door_wall_v33_vlm"
     assert cfg["mapping"]["strict_no_oracle_rooms"] is True
-    assert cfg["mapping"]["room_segmentation"]["algorithm"] == "voxel_occupancy_door_wall_v29"
-    assert cfg["mapping"]["room_segmentation"]["backend"] == "voxel_occupancy_door_wall_v29"
+    assert cfg["mapping"]["room_segmentation"]["algorithm"] == "voxel_occupancy_door_wall_v33"
+    assert cfg["mapping"]["room_segmentation"]["backend"] == "voxel_occupancy_door_wall_v33"
     assert cfg["mapping"]["frontier_source"] == "voxel_vertical_free"
     assert cfg["mapping"]["room_segmentation"]["source_mode"] == "declutter_reconstruct_external"
     assert cfg["mapping"]["room_segmentation"]["legacy_watershed_allowed"] == "debug_only"

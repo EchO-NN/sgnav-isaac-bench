@@ -349,6 +349,50 @@ def _debug_bool_array(debug: Mapping[str, object], key: str, shape: tuple[int, i
     return arr
 
 
+def _compact_json_debug(value: object, *, max_list_items: int = 64, _depth: int = 0) -> object:
+    """Keep result JSON small; full debug arrays belong in snapshot npz files."""
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, np.ndarray):
+        arr = np.asarray(value)
+        summary: dict[str, object] = {
+            "array_summary": True,
+            "shape": [int(v) for v in arr.shape],
+            "dtype": str(arr.dtype),
+            "size": int(arr.size),
+        }
+        if arr.size:
+            try:
+                summary["nonzero"] = int(np.count_nonzero(arr))
+            except Exception:
+                pass
+        if arr.size <= 16:
+            summary["values"] = make_jsonable(arr.tolist())
+        return summary
+    if isinstance(value, Mapping):
+        return {
+            str(key): _compact_json_debug(item, max_list_items=max_list_items, _depth=_depth + 1)
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        seq = list(value)
+        if len(seq) <= int(max_list_items):
+            return [
+                _compact_json_debug(item, max_list_items=max_list_items, _depth=_depth + 1)
+                for item in seq
+            ]
+        return {
+            "list_summary": True,
+            "length": int(len(seq)),
+            "items": [
+                _compact_json_debug(item, max_list_items=max_list_items, _depth=_depth + 1)
+                for item in seq[: int(max_list_items)]
+            ],
+            "truncated_count": int(len(seq) - int(max_list_items)),
+        }
+    return value
+
+
 def _roomseg_debug_for_layer_dump(room_debug: Mapping[str, object], room_segmenter: object | None) -> dict:
     debug = dict(room_debug or {})
     result = getattr(room_segmenter, "last_result", None)
@@ -423,9 +467,21 @@ def _roomseg_voxel_snapshot_arrays(mapper: object) -> dict[str, np.ndarray]:
     state = np.asarray(evidence.get("state"), dtype=np.uint8)
     if state.ndim != 3:
         return {}
+    log_odds = np.asarray(evidence.get("log_odds", np.zeros_like(state, dtype=np.int16)), dtype=np.int16)
+    if log_odds.shape != state.shape:
+        log_odds = np.zeros_like(state, dtype=np.int16)
+    sensor_range_count = np.asarray(evidence.get("sensor_range_count", np.zeros_like(state, dtype=np.uint8)), dtype=np.uint8)
+    if sensor_range_count.shape != state.shape:
+        sensor_range_count = np.zeros_like(state, dtype=np.uint8)
     z_min = float(evidence.get("z_min_m", 0.0))
     z_res = float(evidence.get("z_resolution_m", 1.0))
     z_centers = z_min + (np.arange(state.shape[0], dtype=np.float32) + 0.5) * z_res
+    nav_endpoint = np.asarray(evidence.get("voxel_nav_occupied_endpoint_count_xy", np.zeros(state.shape[1:], dtype=np.uint16)), dtype=np.uint16)
+    nav_free_ray = np.asarray(evidence.get("voxel_nav_free_ray_count_xy", np.zeros(state.shape[1:], dtype=np.uint16)), dtype=np.uint16)
+    if nav_endpoint.shape != state.shape[1:]:
+        nav_endpoint = np.zeros(state.shape[1:], dtype=np.uint16)
+    if nav_free_ray.shape != state.shape[1:]:
+        nav_free_ray = np.zeros(state.shape[1:], dtype=np.uint16)
 
     def scalar(value: object, default: float = np.nan) -> np.ndarray:
         if value is None:
@@ -434,6 +490,10 @@ def _roomseg_voxel_snapshot_arrays(mapper: object) -> dict[str, np.ndarray]:
 
     return {
         "voxel_occupancy_state_zyx": state,
+        "voxel_occupancy_log_odds_zyx": log_odds,
+        "voxel_sensor_range_count_zyx": sensor_range_count,
+        "voxel_nav_occupied_endpoint_count_xy": nav_endpoint,
+        "voxel_nav_free_ray_count_xy": nav_free_ray,
         "voxel_occupancy_z_centers_m": z_centers.astype(np.float32),
         "voxel_occupancy_z_min_m": scalar(evidence.get("z_min_m")),
         "voxel_occupancy_z_max_m": scalar(evidence.get("z_max_m")),
@@ -441,7 +501,27 @@ def _roomseg_voxel_snapshot_arrays(mapper: object) -> dict[str, np.ndarray]:
         "voxel_occupancy_active_z_min_m": scalar(evidence.get("active_z_min_m")),
         "voxel_occupancy_active_z_max_m": scalar(evidence.get("active_z_max_m")),
         "voxel_occupancy_ceiling_height_estimate_m": scalar(evidence.get("ceiling_height_estimate_m")),
+        "voxel_occupancy_ceiling_estimate_status": np.asarray(str(evidence.get("ceiling_estimate_status", "snapshot"))),
+        "voxel_ceiling_estimate_status": np.asarray(str(evidence.get("ceiling_estimate_status", "snapshot"))),
     }
+
+
+def _roomseg_memory_snapshot_arrays(room_segmenter: object | None) -> dict[str, np.ndarray]:
+    if room_segmenter is None:
+        return {}
+    debug = dict(getattr(room_segmenter, "last_debug", {}) or {})
+    out: dict[str, np.ndarray] = {}
+    for key in (
+        "voxel_roomseg_memory_before_json",
+        "voxel_roomseg_memory_after_json",
+        "voxel_door_memory_before_roomseg_json",
+        "voxel_door_memory_after_roomseg_json",
+        "voxel_separator_memory_before_roomseg_json",
+        "voxel_separator_memory_after_roomseg_json",
+    ):
+        if key in debug:
+            out[key] = np.asarray(str(debug[key]))
+    return out
 
 
 def apply_episode_planning_clearance(
@@ -1690,6 +1770,19 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
     voxel_grid_cfg = dict(getattr(args, "room_segmentation_config", {}).get("voxel_grid", {}) or {})
     voxel_nav_cfg = dict(getattr(args, "room_segmentation_config", {}).get("voxel_navigation_projection", {}) or {})
     voxel_blind_zone_cfg = dict(getattr(args, "room_segmentation_config", {}).get("voxel_navigation_blind_zone", {}) or {})
+    voxel_runtime_cfg = dict(getattr(args, "voxel_runtime_config", {}) or {})
+    if bool(voxel_grid_cfg.get("enabled", True)) and bool(voxel_grid_cfg.get("voxel_grid_drives_navigation", True)):
+        required_skip_flags = (
+            "skip_legacy_vertical_profile_when_voxel_backend",
+            "skip_legacy_height_profile_when_voxel_backend",
+            "skip_legacy_roomseg_ray_evidence_when_voxel_backend",
+        )
+        missing_skip_flags = [key for key in required_skip_flags if not bool(voxel_runtime_cfg.get(key, False))]
+        if missing_skip_flags:
+            raise RuntimeError(
+                "voxel grid drives navigation, but legacy mapping recomputation is enabled: %s"
+                % ", ".join(missing_skip_flags)
+            )
     roomseg_depth_stride_px = _resolve_roomseg_depth_stride_px(
         getattr(args, "room_segmentation_config", {}),
         int(args.depth_stride_px),
@@ -1734,7 +1827,95 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
         voxel_grid_config=voxel_grid_cfg,
         voxel_navigation_projection_config=voxel_nav_cfg,
         voxel_navigation_blind_zone_config=voxel_blind_zone_cfg,
+        voxel_runtime_config=voxel_runtime_cfg,
     )
+    voxel_perf_recent_path = Path(args.output).expanduser().with_name("voxel_perf_log.jsonl")
+    voxel_perf_recent_rows: list[dict[str, object]] = []
+
+    def record_voxel_perf_trace(step_idx: int | None) -> None:
+        if not bool(voxel_grid_cfg.get("enabled", True)):
+            return
+        voxel_grid = getattr(mapper, "voxel_grid", None)
+        if voxel_grid is None:
+            return
+        stats = dict(getattr(voxel_grid, "last_integration_stats", {}).to_dict())
+        nav_debug = {
+            str(key): value
+            for key, value in dict(getattr(voxel_grid, "last_navigation_debug", {}) or {}).items()
+            if not isinstance(value, np.ndarray)
+        }
+        row = make_jsonable(
+            {
+                "step": None if step_idx is None else int(step_idx),
+                "backend": stats.get("voxel_integration_backend"),
+                "thread_count": stats.get("voxel_integrate_backend_thread_count"),
+                "effective_thread_count": stats.get("voxel_integrate_backend_effective_thread_count"),
+                "requested_thread_count": stats.get("voxel_integrate_numba_requested_thread_count"),
+                "threads_mode": stats.get("voxel_integrate_numba_threads_mode"),
+                "threading_layer": stats.get("voxel_numba_threading_layer"),
+                "integrate_total_ms": stats.get("voxel_integrate_total_ms"),
+                "pass1_ms": stats.get("voxel_integrate_pass1_ms"),
+                "event_prefix_ms": stats.get("voxel_integrate_event_prefix_ms"),
+                "pass2_ms": stats.get("voxel_integrate_pass2_ms"),
+                "event_bucket_ms": stats.get("voxel_integrate_event_bucket_ms"),
+                "bucket_free_ms": stats.get("voxel_integrate_bucket_free_ms"),
+                "bucket_occ_ms": stats.get("voxel_integrate_bucket_occ_ms"),
+                "bucket_sensor_ms": stats.get("voxel_integrate_bucket_sensor_ms"),
+                "apply_logodds_ms": stats.get("voxel_integrate_apply_logodds_ms"),
+                "apply_sensor_ms": stats.get("voxel_integrate_apply_sensor_ms"),
+                "endpoint_column_ms": stats.get("voxel_integrate_endpoint_column_ms"),
+                "changed_scan_ms": stats.get("voxel_integrate_changed_scan_ms"),
+                "refresh_mode": stats.get("voxel_refresh_mode"),
+                "refresh_state_ms": stats.get("voxel_refresh_state_ms"),
+                "project_navigation_ms": nav_debug.get("voxel_project_navigation_ms"),
+                "free_events": stats.get("voxel_integrate_total_samples"),
+                "sensor_events": stats.get("voxel_integrate_total_sensor_events"),
+                "occ_events": stats.get("voxel_integrate_total_occ_events"),
+                "stats": stats,
+                "navigation": nav_debug,
+            }
+        )
+        voxel_perf_recent_rows.append(row)
+        if len(voxel_perf_recent_rows) > 200:
+            del voxel_perf_recent_rows[:-200]
+        numeric_step = None if step_idx is None else int(step_idx)
+        should_flush = numeric_step is None or numeric_step < 0 or numeric_step % 50 == 0
+        if should_flush:
+            try:
+                voxel_perf_recent_path.parent.mkdir(parents=True, exist_ok=True)
+                voxel_perf_recent_path.write_text(
+                    "\n".join(json.dumps(item, ensure_ascii=False) for item in voxel_perf_recent_rows) + "\n",
+                    encoding="utf-8",
+                )
+            except OSError as exc:
+                print("[VOXEL PERF] failed to write %s: %s" % (str(voxel_perf_recent_path), exc), flush=True)
+        if numeric_step is not None and numeric_step >= 0 and numeric_step % 50 == 0:
+            print(
+                "[VOXEL PERF] step=%d backend=%s th=%s/%s mode=%s layer=%s total=%.2fms p1=%.2f p2=%.2f bucket=%.2f f/o/s=%.2f/%.2f/%.2f log=%.2f sensor=%.2f endpoint=%.2f changed_scan=%.2f refresh=%s nav=%.2f"
+                % (
+                    int(numeric_step),
+                    str(row.get("backend")),
+                    str(row.get("effective_thread_count") or row.get("thread_count")),
+                    str(row.get("requested_thread_count")),
+                    str(row.get("threads_mode")),
+                    str(row.get("threading_layer")),
+                    float(row.get("integrate_total_ms") or 0.0),
+                    float(row.get("pass1_ms") or 0.0),
+                    float(row.get("pass2_ms") or 0.0),
+                    float(row.get("event_bucket_ms") or 0.0),
+                    float(row.get("bucket_free_ms") or 0.0),
+                    float(row.get("bucket_occ_ms") or 0.0),
+                    float(row.get("bucket_sensor_ms") or 0.0),
+                    float(row.get("apply_logodds_ms") or 0.0),
+                    float(row.get("apply_sensor_ms") or 0.0),
+                    float(row.get("endpoint_column_ms") or 0.0),
+                    float(row.get("changed_scan_ms") or 0.0),
+                    str(row.get("refresh_mode")),
+                    float(row.get("project_navigation_ms") or 0.0),
+                ),
+                flush=True,
+            )
+
     static_goal_cells = [(int(r), int(c)) for r, c in episode["goal_regions_grid"]]
     start_pose = tuple(float(v) for v in episode["start_pose_world"])
     mapper.reset((float(start_pose[0]), float(start_pose[1])))
@@ -1883,8 +2064,8 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
         allowed_voxel_backends = {VOXEL_OCCUPANCY_ROOMSEG_BACKEND, *VOXEL_OCCUPANCY_ROOMSEG_LEGACY_BACKENDS}
         if roomseg_backend not in allowed_voxel_backends:
             raise ValueError(
-                "voxel_occupancy_door_wall_v29 room_map_mode requires --roomseg-backend in %s"
-                % sorted(allowed_voxel_backends)
+                "%s room_map_mode requires --roomseg-backend in %s"
+                % (VOXEL_OCCUPANCY_ROOMSEG_BACKEND, sorted(allowed_voxel_backends))
             )
         voxel_cfg = VoxelOccupancyDoorWallRoomSegConfig.from_mapping(
             getattr(args, "room_segmentation_config", {}),
@@ -2146,10 +2327,31 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
     latency_counts = {key: 0 for key in latency_totals_ms}
     mapping_breakdown_totals_ms: dict[str, float] = {}
     mapping_breakdown_counts: dict[str, int] = {}
+    loop_timing_enabled = str(os.environ.get("SGNAV_LOOP_TIMING", "")).strip().lower() in {"1", "true", "yes", "on"}
+    loop_timing_last = time.perf_counter()
+
+    if str(os.environ.get("SGNAV_FAULTHANDLER", "")).strip().lower() in {"1", "true", "yes", "on"}:
+        try:
+            import faulthandler
+            import signal
+
+            faulthandler.register(signal.SIGUSR1, file=sys.stderr, all_threads=True)
+            print("[sgnav-loop-timing] faulthandler SIGUSR1 enabled", flush=True)
+        except Exception as exc:
+            print("[sgnav-loop-timing] faulthandler setup failed: %s" % exc, flush=True)
 
     def record_latency(name: str, started_at: float) -> None:
         latency_totals_ms[name] += max(0.0, (time.perf_counter() - started_at) * 1000.0)
         latency_counts[name] += 1
+
+    def loop_tick(step_idx: int, label: str, *, reset: bool = False) -> None:
+        nonlocal loop_timing_last
+        if not loop_timing_enabled:
+            return
+        now = time.perf_counter()
+        elapsed_ms = 0.0 if reset else max(0.0, (now - loop_timing_last) * 1000.0)
+        loop_timing_last = now
+        print("[sgnav-loop-timing] step=%s %s +%.1fms" % (step_idx, str(label), elapsed_ms), flush=True)
 
     def record_mapping_timing(name: str, elapsed_ms: float) -> None:
         key = str(name)
@@ -2275,6 +2477,7 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
             started_at = time.perf_counter()
             mapper.update(current_obs["depth"], intr, pose_local, current_obs["camera_pose_world"])
             record_mapping_breakdown(getattr(mapper, "last_timing_stats", {}))
+            record_voxel_perf_trace(step_idx)
             mapper.last_debug_stats["depth_source"] = str(current_obs.get("depth_source", "unknown"))
             mapper.last_debug_stats["camera_frame_sync_updates"] = int(current_obs.get("camera_frame_sync_updates", 0) or 0)
             mapper.last_debug_stats["camera_rendering_time"] = current_obs.get("camera_rendering_time")
@@ -2635,6 +2838,11 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
                 if bool(getattr(args, "save_roomseg_voxel_evidence", False))
                 else None
             )
+            memory_snapshot_arrays = _roomseg_memory_snapshot_arrays(room_segmenter)
+            extra_npz_arrays = {
+                **dict(voxel_snapshot_arrays or {}),
+                **dict(memory_snapshot_arrays or {}),
+            }
             return save_roomseg_layer_dump(
                 out_dir=str(getattr(args, "roomseg_snapshot_dir", "result/roomseg_snapshots")),
                 step=int(step_idx),
@@ -2655,7 +2863,7 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
                 save_layers_png=False,
                 save_navigation_room_masks_png=True,
                 npz_keys=ROOMSEG_SNAPSHOT_ARRAY_KEYS,
-                extra_npz_arrays=voxel_snapshot_arrays,
+                extra_npz_arrays=extra_npz_arrays,
                 include_selected_frontier_sector=False,
             )
 
@@ -2974,7 +3182,9 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
                     rgb_device="cuda" if detector_cuda_rgb else "cpu",
                 )
         for step in range(0 if failure_reason is not None else max_steps):
+            loop_tick(step, "step_start", reset=True)
             map_state = update_mapper_state(obs, step)
+            loop_tick(step, "after_update_mapper_state")
             if map_state is None:
                 failure_reason = "depth_unavailable_for_online_mapping"
                 break
@@ -3068,6 +3278,7 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
                 force_perception_step = False
             if step % perception_every == 0 or perception_due:
                 update_scenegraph_frame(obs, step, map_state)
+                loop_tick(step, "after_update_scenegraph_frame")
 
             needs_replan = not current_path or step % replan_every == 0
             if current_path:
@@ -3128,7 +3339,9 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
                     )
                 )
                 if roomseg_context_needed:
+                    loop_tick(step, "before_room_context")
                     room_context_result = update_room_context_for_frontier_scoring(step, map_state)
+                    loop_tick(step, "after_room_context")
                 frontier_free, frontier_observed, frontier_occupancy, frontier_source_metadata = resolve_frontier_source_layers(
                     room_debug=last_room_segmentation_debug,
                     mapper=mapper,
@@ -3139,6 +3352,7 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
                     source=str(getattr(args, "frontier_source", "navigation")),
                     require_navigation_reachable=bool(getattr(args, "frontier_vertical_free_require_navigation_reachable", True)),
                 )
+                loop_tick(step, "after_resolve_frontier_source")
                 last_room_segmentation_debug = {
                     **dict(last_room_segmentation_debug),
                     **dict(frontier_source_metadata),
@@ -3221,6 +3435,7 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
                         allow_near_frontier_fallback=bool(args.frontier_allow_near_fallback),
                         require_reachable=not bool(frontier_mask_probe or explore_until_no_frontiers),
                     )
+                    loop_tick(step, "after_extract_frontiers")
                     last_frontier_clusters = len(frontiers)
                     last_frontiers = list(frontiers)
                     candidate_preview = None
@@ -3245,6 +3460,7 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
                         allow_frontier=True,
                         current_step=step,
                     )
+                    loop_tick(step, "after_choose_navigation_target")
                     nav_decision.metadata = {
                         **dict(nav_decision.metadata or {}),
                         **dict(frontier_source_metadata),
@@ -3669,6 +3885,7 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
                     }
                     planning_goals = clearance_goals
                 result = nav_planner.plan(current_grid, planning_goals)
+                loop_tick(step, "after_nav_plan")
                 if not result.path:
                     if paper_mode and nav_decision.mode == "frontier":
                         reason = "frontier_center_unreachable"
@@ -3787,6 +4004,7 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
                     record_latency("llm", planning_started_at)
 
             if viz is not None and step % viz_every == 0:
+                loop_tick(step, "before_viz_update")
                 viz.update(
                     step=step,
                     rgb=viz_rgb(obs),
@@ -3808,6 +4026,7 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
                     scenegraph_backend="original" if scenegraph.scenegraph is not None else "fallback",
                     score_debug=scenegraph.last_score_debug,
                 )
+                loop_tick(step, "after_viz_update")
 
             target_reached, target_distance_m = navigation_target_reached(
                 current_grid,
@@ -3937,8 +4156,10 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
                     min_clearance_m=float(getattr(args, "lookahead_min_clearance_m", 0.14)),
                     max_skip_cells=int(getattr(args, "smoothing_max_skip_cells", 8)),
                 )
+                loop_tick(step, "after_collision_checked_path")
             else:
                 path_world = path_cells_to_world(current_path[1: min(len(current_path), 20)], dynamic_map_info)
+                loop_tick(step, "after_path_cells_to_world")
             if not path_world:
                 if evaluator.final_distance_to_goal <= success_distance:
                     gt_success_region_reached = True
@@ -4051,6 +4272,7 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
                     )
                 break
             cmd = follower.compute_cmd(pose, path_world)
+            loop_tick(step, "after_compute_cmd")
             cmd, blocked_by_guard = guard_kinematic_cmd(
                 tuple(float(v) for v in pose),
                 cmd,
@@ -4059,6 +4281,7 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
                 dynamic_map_info,
                 float(args.camera_forward_offset_m),
             )
+            loop_tick(step, "after_guard_kinematic_cmd")
             if blocked_by_guard:
                 if paper_mode and last_decision_mode == "frontier":
                     reason = "frontier_unreachable_stop_at_current_pose"
@@ -4104,11 +4327,14 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
                 read_depth=True,
                 rgb_device=next_rgb_device,
             )
+            loop_tick(step, "after_step_kinematic_velocity")
         else:
             if failure_reason is None:
                 failure_reason = "max_control_steps"
 
+        loop_tick(evaluator.num_steps, "after_control_loop", reset=True)
         row = evaluator.finish(stop_called=stop_called, planner=args.planner, detector=args.detector, failure_reason=failure_reason)
+        loop_tick(evaluator.num_steps, "after_evaluator_finish")
         row["sim_backend"] = "isaac"
         row["closed_loop"] = True
         row["control_mode"] = "kinematic_holonomic"
@@ -4260,6 +4486,8 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
         row["online_astar_free_cells"] = int(np.count_nonzero(last_dynamic_astar_navigable))
         row["online_occupied_cells"] = int(np.count_nonzero(last_dynamic_occupancy))
         row["online_mapper_debug"] = dict(getattr(mapper, "last_debug_stats", {}))
+        row["voxel_perf_recent_path"] = str(voxel_perf_recent_path)
+        row["voxel_perf_recent_count"] = int(len(voxel_perf_recent_rows))
         row["nearfield_depth"] = bool(getattr(args, "nearfield_depth", False))
         row["nearfield_mapper_debug"] = dict(getattr(mapper, "last_nearfield_debug_stats", {}))
         row["static_nearfield_map"] = bool(getattr(args, "static_nearfield_map", False))
@@ -4303,8 +4531,8 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
             "frontier_scoring_after_room_context",
         ):
             row[key] = room_context_row.get(key)
-        row["room_segmentation"] = dict(last_room_segmentation_debug)
-        row["room_semantics"] = dict(last_room_semantics_debug)
+        row["room_segmentation"] = _compact_json_debug(dict(last_room_segmentation_debug))
+        row["room_semantics"] = _compact_json_debug(dict(last_room_semantics_debug))
         row["room_mask_count"] = int(room_context_row.get("room_mask_count", len([room for room in last_room_masks if not getattr(room, "stale", False)])) or 0)
         row["room_vlm_backend"] = str(getattr(room_labeler, "backend", "unavailable") if room_labeler is not None else "unavailable")
         row["room_vlm_requests"] = int(getattr(room_labeler, "request_count", 0) if room_labeler is not None else 0)
@@ -4349,7 +4577,9 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
             debug_map = args.debug_map or str(Path(args.output).with_suffix(".png"))
             start = world_xy_to_grid(float(start_pose[0]), float(start_pose[1]), dynamic_map_info)
             save_map_png(debug_map, last_dynamic_occupancy, last_dynamic_navigable, start=start, goals=goal_cells, path_cells=full_path)
+        loop_tick(evaluator.num_steps, "after_row_payload_build")
         row = complete_result_row(row, args)
+        loop_tick(evaluator.num_steps, "after_complete_result_row")
         if roomseg_debug_only:
             row["metric_valid"] = False
             row["detector_backend"] = "none"
@@ -4359,8 +4589,10 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
             row["sgnav_decision_mode"] = "roomseg_debug_only"
             row["sgnav_decision_reason"] = "roomseg_debug_only_no_frontier_or_policy_decision"
         row = make_jsonable(row)
+        loop_tick(evaluator.num_steps, "after_make_jsonable")
         summary_row = final_log_row(row)
         JsonlEpisodeLogger(args.output).log(row)
+        loop_tick(evaluator.num_steps, "after_jsonl_log")
         print(json.dumps(summary_row, ensure_ascii=False), flush=True)
         args._row_already_logged = True
         if args.hold_open:
@@ -5104,6 +5336,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     args.robot_radius_m = float(args.robot_radius_m if args.robot_radius_m is not None else default_robot_radius_m)
     args.online_inflation_radius_m = float(args.online_inflation_radius_m if args.online_inflation_radius_m is not None else get_nested(cfg, "mapping.inflation_radius_m", 0.0))
     args.room_map_mode = str(args.room_map_mode or get_nested(cfg, "mapping.room_map_mode", VERTICAL_FREE_GAP_CLOSURE_CONTEXT))
+    args.voxel_runtime_config = dict(get_nested(cfg, "mapping.voxel_runtime", {}) or {})
     args.room_segmentation_config = dict(get_nested(cfg, "mapping.room_segmentation", {}) or {})
     roomseg_debug_layers_cfg = dict(args.room_segmentation_config.get("debug_layers", {}) or {})
     roomseg_overlay_cfg = dict(args.room_segmentation_config.get("navigation_free_context_overlay", {}) or {})

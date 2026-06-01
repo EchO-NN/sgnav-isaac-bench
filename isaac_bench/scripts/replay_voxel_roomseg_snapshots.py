@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ProcessPoolExecutor, as_completed
 import json
 import math
 import re
@@ -9,6 +10,7 @@ from pathlib import Path
 from typing import Mapping, Sequence
 
 import numpy as np
+from PIL import Image
 
 from isaac_bench.config import get_nested, load_config
 from isaac_bench.debug.roomseg_layer_dump import save_roomseg_layer_dump
@@ -24,16 +26,52 @@ from isaac_bench.mapping.voxel_occupancy_grid import (
 
 
 REPLAY_NPZ_KEYS = (
+    "voxel_occupancy_state_zyx",
+    "voxel_occupancy_log_odds_zyx",
+    "voxel_sensor_range_count_zyx",
+    "voxel_occupancy_z_centers_m",
+    "voxel_occupancy_z_min_m",
+    "voxel_occupancy_z_max_m",
+    "voxel_occupancy_z_resolution_m",
+    "voxel_occupancy_active_z_min_m",
+    "voxel_occupancy_active_z_max_m",
+    "voxel_occupancy_ceiling_height_estimate_m",
+    "voxel_occupancy_ceiling_estimate_status",
+    "voxel_ceiling_estimate_status",
+    "voxel_nav_occupied_endpoint_count_xy",
+    "voxel_nav_free_ray_count_xy",
+    "voxel_roomseg_memory_before_json",
+    "voxel_roomseg_memory_after_json",
+    "voxel_door_memory_before_roomseg_json",
+    "voxel_door_memory_after_roomseg_json",
+    "voxel_separator_memory_before_roomseg_json",
+    "voxel_separator_memory_after_roomseg_json",
     "final_room_label_map",
     "voxel_final_room_label_map",
     "accepted_separators",
     "rejected_separators",
     "voxel_door_seed_mask",
+    "voxel_door_raw_seed_mask",
+    "voxel_door_seed_component_id_map",
+    "voxel_door_seed_cluster_id_map",
+    "voxel_door_seed_line_primitive_id_map",
+    "voxel_door_seed_line_primitive_mask",
+    "voxel_door_extensible_primitive_mask",
+    "voxel_door_rejected_primitive_mask",
+    "voxel_door_extension_trials_map",
+    "voxel_door_extension_reject_reason_id_map",
     "voxel_door_centerline_mask",
     "voxel_door_cut_mask",
+    "voxel_door_visual_only_mask",
+    "voxel_door_partition_cut_candidate_mask",
+    "voxel_door_partition_cut_mask",
+    "voxel_door_partition_cut_rejected_mask",
+    "voxel_door_topology_effective_cut_mask",
+    "voxel_door_partition_reject_reason_id_map",
     "voxel_current_door_cut_mask",
     "voxel_current_door_topology_effective_mask",
     "voxel_stable_door_cut_mask",
+    "voxel_door_stable_cut_mask",
     "voxel_stable_door_visual_mask",
     "voxel_door_memory_observed_decay_band_mask",
     "voxel_door_memory_unobserved_track_mask",
@@ -52,12 +90,17 @@ REPLAY_NPZ_KEYS = (
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Replay voxel room segmentation from saved roomseg snapshot NPZ files.")
-    parser.add_argument("--snapshot-dir", required=True)
+    parser.add_argument("--snapshot", default=None)
+    parser.add_argument("--snapshot-dir", default=None)
     parser.add_argument("--out-dir", required=True)
     parser.add_argument("--config", default="isaac_bench/configs/isaac_bench.yaml")
     parser.add_argument("--resolution-m", type=float, default=None)
     parser.add_argument("--max-snapshots", type=int, default=0)
     parser.add_argument("--reset-memory-per-snapshot", action="store_true")
+    parser.add_argument("--mode", choices=["visualize", "stateless", "stateful"], default="stateless")
+    parser.add_argument("--memory-source", choices=["none", "saved-before", "saved-after"], default="none")
+    parser.add_argument("--jobs", type=int, default=1)
+    parser.add_argument("--recompute-state-from-logodds", action="store_true")
     parser.add_argument("--save-overlay", action="store_true", default=True)
     parser.add_argument("--no-save-overlay", dest="save_overlay", action="store_false")
     parser.add_argument("--save-layer-grid", action="store_true")
@@ -70,57 +113,176 @@ def main(argv: Sequence[str] | None = None) -> int:
         args.save_layer_grid = False
         args.save_compact_npz = False
 
-    snapshot_dir = Path(args.snapshot_dir).expanduser()
+    snapshot_path = None if args.snapshot is None else Path(args.snapshot).expanduser()
+    snapshot_dir = None if args.snapshot_dir is None else Path(args.snapshot_dir).expanduser()
     out_dir = Path(args.out_dir).expanduser()
     out_dir.mkdir(parents=True, exist_ok=True)
-    npz_paths = sorted(snapshot_dir.glob("roomseg_step_*.npz"), key=_snapshot_sort_key)
+    if snapshot_path is not None:
+        npz_paths = [snapshot_path]
+    elif snapshot_dir is not None:
+        npz_paths = sorted(snapshot_dir.glob("roomseg_step_*.npz"), key=_snapshot_sort_key)
+    else:
+        raise SystemExit("must pass --snapshot or --snapshot-dir")
     if args.max_snapshots and int(args.max_snapshots) > 0:
         npz_paths = npz_paths[: int(args.max_snapshots)]
     if not npz_paths:
-        raise SystemExit("no roomseg_step_*.npz files found in %s" % snapshot_dir)
-
-    cfg = load_config(args.config)
-    roomseg_cfg = dict(get_nested(cfg, "mapping.room_segmentation", {}) or {})
-    voxel_grid_cfg = dict(roomseg_cfg.get("voxel_grid", {}) or {})
-    resolution_m = float(args.resolution_m or get_nested(cfg, "mapping.online_resolution_m", 0.05))
-    shape = _snapshot_shape(npz_paths[0])
-    map_info = MapInfo(
-        resolution_m=resolution_m,
-        min_x=0.0,
-        max_x=float(shape[1]) * resolution_m,
-        min_y=0.0,
-        max_y=float(shape[0]) * resolution_m,
-        width=int(shape[1]),
-        height=int(shape[0]),
-    )
-    segmenter = VoxelOccupancyDoorWallRoomSegmenter(config=roomseg_cfg, map_info=map_info)
+        raise SystemExit("no roomseg_step_*.npz files found")
 
     manifest: dict[str, object] = {
-        "snapshot_dir": str(snapshot_dir),
+        "snapshot": None if snapshot_path is None else str(snapshot_path),
+        "snapshot_dir": None if snapshot_dir is None else str(snapshot_dir),
         "out_dir": str(out_dir),
         "config": str(Path(args.config)),
-        "resolution_m": float(resolution_m),
         "snapshot_count": int(len(npz_paths)),
         "processed": 0,
         "errors": [],
+        "mode": str(args.mode),
+        "memory_source": str(args.memory_source),
+        "jobs": int(args.jobs),
         "reset_memory_per_snapshot": bool(args.reset_memory_per_snapshot),
-        "sensor_range_reconstruction": "from_saved_2d_sensor_range_counts",
         "started_at_unix": time.time(),
         "steps": [],
     }
-    for idx, npz_path in enumerate(npz_paths):
-        step = _infer_step(npz_path)
-        if bool(args.reset_memory_per_snapshot):
+    worker_kwargs = {
+        "out_dir": str(out_dir),
+        "config_path": str(args.config),
+        "resolution_m": args.resolution_m,
+        "mode": str(args.mode),
+        "memory_source": str(args.memory_source),
+        "reset_memory_per_snapshot": bool(args.reset_memory_per_snapshot),
+        "save_overlay": bool(args.save_overlay),
+        "save_layer_grid": bool(args.save_layer_grid),
+        "save_compact_npz": bool(args.save_compact_npz),
+        "mask_only": bool(args.mask_only),
+        "recompute_state_from_logodds": bool(args.recompute_state_from_logodds),
+        "snapshot_count": int(len(npz_paths)),
+    }
+    jobs = max(1, int(args.jobs))
+    if jobs > 1 and str(args.mode) in {"visualize", "stateless"}:
+        with ProcessPoolExecutor(max_workers=jobs) as executor:
+            futures = [
+                executor.submit(_process_snapshot_replay, str(path), **worker_kwargs)
+                for path in npz_paths
+            ]
+            for future in as_completed(futures):
+                result = future.result()
+                _record_replay_manifest_entry(manifest, result)
+    else:
+        if jobs > 1 and str(args.mode) == "stateful":
+            manifest["parallel_disabled_reason"] = "stateful_replay_runs_serially"
+        for npz_path in npz_paths:
+            result = _process_snapshot_replay(str(npz_path), **worker_kwargs)
+            _record_replay_manifest_entry(manifest, result)
+
+    manifest["finished_at_unix"] = time.time()
+    if not bool(args.mask_only):
+        (out_dir / "manifest.json").write_text(json.dumps(_json_ready(manifest), ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    print(json.dumps({"out_dir": str(out_dir), "processed": manifest["processed"], "errors": len(manifest["errors"])}, ensure_ascii=False))
+    return 0 if not manifest["errors"] else 2
+
+
+def _record_replay_manifest_entry(manifest: dict[str, object], result: Mapping[str, object]) -> None:
+    if result.get("error") is not None:
+        err = {"step": int(result.get("step", -1)), "input": str(result.get("input", "")), "error": str(result.get("error"))}
+        manifest["errors"].append(err)  # type: ignore[index,union-attr]
+        print("[replay] ERROR step=%06d %s" % (int(err["step"]), str(err["error"])), flush=True)
+        return
+    manifest["processed"] = int(manifest["processed"]) + 1
+    manifest["steps"].append(dict(result))  # type: ignore[index,union-attr]
+    print(
+        "[replay] step=%06d mode=%s rooms old=%s new=%s labeled_changed=%d out=%s"
+        % (
+            int(result.get("step", -1)),
+            str(result.get("replay_mode", "")),
+            result.get("original_room_count"),
+            result.get("replay_room_count"),
+            int(result.get("label_presence_changed_cells", 0) or 0),
+            result.get("navigation_room_masks_png"),
+        ),
+        flush=True,
+    )
+
+
+def _process_snapshot_replay(
+    npz_path_str: str,
+    *,
+    out_dir: str,
+    config_path: str,
+    resolution_m: float | None,
+    mode: str,
+    memory_source: str,
+    reset_memory_per_snapshot: bool,
+    save_overlay: bool,
+    save_layer_grid: bool,
+    save_compact_npz: bool,
+    mask_only: bool,
+    recompute_state_from_logodds: bool,
+    snapshot_count: int,
+) -> dict[str, object]:
+    npz_path = Path(npz_path_str).expanduser()
+    step = _infer_step(npz_path)
+    started = time.perf_counter()
+    try:
+        with np.load(npz_path, allow_pickle=False) as data:
+            arrays = {name: np.asarray(data[name]).copy() for name in data.files}
+        shape = _snapshot_shape(npz_path)
+        cfg = load_config(config_path)
+        roomseg_cfg = dict(get_nested(cfg, "mapping.room_segmentation", {}) or {})
+        voxel_grid_cfg = dict(roomseg_cfg.get("voxel_grid", {}) or {})
+        res_m = float(resolution_m or get_nested(cfg, "mapping.online_resolution_m", 0.05))
+        map_info = MapInfo(
+            resolution_m=float(res_m),
+            min_x=0.0,
+            max_x=float(shape[1]) * float(res_m),
+            min_y=0.0,
+            max_y=float(shape[0]) * float(res_m),
+            width=int(shape[1]),
+            height=int(shape[0]),
+        )
+        occupancy_map = _bool_array(arrays, "occupancy_map", shape)
+        observed_free_mask = _bool_array(arrays, "observed_free_mask", shape)
+        obstacle_mask = _bool_array(arrays, "obstacle_mask", shape)
+        unknown_mask = _bool_array(arrays, "unknown_mask", shape)
+        exact = {
+            "voxel_log_odds_loaded_exact": False,
+            "voxel_sensor_range_loaded_exact": False,
+            "voxel_memory_loaded": False,
+        }
+        if str(mode) == "visualize":
+            replay_labels = np.asarray(
+                arrays.get("voxel_final_room_label_map", arrays.get("final_room_label_map", np.zeros(shape, dtype=np.int32))),
+                dtype=np.int32,
+            )
+            replay_separator = np.asarray(
+                arrays.get("voxel_final_separator_map", arrays.get("accepted_separators", np.zeros(shape, dtype=bool))),
+                dtype=bool,
+            )
+            room_debug = {name: np.asarray(value) for name, value in arrays.items() if np.asarray(value).ndim <= 3}
+            room_debug["algorithm"] = "voxel_replay_visualize"
+            room_debug["backend"] = "voxel_replay_visualize"
+            room_debug["final_room_label_map"] = replay_labels
+            room_debug["voxel_final_room_label_map"] = replay_labels
+            room_debug["accepted_separators"] = replay_separator
+            room_debug["voxel_final_separator_map"] = replay_separator
+        else:
+            voxel_grid = _voxel_grid_from_snapshot(
+                arrays,
+                map_info,
+                voxel_grid_cfg,
+                recompute_state_from_logodds=bool(recompute_state_from_logodds),
+            )
+            exact["voxel_log_odds_loaded_exact"] = "voxel_occupancy_log_odds_zyx" in arrays
+            exact["voxel_sensor_range_loaded_exact"] = "voxel_sensor_range_count_zyx" in arrays
             segmenter = VoxelOccupancyDoorWallRoomSegmenter(config=roomseg_cfg, map_info=map_info)
-        started = time.perf_counter()
-        try:
-            with np.load(npz_path, allow_pickle=False) as data:
-                arrays = {name: np.asarray(data[name]).copy() for name in data.files}
-            voxel_grid = _voxel_grid_from_snapshot(arrays, map_info, voxel_grid_cfg)
-            occupancy_map = _bool_array(arrays, "occupancy_map", shape)
-            observed_free_mask = _bool_array(arrays, "observed_free_mask", shape)
-            obstacle_mask = _bool_array(arrays, "obstacle_mask", shape)
-            unknown_mask = _bool_array(arrays, "unknown_mask", shape)
+            if str(mode) == "stateful" or str(memory_source) != "none":
+                memory_state = _load_memory_state_from_snapshot(arrays, str(memory_source))
+                if str(mode) == "stateful" and memory_state is None:
+                    raise RuntimeError("stateful replay requested but snapshot has no saved memory for %s" % str(memory_source))
+                if memory_state is not None:
+                    segmenter.import_replay_state(memory_state)
+                    exact["voxel_memory_loaded"] = True
+            elif bool(reset_memory_per_snapshot):
+                segmenter = VoxelOccupancyDoorWallRoomSegmenter(config=roomseg_cfg, map_info=map_info)
             segmenter.update(
                 occupancy_map=occupancy_map,
                 observed_free_mask=observed_free_mask,
@@ -132,82 +294,76 @@ def main(argv: Sequence[str] | None = None) -> int:
             result = segmenter.last_result
             if result is None:
                 raise RuntimeError("segmenter did not produce a result")
+            replay_labels = np.asarray(result.room_label_map, dtype=np.int32)
+            replay_separator = np.asarray(result.separator_map, dtype=bool)
             room_debug = dict(segmenter.last_debug)
-            # The renderer expects these canonical dump keys. The voxel backend
-            # also exposes aliases, but make the replay output independent of
-            # backend alias drift.
-            room_debug["final_room_label_map"] = np.asarray(result.room_label_map, dtype=np.int32)
-            room_debug["voxel_final_room_label_map"] = np.asarray(result.room_label_map, dtype=np.int32)
-            room_debug["accepted_separators"] = np.asarray(result.separator_map, dtype=bool)
-            room_debug["voxel_final_separator_map"] = np.asarray(result.separator_map, dtype=bool)
-            frontier_map = arrays.get("frontier_map")
-            selected_frontier = _members_from_mask(arrays.get("selected_frontier_mask"))
-            selected_center = arrays.get("selected_frontier_center_rc")
-            agent_rc = arrays.get("agent_rc")
-            dump = save_roomseg_layer_dump(
-                out_dir=out_dir,
-                step=int(step),
-                room_debug=room_debug,
-                occupancy_map=occupancy_map,
-                observed_free_mask=observed_free_mask,
-                obstacle_mask=obstacle_mask,
-                unknown_mask=unknown_mask,
-                frontier_map=None if frontier_map is None else np.asarray(frontier_map, dtype=bool),
-                selected_frontier_members=selected_frontier,
-                selected_frontier_center_rc=None if selected_center is None else np.asarray(selected_center, dtype=np.int32).reshape(-1)[:2],
-                agent_rc=None if agent_rc is None else np.asarray(agent_rc, dtype=np.int32).reshape(-1)[:2],
-                max_saves=max(10000, int(len(npz_paths)) + 10),
-                save_npz=bool(args.save_compact_npz),
-                save_png=True,
-                save_summary_json=not bool(args.mask_only),
-                save_overlay_png=bool(args.save_overlay),
-                save_layers_png=bool(args.save_layer_grid),
-                save_navigation_room_masks_png=True,
-                npz_keys=REPLAY_NPZ_KEYS,
-                extra_npz_arrays=None,
-                include_selected_frontier_sector=False,
-            )
-            comparison = _compare_with_original(arrays, result.room_label_map, result.separator_map)
-            summary_path = Path(dump["paths"]["summary_json"])
-            summary = dict(dump.get("summary", {}))
-            summary["input_snapshot"] = str(npz_path)
-            summary["replay_comparison"] = comparison
-            summary["replay_runtime_ms"] = float((time.perf_counter() - started) * 1000.0)
-            if not bool(args.mask_only):
-                summary_path.write_text(json.dumps(_json_ready(summary), ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-            manifest["processed"] = int(manifest["processed"]) + 1
-            manifest["steps"].append(
-                {
-                    "step": int(step),
-                    "input": str(npz_path),
-                    "summary": None if bool(args.mask_only) else str(summary_path),
-                    "navigation_room_masks_png": str(dump["paths"]["navigation_room_masks_png"]),
-                    "overlay_png": str(dump["paths"]["overlay_png"]) if bool(args.save_overlay) else None,
-                    "runtime_ms": summary["replay_runtime_ms"],
-                    **comparison,
-                }
-            )
-            print(
-                "[replay] step=%06d rooms old=%s new=%s labeled_changed=%d out=%s"
-                % (
-                    int(step),
-                    comparison.get("original_room_count"),
-                    comparison.get("replay_room_count"),
-                    int(comparison.get("label_presence_changed_cells", 0)),
-                    dump["paths"]["navigation_room_masks_png"],
-                ),
-                flush=True,
-            )
-        except Exception as exc:
-            err = {"step": int(step), "input": str(npz_path), "error": repr(exc)}
-            manifest["errors"].append(err)
-            print("[replay] ERROR step=%06d %s" % (int(step), repr(exc)), flush=True)
-
-    manifest["finished_at_unix"] = time.time()
-    if not bool(args.mask_only):
-        (out_dir / "manifest.json").write_text(json.dumps(_json_ready(manifest), ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    print(json.dumps({"out_dir": str(out_dir), "processed": manifest["processed"], "errors": len(manifest["errors"])}, ensure_ascii=False))
-    return 0 if not manifest["errors"] else 2
+            room_debug["final_room_label_map"] = replay_labels
+            room_debug["voxel_final_room_label_map"] = replay_labels
+            room_debug["accepted_separators"] = replay_separator
+            room_debug["voxel_final_separator_map"] = replay_separator
+        frontier_map = arrays.get("frontier_map")
+        selected_frontier = _members_from_mask(arrays.get("selected_frontier_mask"))
+        selected_center = arrays.get("selected_frontier_center_rc")
+        agent_rc = arrays.get("agent_rc")
+        dump = save_roomseg_layer_dump(
+            out_dir=out_dir,
+            step=int(step),
+            room_debug=room_debug,
+            occupancy_map=occupancy_map,
+            observed_free_mask=observed_free_mask,
+            obstacle_mask=obstacle_mask,
+            unknown_mask=unknown_mask,
+            frontier_map=None if frontier_map is None else np.asarray(frontier_map, dtype=bool),
+            selected_frontier_members=selected_frontier,
+            selected_frontier_center_rc=None if selected_center is None else np.asarray(selected_center, dtype=np.int32).reshape(-1)[:2],
+            agent_rc=None if agent_rc is None else np.asarray(agent_rc, dtype=np.int32).reshape(-1)[:2],
+            max_saves=max(10000, int(snapshot_count) + 10),
+            save_npz=bool(save_compact_npz),
+            save_png=True,
+            save_summary_json=not bool(mask_only),
+            save_overlay_png=bool(save_overlay),
+            save_layers_png=bool(save_layer_grid),
+            save_navigation_room_masks_png=True,
+            npz_keys=REPLAY_NPZ_KEYS,
+            extra_npz_arrays=None,
+            include_selected_frontier_sector=False,
+        )
+        comparison = _compare_with_original(arrays, replay_labels, replay_separator)
+        stable_diff = _stable_door_diff(arrays, room_debug, shape)
+        comparison.update(stable_diff)
+        diff_paths = _write_replay_diff_images(arrays, replay_labels, replay_separator, room_debug, shape, Path(out_dir), int(step))
+        summary_path = Path(dump["paths"]["summary_json"])
+        summary = dict(dump.get("summary", {}))
+        summary.update(
+            {
+                "input_snapshot": str(npz_path),
+                "replay_mode": str(mode),
+                "replay_memory_source": str(memory_source),
+                "voxel_replay_exact_input": bool(exact["voxel_log_odds_loaded_exact"] and exact["voxel_sensor_range_loaded_exact"]),
+                **exact,
+                "replay_comparison": comparison,
+                **comparison,
+                "replay_diff_paths": diff_paths,
+                "replay_runtime_ms": float((time.perf_counter() - started) * 1000.0),
+            }
+        )
+        if not bool(mask_only):
+            summary_path.write_text(json.dumps(_json_ready(summary), ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        return {
+            "step": int(step),
+            "input": str(npz_path),
+            "summary": None if bool(mask_only) else str(summary_path),
+            "navigation_room_masks_png": str(dump["paths"]["navigation_room_masks_png"]),
+            "overlay_png": str(dump["paths"]["overlay_png"]) if bool(save_overlay) else None,
+            "runtime_ms": float(summary["replay_runtime_ms"]),
+            "replay_mode": str(mode),
+            "replay_memory_source": str(memory_source),
+            **exact,
+            **comparison,
+            **diff_paths,
+        }
+    except Exception as exc:
+        return {"step": int(step), "input": str(npz_path), "error": repr(exc)}
 
 
 def _snapshot_shape(path: Path) -> tuple[int, int]:
@@ -227,12 +383,16 @@ def _voxel_grid_from_snapshot(
     arrays: Mapping[str, np.ndarray],
     map_info: MapInfo,
     voxel_grid_cfg: Mapping[str, object],
+    *,
+    recompute_state_from_logodds: bool = False,
 ) -> VoxelOccupancyGrid3D:
     if "voxel_occupancy_state_zyx" not in arrays:
         raise KeyError("snapshot missing voxel_occupancy_state_zyx")
     state = np.asarray(arrays["voxel_occupancy_state_zyx"], dtype=np.uint8).copy()
     if state.ndim != 3:
         raise ValueError("voxel_occupancy_state_zyx must have shape [Z,H,W]")
+    exact_log_odds = "voxel_occupancy_log_odds_zyx" in arrays
+    exact_sensor = "voxel_sensor_range_count_zyx" in arrays
     z_min = _scalar(arrays, "voxel_occupancy_z_min_m", float(voxel_grid_cfg.get("z_min_m", 0.0)))
     z_max = _scalar(arrays, "voxel_occupancy_z_max_m", float(voxel_grid_cfg.get("z_max_m", 3.2)))
     z_res = _scalar(arrays, "voxel_occupancy_z_resolution_m", float(voxel_grid_cfg.get("z_resolution_m", 0.05)))
@@ -246,7 +406,12 @@ def _voxel_grid_from_snapshot(
         z_resolution_m=z_res,
         active_z_min_m=active_z_min,
     )
-    log_odds = _log_odds_from_state(state, cfg)
+    if exact_log_odds:
+        log_odds = np.asarray(arrays["voxel_occupancy_log_odds_zyx"], dtype=np.int16).copy()
+        if log_odds.shape != state.shape:
+            raise ValueError("voxel_occupancy_log_odds_zyx must match state shape")
+    else:
+        log_odds = _log_odds_from_state(state, cfg)
     grid = VoxelOccupancyGrid3D(
         log_odds=log_odds,
         state=state,
@@ -261,7 +426,15 @@ def _voxel_grid_from_snapshot(
         ceiling_height_m=None if not np.isfinite(ceiling) else float(ceiling),
         ceiling_estimate_status="snapshot",
     )
-    grid.sensor_range_count = _reconstruct_sensor_range_count(arrays, grid)
+    if exact_sensor:
+        sensor = np.asarray(arrays["voxel_sensor_range_count_zyx"], dtype=np.uint8).copy()
+        if sensor.shape != state.shape:
+            raise ValueError("voxel_sensor_range_count_zyx must match state shape")
+        grid.sensor_range_count = sensor
+    else:
+        grid.sensor_range_count = _reconstruct_sensor_range_count(arrays, grid)
+    if bool(recompute_state_from_logodds):
+        grid.refresh_state()
     return grid
 
 
@@ -314,6 +487,137 @@ def _compare_with_original(arrays: Mapping[str, np.ndarray], replay_labels: np.n
         "replay_separator_cells": int(np.count_nonzero(replay_sep)),
         "separator_presence_changed_cells": int(np.count_nonzero(original_separator ^ replay_sep)),
     }
+
+
+def _load_memory_state_from_snapshot(arrays: Mapping[str, np.ndarray], memory_source: str) -> dict[str, object] | None:
+    source = str(memory_source or "none").strip().lower()
+    if source == "none":
+        return None
+    if source not in {"saved-before", "saved-after"}:
+        raise ValueError("unsupported replay memory source: %s" % memory_source)
+    suffix = "before" if source == "saved-before" else "after"
+    full_key = "voxel_roomseg_memory_%s_json" % suffix
+    full_state = _json_scalar(arrays, full_key)
+    if isinstance(full_state, Mapping):
+        return dict(full_state)
+    door_state = _json_scalar(arrays, "voxel_door_memory_%s_roomseg_json" % suffix)
+    separator_state = _json_scalar(arrays, "voxel_separator_memory_%s_roomseg_json" % suffix)
+    if isinstance(door_state, Mapping) or isinstance(separator_state, Mapping):
+        return {
+            "schema_version": 1,
+            "door_memory": dict(door_state) if isinstance(door_state, Mapping) else {},
+            "separator_memory": dict(separator_state) if isinstance(separator_state, Mapping) else {},
+        }
+    return None
+
+
+def _json_scalar(arrays: Mapping[str, np.ndarray], key: str) -> object | None:
+    text = _string_scalar(arrays, key)
+    if text is None:
+        return None
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise ValueError("snapshot key %s does not contain valid JSON" % key) from exc
+
+
+def _string_scalar(arrays: Mapping[str, np.ndarray], key: str) -> str | None:
+    if key not in arrays:
+        return None
+    arr = np.asarray(arrays[key])
+    if arr.size == 0:
+        return None
+    value = arr.reshape(-1)[0]
+    if isinstance(value, bytes):
+        text = value.decode("utf-8", errors="replace")
+    else:
+        text = str(value)
+    text = text.strip()
+    if not text or text.lower() in {"none", "null"}:
+        return None
+    return text
+
+
+def _stable_door_diff(arrays: Mapping[str, np.ndarray], room_debug: Mapping[str, object], shape: tuple[int, int]) -> dict[str, object]:
+    out: dict[str, object] = {}
+    keys = (
+        "voxel_current_door_cut_mask",
+        "voxel_current_door_topology_effective_mask",
+        "voxel_stable_door_cut_mask",
+        "voxel_door_stable_cut_mask",
+        "voxel_stable_door_visual_mask",
+        "voxel_door_partition_cut_mask",
+        "voxel_door_topology_effective_cut_mask",
+        "voxel_final_separator_map",
+    )
+    for key in keys:
+        original = _bool_like(arrays.get(key), shape)
+        replay = _bool_like(room_debug.get(key), shape)
+        out["%s_original_cells" % key] = int(np.count_nonzero(original))
+        out["%s_replay_cells" % key] = int(np.count_nonzero(replay))
+        out["%s_changed_cells" % key] = int(np.count_nonzero(original ^ replay))
+    return out
+
+
+def _write_replay_diff_images(
+    arrays: Mapping[str, np.ndarray],
+    replay_labels: np.ndarray,
+    replay_separator: np.ndarray,
+    room_debug: Mapping[str, object],
+    shape: tuple[int, int],
+    out_dir: Path,
+    step: int,
+) -> dict[str, str]:
+    paths: dict[str, str] = {}
+    label_original = np.asarray(arrays.get("final_room_label_map", np.zeros(shape, dtype=np.int32)), dtype=np.int32)
+    label_replay = np.asarray(replay_labels, dtype=np.int32)
+    label_path = out_dir / ("roomseg_step_%06d.replay_label_diff.png" % int(step))
+    _render_label_presence_diff(label_original, label_replay).save(label_path)
+    paths["replay_label_diff_png"] = str(label_path)
+
+    separator_original = _bool_like(arrays.get("accepted_separators"), shape)
+    separator_replay = _bool_like(replay_separator, shape)
+    separator_path = out_dir / ("roomseg_step_%06d.replay_separator_diff.png" % int(step))
+    _render_bool_diff(separator_original, separator_replay).save(separator_path)
+    paths["replay_separator_diff_png"] = str(separator_path)
+
+    stable_original = _bool_like(arrays.get("voxel_stable_door_cut_mask"), shape) | _bool_like(arrays.get("voxel_door_stable_cut_mask"), shape)
+    stable_replay = _bool_like(room_debug.get("voxel_stable_door_cut_mask"), shape) | _bool_like(room_debug.get("voxel_door_stable_cut_mask"), shape)
+    stable_path = out_dir / ("roomseg_step_%06d.replay_stable_door_diff.png" % int(step))
+    _render_bool_diff(stable_original, stable_replay).save(stable_path)
+    paths["replay_stable_door_diff_png"] = str(stable_path)
+    return paths
+
+
+def _render_label_presence_diff(original_labels: np.ndarray, replay_labels: np.ndarray) -> Image.Image:
+    original = np.asarray(original_labels, dtype=np.int32) > 0
+    replay = np.asarray(replay_labels, dtype=np.int32) > 0
+    rgb = np.zeros(original.shape + (3,), dtype=np.uint8)
+    rgb[original & replay] = (210, 210, 210)
+    rgb[original & ~replay] = (255, 80, 80)
+    rgb[~original & replay] = (80, 150, 255)
+    changed_id = (np.asarray(original_labels, dtype=np.int32) != np.asarray(replay_labels, dtype=np.int32)) & original & replay
+    rgb[changed_id] = (255, 220, 60)
+    return Image.fromarray(rgb, mode="RGB")
+
+
+def _render_bool_diff(original_mask: np.ndarray, replay_mask: np.ndarray) -> Image.Image:
+    original = np.asarray(original_mask, dtype=bool)
+    replay = np.asarray(replay_mask, dtype=bool)
+    rgb = np.zeros(original.shape + (3,), dtype=np.uint8)
+    rgb[original & replay] = (230, 230, 230)
+    rgb[original & ~replay] = (255, 80, 80)
+    rgb[~original & replay] = (80, 150, 255)
+    return Image.fromarray(rgb, mode="RGB")
+
+
+def _bool_like(value: object, shape: tuple[int, int]) -> np.ndarray:
+    if value is None:
+        return np.zeros(shape, dtype=bool)
+    arr = np.asarray(value)
+    if arr.shape != shape:
+        return np.zeros(shape, dtype=bool)
+    return np.asarray(arr, dtype=bool)
 
 
 def _room_count(labels: np.ndarray) -> int:

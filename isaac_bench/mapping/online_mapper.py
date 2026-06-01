@@ -59,6 +59,7 @@ class OnlineMapper:
         voxel_grid_config: VoxelOccupancyGridConfig | dict | None = None,
         voxel_navigation_projection_config: dict | None = None,
         voxel_navigation_blind_zone_config: dict | None = None,
+        voxel_runtime_config: dict | None = None,
     ):
         self.size_m = float(size_m)
         self.resolution_m = float(resolution_m)
@@ -129,10 +130,11 @@ class OnlineMapper:
             "occupied_fill_small_holes_max_area_cells": int(nav_cfg.get("occupied_fill_small_holes_max_area_cells", 4)),
             "occupied_priority_over_free": bool(nav_cfg.get("occupied_priority_over_free", True)),
             "unknown_preserve_when_no_observation": bool(nav_cfg.get("unknown_preserve_when_no_observation", True)),
-            "debug_navigation_projection_layers": bool(nav_cfg.get("debug_navigation_projection_layers", True)),
+            "debug_navigation_projection_layers": bool(nav_cfg.get("debug_navigation_projection_layers", False)),
         }
         self.voxel_grid_drives_navigation = bool(self.voxel_grid_config.voxel_grid_drives_navigation)
         self.voxel_grid = VoxelOccupancyGrid3D.zeros(self.grid.free.shape, self.grid.map_info, self.voxel_grid_config)
+        self._warm_voxel_cpu_numba_backend()
         self.last_voxel_navigation_projection: NavigationProjection | None = None
         blind_cfg = dict(voxel_navigation_blind_zone_config or {})
         self.voxel_navigation_blind_zone_config = {
@@ -160,6 +162,14 @@ class OnlineMapper:
         self._initial_blind_zone_center_world_xy: tuple[float, float] | None = None
         self._update_step_index = 0
         self.last_voxel_blind_zone_debug: dict[str, object] = {}
+        runtime_cfg = dict(voxel_runtime_config or {})
+        self.voxel_runtime_debug_level = str(runtime_cfg.get("runtime_debug_level", "counters") or "counters").strip().lower()
+        self.skip_legacy_vertical_profile_when_voxel_backend = bool(runtime_cfg.get("skip_legacy_vertical_profile_when_voxel_backend", False))
+        self.skip_legacy_height_profile_when_voxel_backend = bool(runtime_cfg.get("skip_legacy_height_profile_when_voxel_backend", False))
+        self.skip_legacy_roomseg_ray_evidence_when_voxel_backend = bool(runtime_cfg.get("skip_legacy_roomseg_ray_evidence_when_voxel_backend", False))
+        self._last_legacy_vertical_profile_skipped_by_voxel_backend = False
+        self._last_legacy_height_profile_skipped_by_voxel_backend = False
+        self._last_legacy_roomseg_ray_skipped_by_voxel_backend = False
         storage_z_max = float(height_profile_storage_z_max_m if height_profile_storage_z_max_m is not None else height_profile_z_max_m)
         self.height_profile_config = HeightColumnProfileConfig(
             enabled=bool(height_profile_enabled),
@@ -182,6 +192,15 @@ class OnlineMapper:
         self.last_ceiling_height_estimate = self.ceiling_height_estimator.last_estimate
         self.height_profile = HeightColumnProfileMap.zeros(self.grid.free.shape, self.height_profile_config)
         self._reset_roomseg_ray_evidence()
+
+    def _warm_voxel_cpu_numba_backend(self) -> None:
+        if not bool(getattr(self.voxel_grid_config, "enabled", True)):
+            return
+        if str(getattr(self.voxel_grid_config, "integration_backend", "")).strip().lower() != "cpu_numba":
+            return
+        from isaac_bench.mapping.voxel_cpu_numba_backend import VoxelCpuNumbaBackend
+
+        VoxelCpuNumbaBackend.warmup(self.voxel_grid)
 
     def reset(self, start_xy: Tuple[float, float]) -> None:
         self.grid = OnlineGridMap.centered(start_xy[0], start_xy[1], self.size_m, self.resolution_m)
@@ -316,11 +335,18 @@ class OnlineMapper:
         in_bounds_depth = valid_depth[in_bounds]
         rows_cols = rows_cols[in_bounds]
         rel_z = rel_z[in_bounds]
+        voxel_backend_active = bool(self.voxel_grid_config.enabled and self.voxel_grid_drives_navigation)
+        skip_legacy_vertical_profile = bool(voxel_backend_active and self.skip_legacy_vertical_profile_when_voxel_backend)
+        skip_legacy_height_profile = bool(voxel_backend_active and self.skip_legacy_height_profile_when_voxel_backend)
+        skip_legacy_roomseg_ray = bool(voxel_backend_active and self.skip_legacy_roomseg_ray_evidence_when_voxel_backend)
+        self._last_legacy_vertical_profile_skipped_by_voxel_backend = bool(skip_legacy_vertical_profile)
+        self._last_legacy_height_profile_skipped_by_voxel_backend = bool(skip_legacy_height_profile)
+        self._last_legacy_roomseg_ray_skipped_by_voxel_backend = bool(skip_legacy_roomseg_ray)
         if bool(self.voxel_grid_config.enabled):
             self._mark_voxel_navigation_endpoint_evidence(rows_cols, rel_z)
         if bool(self.height_profile_config.enabled) or bool(self.voxel_grid_config.enabled):
             self.last_ceiling_height_estimate = self.ceiling_height_estimator.update(rel_z, rows_cols)
-        if bool(self.height_profile_config.enabled):
+        if bool(self.height_profile_config.enabled) and not bool(skip_legacy_height_profile):
             self.height_profile_config.active_z_max_m = float(self.last_ceiling_height_estimate.active_z_max_m)
             self.height_profile.active_z_min_m = float(self.height_profile_config.active_z_min_m)
             self.height_profile.active_z_max_m = float(self.height_profile_config.active_z_max_m)
@@ -361,23 +387,27 @@ class OnlineMapper:
             self.last_voxel_navigation_projection = None
             self.last_voxel_blind_zone_debug = {}
         stage_started_at = time.perf_counter()
-        self.vertical_profile.mark_occupied_points(rows_cols, rel_z)
-        if bool(self.height_profile_config.enabled):
+        if not bool(skip_legacy_vertical_profile):
+            self.vertical_profile.mark_occupied_points(rows_cols, rel_z)
+        if bool(self.height_profile_config.enabled) and not bool(skip_legacy_height_profile):
             self.height_profile.mark_occupied_points(rows_cols, rel_z)
         timings["vertical_profile_occupied_ms"] = _elapsed_ms(stage_started_at)
+        timings["legacy_vertical_profile_skipped"] = 1.0 if bool(skip_legacy_vertical_profile) else 0.0
+        timings["legacy_height_profile_skipped"] = 1.0 if bool(skip_legacy_height_profile) else 0.0
         obstacle_mask = (rel_z >= self.obstacle_min_height_m) & (rel_z <= self.obstacle_max_height_m)
         free_mask = (rel_z >= self.free_min_height_m) & (rel_z <= self.free_max_height_m)
         ray_clear_mask = (rel_z >= self.free_min_height_m) & (rel_z <= self.obstacle_max_height_m)
         camera_rel_z = float(camera_pose_world[2]) - floor_z
         map_width = int(self.grid.map_info.width)
         stage_started_at = time.perf_counter()
+        skip_all_legacy_ray_cast = bool(skip_legacy_roomseg_ray and skip_legacy_vertical_profile and (not bool(self.height_profile_config.enabled) or skip_legacy_height_profile))
         ray_result = _collect_ray_cast_evidence(
             origin_cell=(int(origin_cell[0]), int(origin_cell[1])),
-            endpoints=rows_cols,
-            endpoint_rel_z=rel_z,
-            endpoint_depth_m=in_bounds_depth,
-            endpoint_is_obstacle=obstacle_mask,
-            ray_can_clear=ray_clear_mask,
+            endpoints=np.zeros((0, 2), dtype=np.int32) if skip_all_legacy_ray_cast else rows_cols,
+            endpoint_rel_z=np.zeros((0,), dtype=np.float32) if skip_all_legacy_ray_cast else rel_z,
+            endpoint_depth_m=np.zeros((0,), dtype=np.float32) if skip_all_legacy_ray_cast else in_bounds_depth,
+            endpoint_is_obstacle=np.zeros((0,), dtype=bool) if skip_all_legacy_ray_cast else obstacle_mask,
+            ray_can_clear=np.zeros((0,), dtype=bool) if skip_all_legacy_ray_cast else ray_clear_mask,
             map_width=map_width,
             depth_min_m=float(self.depth_min_m),
             depth_max_m=float(self.depth_max_m),
@@ -386,12 +416,13 @@ class OnlineMapper:
             z_max_m=float(self.vertical_profile_free_max_height_m),
             band_ranges_m=self.vertical_profile.band_ranges_m,
         )
-        self._mark_vertical_profile_free_weighted_flat(
-            ray_result.free_flat_by_band,
-            ray_result.free_weight_by_band,
-        )
+        if not bool(skip_legacy_vertical_profile):
+            self._mark_vertical_profile_free_weighted_flat(
+                ray_result.free_flat_by_band,
+                ray_result.free_weight_by_band,
+            )
         height_ray_result = None
-        if bool(self.height_profile_config.enabled):
+        if bool(self.height_profile_config.enabled) and not bool(skip_legacy_height_profile):
             height_ray_result = _collect_ray_cast_evidence(
                 origin_cell=(int(origin_cell[0]), int(origin_cell[1])),
                 endpoints=rows_cols,
@@ -411,17 +442,19 @@ class OnlineMapper:
                 height_ray_result.free_flat_by_band,
                 height_ray_result.free_weight_by_band,
             )
-        self._mark_roomseg_ray_covered_weighted_flat(
-            ray_result.roomseg_ray_covered_flat,
-            ray_result.roomseg_ray_covered_weight,
-        )
-        self._mark_roomseg_terminal_wall_flat(
-            ray_result.terminal_wall_flat,
-            ray_result.terminal_wall_depth_m,
-            ray_result.terminal_wall_rel_z_m,
-        )
-        self._refresh_roomseg_terminal_wall_splat(radius_cells=1)
+        if not bool(skip_legacy_roomseg_ray):
+            self._mark_roomseg_ray_covered_weighted_flat(
+                ray_result.roomseg_ray_covered_flat,
+                ray_result.roomseg_ray_covered_weight,
+            )
+            self._mark_roomseg_terminal_wall_flat(
+                ray_result.terminal_wall_flat,
+                ray_result.terminal_wall_depth_m,
+                ray_result.terminal_wall_rel_z_m,
+            )
+            self._refresh_roomseg_terminal_wall_splat(radius_cells=1)
         timings["ray_cast_ms"] = _elapsed_ms(stage_started_at)
+        timings["legacy_roomseg_ray_skipped"] = 1.0 if bool(skip_legacy_roomseg_ray) else 0.0
 
         stage_started_at = time.perf_counter()
         free_unique = _unique_flat_array(ray_result.free_flat)
@@ -1078,6 +1111,9 @@ class OnlineMapper:
         out = {str(key): float(value) for key, value in timings.items()}
         out["update_total_ms"] = _elapsed_ms(total_started_at)
         out["reason"] = str(reason)
+        out["legacy_vertical_profile_skipped_by_voxel_backend"] = bool(getattr(self, "_last_legacy_vertical_profile_skipped_by_voxel_backend", False))
+        out["legacy_height_profile_skipped_by_voxel_backend"] = bool(getattr(self, "_last_legacy_height_profile_skipped_by_voxel_backend", False))
+        out["legacy_roomseg_ray_skipped_by_voxel_backend"] = bool(getattr(self, "_last_legacy_roomseg_ray_skipped_by_voxel_backend", False))
         self.last_timing_stats = out
 
     def _reset_roomseg_ray_evidence(self) -> None:
@@ -1120,6 +1156,9 @@ class OnlineMapper:
         return {
             "state": np.asarray(self.voxel_grid.state, dtype=np.uint8).copy(),
             "log_odds": np.asarray(self.voxel_grid.log_odds, dtype=np.int16).copy(),
+            "sensor_range_count": np.asarray(self.voxel_grid.sensor_range_count, dtype=np.uint8).copy(),
+            "voxel_nav_occupied_endpoint_count_xy": np.asarray(self.voxel_nav_occupied_endpoint_count, dtype=np.uint16).copy(),
+            "voxel_nav_free_ray_count_xy": np.asarray(self.voxel_nav_free_ray_count, dtype=np.uint16).copy(),
             "z_min_m": float(self.voxel_grid.z_min_m),
             "z_max_m": float(self.voxel_grid.z_max_m),
             "z_resolution_m": float(self.voxel_grid.z_resolution_m),
@@ -1130,6 +1169,7 @@ class OnlineMapper:
                 if self.last_ceiling_height_estimate.height_m is None
                 else float(self.last_ceiling_height_estimate.height_m)
             ),
+            "ceiling_estimate_status": str(getattr(self.voxel_grid, "ceiling_estimate_status", "snapshot")),
         }
 
     def navigation_debug_layers(self) -> dict[str, object]:
@@ -1466,6 +1506,9 @@ class OnlineMapper:
             "height_profile_ray_count": int(height_profile_ray_count),
             "height_profile_skipped_height_rays": int(height_profile_skipped_height_rays),
             "height_profile_z_bin_count": int(self.height_profile.z_bin_count),
+            "legacy_vertical_profile_skipped_by_voxel_backend": bool(getattr(self, "_last_legacy_vertical_profile_skipped_by_voxel_backend", False)),
+            "legacy_height_profile_skipped_by_voxel_backend": bool(getattr(self, "_last_legacy_height_profile_skipped_by_voxel_backend", False)),
+            "legacy_roomseg_ray_skipped_by_voxel_backend": bool(getattr(self, "_last_legacy_roomseg_ray_skipped_by_voxel_backend", False)),
             **dict(self.last_ceiling_height_estimate.debug),
             "free_band_points": int(np.count_nonzero(free_mask)),
             "obstacle_band_points": int(np.count_nonzero(obstacle_mask)),

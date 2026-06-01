@@ -166,12 +166,17 @@ mapping:
   frontier_allow_near_fallback: false
   frontier_debug_dump: false
   frontier_debug_dir: data/debug_frontier
-  room_map_mode: voxel_occupancy_door_wall_v29_vlm
+  room_map_mode: voxel_occupancy_door_wall_v33_vlm
+  voxel_runtime:
+    runtime_debug_level: counters
+    skip_legacy_vertical_profile_when_voxel_backend: true
+    skip_legacy_height_profile_when_voxel_backend: true
+    skip_legacy_roomseg_ray_evidence_when_voxel_backend: true
   strict_no_oracle_rooms: true
   room_segmentation:
     enabled: true
-    algorithm: voxel_occupancy_door_wall_v29
-    backend: voxel_occupancy_door_wall_v29
+    algorithm: voxel_occupancy_door_wall_v33
+    backend: voxel_occupancy_door_wall_v33
     source_mode: declutter_reconstruct_external
     legacy_watershed_allowed: debug_only
     local_rose2_lite_allowed: debug_only
@@ -261,12 +266,31 @@ mapping:
       active_z_max_mode: ceiling_90pct
       active_z_max_ceiling_ratio: 0.90
       active_z_max_fallback_m: 2.00
-      integration_backend: cpu_vectorized
+      integration_backend: cpu_numba
       cuda_device: cuda:0
       cuda_chunk_rays: 8192
       cuda_ray_step_voxels: 1.00
       cuda_max_samples_per_ray: 320
       cuda_keep_logodds_on_device: false
+      cpu_numba_threads: 28
+      cpu_numba_threads_mode: auto
+      cpu_numba_autotune_candidates: [2, 4, 8, 14, 28]
+      cpu_numba_autotune_repeat: 2
+      cpu_numba_autotune_rays: 30000
+      cpu_numba_autotune_cache_path: debug/voxel_cpu_numba_autotune.json
+      cpu_numba_autotune_metric: integrate_ms
+      cpu_numba_chunk_rays: 131072
+      cpu_numba_use_bincount_updates: true
+      cpu_numba_max_samples_per_ray: 320
+      cpu_numba_preallocate_buffers: true
+      cpu_numba_skip_per_ray_unique_if_step_voxels_ge_1: true
+      cpu_numba_strict_required: true
+      cpu_numba_fail_if_thread_count_below: 2
+      cpu_numba_report_threading_layer: true
+      cpu_numba_event_block_size: 4096
+      cpu_numba_event_chunk_count_multiplier: 4
+      cpu_numba_inline_state_refresh: true
+      cpu_numba_disable_changed_flatnonzero: true
       python_debug_backend_allowed: false
       depth_stride_px: 2
       depth_min_m: 0.20
@@ -292,7 +316,8 @@ mapping:
       sensor_range_mark_endpoint_column_enabled: true
       sensor_range_endpoint_column_xy_radius_cells: 0
       sensor_range_mark_active_z_only: true
-      sensor_range_mark_ray_samples_enabled: true
+      sensor_range_mark_ray_samples_enabled: false
+      sensor_range_mark_ray_samples_for_debug: false
       sensor_range_behind_endpoint_margin_m: 0.00
       sensor_range_count_decay_per_update: 0
     voxel_navigation_projection:
@@ -312,7 +337,7 @@ mapping:
       occupied_fill_small_holes_max_area_cells: 4
       occupied_priority_over_free: true
       unknown_preserve_when_no_observation: true
-      debug_navigation_projection_layers: true
+      debug_navigation_projection_layers: false
     voxel_navigation_blind_zone:
       enabled: true
       force_initial_blind_zone_free: true
@@ -490,14 +515,47 @@ mapping:
       reject_if_endpoint_is_other_door: true
       conflict_dilation_cells: 1
       vectorized_seed_classification: true
-      seed_cluster_morph_close_radius_cells: 2
-      seed_cluster_merge_distance_cells: 8
+      seed_cluster_morph_close_radius_cells: 1
+      seed_cluster_merge_distance_cells: 4
       seed_cluster_collinear_angle_deg: 25.0
-      seed_cluster_max_perpendicular_gap_cells: 4
-      seed_cluster_max_along_gap_cells: 16
+      seed_cluster_max_perpendicular_gap_cells: 2
+      seed_cluster_max_along_gap_cells: 12
       seed_cluster_max_width_m: 1.80
       seed_cluster_min_shared_anchor_score: 0.0
+      seed_component_connectivity: 8
+      raw_seed_min_component_cells_for_display: 1
+      primitive_min_seed_cells: 3
+      primitive_min_length_cells: 3
+      primitive_max_thickness_cells: 3
+      primitive_max_residual_cells: 1.75
+      primitive_min_elongation: 1.4
+      primitive_max_along_gap_cells: 2.0
+      enable_seed_blob_line_decomposition: true
+      primitive_extraction_method: ransac_then_split
+      ransac_num_trials: 64
+      ransac_inlier_residual_cells: 1.5
+      ransac_min_inliers: 3
+      max_primitives_per_cluster: 4
+      remove_inliers_after_primitive: true
+      seed_pair_max_along_gap_cells: 12
+      seed_pair_max_axis_angle_deg: 25.0
       completion_orientation_mode: pca_plus_axis_plus_wall_pair
+      accepted_orientation_source: seed_primitive_only
+      allow_axis_hv_for_accepted: false
+      allow_wall_pair_axis_for_accepted: false
+      allow_local_free_neck_axis_for_accepted: false
+      allow_axis_hv_for_debug_trials: true
+      allow_wall_pair_axis_for_debug_trials: true
+      allow_local_free_neck_axis_for_debug_trials: true
+      raw_seed_blocks_step2: false
+      visual_only_door_blocks_step2: false
+      geometry_warning_door_blocks_step2: false
+      topology_effective_door_blocks_step2: true
+      show_raw_seed: true
+      show_seed_line_primitives: true
+      show_rejected_primitives_in_diagnostic: true
+      show_visual_only_door_in_diagnostic: true
+      default_green_only_topology_effective: true
       min_seed_cells_for_accepted_extension: 3
       min_seed_line_length_cells_for_accepted_extension: 3
       min_seed_elongation_for_direction: 1.6
@@ -551,6 +609,9 @@ mapping:
       min_geometry_cut_cells: 1
       door_wall_attachment_max_endpoint_gap_cells: 1
       enable_strong_seed_centerline_fallback: true
+      strong_seed_min_cells: 6
+      strong_seed_max_thickness_cells: 5
+      strong_seed_allow_topology_test_without_two_anchors: true
       strong_seed_centerline_min_cells: 4
       strong_seed_centerline_min_length_cells: 3
       strong_seed_centerline_min_elongation: 1.6
@@ -1259,7 +1320,7 @@ sgnav:
     long_edge_geometric_pruning: true
     group_nodes: true
     room_nodes:
-      source: voxel_occupancy_door_wall_v29_vlm
+      source: voxel_occupancy_door_wall_v33_vlm
       use_dataset_room_labels_in_metric: false
       strict_no_oracle_rooms: true
       room_label_backend: vlm
