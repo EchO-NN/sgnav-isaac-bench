@@ -43,6 +43,7 @@ from isaac_bench.mapping.voxel_door_detector import (
     DOOR_ANCHOR_PROJECTED_ANCHOR,
     DOOR_ANCHOR_STEP1,
     DOOR_ANCHOR_STRICT_RAW,
+    DoorMemoryObservationMaps,
     VoxelDoorCompletionResult,
     VoxelDoorDetectorConfig,
     VoxelDoorMemory,
@@ -485,7 +486,11 @@ def run_voxel_occupancy_door_wall_roomseg(
         resolution_m=float(resolution_m),
         config=cfg.voxel_evidence,
     )
-    door_seed_result = classify_voxel_door_seeds(voxel_grid=voxel_grid, config=cfg.door)
+    door_seed_result = classify_voxel_door_seeds(
+        voxel_grid=voxel_grid,
+        config=cfg.door,
+        sensor_range_count=getattr(voxel_grid, "sensor_range_count", None),
+    )
     door_seed_mask = np.asarray(door_seed_result.door_seed_mask, dtype=bool)
 
     wall_line_support_strong_xy = np.asarray(
@@ -709,9 +714,36 @@ def run_voxel_occupancy_door_wall_roomseg(
     current_door_visual_mask = np.asarray(door_completion.door_centerline_visual_mask, dtype=bool)
     current_door_cut_mask = np.asarray(door_completion.door_cut_mask_for_partition, dtype=bool)
     current_geometry_warning_cut_mask = np.asarray(door_completion.door_geometry_warning_cut_mask, dtype=bool)
-    current_topology_effective_cut_mask = np.asarray(door_completion.door_topology_effective_cut_mask, dtype=bool)
+    current_topology_effective_cut_mask = np.asarray(
+        door_completion.debug.get("voxel_door_partition_effective_verified_mask", door_completion.door_topology_effective_cut_mask),
+        dtype=bool,
+    )
+    sensor_range_count_xy = np.asarray(
+        evidence.debug.get("voxel_sensor_range_count_xy", np.zeros(shape, dtype=np.uint16)),
+        dtype=np.uint16,
+    )
+    if sensor_range_count_xy.shape != shape:
+        sensor_range_count_xy = np.zeros(shape, dtype=np.uint16)
+    sensor_range_xy = sensor_range_count_xy > 0
+    if not np.any(sensor_range_xy):
+        sensor_range_xy = np.asarray(evidence.active_observed_xy, dtype=bool)
+    door_memory_observation = DoorMemoryObservationMaps(
+        observed_xy=np.asarray(evidence.active_observed_xy, dtype=bool)
+        | np.asarray(evidence.vertical_free_xy, dtype=bool)
+        | np.asarray(evidence.wall_xy, dtype=bool),
+        sensor_range_xy=np.asarray(sensor_range_xy, dtype=bool),
+        vertical_free_xy=np.asarray(evidence.vertical_free_xy, dtype=bool),
+        wall_xy=np.asarray(real_wall_barrier_for_partition, dtype=bool),
+        raw_seed_mask=np.asarray(door_seed_mask, dtype=bool),
+        current_verified_cut_mask=np.asarray(current_topology_effective_cut_mask, dtype=bool),
+    )
     if door_memory is not None:
-        door_memory_result = door_memory.update(door_completion.candidates, step=int(step), shape=shape)
+        door_memory_result = door_memory.update(
+            door_completion.candidates,
+            step=int(step),
+            shape=shape,
+            observation=door_memory_observation,
+        )
         stable_door_cut_mask = np.asarray(door_memory_result.stable_door_cut_mask, dtype=bool)
         stable_door_visual_mask = np.asarray(door_memory_result.stable_door_visual_mask, dtype=bool)
         door_memory_debug = dict(door_memory_result.debug)
@@ -722,6 +754,9 @@ def run_voxel_occupancy_door_wall_roomseg(
             "voxel_door_memory_enabled": bool(cfg.door.door_memory_enabled),
             "voxel_door_memory_active": False,
             "voxel_door_memory_track_count": 0,
+            "voxel_door_memory_observed_decay_band_mask": np.zeros(shape, dtype=bool),
+            "voxel_door_memory_unobserved_track_mask": np.zeros(shape, dtype=bool),
+            "voxel_door_memory_contradiction_mask": np.zeros(shape, dtype=bool),
         }
     current_accepted_visual_mask = np.asarray(door_completion.debug.get("voxel_accepted_door_centerline_mask", current_door_cut_mask), dtype=bool)
     current_accepted_cut_mask = current_door_cut_mask.copy()
@@ -1057,12 +1092,21 @@ def run_voxel_occupancy_door_wall_roomseg(
         "voxel_door_current_centerline_visual_mask": current_door_visual_mask,
         "voxel_door_visual_only_mask": np.asarray(door_completion.debug.get("voxel_door_visual_only_mask", np.zeros(shape, dtype=bool)), dtype=bool),
         "voxel_door_geometry_warning_cut_mask": (current_geometry_warning_cut_mask | np.asarray(door_completion.debug.get("voxel_door_geometry_warning_cut_mask", np.zeros(shape, dtype=bool)), dtype=bool)).astype(bool),
+        "voxel_door_geometry_only_mask": np.asarray(door_completion.debug.get("voxel_door_geometry_only_mask", np.zeros(shape, dtype=bool)), dtype=bool),
+        "voxel_door_attachment_only_mask": np.asarray(door_completion.debug.get("voxel_door_attachment_only_mask", np.zeros(shape, dtype=bool)), dtype=bool),
+        "voxel_door_cut_not_closed_to_wall_mask": np.asarray(door_completion.debug.get("voxel_door_cut_not_closed_to_wall_mask", np.zeros(shape, dtype=bool)), dtype=bool),
+        "voxel_door_partition_effective_verified_mask": (current_topology_effective_cut_mask | stable_door_cut_mask).astype(bool),
         "voxel_door_topology_effective_cut_mask": (current_topology_effective_cut_mask | stable_door_cut_mask).astype(bool),
         "voxel_door_partition_cut_candidate_mask": door_completion.door_partition_cut_candidate_mask,
         "voxel_door_partition_cut_accepted_mask": door_cut_mask,
         "voxel_door_current_cut_mask": current_door_cut_mask,
+        "voxel_current_door_cut_mask": current_accepted_cut_mask,
+        "voxel_current_door_topology_effective_mask": current_topology_effective_cut_mask,
         "voxel_stable_door_cut_mask": stable_door_cut_mask,
         "voxel_stable_door_visual_mask": stable_door_visual_mask,
+        "voxel_door_memory_observed_decay_band_mask": np.asarray(door_memory_debug.get("voxel_door_memory_observed_decay_band_mask", np.zeros(shape, dtype=bool)), dtype=bool),
+        "voxel_door_memory_unobserved_track_mask": np.asarray(door_memory_debug.get("voxel_door_memory_unobserved_track_mask", np.zeros(shape, dtype=bool)), dtype=bool),
+        "voxel_door_memory_contradiction_mask": np.asarray(door_memory_debug.get("voxel_door_memory_contradiction_mask", np.zeros(shape, dtype=bool)), dtype=bool),
         "voxel_final_door_cut_mask": door_cut_mask,
         "voxel_door_final_cut_mask": door_cut_mask,
         "voxel_door_wall_attachment_reject_map": np.asarray(door_completion.debug.get("voxel_door_wall_attachment_reject_map", np.zeros(shape, dtype=np.uint8)), dtype=np.uint8),
@@ -1160,8 +1204,10 @@ def run_voxel_occupancy_door_wall_roomseg(
         "voxel_door_current_cut_cells": int(np.count_nonzero(current_door_cut_mask)),
         "voxel_stable_door_cut_cells": int(np.count_nonzero(stable_door_cut_mask)),
         "voxel_door_topology_effective_cells": int(np.count_nonzero(current_topology_effective_cut_mask | stable_door_cut_mask)),
+        "voxel_door_partition_effective_verified_cells": int(np.count_nonzero(current_topology_effective_cut_mask | stable_door_cut_mask)),
         "voxel_door_geometry_warning_cells": int(np.count_nonzero(current_geometry_warning_cut_mask)),
         "voxel_final_door_cut_cells": int(np.count_nonzero(door_cut_mask)),
+        "voxel_v30_door_partition_stability_patch": True,
         "voxel_seed_not_added_to_partition_free": True,
         "voxel_legacy_seed_free_injection_would_add_cells": int(np.count_nonzero(current_accepted_seed_mask)),
         "voxel_legacy_seed_free_injection_overlap_cut_cells": int(np.count_nonzero(current_accepted_seed_mask & door_cut_mask)),
@@ -1217,6 +1263,7 @@ def run_voxel_occupancy_door_wall_roomseg(
         "roomseg_backend": VOXEL_OCCUPANCY_ROOMSEG_BACKEND,
         "algorithm": VOXEL_OCCUPANCY_ROOMSEG_ALGORITHM,
         "variant": "voxel_v29_door_seed_partition_fix",
+        "voxel_v30_door_partition_stability_patch": True,
         "source": VOXEL_OCCUPANCY_ROOMSEG_BACKEND,
         "context_source": VOXEL_OCCUPANCY_ROOMSEG_CONTEXT,
         "room_map_mode": VOXEL_OCCUPANCY_ROOMSEG_CONTEXT,
@@ -1888,21 +1935,37 @@ def _apply_corridor_local_acceptance(
     out_map = np.asarray(accepted_map, dtype=bool).copy()
     locally_accepted = 0
     checked = 0
+    reject_counts: Counter[str] = Counter()
     for candidate in rejected:
         mask = candidate.mask(free.shape)
         candidate.debug["corridor_local_acceptance_checked"] = True
         checked += 1
         reason = str(candidate.reject_reason or "")
-        length_ok = 0.40 <= float(candidate.length_m) <= 1.60
-        no_door = not bool(np.any(mask & door_block))
-        crosses_free = bool(np.any(mask & free))
-        target_touch = bool(np.count_nonzero(dilate(mask, 1) & target) >= 2)
-        topology_like = reason in {"reject_no_topology_gain", "reject_no_component_split", "reject_tiny_fragment", "reject_no_new_component", "reject_local_fragment_too_small"}
-        if topology_like and length_ok and no_door and crosses_free and target_touch:
+        topology_like = reason in {
+            "reject_no_topology_gain",
+            "reject_no_component_split",
+            "reject_tiny_fragment",
+            "reject_no_new_component",
+            "reject_local_fragment_too_small",
+            "reject_split_tiny_side_width_1_to_3_cells",
+            "reject_too_many_tiny_fragments",
+            "reject_side_area_too_small",
+            "reject_no_two_sides",
+            "reject_tiny_side",
+        }
+        neck_ok, neck_debug = validate_step2_wall_to_wall_neck_v30(
+            candidate,
+            free=free,
+            target_wall=target,
+            door_block=door_block,
+            resolution_m=float(resolution_m),
+        )
+        candidate.debug.update(neck_debug)
+        if topology_like and bool(neck_ok):
             candidate.accepted = True
             candidate.reject_reason = ""
             candidate.debug["corridor_local_acceptance_accepted"] = True
-            candidate.debug["corridor_local_acceptance_reason"] = "accepted_wall_to_wall_free_neck"
+            candidate.debug["corridor_local_acceptance_reason"] = "accepted_wall_to_wall_neck_v30"
             out_accepted.append(candidate)
             out_map |= mask
             locally_accepted += 1
@@ -1911,13 +1974,85 @@ def _apply_corridor_local_acceptance(
             candidate.debug["corridor_local_acceptance_reason"] = (
                 "not_topology_reject"
                 if not topology_like
-                else "length_or_door_or_free_or_target_check_failed"
+                else str(neck_debug.get("step2_local_neck_v30_reject_reason", "local_neck_rejected"))
             )
+            reject_counts[str(candidate.debug["corridor_local_acceptance_reason"])] += 1
             out_rejected.append(candidate)
     return out_accepted, out_rejected, out_map.astype(bool), {
         "voxel_step2_corridor_local_acceptance_checked_count": int(checked),
         "voxel_step2_corridor_local_acceptance_accepted_count": int(locally_accepted),
+        "voxel_step2_local_neck_v30_accepted_count": int(locally_accepted),
+        "voxel_step2_local_neck_v30_reject_counts": dict(reject_counts),
     }
+
+
+def validate_step2_wall_to_wall_neck_v30(
+    candidate: SeparatorCandidate,
+    *,
+    free: np.ndarray,
+    target_wall: np.ndarray,
+    door_block: np.ndarray,
+    resolution_m: float,
+) -> tuple[bool, dict[str, object]]:
+    mask = candidate.mask(np.asarray(free, dtype=bool).shape)
+    free_arr = np.asarray(free, dtype=bool)
+    target = np.asarray(target_wall, dtype=bool)
+    door = np.asarray(door_block, dtype=bool)
+    length_ok = 0.40 <= float(candidate.length_m) <= 1.60
+    no_door = not bool(np.any(mask & door))
+    crosses_free = bool(np.any(mask & free_arr))
+    target_touch_count = int(np.count_nonzero(dilate(mask, 1) & target))
+    target_touch = bool(target_touch_count >= 2)
+    before = free_arr & ~target
+    roi = _mask_bbox_local(dilate(mask, max(2, int(round(0.25 / max(float(resolution_m), 1e-6))))), before.shape)
+    r0, r1, c0, c1 = roi
+    before_local = before[r0:r1, c0:c1]
+    cut_local = mask[r0:r1, c0:c1]
+    before_labels, before_n = ndimage.label(before_local, structure=conn(4))
+    after_local = before_local & ~cut_local
+    after_labels, after_n = ndimage.label(after_local, structure=conn(4))
+    adjacent = dilate(cut_local, 1) & after_local
+    touched = sorted({int(v) for v in np.unique(after_labels[adjacent]) if int(v) > 0})
+    side_areas = [int(np.count_nonzero(after_labels == int(label))) for label in touched]
+    side_ok = len(touched) >= 2 and not any(area < 2 for area in side_areas[:2])
+    local_gain = int(after_n) > int(before_n)
+    ok = bool(length_ok and no_door and crosses_free and target_touch and (local_gain or side_ok))
+    reject_reason = None
+    if not ok:
+        if not length_ok:
+            reject_reason = "length_out_of_range"
+        elif not no_door:
+            reject_reason = "intersects_verified_door"
+        elif not crosses_free:
+            reject_reason = "does_not_cross_free"
+        elif not target_touch:
+            reject_reason = "does_not_touch_target_wall_twice"
+        else:
+            reject_reason = "no_local_wall_to_wall_neck_split"
+    return ok, {
+        "step2_local_neck_v30_checked": True,
+        "step2_local_neck_v30_length_ok": bool(length_ok),
+        "step2_local_neck_v30_no_door_intersection": bool(no_door),
+        "step2_local_neck_v30_crosses_free": bool(crosses_free),
+        "step2_local_neck_v30_target_touch_count": int(target_touch_count),
+        "step2_local_neck_v30_local_gain": bool(local_gain),
+        "step2_local_neck_v30_side_ok": bool(side_ok),
+        "step2_local_neck_v30_touched_labels": [int(v) for v in touched],
+        "step2_local_neck_v30_side_areas": [int(v) for v in side_areas],
+        "step2_local_neck_v30_reject_reason": reject_reason,
+    }
+
+
+def _mask_bbox_local(mask: np.ndarray, shape: tuple[int, int]) -> tuple[int, int, int, int]:
+    rows, cols = np.nonzero(np.asarray(mask, dtype=bool))
+    if rows.size == 0:
+        return 0, int(shape[0]), 0, int(shape[1])
+    return (
+        max(0, int(rows.min())),
+        min(int(shape[0]), int(rows.max()) + 1),
+        max(0, int(cols.min())),
+        min(int(shape[1]), int(cols.max()) + 1),
+    )
 
 
 def _dedup_step2_lines(lines: Sequence[FilteredWallLine]) -> tuple[list[FilteredWallLine], int]:

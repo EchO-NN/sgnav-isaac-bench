@@ -41,6 +41,7 @@ def test_topology_tiny_fragments_uses_delta_not_absolute() -> None:
         reject_corridor_split=False,
         reject_open_living_room_internal_split=False,
         reject_if_side_width_cells_leq=0,
+        reject_small_known_side_for_line_extensions=False,
         separator=SeparatorAnchorConfig(require_two_anchors=False),
     )
 
@@ -74,6 +75,7 @@ def test_topology_absolute_tiny_fragment_mode_still_rejects_for_compatibility() 
         reject_corridor_split=False,
         reject_open_living_room_internal_split=False,
         reject_if_side_width_cells_leq=0,
+        reject_small_known_side_for_line_extensions=False,
         separator=SeparatorAnchorConfig(require_two_anchors=False),
     )
 

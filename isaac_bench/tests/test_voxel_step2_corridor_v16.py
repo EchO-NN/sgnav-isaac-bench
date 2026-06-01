@@ -34,6 +34,7 @@ def _cfg() -> TopologyTestConfig:
         corridor_tiny_side_min_length_m=0.35,
         corridor_accept_long_narrow_side=True,
         corridor_local_topology_radius_cells=20,
+        reject_small_known_side_for_line_extensions=False,
     )
 
 
@@ -114,3 +115,65 @@ def test_v16_step2_accepted_cut_participates_final_partition() -> None:
     assert cut_debug["step2_partition_cut_v16"] is True
     assert int(count) >= 2
     assert int(labels.max()) >= 2
+
+
+def test_line_extension_rejects_small_known_side_when_boundary_unknown_low() -> None:
+    shape = (32, 32)
+    free = np.zeros(shape, dtype=bool)
+    free[5:25, 5:25] = True
+
+    cfg = TopologyTestConfig(
+        separator=SeparatorAnchorConfig(require_two_anchors=False),
+        corridor_min_split_area_m2=0.01,
+        corridor_reject_tiny_side_width_cells_leq=0,
+        reject_small_known_side_for_line_extensions=True,
+        small_known_side_area_m2=2.0,
+        small_known_side_unknown_ratio_max=0.20,
+    )
+    accepted, rejected, _accepted_map, _labels, _debug = greedily_select_separators(
+        [_candidate(1, (5, 8), (24, 8))],
+        free_clean=free,
+        unknown_clean=np.zeros(shape, dtype=bool),
+        wall_candidate_clean=np.zeros(shape, dtype=bool),
+        corridor_skeleton=np.zeros(shape, dtype=bool),
+        resolution_m=0.10,
+        config=cfg,
+    )
+
+    assert not accepted
+    assert len(rejected) == 1
+    assert rejected[0].reject_reason == "reject_small_known_side_low_unknown"
+    assert rejected[0].debug["small_known_side_rejected"] is True
+
+
+def test_line_extension_keeps_small_side_when_boundary_unknown_high() -> None:
+    shape = (32, 32)
+    free = np.zeros(shape, dtype=bool)
+    free[5:25, 5:25] = True
+    unknown = np.zeros(shape, dtype=bool)
+    unknown[4, 4:9] = True
+    unknown[25, 4:9] = True
+    unknown[5:25, 4] = True
+
+    cfg = TopologyTestConfig(
+        separator=SeparatorAnchorConfig(require_two_anchors=False),
+        corridor_min_split_area_m2=0.01,
+        corridor_reject_tiny_side_width_cells_leq=0,
+        reject_small_known_side_for_line_extensions=True,
+        small_known_side_area_m2=2.0,
+        small_known_side_unknown_ratio_max=0.20,
+    )
+    accepted, rejected, accepted_map, _labels, _debug = greedily_select_separators(
+        [_candidate(1, (5, 8), (24, 8))],
+        free_clean=free,
+        unknown_clean=unknown,
+        wall_candidate_clean=np.zeros(shape, dtype=bool),
+        corridor_skeleton=np.zeros(shape, dtype=bool),
+        resolution_m=0.10,
+        config=cfg,
+    )
+
+    assert len(accepted) == 1
+    assert not rejected
+    assert np.any(accepted_map)
+    assert accepted[0].debug["small_known_side_rejected"] is False

@@ -32,6 +32,7 @@ def _legacy_completion_config(**overrides: object) -> VoxelDoorDetectorConfig:
         "min_seed_elongation_for_direction": 1.0,
         "accepted_orientation_mode": "legacy",
         "local_free_neck_orientation_debug_only": False,
+        "partition_reject_small_known_side_enabled": False,
     }
     data.update(overrides)
     return VoxelDoorDetectorConfig(**data)

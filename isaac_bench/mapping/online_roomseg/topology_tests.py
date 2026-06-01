@@ -32,6 +32,10 @@ class TopologyTestConfig:
     narrow_neck_width_max_m: float = 1.60
     reject_open_living_room_internal_split: bool = True
     reject_if_side_width_cells_leq: int = 0
+    reject_small_known_side_for_line_extensions: bool = True
+    small_known_side_area_m2: float = 2.00
+    small_known_side_unknown_ratio_max: float = 0.20
+    small_known_side_boundary_dilation_cells: int = 1
     corridor_min_split_area_m2: float = 0.05
     corridor_min_new_component_width_m: float = 0.10
     corridor_reject_tiny_side_width_cells_leq: int = 2
@@ -206,6 +210,7 @@ def evaluate_candidate(
         return evaluate_corridor_separator_candidate_v16(
             candidate,
             free_clean=free,
+            unknown_clean=unknown,
             current_separator_map=current,
             candidate_map=candidate_map,
             corridor_skeleton=skeleton,
@@ -239,6 +244,22 @@ def evaluate_candidate(
     main = component_info[:2]
     min_width = min(float(item.get("thickness_m", 0.0)) for item in main) if len(main) >= 2 else 0.0
     min_side_width_cells = int(round(float(min_width) / max(float(resolution_m), 1e-9))) if len(main) >= 2 else 0
+    if str(candidate.kind) == "line_extension_door_neck":
+        small_known_side_reject, small_known_side_debug = _small_known_side_reject_for_line_extension(
+            component_info=main,
+            labels=after_labels,
+            unknown_clean=unknown,
+            resolution_m=float(resolution_m),
+            config=config,
+        )
+        if small_known_side_reject:
+            return False, "reject_small_known_side_low_unknown", candidate_map, {
+                **anchor_debug,
+                "candidate_mask_cell_count": int(np.count_nonzero(candidate_map)),
+                "components": component_info[:8],
+                "topology_touched_labels": touched,
+                **small_known_side_debug,
+            }
     if int(reject_width_cells) > 0 and min_side_width_cells <= int(reject_width_cells) and (
         not is_corridor_extension
         or _is_true_sliver_split(
@@ -389,6 +410,7 @@ def evaluate_corridor_separator_candidate_v16(
     candidate: SeparatorCandidate,
     *,
     free_clean: np.ndarray,
+    unknown_clean: np.ndarray,
     current_separator_map: np.ndarray,
     candidate_map: np.ndarray,
     corridor_skeleton: np.ndarray,
@@ -398,6 +420,7 @@ def evaluate_corridor_separator_candidate_v16(
 ) -> tuple[bool, str, np.ndarray, dict]:
     anchor = dict(anchor_debug or {})
     free = np.asarray(free_clean, dtype=bool)
+    unknown = np.asarray(unknown_clean, dtype=bool)
     current = np.asarray(current_separator_map, dtype=bool)
     cut = np.asarray(candidate_map, dtype=bool) & free & ~current
     before = free & ~current
@@ -460,6 +483,24 @@ def evaluate_corridor_separator_candidate_v16(
     min_side_width_cells = int(round(float(min_width) / max(float(resolution_m), 1e-9))) if len(main) >= 2 else 0
     min_side_area_cells = int(min(int(item.get("area_cells", 0)) for item in main)) if main else 0
     reject_width_cells = int(config.corridor_reject_tiny_side_width_cells_leq)
+    small_known_side_reject, small_known_side_debug = _small_known_side_reject_for_line_extension(
+        component_info=main,
+        labels=labels_for_sides,
+        unknown_clean=unknown,
+        resolution_m=float(resolution_m),
+        config=config,
+    )
+    if small_known_side_reject:
+        return False, "reject_small_known_side_low_unknown", cut, {
+            **anchor,
+            "corridor_topology_v16": True,
+            "candidate_mask_cell_count": int(np.count_nonzero(cut)),
+            "components": component_info[:8],
+            "topology_touched_labels": [int(v) for v in side_labels],
+            "topology_min_side_width_cells": int(min_side_width_cells),
+            "topology_min_side_area_cells": int(min_side_area_cells),
+            **small_known_side_debug,
+        }
     true_sliver = False
     if reject_width_cells > 0 and min_side_width_cells <= reject_width_cells:
         true_sliver = _corridor_true_sliver_v16(
@@ -573,6 +614,7 @@ def evaluate_corridor_separator_candidate_v16(
         "corridor_preservation_score": float(candidate.corridor_preservation_score),
         "corridor_long_narrow_side_accepted": bool(long_narrow_accepted),
         "corridor_local_topology_radius_cells": int(local_radius),
+        **small_known_side_debug,
     }
 
 
@@ -872,6 +914,62 @@ def _candidate_contact_lengths(candidate_map: np.ndarray, labels: np.ndarray, to
     for label in touched_labels:
         out[int(label)] = int(np.count_nonzero(contact_region & (label_arr == int(label))))
     return out
+
+
+def _small_known_side_reject_for_line_extension(
+    *,
+    component_info: Sequence[dict],
+    labels: np.ndarray,
+    unknown_clean: np.ndarray,
+    resolution_m: float,
+    config: TopologyTestConfig,
+) -> tuple[bool, dict]:
+    enabled = bool(config.reject_small_known_side_for_line_extensions)
+    area_threshold = float(config.small_known_side_area_m2)
+    unknown_threshold = float(config.small_known_side_unknown_ratio_max)
+    dilation_cells = max(1, int(config.small_known_side_boundary_dilation_cells))
+    debug: dict[str, object] = {
+        "small_known_side_gate_enabled": bool(enabled),
+        "small_known_side_area_threshold_m2": float(area_threshold),
+        "small_known_side_unknown_ratio_threshold": float(unknown_threshold),
+        "small_known_side_boundary_dilation_cells": int(dilation_cells),
+        "small_known_side_components": [],
+    }
+    if not enabled or area_threshold <= 0.0 or len(component_info) < 2:
+        debug["small_known_side_rejected"] = False
+        return False, debug
+
+    label_arr = np.asarray(labels, dtype=np.int32)
+    unknown = np.asarray(unknown_clean, dtype=bool)
+    rejected = False
+    entries: list[dict[str, object]] = []
+    for info in component_info[:2]:
+        label = int(info.get("label", 0))
+        if label <= 0:
+            continue
+        comp = label_arr == int(label)
+        if not np.any(comp):
+            continue
+        area_m2 = float(info.get("area_m2", float(np.count_nonzero(comp)) * float(resolution_m) ** 2))
+        ring = dilate(comp, dilation_cells) & ~comp
+        ring_cells = int(np.count_nonzero(ring))
+        unknown_cells = int(np.count_nonzero(ring & unknown))
+        unknown_ratio = 0.0 if ring_cells <= 0 else float(unknown_cells) / float(ring_cells)
+        entry = {
+            "label": int(label),
+            "area_m2": float(area_m2),
+            "boundary_cells": int(ring_cells),
+            "boundary_unknown_cells": int(unknown_cells),
+            "boundary_unknown_ratio": float(unknown_ratio),
+            "rejected": bool(area_m2 < area_threshold and unknown_ratio < unknown_threshold),
+        }
+        if bool(entry["rejected"]):
+            rejected = True
+        entries.append(entry)
+    debug["small_known_side_components"] = entries
+    debug["small_known_side_rejected"] = bool(rejected)
+    debug["small_known_side_reject_reason"] = "reject_small_known_side_low_unknown" if rejected else None
+    return bool(rejected), debug
 
 
 def _fragment_stats(

@@ -458,6 +458,7 @@ mapping:
       upper_occupied_ratio_min_observed: 0.80
       min_upper_observed_cells: 3
       min_upper_occupied_cells: 3
+      door_seed_sensor_range_count_threshold: 0
       require_occupied_centroid_above_free_centroid: true
       min_top_occupied_cells: 3
       allow_unknown_tail_after_top_occupied: true
@@ -532,6 +533,10 @@ mapping:
       partition_topology_allow_neck_cut_without_global_gain: true
       partition_topology_min_side_area_cells: 3
       partition_topology_min_side_width_cells: 1
+      partition_reject_small_known_side_enabled: true
+      partition_small_known_side_area_m2: 2.00
+      partition_small_known_side_unknown_ratio_max: 0.20
+      partition_small_known_side_boundary_dilation_cells: 1
       enable_one_seed_one_wall_completion: true
       enable_seed_pair_bridge_completion: true
       seed_pair_max_center_distance_m: 1.40
@@ -555,8 +560,24 @@ mapping:
       door_memory_match_iou_min: 0.05
       door_memory_match_distance_cells: 6
       door_memory_match_angle_deg: 20.0
+      door_memory_observation_dilation_cells: 2
+      door_memory_min_observed_cells_for_decay: 2
+      door_memory_contradiction_band_cells: 2
+      door_memory_min_observed_cells_for_contradiction: 4
+      door_memory_contradict_wall_ratio: 0.75
+      door_memory_contradictions_to_prune: 5
+      door_memory_match_dilation_cells: 2
+      door_memory_dilated_iou_min: 0.10
+      door_memory_seed_overlap_min: 0.20
+      door_memory_anchor_match_distance_cells: 4
+      door_memory_weak_refresh_updates_visual: false
+      door_memory_replace_quality_margin: 0.20
+      door_memory_allow_verified_geometry_replace: true
+      door_memory_prevent_shrinking_stable_cut: true
+      door_memory_min_length_ratio_to_replace: 0.80
       door_memory_decay_per_update: 0.02
       door_memory_confirm_increment: 0.35
+      door_memory_weak_refresh_increment: 0.12
       door_memory_min_confidence_to_keep: 0.15
       door_memory_ttl_updates: 30
       show_candidate_lines_in_debug: true
@@ -976,6 +997,10 @@ mapping:
         centered_extension_bridge_unknown: true
         centered_extension_bridge_nonfree_if_between_free: false
         require_cut_adjacent_to_wall_or_barrier: true
+        reject_small_known_side_for_line_extensions: true
+        small_known_side_area_m2: 2.00
+        small_known_side_unknown_ratio_max: 0.20
+        small_known_side_boundary_dilation_cells: 1
         reject_corridor_split: true
         open_room_width_min_m: 1.80
         open_room_min_side_area_m2: 2.00

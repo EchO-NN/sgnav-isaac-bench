@@ -1687,7 +1687,12 @@ class SGNavPopupVisualizer:
         if not np.any(door_visual_only):
             door_visual_only = door_visual_all & ~door_visual & ~self._room_debug_array("voxel_door_cut_mask", shape, bool)
         door_geometry_warning = self._room_debug_array("voxel_door_geometry_warning_cut_mask", shape, bool)
-        door_topology_effective = self._room_debug_array("voxel_door_topology_effective_cut_mask", shape, bool)
+        door_geometry_only = self._room_debug_array("voxel_door_geometry_only_mask", shape, bool)
+        door_attachment_only = self._room_debug_array("voxel_door_attachment_only_mask", shape, bool)
+        door_not_closed = self._room_debug_array("voxel_door_cut_not_closed_to_wall_mask", shape, bool)
+        door_topology_effective = self._room_debug_array("voxel_door_partition_effective_verified_mask", shape, bool)
+        if not np.any(door_topology_effective):
+            door_topology_effective = self._room_debug_array("voxel_door_topology_effective_cut_mask", shape, bool)
         if not np.any(door_topology_effective):
             door_topology_effective = self._room_debug_array("voxel_door_final_cut_mask", shape, bool)
         door_partition_candidate = self._room_debug_array("voxel_door_partition_cut_candidate_mask", shape, bool)
@@ -1698,6 +1703,7 @@ class SGNavPopupVisualizer:
         door_cut = self._room_debug_array("voxel_door_cut_mask", shape, bool)
         if not np.any(door_cut):
             door_cut = self._room_debug_array("voxel_door_partition_cut_accepted_mask", shape, bool)
+        door_visual_debug = door_visual_all & ~door_topology_effective & ~stable_door_cut
         door_trial = self._room_debug_array("voxel_door_trial_candidate_lines_map", shape, bool)
         door_trial_rejected = self._room_debug_array("voxel_door_trial_rejected_lines_map", shape, bool)
         door_selected = self._room_debug_array("voxel_door_selected_candidate_lines_map", shape, bool)
@@ -1776,16 +1782,22 @@ class SGNavPopupVisualizer:
             canvas[door_partition_candidate & ~door_cut] = (170, 220, 80)
             canvas[door_partition_rejected & ~door_cut] = (255, 100, 50)
             canvas[door_topology_warning & ~door_cut] = (255, 205, 70)
-            canvas[door_visual_only & ~door_cut] = (255, 145, 45)
+            canvas[door_visual_debug & ~door_cut] = (78, 105, 84)
+            canvas[door_visual_only & ~door_cut] = (125, 125, 125)
             canvas[door_geometry_warning & ~door_cut] = (255, 168, 55)
+            canvas[door_geometry_only & ~door_cut] = (255, 168, 55)
+            canvas[door_attachment_only & ~door_cut] = (255, 112, 55)
+            canvas[door_not_closed & ~door_cut] = (210, 95, 70)
             canvas[rejected] = (130, 112, 118)
         canvas[step1] = (245, 215, 55)
         canvas[step2] = (220, 60, 255)
         canvas[stable_step2 & ~step2] = (175, 45, 210)
-        canvas[door_visual] = (0, 255, 70)
-        canvas[stable_door_visual & ~door_visual] = (55, 210, 155)
-        canvas[door_cut] = (80, 255, 80)
-        canvas[stable_door_cut] = (55, 235, 155)
+        if show_diag:
+            canvas[door_visual_debug & ~door_topology_effective] = (0, 135, 60)
+            canvas[stable_door_visual & ~door_topology_effective] = (115, 205, 175)
+        canvas[door_topology_effective] = (90, 255, 70)
+        canvas[door_cut] = (90, 255, 70)
+        canvas[stable_door_cut] = (255, 95, 190)
         canvas[extensible_door_seed] = (50, 125, 255)
         canvas[door_seed] = (0, 80, 255)
         canvas[frontier] = (0, 235, 255)
@@ -1849,22 +1861,23 @@ class SGNavPopupVisualizer:
             stable_step2_count = int(np.count_nonzero(stable_step2))
             warning_count = int(np.count_nonzero(door_topology_warning))
             update_reason = str(self._room_segmentation_debug.get("roomseg_frontier_update_reason", "NA"))
-            title_a = "voxel v26 | wall=%d proj=%d red=%d step2_src=%d proj_src=%d hit=%d acc=%d" % (
-                wall_line_support_count,
-                projected_wall_count,
-                display_wall_count,
-                step2_source_count,
-                projected_step2_source_count,
-                step2_hit_count,
+            title_a = "voxel v30 | seed_raw=%d ext=%d visual=%d verified=%d stable=%d visual_only=%d step2_acc=%d" % (
+                door_seed_count,
+                door_extensible_seed_count,
+                door_visual_count,
+                door_topology_count,
+                stable_count,
+                door_visual_only_count,
                 step2_accepted_count,
             )
             raw_seed_not_blocking = int(bool(self._room_segmentation_debug.get("voxel_step2_block_topology_effective_door_only", False)))
             seed_not_in_free = int(bool(self._room_segmentation_debug.get("voxel_seed_not_added_to_partition_free", False)))
-            title_b = "seed_raw=%d seed_extensible=%d door_visual_only=%d door_topology=%d door_final_cut=%d stable_s2=%d raw_seed_not_blocking_step2=%d seed_not_in_partition_free=%d" % (
-                door_seed_count,
-                door_extensible_seed_count,
-                door_visual_only_count,
-                door_topology_count,
+            title_b = "wall=%d proj=%d red=%d step2_src=%d hit=%d door_final_cut=%d stable_s2=%d raw_seed_not_blocking_step2=%d seed_not_in_partition_free=%d" % (
+                wall_line_support_count,
+                projected_wall_count,
+                display_wall_count,
+                step2_source_count,
+                step2_hit_count,
                 door_cut_count,
                 stable_step2_count,
                 raw_seed_not_blocking,

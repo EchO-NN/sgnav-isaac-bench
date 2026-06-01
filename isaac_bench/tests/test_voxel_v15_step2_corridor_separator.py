@@ -41,6 +41,7 @@ def test_step2_corridor_separator_uses_relaxed_corridor_thresholds() -> None:
             corridor_min_split_area_m2=0.05,
             corridor_min_new_component_width_m=0.10,
             corridor_reject_tiny_side_width_cells_leq=3,
+            reject_small_known_side_for_line_extensions=False,
         ),
     )
 
@@ -71,6 +72,7 @@ def test_step2_corridor_separator_still_rejects_true_tiny_sliver() -> None:
             corridor_reject_tiny_side_width_cells_leq=3,
             corridor_tiny_side_min_area_m2=0.08,
             corridor_tiny_side_min_length_m=0.25,
+            reject_small_known_side_for_line_extensions=False,
         ),
     )
 

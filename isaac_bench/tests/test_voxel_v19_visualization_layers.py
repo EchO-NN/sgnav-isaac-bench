@@ -17,6 +17,7 @@ def _base_debug(shape: tuple[int, int]) -> dict[str, object]:
         "voxel_door_centerline_visual_mask": np.zeros(shape, dtype=bool),
         "voxel_door_provisional_accepted_visual_mask": np.zeros(shape, dtype=bool),
         "voxel_accepted_door_centerline_mask": np.zeros(shape, dtype=bool),
+        "voxel_door_partition_effective_verified_mask": np.zeros(shape, dtype=bool),
         "voxel_door_visual_only_mask": np.zeros(shape, dtype=bool),
         "voxel_door_cut_mask": np.zeros(shape, dtype=bool),
         "voxel_step2_extension_separator_map": np.zeros(shape, dtype=bool),
@@ -61,7 +62,7 @@ def test_v19_display_wall_key_is_required_without_fallback() -> None:
     assert layers["voxel_display_wall"]["primitive_count"] == 0
 
 
-def test_v19_default_green_uses_only_accepted_door_centerline() -> None:
+def test_v30_default_green_uses_only_verified_door_cut() -> None:
     shape = (5, 5)
     debug = _base_debug(shape)
     debug["voxel_door_centerline_visual_mask"][2, 2] = True
@@ -74,8 +75,11 @@ def test_v19_default_green_uses_only_accepted_door_centerline() -> None:
 
     debug["voxel_accepted_door_centerline_mask"][2, 2] = True
     arr, layers = _render(debug, shape)
-    assert _cell_pixel(arr, 2, 2, shape) == (0, 255, 70)
-    assert layers["voxel_door_centerline"]["primitive_count"] == 1
+    assert _cell_pixel(arr, 2, 2, shape) != (0, 255, 70)
+
+    debug["voxel_door_partition_effective_verified_mask"][2, 2] = True
+    arr, layers = _render(debug, shape)
+    assert _cell_pixel(arr, 2, 2, shape) == (90, 255, 70)
 
 
 def test_v19_wall_line_support_is_diagnostic_only() -> None:

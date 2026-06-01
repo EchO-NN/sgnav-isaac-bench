@@ -55,6 +55,7 @@ class VoxelDoorDetectorConfig:
     upper_occupied_ratio_min_observed: float = 0.80
     min_upper_observed_cells: int = 3
     min_upper_occupied_cells: int = 3
+    door_seed_sensor_range_count_threshold: int = 0
     require_occupied_centroid_above_free_centroid: bool = True
     min_top_occupied_cells: int = 3
     allow_unknown_tail_after_top_occupied: bool = True
@@ -129,6 +130,10 @@ class VoxelDoorDetectorConfig:
     partition_topology_allow_neck_cut_without_global_gain: bool = True
     partition_topology_min_side_area_cells: int = 3
     partition_topology_min_side_width_cells: int = 1
+    partition_reject_small_known_side_enabled: bool = True
+    partition_small_known_side_area_m2: float = 2.00
+    partition_small_known_side_unknown_ratio_max: float = 0.20
+    partition_small_known_side_boundary_dilation_cells: int = 1
     enable_one_seed_one_wall_completion: bool = True
     enable_seed_pair_bridge_completion: bool = True
     seed_pair_max_center_distance_m: float = 1.40
@@ -152,8 +157,24 @@ class VoxelDoorDetectorConfig:
     door_memory_match_iou_min: float = 0.05
     door_memory_match_distance_cells: int = 6
     door_memory_match_angle_deg: float = 20.0
+    door_memory_observation_dilation_cells: int = 2
+    door_memory_min_observed_cells_for_decay: int = 2
+    door_memory_contradiction_band_cells: int = 2
+    door_memory_min_observed_cells_for_contradiction: int = 4
+    door_memory_contradict_wall_ratio: float = 0.75
+    door_memory_contradictions_to_prune: int = 5
+    door_memory_match_dilation_cells: int = 2
+    door_memory_dilated_iou_min: float = 0.10
+    door_memory_seed_overlap_min: float = 0.20
+    door_memory_anchor_match_distance_cells: int = 4
+    door_memory_weak_refresh_updates_visual: bool = False
+    door_memory_replace_quality_margin: float = 0.20
+    door_memory_allow_verified_geometry_replace: bool = True
+    door_memory_prevent_shrinking_stable_cut: bool = True
+    door_memory_min_length_ratio_to_replace: float = 0.80
     door_memory_decay_per_update: float = 0.02
     door_memory_confirm_increment: float = 0.35
+    door_memory_weak_refresh_increment: float = 0.12
     door_memory_min_confidence_to_keep: float = 0.15
     door_memory_ttl_updates: int = 30
     show_candidate_lines_in_debug: bool = True
@@ -596,6 +617,16 @@ class DoorAnchorWalkResult:
 
 
 @dataclass
+class DoorMemoryObservationMaps:
+    observed_xy: np.ndarray
+    sensor_range_xy: np.ndarray
+    vertical_free_xy: np.ndarray
+    wall_xy: np.ndarray
+    raw_seed_mask: np.ndarray
+    current_verified_cut_mask: np.ndarray
+
+
+@dataclass
 class StableDoorTrack:
     track_id: int
     first_seen_step: int
@@ -605,8 +636,19 @@ class StableDoorTrack:
     major_dir_rc: tuple[float, float]
     cut_cells: list[tuple[int, int]]
     visual_cells: list[tuple[int, int]]
+    stable_seed_cells: list[tuple[int, int]] = field(default_factory=list)
+    anchor_a_rc: tuple[int, int] | None = None
+    anchor_b_rc: tuple[int, int] | None = None
+    best_score: float = 0.0
+    last_verified_step: int = -1
+    last_weak_refresh_step: int = -1
+    last_observed_step: int = -1
+    not_observed_updates: int = 0
+    geometry_locked: bool = True
     source_candidate_ids: list[int] = field(default_factory=list)
     update_count: int = 1
+    missed_updates: int = 0
+    contradiction_count: int = 0
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -618,8 +660,19 @@ class StableDoorTrack:
             "major_dir_rc": [float(self.major_dir_rc[0]), float(self.major_dir_rc[1])],
             "cut_cells": [[int(r), int(c)] for r, c in self.cut_cells],
             "visual_cells": [[int(r), int(c)] for r, c in self.visual_cells],
+            "stable_seed_cells": [[int(r), int(c)] for r, c in self.stable_seed_cells],
+            "anchor_a_rc": None if self.anchor_a_rc is None else [int(self.anchor_a_rc[0]), int(self.anchor_a_rc[1])],
+            "anchor_b_rc": None if self.anchor_b_rc is None else [int(self.anchor_b_rc[0]), int(self.anchor_b_rc[1])],
+            "best_score": float(self.best_score),
+            "last_verified_step": int(self.last_verified_step),
+            "last_weak_refresh_step": int(self.last_weak_refresh_step),
+            "last_observed_step": int(self.last_observed_step),
+            "not_observed_updates": int(self.not_observed_updates),
+            "geometry_locked": bool(self.geometry_locked),
             "source_candidate_ids": [int(v) for v in self.source_candidate_ids],
             "update_count": int(self.update_count),
+            "missed_updates": int(self.missed_updates),
+            "contradiction_count": int(self.contradiction_count),
         }
 
 
@@ -648,6 +701,7 @@ class VoxelDoorMemory:
         *,
         step: int,
         shape: tuple[int, int],
+        observation: DoorMemoryObservationMaps | None = None,
     ) -> StableDoorMemoryResult:
         cfg = self.config
         stable_empty = np.zeros(shape, dtype=bool)
@@ -660,16 +714,61 @@ class VoxelDoorMemory:
                 debug={"voxel_door_memory_enabled": False, "voxel_door_memory_track_count": 0},
             )
 
+        observation = self._validated_observation(observation, shape)
+        observed_decay_band = np.zeros(shape, dtype=bool)
+        unobserved_track_mask = np.zeros(shape, dtype=bool)
+        contradiction_mask = np.zeros(shape, dtype=bool)
+        tracks_unobserved = 0
+        tracks_decayed = 0
+        contradiction_updates = 0
         for track in self._tracks:
-            if int(track.last_seen_step) != int(step):
-                track.confidence = max(0.0, float(track.confidence) - float(getattr(cfg, "door_memory_decay_per_update", 0.10)))
+            track_mask = _cells_to_mask(track.cut_cells, shape) | _cells_to_mask(getattr(track, "stable_seed_cells", []), shape)
+            if not np.any(track_mask):
+                track_mask = _cells_to_mask(track.visual_cells, shape)
+            if observation is not None:
+                band = dilate(track_mask, max(0, int(getattr(cfg, "door_memory_observation_dilation_cells", 2))))
+                observed = band & observation.sensor_range_xy
+                if int(np.count_nonzero(observed)) < int(getattr(cfg, "door_memory_min_observed_cells_for_decay", 2)):
+                    track.not_observed_updates = int(getattr(track, "not_observed_updates", 0)) + 1
+                    tracks_unobserved += 1
+                    unobserved_track_mask |= track_mask
+                    continue
+                observed_decay_band |= observed
+                track.last_observed_step = int(step)
+                if self._track_contradicted(track, observation, shape):
+                    track.contradiction_count = int(getattr(track, "contradiction_count", 0)) + 1
+                    contradiction_updates += 1
+                    contradiction_mask |= dilate(track_mask, max(0, int(getattr(cfg, "door_memory_contradiction_band_cells", 2)))) & observation.sensor_range_xy
+                elif int(getattr(track, "contradiction_count", 0)) > 0:
+                    track.contradiction_count = max(0, int(track.contradiction_count) - 1)
+                track.not_observed_updates = 0
+            track.missed_updates = int(getattr(track, "missed_updates", 0)) + 1
+            track.confidence = max(0.0, float(track.confidence) - float(getattr(cfg, "door_memory_decay_per_update", 0.10)))
+            tracks_decayed += 1
 
-        current = [
+        for track in self._tracks:
+            if not hasattr(track, "stable_seed_cells") or track.stable_seed_cells is None:
+                track.stable_seed_cells = []
+            if int(getattr(track, "last_observed_step", -1)) < 0:
+                track.last_observed_step = int(track.last_seen_step)
+            if int(getattr(track, "last_verified_step", -1)) < 0:
+                track.last_verified_step = int(track.last_seen_step)
+            if float(getattr(track, "best_score", 0.0)) <= 0.0:
+                track.best_score = float(len(track.cut_cells))
+
+        verified_current = [
             candidate
             for candidate in candidates
             if bool(candidate.accepted)
-            and bool(candidate.debug.get("partition_accepted", False))
+            and bool(candidate.debug.get("partition_effective_verified", candidate.debug.get("partition_accepted", False)))
             and bool(candidate.door_cut_cells)
+        ]
+        refresh_evidence = [
+            candidate
+            for candidate in candidates
+            if bool(candidate.accepted)
+            or bool(candidate.debug.get("partition_geometry_accepted", False))
+            or bool(candidate.debug.get("stable_memory_refresh_eligible", False))
         ]
         rejected_visual_only = int(
             sum(1 for candidate in candidates if bool(candidate.accepted) and not bool(candidate.debug.get("partition_accepted", False)))
@@ -681,12 +780,18 @@ class VoxelDoorMemory:
         matched_current_mask = np.zeros(shape, dtype=bool)
         created = 0
         updated = 0
-        for candidate in current:
+        verified_replaced_geometry = 0
+        verified_kept_geometry = 0
+        weak_refreshed = 0
+        weak_refreshed_no_geometry_update = 0
+        for candidate in verified_current:
             cut_cells = [tuple(v) for v in candidate.door_cut_cells]
             visual_cells = [tuple(v) for v in (candidate.extended_centerline_cells or candidate.door_cut_cells)]
+            stable_seed_cells = self._candidate_seed_cells(candidate)
             cut_mask = _cells_to_mask(cut_cells, shape)
             matched_current_mask |= cut_mask
             best_track = self._best_matching_track(candidate, cut_mask, shape, matched_ids)
+            candidate_quality = self._candidate_quality(candidate, cut_mask, shape, best_track)
             if best_track is None:
                 self._tracks.append(
                     StableDoorTrack(
@@ -698,8 +803,19 @@ class VoxelDoorMemory:
                         major_dir_rc=(float(candidate.major_dir_rc[0]), float(candidate.major_dir_rc[1])),
                         cut_cells=cut_cells,
                         visual_cells=visual_cells,
+                        stable_seed_cells=stable_seed_cells,
+                        anchor_a_rc=None if candidate.wall_anchor_a is None else (int(candidate.wall_anchor_a[0]), int(candidate.wall_anchor_a[1])),
+                        anchor_b_rc=None if candidate.wall_anchor_b is None else (int(candidate.wall_anchor_b[0]), int(candidate.wall_anchor_b[1])),
+                        best_score=float(candidate_quality),
+                        last_verified_step=int(step),
+                        last_weak_refresh_step=-1,
+                        last_observed_step=int(step),
+                        not_observed_updates=0,
+                        geometry_locked=True,
                         source_candidate_ids=[int(candidate.candidate_id)],
                         update_count=1,
+                        missed_updates=0,
+                        contradiction_count=0,
                     )
                 )
                 matched_ids.add(int(self._next_track_id))
@@ -711,23 +827,76 @@ class VoxelDoorMemory:
                 1.0,
                 float(best_track.confidence) + float(getattr(cfg, "door_memory_confirm_increment", 0.35)),
             )
-            best_track.center_rc = (float(candidate.center_rc[0]), float(candidate.center_rc[1]))
-            best_track.major_dir_rc = (float(candidate.major_dir_rc[0]), float(candidate.major_dir_rc[1]))
-            best_track.cut_cells = cut_cells
-            best_track.visual_cells = visual_cells
+            replace_geometry = self._should_replace_verified_geometry(best_track, candidate, cut_mask, shape, float(candidate_quality))
+            if replace_geometry:
+                best_track.center_rc = (float(candidate.center_rc[0]), float(candidate.center_rc[1]))
+                best_track.major_dir_rc = (float(candidate.major_dir_rc[0]), float(candidate.major_dir_rc[1]))
+                best_track.cut_cells = cut_cells
+                best_track.visual_cells = visual_cells
+                best_track.stable_seed_cells = stable_seed_cells
+                best_track.anchor_a_rc = None if candidate.wall_anchor_a is None else (int(candidate.wall_anchor_a[0]), int(candidate.wall_anchor_a[1]))
+                best_track.anchor_b_rc = None if candidate.wall_anchor_b is None else (int(candidate.wall_anchor_b[0]), int(candidate.wall_anchor_b[1]))
+                best_track.best_score = max(float(getattr(best_track, "best_score", 0.0)), float(candidate_quality))
+                verified_replaced_geometry += 1
+            else:
+                best_track.best_score = max(float(getattr(best_track, "best_score", 0.0)), float(candidate_quality))
+                verified_kept_geometry += 1
             best_track.source_candidate_ids.append(int(candidate.candidate_id))
             best_track.source_candidate_ids = best_track.source_candidate_ids[-16:]
             best_track.update_count += 1
+            best_track.missed_updates = 0
+            best_track.contradiction_count = 0
+            best_track.not_observed_updates = 0
+            best_track.last_verified_step = int(step)
+            best_track.last_observed_step = int(step)
             matched_ids.add(int(best_track.track_id))
             updated += 1
 
+        for candidate in refresh_evidence:
+            if bool(candidate.debug.get("partition_effective_verified", candidate.debug.get("partition_accepted", False))):
+                continue
+            evidence_cells = [tuple(v) for v in (candidate.door_cut_cells or candidate.extended_centerline_cells or candidate.seed_projected_centerline_cells)]
+            evidence_mask = _cells_to_mask(evidence_cells, shape)
+            if not np.any(evidence_mask):
+                continue
+            best_track = self._best_matching_track(candidate, evidence_mask, shape, matched_ids)
+            if best_track is None:
+                continue
+            best_track.last_seen_step = int(step)
+            best_track.confidence = min(
+                1.0,
+                float(best_track.confidence) + float(getattr(cfg, "door_memory_weak_refresh_increment", 0.12)),
+            )
+            best_track.source_candidate_ids.append(int(candidate.candidate_id))
+            best_track.source_candidate_ids = best_track.source_candidate_ids[-16:]
+            best_track.update_count += 1
+            best_track.missed_updates = 0
+            best_track.not_observed_updates = 0
+            best_track.last_weak_refresh_step = int(step)
+            best_track.last_seen_step = int(step)
+            if bool(getattr(cfg, "door_memory_weak_refresh_updates_visual", False)) and self._weak_visual_can_replace(best_track, candidate, evidence_mask, shape):
+                best_track.visual_cells = evidence_cells
+            else:
+                weak_refreshed_no_geometry_update += 1
+            matched_ids.add(int(best_track.track_id))
+            weak_refreshed += 1
+
         ttl = int(getattr(cfg, "door_memory_ttl_updates", 8))
         min_conf = float(getattr(cfg, "door_memory_min_confidence_to_keep", 0.25))
+        contradictions_to_prune = int(getattr(cfg, "door_memory_contradictions_to_prune", 5))
+        confidence_prune_enabled = observation is None
         before_prune = len(self._tracks)
         self._tracks = [
             track
             for track in self._tracks
-            if float(track.confidence) >= min_conf and int(step) - int(track.last_seen_step) <= ttl
+            if not (
+                (
+                    confidence_prune_enabled
+                    and float(track.confidence) < min_conf
+                    and int(getattr(track, "missed_updates", 0)) > ttl
+                )
+                or int(getattr(track, "contradiction_count", 0)) >= contradictions_to_prune
+            )
         ]
         stable_cut = np.zeros(shape, dtype=bool)
         stable_visual = np.zeros(shape, dtype=bool)
@@ -737,12 +906,29 @@ class VoxelDoorMemory:
         debug = {
             "voxel_door_memory_enabled": True,
             "voxel_door_memory_track_count": int(len(self._tracks)),
-            "voxel_door_memory_current_candidate_count": int(len(current)),
+            "voxel_door_memory_current_candidate_count": int(len(verified_current)),
+            "voxel_door_memory_verified_candidate_count": int(len(verified_current)),
+            "voxel_door_memory_refresh_evidence_count": int(len(refresh_evidence)),
             "voxel_door_memory_rejected_visual_only_count": int(rejected_visual_only),
             "voxel_door_memory_rejected_partition_false_count": int(rejected_partition_false),
             "voxel_door_memory_created_count": int(created),
+            "voxel_door_memory_verified_create_count": int(created),
             "voxel_door_memory_updated_count": int(updated),
-            "voxel_door_memory_pruned_count": int(before_prune + created - len(self._tracks)),
+            "voxel_door_memory_verified_update_count": int(updated),
+            "voxel_door_memory_weak_refresh_count": int(weak_refreshed),
+            "voxel_door_memory_observation_aware_decay": bool(observation is not None),
+            "voxel_door_memory_tracks_unobserved_count": int(tracks_unobserved),
+            "voxel_door_memory_tracks_decayed_count": int(tracks_decayed),
+            "voxel_door_memory_tracks_weak_refreshed_no_geometry_update": int(weak_refreshed_no_geometry_update),
+            "voxel_door_memory_verified_update_kept_old_geometry": int(verified_kept_geometry),
+            "voxel_door_memory_verified_update_replaced_geometry": int(verified_replaced_geometry),
+            "voxel_door_memory_contradiction_count_total": int(sum(int(getattr(track, "contradiction_count", 0)) for track in self._tracks)),
+            "voxel_door_memory_contradiction_updates": int(contradiction_updates),
+            "voxel_door_memory_confidence_prune_enabled": bool(confidence_prune_enabled),
+            "voxel_door_memory_observed_decay_band_mask": observed_decay_band.astype(bool),
+            "voxel_door_memory_unobserved_track_mask": unobserved_track_mask.astype(bool),
+            "voxel_door_memory_contradiction_mask": contradiction_mask.astype(bool),
+            "voxel_door_memory_pruned_count": int(before_prune - len(self._tracks)),
             "voxel_door_memory_stable_cut_cells": int(np.count_nonzero(stable_cut)),
             "voxel_door_memory_stable_visual_cells": int(np.count_nonzero(stable_visual)),
             "voxel_door_memory_tracks": [track.to_dict() for track in self._tracks],
@@ -764,34 +950,218 @@ class VoxelDoorMemory:
     ) -> StableDoorTrack | None:
         cfg = self.config
         best: tuple[float, StableDoorTrack] | None = None
+        cand_mask = np.asarray(cut_mask, dtype=bool)
+        cand_d = dilate(cand_mask, max(0, int(getattr(cfg, "door_memory_match_dilation_cells", 2))))
+        cand_count = int(np.count_nonzero(cand_d))
         candidate_center = np.asarray(candidate.center_rc, dtype=np.float32)
-        candidate_major = np.asarray(candidate.major_dir_rc, dtype=np.float32)
-        candidate_major /= max(float(np.linalg.norm(candidate_major)), 1e-6)
+        candidate_major = self._normalized_vector(candidate.major_dir_rc)
+        candidate_anchors = [
+            None if candidate.wall_anchor_a is None else (int(candidate.wall_anchor_a[0]), int(candidate.wall_anchor_a[1])),
+            None if candidate.wall_anchor_b is None else (int(candidate.wall_anchor_b[0]), int(candidate.wall_anchor_b[1])),
+        ]
         for track in self._tracks:
             if int(track.track_id) in matched_ids:
                 continue
             track_mask = _cells_to_mask(track.cut_cells, shape)
-            union = int(np.count_nonzero(track_mask | cut_mask))
-            inter = int(np.count_nonzero(track_mask & cut_mask))
-            iou = 0.0 if union <= 0 else float(inter) / float(union)
+            track_d = dilate(track_mask, max(0, int(getattr(cfg, "door_memory_match_dilation_cells", 2))))
+            union = int(np.count_nonzero(track_d | cand_d))
+            inter = int(np.count_nonzero(track_d & cand_d))
+            dilated_iou = 0.0 if union <= 0 else float(inter) / float(union)
             track_center = np.asarray(track.center_rc, dtype=np.float32)
             dist = float(np.linalg.norm(candidate_center - track_center))
-            track_major = np.asarray(track.major_dir_rc, dtype=np.float32)
-            track_major /= max(float(np.linalg.norm(track_major)), 1e-6)
+            track_major = self._normalized_vector(track.major_dir_rc)
             angle = float(np.degrees(np.arccos(min(1.0, max(-1.0, abs(float(np.dot(candidate_major, track_major))))))))
-            if iou < float(getattr(cfg, "door_memory_match_iou_min", 0.20)):
-                if dist > float(getattr(cfg, "door_memory_match_distance_cells", 3)) or angle > float(getattr(cfg, "door_memory_match_angle_deg", 20.0)):
-                    continue
-            score = float(iou + 0.05 * max(0.0, float(getattr(cfg, "door_memory_match_distance_cells", 3)) - dist))
+            stable_seed_mask = _cells_to_mask(getattr(track, "stable_seed_cells", []), shape)
+            seed_overlap = 0.0
+            if cand_count > 0:
+                seed_overlap = float(np.count_nonzero(cand_d & stable_seed_mask)) / float(cand_count)
+            anchor_close = self._anchors_close(
+                candidate_anchors,
+                [getattr(track, "anchor_a_rc", None), getattr(track, "anchor_b_rc", None)],
+                max_distance_cells=float(getattr(cfg, "door_memory_anchor_match_distance_cells", 4)),
+            )
+            center_angle_match = dist <= float(getattr(cfg, "door_memory_match_distance_cells", 3)) and angle <= float(getattr(cfg, "door_memory_match_angle_deg", 20.0))
+            if not (
+                dilated_iou >= float(getattr(cfg, "door_memory_dilated_iou_min", getattr(cfg, "door_memory_match_iou_min", 0.20)))
+                or center_angle_match
+                or seed_overlap >= float(getattr(cfg, "door_memory_seed_overlap_min", 0.20))
+                or anchor_close
+            ):
+                continue
+            score = float(
+                3.0 * dilated_iou
+                + 1.5 * seed_overlap
+                + (0.5 if center_angle_match else 0.0)
+                + (0.5 if anchor_close else 0.0)
+                + 0.05 * max(0.0, float(getattr(cfg, "door_memory_match_distance_cells", 3)) - dist)
+            )
             if best is None or score > best[0]:
                 best = (score, track)
         return None if best is None else best[1]
+
+    def _validated_observation(
+        self,
+        observation: DoorMemoryObservationMaps | None,
+        shape: tuple[int, int],
+    ) -> DoorMemoryObservationMaps | None:
+        if observation is None:
+            return None
+
+        def as_bool(name: str) -> np.ndarray:
+            arr = np.asarray(getattr(observation, name), dtype=bool)
+            if arr.shape != tuple(shape):
+                raise ValueError("door memory observation %s must match roomseg shape" % name)
+            return arr
+
+        return DoorMemoryObservationMaps(
+            observed_xy=as_bool("observed_xy"),
+            sensor_range_xy=as_bool("sensor_range_xy"),
+            vertical_free_xy=as_bool("vertical_free_xy"),
+            wall_xy=as_bool("wall_xy"),
+            raw_seed_mask=as_bool("raw_seed_mask"),
+            current_verified_cut_mask=as_bool("current_verified_cut_mask"),
+        )
+
+    def _candidate_seed_cells(self, candidate: VoxelDoorLineCandidate) -> list[tuple[int, int]]:
+        cells = candidate.seed_cells or candidate.seed_projected_centerline_cells
+        return sorted({(int(r), int(c)) for r, c in cells})
+
+    def _candidate_quality(
+        self,
+        candidate: VoxelDoorLineCandidate,
+        cut_mask: np.ndarray,
+        shape: tuple[int, int],
+        track: StableDoorTrack | None,
+    ) -> float:
+        debug = candidate.debug
+        score = 0.0
+        score += 2.0 if bool(debug.get("partition_effective_verified", debug.get("partition_accepted", False))) else 0.0
+        score += 1.0 if candidate.wall_anchor_a is not None and candidate.wall_anchor_b is not None else 0.0
+        cut_len = int(np.count_nonzero(cut_mask))
+        score += 0.3 * min(1.0, float(cut_len) / 12.0)
+        if track is not None:
+            seed_mask = _cells_to_mask(getattr(track, "stable_seed_cells", []), shape)
+            cand_d = dilate(np.asarray(cut_mask, dtype=bool), max(0, int(getattr(self.config, "door_memory_match_dilation_cells", 2))))
+            denom = max(1, int(np.count_nonzero(cand_d)))
+            score += 0.5 * float(np.count_nonzero(cand_d & seed_mask)) / float(denom)
+        unknown_ratio = float(debug.get("partition_inner_unknown_ratio", debug.get("inner_unknown_ratio", 0.0)) or 0.0)
+        wall_ratio = float(debug.get("partition_inner_wall_ratio", debug.get("inner_wall_ratio", 0.0)) or 0.0)
+        score -= 0.5 * max(0.0, min(1.0, unknown_ratio))
+        score -= 0.5 * max(0.0, min(1.0, wall_ratio))
+        return float(score)
+
+    def _should_replace_verified_geometry(
+        self,
+        track: StableDoorTrack,
+        candidate: VoxelDoorLineCandidate,
+        cut_mask: np.ndarray,
+        shape: tuple[int, int],
+        candidate_quality: float,
+    ) -> bool:
+        cfg = self.config
+        if not bool(getattr(cfg, "door_memory_allow_verified_geometry_replace", True)):
+            return False
+        old_mask = _cells_to_mask(track.cut_cells, shape)
+        old_len = max(1, int(np.count_nonzero(old_mask)))
+        new_len = int(np.count_nonzero(cut_mask))
+        if bool(getattr(cfg, "door_memory_prevent_shrinking_stable_cut", True)):
+            min_ratio = float(getattr(cfg, "door_memory_min_length_ratio_to_replace", 0.80))
+            if float(new_len) < float(old_len) * min_ratio:
+                return False
+        old_quality = float(getattr(track, "best_score", 0.0))
+        if float(candidate_quality) >= old_quality + float(getattr(cfg, "door_memory_replace_quality_margin", 0.20)):
+            return True
+        dilated_iou = self._dilated_iou(old_mask, np.asarray(cut_mask, dtype=bool), int(getattr(cfg, "door_memory_match_dilation_cells", 2)))
+        if (
+            dilated_iou >= float(getattr(cfg, "door_memory_dilated_iou_min", 0.10))
+            and new_len >= old_len
+            and float(candidate_quality) >= old_quality - 1e-6
+        ):
+            return True
+        return False
+
+    def _weak_visual_can_replace(
+        self,
+        track: StableDoorTrack,
+        candidate: VoxelDoorLineCandidate,
+        evidence_mask: np.ndarray,
+        shape: tuple[int, int],
+    ) -> bool:
+        stable_cut = _cells_to_mask(track.cut_cells, shape)
+        stable_visual_len = max(1, len(track.visual_cells))
+        new_len = int(np.count_nonzero(evidence_mask))
+        if float(new_len) < 0.80 * float(stable_visual_len):
+            return False
+        overlap = self._dilated_iou(stable_cut, np.asarray(evidence_mask, dtype=bool), int(getattr(self.config, "door_memory_match_dilation_cells", 2)))
+        if overlap < float(getattr(self.config, "door_memory_dilated_iou_min", 0.10)):
+            return False
+        cand_major = self._normalized_vector(candidate.major_dir_rc)
+        track_major = self._normalized_vector(track.major_dir_rc)
+        angle = float(np.degrees(np.arccos(min(1.0, max(-1.0, abs(float(np.dot(cand_major, track_major))))))))
+        return angle <= 10.0
+
+    def _track_contradicted(
+        self,
+        track: StableDoorTrack,
+        observation: DoorMemoryObservationMaps,
+        shape: tuple[int, int],
+    ) -> bool:
+        cfg = self.config
+        cut_mask = _cells_to_mask(track.cut_cells, shape)
+        seed_mask = _cells_to_mask(getattr(track, "stable_seed_cells", []), shape)
+        band = dilate(cut_mask | seed_mask, max(0, int(getattr(cfg, "door_memory_contradiction_band_cells", 2))))
+        observed = band & observation.sensor_range_xy
+        observed_count = int(np.count_nonzero(observed))
+        if observed_count < int(getattr(cfg, "door_memory_min_observed_cells_for_contradiction", 4)):
+            return False
+        wall_ratio = float(np.count_nonzero(observed & observation.wall_xy)) / float(max(1, observed_count))
+        seed_absent = int(np.count_nonzero(observed & observation.raw_seed_mask)) == 0
+        verified_absent = int(np.count_nonzero(observed & observation.current_verified_cut_mask)) == 0
+        return (
+            wall_ratio >= float(getattr(cfg, "door_memory_contradict_wall_ratio", 0.75))
+            and seed_absent
+            and verified_absent
+        )
+
+    def _dilated_iou(self, a: np.ndarray, b: np.ndarray, dilation_cells: int) -> float:
+        aa = dilate(np.asarray(a, dtype=bool), max(0, int(dilation_cells)))
+        bb = dilate(np.asarray(b, dtype=bool), max(0, int(dilation_cells)))
+        union = int(np.count_nonzero(aa | bb))
+        if union <= 0:
+            return 0.0
+        return float(np.count_nonzero(aa & bb)) / float(union)
+
+    def _normalized_vector(self, vec: Sequence[float]) -> np.ndarray:
+        out = np.asarray(vec, dtype=np.float32).reshape(2)
+        norm = float(np.linalg.norm(out))
+        if norm <= 1e-6:
+            return np.asarray([1.0, 0.0], dtype=np.float32)
+        return out / norm
+
+    def _anchors_close(
+        self,
+        candidate_anchors: Sequence[tuple[int, int] | None],
+        track_anchors: Sequence[tuple[int, int] | None],
+        *,
+        max_distance_cells: float,
+    ) -> bool:
+        for ca in candidate_anchors:
+            if ca is None:
+                continue
+            cvec = np.asarray(ca, dtype=np.float32)
+            for ta in track_anchors:
+                if ta is None:
+                    continue
+                if float(np.linalg.norm(cvec - np.asarray(ta, dtype=np.float32))) <= float(max_distance_cells):
+                    return True
+        return False
 
 
 def classify_voxel_door_seeds(
     *,
     voxel_grid: VoxelOccupancyGrid3D,
     config: VoxelDoorDetectorConfig | Mapping[str, object] | None = None,
+    sensor_range_count: np.ndarray | None = None,
 ) -> VoxelDoorSeedResult:
     cfg = config if isinstance(config, VoxelDoorDetectorConfig) else VoxelDoorDetectorConfig.from_mapping(config)
     shape = tuple(voxel_grid.shape)
@@ -813,6 +1183,13 @@ def classify_voxel_door_seeds(
     active_idx = voxel_grid.active_z_indices(z_min_m=float(cfg.z_scan_min_m), z_max_m=float(voxel_grid.active_z_max_m or voxel_grid.config.active_z_max_fallback_m))
     z_centers = voxel_grid.z_centers_m
     z_state = np.asarray(voxel_grid.state, dtype=np.uint8)
+    z_sensor_range_count = sensor_range_count
+    if z_sensor_range_count is None:
+        z_sensor_range_count = getattr(voxel_grid, "sensor_range_count", None)
+    if z_sensor_range_count is not None:
+        z_sensor_range_count = np.asarray(z_sensor_range_count)
+        if z_sensor_range_count.shape != z_state.shape:
+            z_sensor_range_count = None
     seed_started_at = time.perf_counter()
     if bool(cfg.vectorized_seed_classification):
         (
@@ -825,7 +1202,15 @@ def classify_voxel_door_seeds(
             rejected_seed_reasons,
             accepted_seed_evidence,
             seed_debug_maps,
-        ) = classify_voxel_door_seeds_vectorized(z_state, z_centers, active_idx, cfg, shape=shape, return_debug=True)
+        ) = classify_voxel_door_seeds_vectorized(
+            z_state,
+            z_centers,
+            active_idx,
+            cfg,
+            shape=shape,
+            return_debug=True,
+            sensor_range_count=z_sensor_range_count,
+        )
     else:
         seed = np.zeros(shape, dtype=bool)
         reason_map = np.zeros(shape, dtype=np.uint8)
@@ -838,7 +1223,8 @@ def classify_voxel_door_seeds(
         rejected_seed_reasons = Counter()
         for r in range(shape[0]):
             for c in range(shape[1]):
-                ev = classify_voxel_door_seed_column(z_state[:, r, c], z_centers, active_idx, cfg, row=r, col=c)
+                sensor_col = None if z_sensor_range_count is None else z_sensor_range_count[:, r, c]
+                ev = classify_voxel_door_seed_column(z_state[:, r, c], z_centers, active_idx, cfg, row=r, col=c, sensor_range_count_col=sensor_col)
                 lower_free_xy[r, c] = int(ev.lower_free_cells)
                 top_occ_xy[r, c] = int(ev.top_occupied_cells)
                 unknown_tail_xy[r, c] = int(ev.unknown_tail_cells)
@@ -860,6 +1246,7 @@ def classify_voxel_door_seeds(
         "voxel_door_turn_z_estimate_mode": "free_centroid_plus_scaled_free_extent",
         "voxel_door_centroid_turn_extent_scale": float(cfg.centroid_turn_extent_scale),
         "voxel_door_vectorized_seed_classification": bool(cfg.vectorized_seed_classification),
+        "voxel_door_sensor_aware_seed_classification": bool(z_sensor_range_count is not None),
         "voxel_door_seed_ms": float(seed_ms),
         "voxel_door_seed_mask": seed.astype(bool),
         "voxel_door_seed_component_map": labels.astype(np.int32),
@@ -1046,6 +1433,15 @@ def complete_voxel_doors_from_seeds(
             cid += 1
         if trial_candidates:
             selected = _select_best_cluster_candidate(trial_candidates)
+            selected_reason = (
+                "verified_partition"
+                if bool(selected.debug.get("partition_effective_verified", False))
+                else (
+                    "geometry_candidate"
+                    if bool(selected.debug.get("partition_geometry_accepted", False))
+                    else ("visual_candidate" if bool(selected.accepted) else "best_rejected_candidate")
+                )
+            )
             selected_candidates.append(selected)
             trial_groups.append(
                 DoorTrialCandidateGroup(
@@ -1053,12 +1449,14 @@ def complete_voxel_doors_from_seeds(
                     component_ids=[int(v) for v in group.component_ids],
                     trials=list(trial_candidates),
                     selected_candidate_id=int(selected.candidate_id),
-                    selected_reason="best_score_partition_visual",
+                    selected_reason=selected_reason,
                     debug={
                         "trial_count": int(len(trial_candidates)),
                         "selected_score": float(selected.debug.get("score", 0.0)),
                         "selected_partition_accepted": bool(selected.debug.get("partition_accepted", False)),
+                        "selected_partition_effective_verified": bool(selected.debug.get("partition_effective_verified", False)),
                         "selected_visual_accepted": bool(selected.accepted),
+                        "selected_reason": selected_reason,
                         "seed_group_id": int(group.group_id),
                         "seed_group_kind": str(group.group_kind),
                         "source_cluster_ids": [int(v) for v in group.source_cluster_ids],
@@ -1114,7 +1512,11 @@ def complete_voxel_doors_from_seeds(
     visual_partition_mask = np.zeros(shape, dtype=bool)
     visual_only_mask = np.zeros(shape, dtype=bool)
     geometry_warning_cut_mask = np.zeros(shape, dtype=bool)
+    geometry_only_cut_mask = np.zeros(shape, dtype=bool)
+    attachment_only_cut_mask = np.zeros(shape, dtype=bool)
+    cut_not_closed_to_wall_mask = np.zeros(shape, dtype=bool)
     partition_mask = np.zeros(shape, dtype=bool)
+    effective_verified_mask = np.zeros(shape, dtype=bool)
     topology_accepted_cut_mask = np.zeros(shape, dtype=bool)
     topology_warning_cut_mask = np.zeros(shape, dtype=bool)
     wall_attachment_reject_map = np.zeros(shape, dtype=np.uint8)
@@ -1144,7 +1546,8 @@ def complete_voxel_doors_from_seeds(
             if bool(candidate.debug.get("partition_accepted", bool(candidate.door_cut_cells))):
                 visual_partition_mask |= visual
                 partition_mask |= cut
-                if bool(candidate.debug.get("partition_topology_effective", candidate.debug.get("partition_topology_accepted", False))):
+                if bool(candidate.debug.get("partition_effective_verified", candidate.debug.get("partition_topology_effective", candidate.debug.get("partition_topology_accepted", False)))):
+                    effective_verified_mask |= cut
                     topology_accepted_cut_mask |= cut
                 elif bool(candidate.debug.get("door_topology_warning", False)):
                     topology_warning_cut_mask |= cut
@@ -1154,6 +1557,12 @@ def complete_voxel_doors_from_seeds(
                 if bool(candidate.debug.get("partition_geometry_accepted", False)):
                     geometry_cells = _cells_to_mask(candidate.door_cut_cells or [tuple(v) for v in candidate.debug.get("partition_cut_candidate_cells", [])], shape)  # type: ignore[arg-type]
                     geometry_warning_cut_mask |= geometry_cells
+                    if bool(candidate.debug.get("partition_closure_attached", False)) and not bool(candidate.debug.get("partition_topology_gain", False)):
+                        attachment_only_cut_mask |= geometry_cells
+                    else:
+                        geometry_only_cut_mask |= geometry_cells
+                    if str(candidate.debug.get("reject_reason_partition") or "") in {"door_cut_not_closed_to_wall", "door_cut_not_strict_wall_to_wall_closure"}:
+                        cut_not_closed_to_wall_mask |= geometry_cells
                     topology_warning_cut_mask |= geometry_cells
                     wall_attachment_reject_map[geometry_cells] = _door_reject_code(str(candidate.debug.get("door_wall_attachment_reject_reason") or "door_cut_not_wall_attached"))
                 partition_rejected_mask |= cand_cut
@@ -1169,15 +1578,16 @@ def complete_voxel_doors_from_seeds(
         if candidate.accepted and not bool(candidate.debug.get("partition_accepted", False))
     )
     topology_reason_counts = Counter(
-        str(candidate.debug.get("reject_reason_topology"))
+        str(candidate.debug.get("door_topology_reject_reason") or candidate.debug.get("reject_reason_topology"))
         for candidate in selected_candidates
-        if candidate.accepted and candidate.debug.get("reject_reason_topology") is not None
+        if candidate.accepted and (candidate.debug.get("door_topology_reject_reason") is not None or candidate.debug.get("reject_reason_topology") is not None)
     )
     trial_reason_counts = Counter(str(candidate.debug.get("reject_reason_visual") or candidate.reject_reason) for candidate in all_trial_candidates if not candidate.accepted)
     source_counts = _anchor_source_counts(source_map, wall)
     completion_mode_counts = Counter(str(candidate.debug.get("completion_mode", DOOR_COMPLETION_REJECTED)) for candidate in selected_candidates)
     trial_mode_counts = Counter(str(candidate.debug.get("completion_mode", DOOR_COMPLETION_REJECTED)) for candidate in all_trial_candidates)
     orientation_counts = Counter(str(candidate.debug.get("orientation_source", "unknown")) for candidate in all_trial_candidates)
+    selected_reason_counts = Counter(str(group.selected_reason) for group in trial_groups)
     visual_count = int(sum(1 for candidate in selected_candidates if candidate.accepted))
     partition_count = int(
         sum(
@@ -1213,6 +1623,10 @@ def complete_voxel_doors_from_seeds(
         "voxel_door_partition_cut_accepted_mask": partition_mask.astype(bool),
         "voxel_door_geometry_accepted_cut_mask": (partition_mask | geometry_warning_cut_mask).astype(bool),
         "voxel_door_geometry_warning_cut_mask": geometry_warning_cut_mask.astype(bool),
+        "voxel_door_geometry_only_mask": geometry_only_cut_mask.astype(bool),
+        "voxel_door_attachment_only_mask": attachment_only_cut_mask.astype(bool),
+        "voxel_door_cut_not_closed_to_wall_mask": cut_not_closed_to_wall_mask.astype(bool),
+        "voxel_door_partition_effective_verified_mask": effective_verified_mask.astype(bool),
         "voxel_door_topology_effective_cut_mask": topology_accepted_cut_mask.astype(bool),
         "voxel_door_final_cut_mask": partition_mask.astype(bool),
         "voxel_door_topology_accepted_cut_mask": topology_accepted_cut_mask.astype(bool),
@@ -1229,6 +1643,7 @@ def complete_voxel_doors_from_seeds(
         "voxel_door_completion_mode_counts": dict(completion_mode_counts),
         "voxel_door_candidate_mode_counts": dict(trial_mode_counts),
         "voxel_door_candidate_orientation_counts": dict(orientation_counts),
+        "voxel_door_candidate_selected_reason_counts": dict(selected_reason_counts),
         "voxel_door_rejected_long_line_count": int(
             sum(
                 1
@@ -1256,6 +1671,7 @@ def complete_voxel_doors_from_seeds(
         "voxel_door_partition_accepted_count": int(partition_count),
         "voxel_door_accepted_count": int(partition_count),
         "voxel_door_topology_effective_cells": int(np.count_nonzero(topology_accepted_cut_mask)),
+        "voxel_door_partition_effective_verified_cells": int(np.count_nonzero(effective_verified_mask)),
         "voxel_door_final_cut_cells": int(np.count_nonzero(partition_mask)),
         "voxel_door_geometry_warning_cells": int(np.count_nonzero(geometry_warning_cut_mask)),
         "voxel_door_rejected_count": int(sum(1 for candidate in selected_candidates if not candidate.accepted)),
@@ -1313,7 +1729,11 @@ def detect_voxel_doors(
     if not bool(cfg.enabled):
         return _empty_result(shape, enabled=False)
 
-    seed_result = classify_voxel_door_seeds(voxel_grid=voxel_grid, config=cfg)
+    seed_result = classify_voxel_door_seeds(
+        voxel_grid=voxel_grid,
+        config=cfg,
+        sensor_range_count=getattr(voxel_grid, "sensor_range_count", None),
+    )
     completion = complete_voxel_doors_from_seeds(
         seed_result=seed_result,
         free_map=free,
@@ -1347,6 +1767,7 @@ def classify_voxel_door_seeds_vectorized(
     *,
     shape: tuple[int, int],
     return_debug: bool = False,
+    sensor_range_count: np.ndarray | None = None,
 ):
     method = str(getattr(cfg, "seed_method", "centroid_ratio") or "centroid_ratio").strip().lower()
     if method in {"centroid_ratio", "centroid", "ratio"}:
@@ -1357,6 +1778,7 @@ def classify_voxel_door_seeds_vectorized(
             cfg,
             shape=shape,
             return_debug=return_debug,
+            sensor_range_count=sensor_range_count,
         )
     return classify_voxel_door_seeds_strict_contiguous_vectorized(
         z_state,
@@ -1544,8 +1966,12 @@ def classify_voxel_door_seeds_centroid_ratio_vectorized(
     *,
     shape: tuple[int, int],
     return_debug: bool = False,
+    sensor_range_count: np.ndarray | None = None,
 ):
     states_all = np.asarray(z_state, dtype=np.uint8)
+    sensor_all = None if sensor_range_count is None else np.asarray(sensor_range_count)
+    if sensor_all is not None and sensor_all.shape != states_all.shape:
+        sensor_all = None
     centers = np.asarray(z_centers_m, dtype=np.float32).reshape(-1)
     idxs = np.asarray(active_z_indices, dtype=np.int32).reshape(-1)
     idxs = idxs[(idxs >= 0) & (idxs < states_all.shape[0]) & (centers[idxs] >= float(cfg.z_scan_min_m))]
@@ -1572,11 +1998,22 @@ def classify_voxel_door_seeds_centroid_ratio_vectorized(
     z_resolution = _estimate_z_resolution_m(z)
     is_free = state == int(VOXEL_FREE)
     is_occ = state == int(VOXEL_OCCUPIED)
-    is_obs = is_free | is_occ
+    is_unknown = state == int(VOXEL_UNKNOWN)
+    if sensor_all is None:
+        sensor_state = np.zeros_like(state, dtype=np.int16)
+    else:
+        sensor_state = sensor_all[idxs].reshape(int(idxs.size), height * width)
+    sensor_threshold = int(getattr(cfg, "door_seed_sensor_range_count_threshold", 0))
+    is_in_range = sensor_state > sensor_threshold
+    is_in_range_unknown = is_unknown & is_in_range
+    is_effective_observed = is_free | is_occ | is_in_range_unknown
+    is_upper_solid = is_occ | is_in_range_unknown
 
     free_count = np.sum(is_free, axis=0).astype(np.int32)
     occ_count = np.sum(is_occ, axis=0).astype(np.int32)
-    obs_count = np.sum(is_obs, axis=0).astype(np.int32)
+    obs_count = np.sum(is_effective_observed, axis=0).astype(np.int32)
+    solid_count = np.sum(is_upper_solid, axis=0).astype(np.int32)
+    in_range_unknown_count = np.sum(is_in_range_unknown, axis=0).astype(np.int32)
     free_sum_z = np.sum(is_free.astype(np.float32) * z_column, axis=0)
     occ_sum_z = np.sum(is_occ.astype(np.float32) * z_column, axis=0)
     free_centroid = np.full(column_count, np.nan, dtype=np.float32)
@@ -1601,18 +2038,24 @@ def classify_voxel_door_seeds_centroid_ratio_vectorized(
 
     free_cum = np.cumsum(is_free, axis=0, dtype=np.int32)
     occ_cum = np.cumsum(is_occ, axis=0, dtype=np.int32)
-    obs_cum = np.cumsum(is_obs, axis=0, dtype=np.int32)
+    obs_cum = np.cumsum(is_effective_observed, axis=0, dtype=np.int32)
+    solid_cum = np.cumsum(is_upper_solid, axis=0, dtype=np.int32)
     lower_free = _gather_cum_before(free_cum, turn_pos)
     lower_occ = _gather_cum_before(occ_cum, turn_pos)
     lower_obs = _gather_cum_before(obs_cum, turn_pos)
-    lower_total = np.clip(turn_pos, 0, z_count).astype(np.int32)
+    lower_solid = _gather_cum_before(solid_cum, turn_pos)
+    if sensor_all is None:
+        lower_total = np.clip(turn_pos, 0, z_count).astype(np.int32)
+    else:
+        lower_total = lower_obs.astype(np.int32)
     upper_occ = (occ_count - lower_occ).astype(np.int32)
+    upper_solid = (solid_count - lower_solid).astype(np.int32)
     upper_obs = (obs_count - lower_obs).astype(np.int32)
 
     lower_free_ratio = np.zeros(column_count, dtype=np.float32)
     np.divide(lower_free.astype(np.float32), np.maximum(lower_total, 1), out=lower_free_ratio, where=lower_total > 0)
     upper_occ_ratio = np.zeros(column_count, dtype=np.float32)
-    np.divide(upper_occ.astype(np.float32), np.maximum(upper_obs, 1), out=upper_occ_ratio, where=upper_obs > 0)
+    np.divide(upper_solid.astype(np.float32), np.maximum(upper_obs, 1), out=upper_occ_ratio, where=upper_obs > 0)
 
     reason = np.full(column_count, "accepted", dtype=object)
 
@@ -1653,6 +2096,10 @@ def classify_voxel_door_seeds_centroid_ratio_vectorized(
         "voxel_door_upper_occupied_ratio_observed_xy": upper_occ_ratio.reshape(shape).astype(np.float32),
         "voxel_door_upper_observed_count_xy": np.clip(upper_obs, 0, np.iinfo(np.uint16).max).reshape(shape).astype(np.uint16),
         "voxel_door_upper_occupied_count_xy": np.clip(upper_occ, 0, np.iinfo(np.uint16).max).reshape(shape).astype(np.uint16),
+        "voxel_door_upper_solid_count_xy": np.clip(upper_solid, 0, np.iinfo(np.uint16).max).reshape(shape).astype(np.uint16),
+        "voxel_door_upper_actual_occupied_count_xy": np.clip(upper_occ, 0, np.iinfo(np.uint16).max).reshape(shape).astype(np.uint16),
+        "voxel_door_effective_observed_count_xy": np.clip(obs_count, 0, np.iinfo(np.uint16).max).reshape(shape).astype(np.uint16),
+        "voxel_door_in_range_unknown_count_xy": np.clip(in_range_unknown_count, 0, np.iinfo(np.uint16).max).reshape(shape).astype(np.uint16),
         "voxel_door_free_count_xy": np.clip(free_count, 0, np.iinfo(np.uint16).max).reshape(shape).astype(np.uint16),
         "voxel_door_occupied_count_xy": np.clip(occ_count, 0, np.iinfo(np.uint16).max).reshape(shape).astype(np.uint16),
         "voxel_door_observed_count_xy": np.clip(obs_count, 0, np.iinfo(np.uint16).max).reshape(shape).astype(np.uint16),
@@ -1692,10 +2139,19 @@ def classify_voxel_door_seed_column(
     *,
     row: int = 0,
     col: int = 0,
+    sensor_range_count_col: np.ndarray | None = None,
 ) -> VoxelDoorSeedEvidence:
     method = str(getattr(cfg, "seed_method", "centroid_ratio") or "centroid_ratio").strip().lower()
     if method in {"centroid_ratio", "centroid", "ratio"}:
-        return _classify_centroid_ratio_seed_column(z_state_col, z_centers_m, active_z_indices, cfg, row=row, col=col)
+        return _classify_centroid_ratio_seed_column(
+            z_state_col,
+            z_centers_m,
+            active_z_indices,
+            cfg,
+            row=row,
+            col=col,
+            sensor_range_count_col=sensor_range_count_col,
+        )
     states = np.asarray(z_state_col, dtype=np.uint8).reshape(-1)
     centers = np.asarray(z_centers_m, dtype=np.float32).reshape(-1)
     idxs = np.asarray(active_z_indices, dtype=np.int32).reshape(-1)
@@ -1763,8 +2219,10 @@ def _classify_centroid_ratio_seed_column(
     *,
     row: int = 0,
     col: int = 0,
+    sensor_range_count_col: np.ndarray | None = None,
 ) -> VoxelDoorSeedEvidence:
     states = np.asarray(z_state_col, dtype=np.uint8).reshape(-1, 1, 1)
+    sensor = None if sensor_range_count_col is None else np.asarray(sensor_range_count_col).reshape(-1, 1, 1)
     (
         seed,
         reason_map,
@@ -1782,6 +2240,7 @@ def _classify_centroid_ratio_seed_column(
         cfg,
         shape=(1, 1),
         return_debug=True,
+        sensor_range_count=sensor,
     )
     accepted = bool(seed[0, 0])
     code = int(reason_map[0, 0])
@@ -2392,22 +2851,24 @@ def _infer_directions_from_local_free_neck(cluster: DoorSeedCluster, free_clean:
 
 
 def _select_best_cluster_candidate(candidates: Sequence[VoxelDoorLineCandidate]) -> VoxelDoorLineCandidate:
-    def key(candidate: VoxelDoorLineCandidate) -> tuple[int, int, int, int, int, float, float, float, int]:
+    def key(candidate: VoxelDoorLineCandidate) -> tuple[int, int, int, int, int, int, float, float, int]:
         source = str(candidate.debug.get("orientation_source", ""))
         width_m = float(candidate.width_m)
-        long_penalty = max(0.0, width_m - float(candidate.debug.get("door_width_max_m", 1.80)))
-        width_penalty = abs(width_m - 0.90)
         two_anchor = candidate.wall_anchor_a is not None and candidate.wall_anchor_b is not None
+        seed_overlap = int(candidate.debug.get("door_partition_seed_on_line_cells", 0) or 0)
+        visual_cells = int(candidate.debug.get("visual_line_cells", 0) or 0)
+        seed_span_m = max(float(len(candidate.seed_cells)) * 0.10, 0.10)
+        width_delta = abs(width_m - seed_span_m)
         return (
-            1 if bool(candidate.debug.get("partition_accepted", False)) else 0,
+            1 if bool(candidate.debug.get("partition_effective_verified", candidate.debug.get("partition_accepted", False))) else 0,
+            1 if bool(candidate.debug.get("partition_geometry_accepted", False)) else 0,
             1 if candidate.accepted else 0,
             1 if two_anchor else 0,
-            0 if bool(candidate.debug.get("door_topology_warning", False)) else 1,
+            int(seed_overlap),
             -1 if "diag" in source else 0,
-            -float(long_penalty),
-            -float(width_penalty),
+            -float(width_delta),
             float(candidate.debug.get("score", 0.0)),
-            -int(candidate.debug.get("visual_line_cells", 0)),
+            -int(visual_cells),
         )
 
     return max(candidates, key=key)
@@ -2445,6 +2906,7 @@ def _door_reject_code(reason: str) -> int:
         "visual_only_not_partition": 13,
         "door_partition_intersects_stable_other_door": 14,
         "raw_seed_conflict_ignored": 15,
+        "door_partition_small_known_side_low_unknown": 16,
     }
     return int(values.get(str(reason), 255))
 
@@ -2624,15 +3086,18 @@ def _candidate_from_seed_component(
     width_m = float(len(full_cells) * resolution_m)
     own_seed = _cells_to_mask(seed_cells, free_clean.shape)
     visual_mask = _cells_to_mask(full_cells, free_clean.shape)
-    cut_result = build_door_partition_cut(
+    cut_result = build_door_partition_cut_v30(
         full_line_cells=full_cells,
         seed_mask=own_seed,
         accepted_seed_mask=same_seed_mask,
         partition_free=np.asarray(partition_free_clean, dtype=bool),
         partition_unknown=np.asarray(unknown_clean, dtype=bool),
         real_wall_barrier=real_wall,
-        max_bridge_gap_cells=int(getattr(cfg, "partition_cut_bridge_unknown_max_cells", 4)),
+        anchor_a=anchor_a,
+        anchor_b=anchor_b,
+        max_unknown_bridge_gap_cells=int(getattr(cfg, "partition_cut_bridge_unknown_max_cells", 4)),
         max_nonfree_bridge_gap_cells=int(getattr(cfg, "partition_cut_bridge_nonfree_max_cells", 1)),
+        max_endpoint_wall_gap_cells=int(getattr(cfg, "door_wall_attachment_max_endpoint_gap_cells", 1)),
         seed_dilation_cells=int(getattr(cfg, "partition_cut_seed_dilation_cells", 1)),
         min_cut_cells=int(getattr(cfg, "partition_cut_min_cells", 1)),
     )
@@ -2748,13 +3213,50 @@ def _candidate_from_seed_component(
         or int(topology.new_component_count) > 0
         or not bool(getattr(cfg, "partition_topology_enabled", True))
     )
-    partition_topology_effective = bool(geometry_partition_accepted and (topology_gain_effective or bool(attachment.attached)))
+    closure_verified, closure_debug = verify_cut_wall_to_wall_closure_v30(
+        cut_mask=geometry_partition_mask,
+        full_line_cells=full_cells,
+        anchor_a=anchor_a,
+        anchor_b=anchor_b,
+        real_wall_barrier=real_wall,
+        base_partition_free=np.asarray(partition_free_clean, dtype=bool),
+        max_endpoint_gap_cells=int(getattr(cfg, "door_wall_attachment_max_endpoint_gap_cells", 1)),
+        min_side_area_cells=int(getattr(cfg, "partition_topology_min_side_area_cells", 2)),
+        min_side_width_cells=int(getattr(cfg, "partition_topology_min_side_width_cells", 1)),
+    )
+    small_known_side_rejected, small_known_side_debug = validate_door_partition_small_known_side(
+        cut_mask=geometry_partition_mask,
+        base_partition_free=np.asarray(partition_free_clean, dtype=bool),
+        partition_unknown=np.asarray(unknown_clean, dtype=bool),
+        partition_real_wall_map=real_wall,
+        resolution_m=float(resolution_m),
+        cfg=cfg,
+    )
+    small_known_side_reason = (
+        "door_partition_small_known_side_low_unknown" if bool(small_known_side_rejected) else None
+    )
+    partition_effective_verified = bool(
+        geometry_partition_accepted
+        and not bool(small_known_side_rejected)
+        and (topology_gain_effective or bool(closure_verified))
+    )
+    partition_topology_effective = bool(partition_effective_verified)
     final_partition_reject_reason = geometry_reject_reason
-    if geometry_partition_accepted and not partition_topology_effective:
-        final_partition_reject_reason = str(topology.reject_reason or attachment.reject_reason or "door_cut_no_topology_gain")
+    if geometry_partition_accepted and small_known_side_reason is not None:
+        final_partition_reject_reason = str(small_known_side_reason)
         partition_cells = []
         partition_mask = np.zeros_like(partition_mask, dtype=bool)
-    elif partition_topology_effective:
+    elif geometry_partition_accepted and not partition_effective_verified:
+        final_partition_reject_reason = str(
+            cut_result.debug.get("door_partition_cut_v30_reject_reason")
+            or topology.reject_reason
+            or closure_debug.get("partition_closure_reject_reason")
+            or attachment.reject_reason
+            or "door_cut_no_topology_gain"
+        )
+        partition_cells = []
+        partition_mask = np.zeros_like(partition_mask, dtype=bool)
+    elif partition_effective_verified:
         final_partition_reject_reason = None
         partition_cells = list(geometry_partition_cells)
         partition_mask = geometry_partition_mask.copy()
@@ -2836,10 +3338,17 @@ def _candidate_from_seed_component(
             **cut_result.debug,
             **topology.to_dict(),
             **attachment.to_dict(),
+            **closure_debug,
+            **small_known_side_debug,
             "visual_accepted": visual_reject_reason is None,
             "partition_geometry_accepted": bool(geometry_partition_accepted),
+            "partition_closure_attached": bool(attachment.attached),
+            "partition_wall_to_wall_closure_verified": bool(closure_verified),
+            "partition_topology_gain": bool(topology_gain_effective),
+            "partition_effective_verified": bool(partition_effective_verified),
+            "stable_memory_refresh_eligible": bool(visual_reject_reason is None or geometry_partition_accepted),
             "partition_topology_effective": bool(partition_topology_effective),
-            "partition_accepted": final_partition_reject_reason is None,
+            "partition_accepted": bool(partition_effective_verified and final_partition_reject_reason is None),
             "partition_accepted_by_geometry_first": False,
             "partition_topology_reject_mode": str(getattr(cfg, "partition_topology_reject_mode", "warn_only")),
             "door_topology_warning": bool(topology_warning),
@@ -3061,18 +3570,24 @@ def _batch_reject_conflicting_doors(
                 b.door_cut_cells = []
                 for item in (a, b):
                     item.debug["partition_accepted"] = False
+                    item.debug["partition_effective_verified"] = False
+                    item.debug["partition_topology_effective"] = False
                     item.debug["partition_topology_accepted"] = False
                     item.debug["reject_reason_partition"] = "partition_intersects_other_door_candidate"
                     item.debug["reject_reason_topology"] = "partition_intersects_other_door_candidate"
             elif score_a < score_b:
                 a.door_cut_cells = []
                 a.debug["partition_accepted"] = False
+                a.debug["partition_effective_verified"] = False
+                a.debug["partition_topology_effective"] = False
                 a.debug["partition_topology_accepted"] = False
                 a.debug["reject_reason_partition"] = "partition_intersects_other_door_candidate"
                 a.debug["reject_reason_topology"] = "partition_intersects_other_door_candidate"
             else:
                 b.door_cut_cells = []
                 b.debug["partition_accepted"] = False
+                b.debug["partition_effective_verified"] = False
+                b.debug["partition_topology_effective"] = False
                 b.debug["partition_topology_accepted"] = False
                 b.debug["reject_reason_partition"] = "partition_intersects_other_door_candidate"
                 b.debug["reject_reason_topology"] = "partition_intersects_other_door_candidate"
@@ -3250,6 +3765,297 @@ def build_door_partition_cut(
             "door_partition_cut_bridged_cells": [[int(r), int(c)] for r, c in bridged_cells[:64]],
         },
     )
+
+
+def build_door_partition_cut_v30(
+    *,
+    full_line_cells: Sequence[tuple[int, int]],
+    seed_mask: np.ndarray,
+    accepted_seed_mask: np.ndarray | None,
+    partition_free: np.ndarray,
+    partition_unknown: np.ndarray,
+    real_wall_barrier: np.ndarray,
+    anchor_a: tuple[int, int] | None,
+    anchor_b: tuple[int, int] | None,
+    max_unknown_bridge_gap_cells: int,
+    max_nonfree_bridge_gap_cells: int,
+    max_endpoint_wall_gap_cells: int,
+    seed_dilation_cells: int,
+    min_cut_cells: int,
+) -> DoorPartitionCutResult:
+    shape = np.asarray(partition_free, dtype=bool).shape
+    if anchor_a is None or anchor_b is None:
+        result = build_door_partition_cut(
+            full_line_cells=full_line_cells,
+            seed_mask=seed_mask,
+            accepted_seed_mask=accepted_seed_mask,
+            partition_free=partition_free,
+            partition_unknown=partition_unknown,
+            real_wall_barrier=real_wall_barrier,
+            max_bridge_gap_cells=int(max_unknown_bridge_gap_cells),
+            max_nonfree_bridge_gap_cells=int(max_nonfree_bridge_gap_cells),
+            seed_dilation_cells=int(seed_dilation_cells),
+            min_cut_cells=int(min_cut_cells),
+        )
+        result.debug.update(
+            {
+                "door_partition_cut_v30_mode": "legacy_seed_interval",
+                "door_partition_cut_v30_anchor_to_anchor": False,
+                "door_partition_cut_v30_closed_to_wall": False,
+                "door_partition_cut_v30_reject_reason": "one_anchor_or_seed_only",
+            }
+        )
+        return result
+
+    free = np.asarray(partition_free, dtype=bool)
+    unknown = np.asarray(partition_unknown, dtype=bool)
+    real_wall = np.asarray(real_wall_barrier, dtype=bool)
+    seed = np.asarray(seed_mask, dtype=bool)
+    accepted_seed = seed if accepted_seed_mask is None else np.asarray(accepted_seed_mask, dtype=bool)
+    seed_band = dilate(seed | accepted_seed, int(seed_dilation_cells))
+    ordered = [(int(r), int(c)) for r, c in full_line_cells if 0 <= int(r) < shape[0] and 0 <= int(c) < shape[1]]
+    if len(ordered) < 3:
+        out = np.zeros(shape, dtype=bool)
+        return DoorPartitionCutResult(
+            mask=out,
+            ordered_cells=ordered,
+            cut_cells=[],
+            bridged_cells=[],
+            debug={
+                "door_partition_cut_v30_mode": "anchor_to_anchor",
+                "door_partition_cut_v30_anchor_to_anchor": True,
+                "door_partition_cut_v30_closed_to_wall": False,
+                "door_partition_cut_v30_reject_reason": "door_partition_cut_empty",
+            },
+        )
+    ia = _nearest_line_index(ordered, anchor_a)
+    ib = _nearest_line_index(ordered, anchor_b)
+    lo, hi = sorted((int(ia), int(ib)))
+    interval_indices = list(range(lo + 1, hi))
+    if not interval_indices:
+        out = np.zeros(shape, dtype=bool)
+        return DoorPartitionCutResult(
+            mask=out,
+            ordered_cells=ordered,
+            cut_cells=[],
+            bridged_cells=[],
+            debug={
+                "door_partition_cut_v30_mode": "anchor_to_anchor",
+                "door_partition_cut_v30_anchor_to_anchor": True,
+                "door_partition_cut_v30_closed_to_wall": False,
+                "door_partition_cut_v30_reject_reason": "door_partition_cut_empty",
+                "door_partition_cut_v30_anchor_indices": [int(ia), int(ib)],
+            },
+        )
+    interval = [ordered[idx] for idx in interval_indices]
+    cuttable = free | seed_band | accepted_seed
+    valid = np.asarray([bool(cuttable[r, c] and not real_wall[r, c]) for r, c in interval], dtype=bool)
+    unknown_bridgeable = np.asarray([bool(unknown[r, c] and not real_wall[r, c]) for r, c in interval], dtype=bool)
+    nonfree_bridgeable = np.asarray(
+        [bool((not free[r, c]) and (not unknown[r, c]) and (not seed_band[r, c]) and (not accepted_seed[r, c]) and not real_wall[r, c]) for r, c in interval],
+        dtype=bool,
+    )
+    bridged, bridged_local_indices = _bridge_valid_door_line_gaps_v16(
+        valid,
+        int(max_unknown_bridge_gap_cells),
+        unknown_bridgeable=unknown_bridgeable,
+        max_nonfree_gap_cells=int(max_nonfree_bridge_gap_cells),
+        nonfree_bridgeable=nonfree_bridgeable,
+    )
+    cut_cells = [
+        interval[idx]
+        for idx in range(len(interval))
+        if bool(bridged[idx] and not real_wall[interval[idx][0], interval[idx][1]])
+    ]
+    if len(cut_cells) < max(1, int(min_cut_cells)):
+        cut_cells = []
+    out = _cells_to_mask(cut_cells, shape)
+    if cut_cells:
+        cut_indices = [idx for idx in interval_indices if ordered[idx] in set(cut_cells)]
+        left_gap = _line_gap_to_wall(ordered, min(cut_indices), -1, real_wall) if cut_indices else 10**9
+        right_gap = _line_gap_to_wall(ordered, max(cut_indices), 1, real_wall) if cut_indices else 10**9
+    else:
+        left_gap = right_gap = 10**9
+    max_gap = max(0, int(max_endpoint_wall_gap_cells))
+    closed = bool(cut_cells and int(left_gap) <= max_gap and int(right_gap) <= max_gap)
+    bridged_cells = [interval[idx] for idx in bridged_local_indices if 0 <= int(idx) < len(interval)]
+    return DoorPartitionCutResult(
+        mask=out.astype(bool),
+        ordered_cells=ordered,
+        cut_cells=cut_cells,
+        bridged_cells=bridged_cells,
+        debug={
+            "door_partition_cut_v30_mode": "anchor_to_anchor",
+            "door_partition_cut_v30_anchor_to_anchor": True,
+            "door_partition_cut_v30_anchor_indices": [int(ia), int(ib)],
+            "door_partition_cut_v30_interval_cells": int(len(interval)),
+            "door_partition_cut_v30_closed_to_wall": bool(closed),
+            "door_partition_cut_v30_left_gap_cells": int(left_gap),
+            "door_partition_cut_v30_right_gap_cells": int(right_gap),
+            "door_partition_cut_v30_reject_reason": None if bool(closed) else "door_cut_not_closed_to_wall",
+            "door_partition_cut_bridge_gap_count": int(len(bridged_local_indices)),
+            "door_partition_cut_ordered_cells": int(len(ordered)),
+            "door_partition_cut_interval_cells": int(len(interval)),
+            "door_partition_cut_cells": int(len(cut_cells)),
+            "door_partition_cut_seed_cells": int(sum(1 for r, c in cut_cells if bool(accepted_seed[r, c] or seed_band[r, c]))),
+            "door_partition_cut_bridged_cells": [[int(r), int(c)] for r, c in bridged_cells[:64]],
+        },
+    )
+
+
+def verify_cut_wall_to_wall_closure_v30(
+    *,
+    cut_mask: np.ndarray,
+    full_line_cells: Sequence[tuple[int, int]],
+    anchor_a: tuple[int, int] | None,
+    anchor_b: tuple[int, int] | None,
+    real_wall_barrier: np.ndarray,
+    base_partition_free: np.ndarray,
+    max_endpoint_gap_cells: int,
+    connectivity: int = 4,
+    min_side_area_cells: int = 2,
+    min_side_width_cells: int = 1,
+) -> tuple[bool, dict[str, object]]:
+    cut = np.asarray(cut_mask, dtype=bool)
+    wall = np.asarray(real_wall_barrier, dtype=bool)
+    free = np.asarray(base_partition_free, dtype=bool)
+    debug: dict[str, object] = {
+        "partition_closure_check_v30": True,
+        "partition_closure_has_two_anchors": bool(anchor_a is not None and anchor_b is not None),
+    }
+    if cut.shape != wall.shape or cut.shape != free.shape:
+        raise ValueError("door closure maps must share one HxW shape")
+    if anchor_a is None or anchor_b is None:
+        debug["partition_closure_reject_reason"] = "missing_two_anchors"
+        return False, debug
+    ordered = [(int(r), int(c)) for r, c in full_line_cells if 0 <= int(r) < cut.shape[0] and 0 <= int(c) < cut.shape[1]]
+    cut_indices = [idx for idx, (r, c) in enumerate(ordered) if bool(cut[r, c])]
+    if not ordered or not cut_indices:
+        debug["partition_closure_reject_reason"] = "door_partition_cut_empty"
+        return False, debug
+    left_gap = _line_gap_to_wall(ordered, min(cut_indices), -1, wall)
+    right_gap = _line_gap_to_wall(ordered, max(cut_indices), 1, wall)
+    endpoint_attached = int(left_gap) <= int(max_endpoint_gap_cells) and int(right_gap) <= int(max_endpoint_gap_cells)
+    crosses_free = bool(np.any(cut & free))
+    before_free = free & ~wall
+    roi = _mask_bbox(dilate(cut, 3), cut.shape)
+    r0, r1, c0, c1 = roi
+    before_local = before_free[r0:r1, c0:c1]
+    cut_local = cut[r0:r1, c0:c1]
+    before_labels, before_n = ndimage.label(before_local, structure=conn(int(connectivity)))
+    after_local = before_local & ~cut_local
+    after_labels, after_n = ndimage.label(after_local, structure=conn(int(connectivity)))
+    adjacent = dilate(cut_local, 1) & after_local
+    touched = sorted({int(v) for v in np.unique(after_labels[adjacent]) if int(v) > 0})
+    side_areas: list[int] = []
+    side_widths: list[float] = []
+    for label in touched:
+        area, width = _door_side_area_and_width_cells(after_labels == int(label))
+        side_areas.append(int(area))
+        side_widths.append(float(width))
+    min_area = max(1, int(min_side_area_cells))
+    min_width = max(1, int(min_side_width_cells))
+    side_ok = len(touched) >= 2 and not any(area < min_area for area in side_areas[:2]) and not any(width < min_width for width in side_widths[:2])
+    local_gain = int(after_n) > int(before_n)
+    verified = bool(endpoint_attached and crosses_free and (local_gain or side_ok))
+    debug.update(
+        {
+            "partition_closure_left_gap_cells": int(left_gap),
+            "partition_closure_right_gap_cells": int(right_gap),
+            "partition_closure_endpoint_attached": bool(endpoint_attached),
+            "partition_closure_crosses_free": bool(crosses_free),
+            "partition_closure_local_gain": bool(local_gain),
+            "partition_closure_touched_labels": [int(v) for v in touched],
+            "partition_closure_side_areas": [int(v) for v in side_areas],
+            "partition_closure_side_widths_cells": [float(v) for v in side_widths],
+            "partition_closure_side_ok": bool(side_ok),
+            "partition_closure_reject_reason": None if verified else "door_cut_not_strict_wall_to_wall_closure",
+        }
+    )
+    return verified, debug
+
+
+def validate_door_partition_small_known_side(
+    *,
+    cut_mask: np.ndarray,
+    base_partition_free: np.ndarray,
+    partition_unknown: np.ndarray,
+    partition_real_wall_map: np.ndarray,
+    resolution_m: float,
+    cfg: VoxelDoorDetectorConfig,
+) -> tuple[bool, dict[str, object]]:
+    enabled = bool(getattr(cfg, "partition_reject_small_known_side_enabled", True))
+    area_threshold = float(getattr(cfg, "partition_small_known_side_area_m2", 2.0))
+    unknown_threshold = float(getattr(cfg, "partition_small_known_side_unknown_ratio_max", 0.20))
+    dilation_cells = max(1, int(getattr(cfg, "partition_small_known_side_boundary_dilation_cells", 1)))
+    debug: dict[str, object] = {
+        "partition_small_known_side_gate_enabled": bool(enabled),
+        "partition_small_known_side_area_threshold_m2": float(area_threshold),
+        "partition_small_known_side_unknown_ratio_threshold": float(unknown_threshold),
+        "partition_small_known_side_boundary_dilation_cells": int(dilation_cells),
+        "partition_small_known_side_components": [],
+    }
+    cut = np.asarray(cut_mask, dtype=bool)
+    free = np.asarray(base_partition_free, dtype=bool)
+    unknown = np.asarray(partition_unknown, dtype=bool)
+    wall = np.asarray(partition_real_wall_map, dtype=bool)
+    if cut.shape != free.shape or cut.shape != unknown.shape or cut.shape != wall.shape:
+        raise ValueError("door small-known-side maps must share one HxW shape")
+    if not enabled or area_threshold <= 0.0 or not np.any(cut):
+        debug["partition_small_known_side_rejected"] = False
+        return False, debug
+
+    before = free & ~wall
+    after = before & ~cut
+    labels, _count = ndimage.label(after, structure=conn(4))
+    adjacent = dilate(cut, 1) & after
+    touched = sorted({int(v) for v in np.unique(labels[adjacent]) if int(v) > 0})
+    debug["partition_small_known_side_touched_labels"] = [int(v) for v in touched]
+    if len(touched) < 2:
+        debug["partition_small_known_side_rejected"] = False
+        return False, debug
+
+    components: list[dict[str, object]] = []
+    for label in touched:
+        comp = labels == int(label)
+        area_cells = int(np.count_nonzero(comp))
+        area_m2 = float(area_cells) * float(resolution_m) ** 2
+        ring = dilate(comp, dilation_cells) & ~comp
+        ring_cells = int(np.count_nonzero(ring))
+        unknown_cells = int(np.count_nonzero(ring & unknown))
+        unknown_ratio = 0.0 if ring_cells <= 0 else float(unknown_cells) / float(ring_cells)
+        components.append(
+            {
+                "label": int(label),
+                "area_cells": int(area_cells),
+                "area_m2": float(area_m2),
+                "boundary_cells": int(ring_cells),
+                "boundary_unknown_cells": int(unknown_cells),
+                "boundary_unknown_ratio": float(unknown_ratio),
+                "rejected": bool(area_m2 < area_threshold and unknown_ratio < unknown_threshold),
+            }
+        )
+    components.sort(key=lambda item: int(item.get("area_cells", 0)), reverse=True)
+    main = components[:2]
+    rejected = any(bool(item.get("rejected", False)) for item in main)
+    debug["partition_small_known_side_components"] = main
+    debug["partition_small_known_side_rejected"] = bool(rejected)
+    debug["partition_small_known_side_reject_reason"] = (
+        "door_partition_small_known_side_low_unknown" if rejected else None
+    )
+    return bool(rejected), debug
+
+
+def _nearest_line_index(cells: Sequence[tuple[int, int]], target: tuple[int, int]) -> int:
+    tr, tc = int(target[0]), int(target[1])
+    best_idx = 0
+    best_dist = 10**9
+    for idx, (r, c) in enumerate(cells):
+        dist = abs(int(r) - tr) + abs(int(c) - tc)
+        if int(dist) < int(best_dist):
+            best_idx = int(idx)
+            best_dist = int(dist)
+    return int(best_idx)
 
 
 def validate_door_partition_cut_topology(
@@ -3702,6 +4508,10 @@ def _empty_seed_debug_maps(shape: tuple[int, int]) -> dict[str, np.ndarray]:
         "voxel_door_upper_occupied_ratio_observed_xy": np.zeros(shape, dtype=np.float32),
         "voxel_door_upper_observed_count_xy": np.zeros(shape, dtype=np.uint16),
         "voxel_door_upper_occupied_count_xy": np.zeros(shape, dtype=np.uint16),
+        "voxel_door_upper_solid_count_xy": np.zeros(shape, dtype=np.uint16),
+        "voxel_door_upper_actual_occupied_count_xy": np.zeros(shape, dtype=np.uint16),
+        "voxel_door_effective_observed_count_xy": np.zeros(shape, dtype=np.uint16),
+        "voxel_door_in_range_unknown_count_xy": np.zeros(shape, dtype=np.uint16),
         "voxel_door_free_count_xy": np.zeros(shape, dtype=np.uint16),
         "voxel_door_occupied_count_xy": np.zeros(shape, dtype=np.uint16),
         "voxel_door_observed_count_xy": np.zeros(shape, dtype=np.uint16),

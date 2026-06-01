@@ -20,6 +20,7 @@ def _base_debug(shape: tuple[int, int]) -> dict[str, object]:
         "voxel_door_seed_mask": np.zeros(shape, dtype=bool),
         "voxel_door_centerline_visual_mask": np.zeros(shape, dtype=bool),
         "voxel_accepted_door_centerline_mask": np.zeros(shape, dtype=bool),
+        "voxel_door_partition_effective_verified_mask": np.zeros(shape, dtype=bool),
         "voxel_door_visual_only_mask": np.zeros(shape, dtype=bool),
         "voxel_free_wall_conflict_xy": np.zeros(shape, dtype=bool),
         "voxel_wall_projection_rejected_support_map": np.zeros(shape, dtype=bool),
@@ -54,19 +55,20 @@ def _cell_pixel(arr: np.ndarray, row: int, col: int, shape: tuple[int, int] = (4
     return tuple(int(v) for v in arr[y, x].tolist())
 
 
-def test_voxel_panel_uses_blue_seed_and_green_door_extension() -> None:
+def test_voxel_panel_uses_blue_seed_and_green_verified_door_cut() -> None:
     shape = (4, 4)
     debug = _base_debug(shape)
     debug["voxel_door_seed_mask"][1, 1] = True
     debug["voxel_door_centerline_visual_mask"][1, 2] = True
     debug["voxel_accepted_door_centerline_mask"][1, 2] = True
+    debug["voxel_door_partition_effective_verified_mask"][1, 2] = True
     debug["voxel_door_cut_mask"][2, 2] = True
 
     arr = _render(debug, shape)
 
     assert _cell_pixel(arr, 1, 1, shape) == (0, 80, 255)
-    assert _cell_pixel(arr, 1, 2, shape) == (0, 255, 70)
-    assert _cell_pixel(arr, 2, 2, shape) == (80, 255, 80)
+    assert _cell_pixel(arr, 1, 2, shape) == (90, 255, 70)
+    assert _cell_pixel(arr, 2, 2, shape) == (90, 255, 70)
 
 
 def test_voxel_panel_draws_visual_line_without_faking_bright_cut() -> None:

@@ -44,6 +44,7 @@ def _completion_config(**overrides: object) -> VoxelDoorDetectorConfig:
         "local_free_neck_orientation_debug_only": False,
         "wall_anchor_radius_cells": 0,
         "seed_cluster_morph_close_radius_cells": 0,
+        "partition_reject_small_known_side_enabled": False,
     }
     data.update(overrides)
     return VoxelDoorDetectorConfig(**data)

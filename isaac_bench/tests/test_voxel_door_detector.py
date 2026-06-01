@@ -112,6 +112,7 @@ def test_seed_blob_projects_to_single_centerline_and_hits_two_walls() -> None:
         wall_map=wall,
         unknown_map=unknown,
         resolution_m=0.10,
+        config=VoxelDoorDetectorConfig(partition_reject_small_known_side_enabled=False),
     )
 
     assert int(result.debug["voxel_door_accepted_count"]) >= 1
