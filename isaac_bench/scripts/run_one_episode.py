@@ -87,6 +87,17 @@ from isaac_bench.metrics.episode_logger import JsonlEpisodeLogger, make_jsonable
 from isaac_bench.metrics.evaluator import EpisodeEvaluator
 from isaac_bench.metrics.result_schema import BenchmarkAssetError, complete_result_row, validate_strict_benchmark_assets
 from isaac_bench.navigation.astar import ClearanceAStarPlanner, GridAStarPlanner, astar_distance_map
+from isaac_bench.navigation.frontier_execution_state import (
+    CommittedFrontierExecutionState,
+    frontier_arrival_status,
+    make_committed_frontier_arrival_key,
+)
+from isaac_bench.navigation.frontier_recovery import (
+    FrontierRecoveryConfig,
+    FrontierRecoveryTarget,
+    find_best_reachable_frontier_approach,
+)
+from isaac_bench.navigation.frontier_targeting import FrontierTargetResolution, resolve_frontier_target
 from isaac_bench.navigation.frontier_commitment import FrontierCommitmentManager
 from isaac_bench.navigation.waypoint_follower import HolonomicWaypointFollower
 from isaac_bench.perception.detection_types import (
@@ -115,11 +126,157 @@ class FrontierRoomsegUpdateGateState:
     last_skip_reason: str | None = None
 
 
+@dataclass
+class FrontierArrivalUpdateState:
+    initialized: bool = False
+    arrival_pending: bool = False
+    arrival_step: int = -1
+    arrival_frontier_key: tuple | None = None
+    refresh_pending: bool = False
+    refresh_reason: str = ""
+    refresh_step: int = -1
+    refresh_frontier_key: tuple | None = None
+    block_reselect_until_refresh: bool = False
+    update_in_progress: bool = False
+    last_consumed_arrival_key: tuple | None = None
+    last_consumed_key: tuple | None = None
+    last_update_step: int = -1
+    last_update_reason: str = ""
+    last_skip_reason: str = ""
+    cooldown_until_step: int = -1
+
+
+@dataclass
+class ClearanceGoalFilterResult:
+    goals: List[Tuple[int, int]]
+    rejected_original_count: int
+    snapped_count: int
+    no_safe_goal_count: int
+    min_clearance_m: float
+    search_radius_cells: int
+    debug_by_input: List[dict] = field(default_factory=list)
+
+    def metadata(self) -> dict:
+        return {
+            "astar_goal_clearance_filter_enabled": True,
+            "astar_goal_cells_after_clearance_filter": int(len(self.goals)),
+            "astar_goal_clearance_rejected_original_count": int(self.rejected_original_count),
+            "astar_goal_clearance_snapped_count": int(self.snapped_count),
+            "astar_goal_clearance_no_safe_goal_count": int(self.no_safe_goal_count),
+            "astar_goal_clearance_debug_by_input": list(self.debug_by_input[:32]),
+        }
+
+
+@dataclass
+class RoomsegFrontierUpdateToken:
+    allowed: bool
+    reason: str
+    step: int
+
+
+def make_frontier_arrival_key(nav_decision) -> tuple:
+    if nav_decision is None:
+        return ("none", None, None)
+    meta = dict(getattr(nav_decision, "metadata", None) or {})
+    commitment = dict(meta.get("frontier_commitment") or {})
+    active_id = meta.get("active_frontier_id", commitment.get("active_frontier_id"))
+    target0 = None
+    target_cells = list(getattr(nav_decision, "target_cells", None) or [])
+    if target_cells:
+        try:
+            target0 = tuple(int(v) for v in target_cells[0])
+        except Exception:
+            target0 = tuple(target_cells[0])
+    return (str(getattr(nav_decision, "mode", "none")), active_id, target0)
+
+
+def request_frontier_refresh(
+    *,
+    refresh_state: FrontierArrivalUpdateState,
+    step: int,
+    reason: str,
+    frontier_key: tuple | None,
+    block_reselect: bool = True,
+) -> None:
+    refresh_state.initialized = True
+    refresh_state.arrival_pending = True
+    refresh_state.arrival_step = int(step)
+    refresh_state.arrival_frontier_key = frontier_key
+    refresh_state.refresh_pending = True
+    refresh_state.refresh_reason = str(reason)
+    refresh_state.refresh_step = int(step)
+    refresh_state.refresh_frontier_key = ("frontier_refresh", frontier_key, str(reason), int(step))
+    refresh_state.block_reselect_until_refresh = bool(block_reselect)
+    refresh_state.update_in_progress = False
+
+
+def consume_frontier_refresh(
+    *,
+    refresh_state: FrontierArrivalUpdateState,
+    step: int,
+    reason: str,
+    cooldown_steps: int,
+) -> None:
+    refresh_state.last_consumed_arrival_key = refresh_state.arrival_frontier_key
+    refresh_state.last_consumed_key = refresh_state.refresh_frontier_key
+    refresh_state.arrival_pending = False
+    refresh_state.refresh_pending = False
+    refresh_state.block_reselect_until_refresh = False
+    refresh_state.update_in_progress = False
+    refresh_state.last_update_step = int(step)
+    refresh_state.last_update_reason = str(reason)
+    refresh_state.cooldown_until_step = int(step) + int(cooldown_steps)
+
+
+def frontier_recovery_config_from_args(args) -> FrontierRecoveryConfig:
+    return FrontierRecoveryConfig(
+        enabled=bool(getattr(args, "frontier_unreachable_recovery_enabled", True)),
+        local_search_radius_m=float(getattr(args, "frontier_unreachable_recovery_local_search_radius_m", 1.50)),
+        global_search_enabled=bool(getattr(args, "frontier_unreachable_recovery_global_search_enabled", True)),
+        global_max_frontier_distance_m=float(getattr(args, "frontier_unreachable_recovery_global_max_frontier_distance_m", 3.00)),
+        min_clearance_m=float(getattr(args, "frontier_unreachable_recovery_min_clearance_m", 0.18)),
+        min_approach_improvement_m=float(getattr(args, "frontier_unreachable_recovery_min_approach_improvement_m", 0.20)),
+        allow_current_as_partial_arrival=bool(
+            getattr(args, "frontier_unreachable_recovery_allow_current_as_partial_arrival", True)
+        ),
+        max_recovery_attempts_per_frontier=int(getattr(args, "frontier_unreachable_recovery_max_attempts_per_frontier", 1)),
+        max_debug_candidates=int(getattr(args, "frontier_unreachable_recovery_max_debug_candidates", 64)),
+    )
+
+
+def _as_grid_cell(value) -> tuple[int, int] | None:
+    if value is None:
+        return None
+    try:
+        if len(value) < 2:
+            return None
+        return (int(value[0]), int(value[1]))
+    except Exception:
+        return None
+
+
+def _frontier_members_for_recovery(nav_decision, execution: CommittedFrontierExecutionState) -> tuple[tuple[int, int] | None, list[tuple[int, int]]]:
+    selected_frontier = None
+    if nav_decision is not None and getattr(nav_decision, "frontier_decision", None) is not None:
+        selected_frontier = nav_decision.frontier_decision.selected_frontier
+    center = None
+    members: list[tuple[int, int]] = []
+    if selected_frontier is not None:
+        center = _as_grid_cell(getattr(selected_frontier, "center_grid", None))
+        members = [cell for cell in (_as_grid_cell(v) for v in getattr(selected_frontier, "members", []) or []) if cell is not None]
+    if center is None:
+        center = _as_grid_cell(getattr(execution, "selected_center_grid", None))
+    if not members and center is not None:
+        members = [center]
+    return center, members
+
+
 def should_update_roomseg_frontiers(
     *,
     step: int,
     has_current_path: bool,
     gate_state: FrontierRoomsegUpdateGateState,
+    arrival_state: FrontierArrivalUpdateState | None = None,
     policy: str = "at_frontier_arrival",
     freeze_during_navigation: bool = True,
     target_reached: bool = False,
@@ -139,6 +296,17 @@ def should_update_roomseg_frontiers(
         return True, "debug_force"
     if not bool(gate_state.initialized):
         return True, "initial"
+    if arrival_state is not None and bool(getattr(arrival_state, "refresh_pending", False)):
+        key = getattr(arrival_state, "refresh_frontier_key", None)
+        if key != getattr(arrival_state, "last_consumed_key", None):
+            return True, str(getattr(arrival_state, "refresh_reason", "") or "frontier_refresh")
+        return False, "frontier_refresh_already_consumed"
+    if arrival_state is not None and int(step) < int(arrival_state.cooldown_until_step):
+        return False, "frontier_arrival_cooldown"
+    if arrival_state is not None and bool(arrival_state.arrival_pending):
+        if arrival_state.arrival_frontier_key != arrival_state.last_consumed_arrival_key:
+            return True, "frontier_arrival"
+        return False, "frontier_arrival_already_consumed"
     if bool(target_reached):
         return True, "target_reached"
     if bool(target_invalidated) and bool(update_on_target_invalidated):
@@ -579,6 +747,47 @@ def clearance_map_m(traversible: np.ndarray, resolution_m: float) -> np.ndarray:
         return np.asarray(planner.clearance_m, dtype=np.float32)
 
 
+def effective_lookahead_min_clearance_m(
+    configured_min_clearance_m: float,
+    *,
+    robot_radius_m: float,
+    runtime_planning_clearance_m: float = 0.0,
+    astar_clearance_hard_min_m: float = 0.0,
+) -> float:
+    """Keep lookahead validation at least as strict as config and A* policy."""
+    configured = max(0.0, float(configured_min_clearance_m))
+    planner_floor = max(
+        0.0,
+        float(robot_radius_m) + max(0.0, float(runtime_planning_clearance_m)),
+        float(astar_clearance_hard_min_m),
+    )
+    if configured <= 0.0:
+        return planner_floor
+    return max(configured, planner_floor)
+
+
+def clearance_policy_debug(
+    configured_min_clearance_m: float,
+    *,
+    robot_radius_m: float,
+    runtime_planning_clearance_m: float = 0.0,
+    astar_clearance_hard_min_m: float = 0.0,
+) -> dict[str, object]:
+    configured = max(0.0, float(configured_min_clearance_m))
+    planner_floor = max(
+        0.0,
+        float(robot_radius_m) + max(0.0, float(runtime_planning_clearance_m)),
+        float(astar_clearance_hard_min_m),
+    )
+    effective = planner_floor if configured <= 0.0 else max(configured, planner_floor)
+    return {
+        "lookahead_clearance_configured_m": float(configured),
+        "lookahead_clearance_planner_floor_m": float(planner_floor),
+        "lookahead_clearance_effective_m": float(effective),
+        "lookahead_clearance_policy": "max(configured, planner_floor)",
+    }
+
+
 def make_runtime_nav_planner(args, traversible: np.ndarray, occupancy: np.ndarray, resolution_m: float):
     if bool(getattr(args, "astar_clearance_cost_enabled", False)):
         planner = ClearanceAStarPlanner(
@@ -594,6 +803,32 @@ def make_runtime_nav_planner(args, traversible: np.ndarray, occupancy: np.ndarra
         return planner, np.asarray(planner.clearance_m, dtype=np.float32), True
     planner = GridAStarPlanner(traversible, resolution_m, allow_diagonal=bool(getattr(args, "astar_allow_diagonal", True)))
     return planner, clearance_map_m(traversible, resolution_m), False
+
+
+def snap_to_free_local(navigable: np.ndarray, current_cell: tuple[int, int], radius_cells: int = 3) -> tuple[int, int] | None:
+    nav = np.asarray(navigable, dtype=bool)
+    if nav.ndim != 2:
+        return None
+    row, col = int(current_cell[0]), int(current_cell[1])
+    h, w = nav.shape
+    if 0 <= row < h and 0 <= col < w and bool(nav[row, col]):
+        return (row, col)
+    radius = max(0, int(radius_cells))
+    best: tuple[float, int, int] | None = None
+    for dr in range(-radius, radius + 1):
+        rr = row + dr
+        if rr < 0 or rr >= h:
+            continue
+        for dc in range(-radius, radius + 1):
+            cc = col + dc
+            if cc < 0 or cc >= w or not bool(nav[rr, cc]):
+                continue
+            dist2 = float(dr * dr + dc * dc)
+            if best is None or dist2 < best[0]:
+                best = (dist2, rr, cc)
+    if best is None:
+        return None
+    return (int(best[1]), int(best[2]))
 
 
 def _disk_dilate_bool(mask: np.ndarray, radius_cells: int) -> np.ndarray:
@@ -983,17 +1218,17 @@ def planning_target_cells_within_radius(
     return [cell for cell, _rank in sorted(candidates.items(), key=lambda item: item[1])]
 
 
-def filter_goal_cells_by_clearance(
+def filter_goal_cells_by_clearance_result(
     goal_cells: Iterable[Tuple[int, int]],
     traversible: np.ndarray,
     clearance_m: np.ndarray,
     *,
     min_clearance_m: float,
     search_radius_cells: int,
-) -> List[Tuple[int, int]]:
+) -> ClearanceGoalFilterResult:
     cells = [tuple(int(v) for v in cell) for cell in goal_cells]
     if not cells:
-        return []
+        return ClearanceGoalFilterResult([], 0, 0, 0, max(0.0, float(min_clearance_m)), max(0, int(search_radius_cells)), [])
     nav = np.asarray(traversible, dtype=bool)
     clearance = np.asarray(clearance_m, dtype=np.float32)
     h, w = nav.shape
@@ -1001,10 +1236,18 @@ def filter_goal_cells_by_clearance(
     radius = max(0, int(search_radius_cells))
     out: list[Tuple[int, int]] = []
     seen: set[Tuple[int, int]] = set()
+    rejected_original_count = 0
+    snapped_count = 0
+    no_safe_goal_count = 0
+    debug_by_input: list[dict] = []
     for row, col in cells:
+        input_cell = (int(row), int(col))
+        original_clearance = float(clearance[row, col]) if 0 <= row < h and 0 <= col < w else 0.0
         if 0 <= row < h and 0 <= col < w and bool(nav[row, col]) and float(clearance[row, col]) >= min_clearance:
             candidate = (int(row), int(col))
+            reason = "original_clearance_ok"
         else:
+            rejected_original_count += 1
             best_cell = None
             best_rank = None
             for dr in range(-radius, radius + 1):
@@ -1021,11 +1264,58 @@ def filter_goal_cells_by_clearance(
                     if best_rank is None or rank < best_rank:
                         best_rank = rank
                         best_cell = (rr, cc)
-            candidate = best_cell if best_cell is not None else (int(row), int(col))
+            if best_cell is None:
+                no_safe_goal_count += 1
+                debug_by_input.append(
+                    {
+                        "input_cell": [int(input_cell[0]), int(input_cell[1])],
+                        "input_clearance_m": float(original_clearance),
+                        "selected_cell": None,
+                        "reason": "no_clearance_safe_goal_nearby",
+                    }
+                )
+                continue
+            candidate = best_cell
+            snapped_count += int(candidate != input_cell)
+            reason = "snapped_to_clearance_safe_goal" if candidate != input_cell else "same_cell_after_search"
         if candidate not in seen:
             seen.add(candidate)
             out.append(candidate)
-    return out
+        debug_by_input.append(
+            {
+                "input_cell": [int(input_cell[0]), int(input_cell[1])],
+                "input_clearance_m": float(original_clearance),
+                "selected_cell": [int(candidate[0]), int(candidate[1])],
+                "selected_clearance_m": float(clearance[int(candidate[0]), int(candidate[1])]),
+                "reason": reason,
+            }
+        )
+    return ClearanceGoalFilterResult(
+        out,
+        int(rejected_original_count),
+        int(snapped_count),
+        int(no_safe_goal_count),
+        float(min_clearance),
+        int(radius),
+        debug_by_input,
+    )
+
+
+def filter_goal_cells_by_clearance(
+    goal_cells: Iterable[Tuple[int, int]],
+    traversible: np.ndarray,
+    clearance_m: np.ndarray,
+    *,
+    min_clearance_m: float,
+    search_radius_cells: int,
+) -> List[Tuple[int, int]]:
+    return filter_goal_cells_by_clearance_result(
+        goal_cells,
+        traversible,
+        clearance_m,
+        min_clearance_m=min_clearance_m,
+        search_radius_cells=search_radius_cells,
+    ).goals
 
 
 def path_clearance_debug(path: Sequence[Tuple[int, int]], clearance_m: np.ndarray, robot_radius_m: float) -> dict[str, object]:
@@ -1397,6 +1687,27 @@ def success_region_can_finish(
     return bool(policy_stop_confirmed or not require_sgnav_stop)
 
 
+def update_metric_evaluator_pose_or_mark_invalid(
+    evaluator: EpisodeEvaluator,
+    metric_planner: GridAStarPlanner,
+    pose_world: Sequence[float],
+    map_info: MapInfo,
+    *,
+    collided: bool = False,
+) -> Tuple[bool, Optional[Tuple[int, int]]]:
+    metric_grid = metric_planner.snap_to_free(
+        world_xy_to_grid(float(pose_world[0]), float(pose_world[1]), map_info)
+    )
+    if metric_grid is None:
+        evaluator.num_steps += 1
+        evaluator.path_accum.update((float(pose_world[0]), float(pose_world[1])))
+        if collided:
+            evaluator.num_collisions += 1
+        return False, None
+    evaluator.update_pose(pose_world, metric_grid, collided=collided)
+    return True, metric_grid
+
+
 def final_log_row(row: dict) -> dict:
     if row.get("failure_reason"):
         stop_reason = row["failure_reason"]
@@ -1421,6 +1732,13 @@ def final_log_row(row: dict) -> dict:
         "frontier_actual_target_grid",
         "frontier_unreachable_recovery",
         "frontier_unreachable_reason",
+        "frontier_refresh_pending",
+        "frontier_refresh_reason",
+        "frontier_refresh_consumed_step",
+        "frontier_reselect_blocked_until_refresh",
+        "frontier_direct_target_unreachable_count",
+        "frontier_recovery",
+        "frontier_execution_debug",
         "frontier_stop_at_current_grid",
         "frontier_blacklisted",
         "active_long_term_goal_mode",
@@ -1443,6 +1761,10 @@ def final_log_row(row: dict) -> dict:
         "explore_until_no_frontiers",
         "goal_success_ignored_steps",
         "stop_blocked_reason",
+        "metric_pose_valid",
+        "metric_pose_invalid_steps",
+        "metric_pose_last_invalid_step",
+        "metric_pose_last_invalid_reason",
         "mapping_latency_ms",
         "mapping_latency_breakdown_avg_ms",
         "mapping_latency_breakdown_counts",
@@ -1581,6 +1903,191 @@ def pose_swept_is_grid_safe(
     return True
 
 
+def _pose_clearance_status(
+    pose: Tuple[float, float, float, float],
+    traversible: np.ndarray,
+    clearance_m: np.ndarray,
+    map_info: MapInfo,
+    min_clearance_m: float,
+    camera_forward_offset_m: float = 0.0,
+) -> tuple[bool, float, tuple[int, int] | None, str | None]:
+    nav = np.asarray(traversible, dtype=bool)
+    clearance = np.asarray(clearance_m, dtype=np.float32)
+    x, y, _z, yaw = [float(v) for v in pose]
+    samples = [(x, y)]
+    if abs(float(camera_forward_offset_m)) > 1e-6:
+        samples.append((x + math.cos(yaw) * float(camera_forward_offset_m), y + math.sin(yaw) * float(camera_forward_offset_m)))
+    h, w = nav.shape
+    min_seen = float("inf")
+    for sx, sy in samples:
+        row, col = world_xy_to_grid(float(sx), float(sy), map_info)
+        if row < 0 or row >= h or col < 0 or col >= w:
+            return False, 0.0 if not math.isfinite(min_seen) else min_seen, (int(row), int(col)), "outside_grid"
+        if not bool(nav[row, col]):
+            return False, float(clearance[row, col]) if clearance.shape == nav.shape else 0.0, (int(row), int(col)), "non_traversible"
+        clear = float(clearance[row, col]) if clearance.shape == nav.shape else 0.0
+        min_seen = min(min_seen, clear)
+        if clear + 1e-6 < float(min_clearance_m):
+            return False, clear, (int(row), int(col)), "low_clearance"
+    if not math.isfinite(min_seen):
+        min_seen = 0.0
+    return True, float(min_seen), None, None
+
+
+def pose_has_clearance(
+    pose: Tuple[float, float, float, float],
+    traversible: np.ndarray,
+    clearance_m: np.ndarray,
+    map_info: MapInfo,
+    min_clearance_m: float,
+    camera_forward_offset_m: float = 0.0,
+) -> bool:
+    ok, _min_clearance, _failed_grid, _reason = _pose_clearance_status(
+        pose,
+        traversible,
+        clearance_m,
+        map_info,
+        min_clearance_m,
+        camera_forward_offset_m,
+    )
+    return bool(ok)
+
+
+def pose_swept_has_clearance(
+    pose: Tuple[float, float, float, float],
+    cmd: Tuple[float, float, float],
+    dt: float,
+    traversible: np.ndarray,
+    clearance_m: np.ndarray,
+    map_info: MapInfo,
+    min_clearance_m: float,
+    camera_forward_offset_m: float = 0.0,
+    sample_step_m: float | None = None,
+) -> tuple[bool, dict[str, object]]:
+    start = tuple(float(v) for v in pose)
+    end = predict_kinematic_pose(start, cmd, float(dt))
+    dx = float(end[0]) - float(start[0])
+    dy = float(end[1]) - float(start[1])
+    dyaw = float(end[3]) - float(start[3])
+    while dyaw > math.pi:
+        dyaw -= 2.0 * math.pi
+    while dyaw < -math.pi:
+        dyaw += 2.0 * math.pi
+    step_m = float(sample_step_m) if sample_step_m is not None else max(0.02, float(map_info.resolution_m) * 0.5)
+    linear_steps = int(math.ceil(math.hypot(dx, dy) / max(step_m, 1e-6)))
+    angular_steps = int(math.ceil(abs(dyaw) / math.radians(6.0)))
+    samples = max(1, linear_steps, angular_steps)
+    min_swept_clearance = float("inf")
+    failed_grid = None
+    block_reason = None
+    for idx in range(samples + 1):
+        t = float(idx) / float(samples)
+        yaw = float(start[3]) + dyaw * t
+        while yaw > math.pi:
+            yaw -= 2.0 * math.pi
+        while yaw < -math.pi:
+            yaw += 2.0 * math.pi
+        interp = (
+            float(start[0]) + dx * t,
+            float(start[1]) + dy * t,
+            float(start[2]),
+            yaw,
+        )
+        ok, clear, grid, reason = _pose_clearance_status(
+            interp,
+            traversible,
+            clearance_m,
+            map_info,
+            min_clearance_m,
+            camera_forward_offset_m,
+        )
+        min_swept_clearance = min(min_swept_clearance, float(clear))
+        if not ok:
+            failed_grid = grid
+            block_reason = reason
+            break
+    if not math.isfinite(min_swept_clearance):
+        min_swept_clearance = 0.0
+    debug = {
+        "guard_min_clearance_m": float(min_clearance_m),
+        "guard_min_swept_clearance_m": float(min_swept_clearance),
+        "guard_failed_sample_grid": [int(failed_grid[0]), int(failed_grid[1])] if failed_grid is not None else None,
+        "guard_block_reason": block_reason,
+        "guard_sweep_samples": int(samples + 1),
+    }
+    return bool(block_reason is None), debug
+
+
+def guard_kinematic_cmd_with_clearance(
+    pose: Tuple[float, float, float, float],
+    cmd: Tuple[float, float, float],
+    dt: float,
+    traversible: np.ndarray,
+    clearance_m: np.ndarray,
+    map_info: MapInfo,
+    min_clearance_m: float,
+    camera_forward_offset_m: float,
+) -> Tuple[Tuple[float, float, float], bool, dict[str, object]]:
+    last_debug: dict[str, object] = {
+        "guard_min_clearance_m": float(min_clearance_m),
+        "guard_min_swept_clearance_m": None,
+        "guard_failed_sample_grid": None,
+        "guard_block_reason": None,
+        "guard_accepted_scale": None,
+    }
+    for scale in (1.0, 0.75, 0.5, 0.25, 0.125, 0.0625):
+        scaled = (float(cmd[0]) * scale, float(cmd[1]) * scale, float(cmd[2]))
+        ok, debug = pose_swept_has_clearance(
+            pose,
+            scaled,
+            dt,
+            traversible,
+            clearance_m,
+            map_info,
+            min_clearance_m,
+            camera_forward_offset_m,
+        )
+        last_debug = {**debug, "guard_accepted_scale": float(scale) if ok else None}
+        if ok:
+            return scaled, False, last_debug
+    rotate_only = (0.0, 0.0, float(cmd[2]))
+    if abs(rotate_only[2]) > 1e-6:
+        ok, debug = pose_swept_has_clearance(
+            pose,
+            rotate_only,
+            dt,
+            traversible,
+            clearance_m,
+            map_info,
+            min_clearance_m,
+            camera_forward_offset_m,
+        )
+        if ok:
+            linear_requested = math.hypot(float(cmd[0]), float(cmd[1])) > 1e-6
+            return rotate_only, bool(linear_requested), {**debug, "guard_accepted_scale": 0.0, "guard_rotation_only": True}
+        last_debug = {**debug, "guard_accepted_scale": None, "guard_rotation_only": True}
+    stopped = (0.0, 0.0, 0.0)
+    ok, debug = pose_swept_has_clearance(
+        pose,
+        stopped,
+        dt,
+        traversible,
+        clearance_m,
+        map_info,
+        min_clearance_m,
+        camera_forward_offset_m,
+    )
+    if ok:
+        return stopped, True, {
+            **debug,
+            "guard_block_reason": last_debug.get("guard_block_reason"),
+            "guard_failed_sample_grid": last_debug.get("guard_failed_sample_grid"),
+            "guard_min_swept_clearance_m": last_debug.get("guard_min_swept_clearance_m", debug.get("guard_min_swept_clearance_m")),
+            "guard_accepted_scale": 0.0,
+        }
+    return stopped, True, {**last_debug, "guard_fallback_stop_unsafe": True}
+
+
 def guard_kinematic_cmd(
     pose: Tuple[float, float, float, float],
     cmd: Tuple[float, float, float],
@@ -1595,7 +2102,8 @@ def guard_kinematic_cmd(
             return scaled, False
     rotate_only = (0.0, 0.0, float(cmd[2]))
     if abs(rotate_only[2]) > 1e-6 and pose_swept_is_grid_safe(pose, rotate_only, dt, navigable, map_info, camera_forward_offset_m):
-        return rotate_only, False
+        linear_requested = math.hypot(float(cmd[0]), float(cmd[1])) > 1e-6
+        return rotate_only, bool(linear_requested)
     stopped = (0.0, 0.0, 0.0)
     if pose_swept_is_grid_safe(pose, stopped, dt, navigable, map_info, camera_forward_offset_m):
         return stopped, True
@@ -1830,6 +2338,8 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
         voxel_runtime_config=voxel_runtime_cfg,
     )
     voxel_perf_recent_path = Path(args.output).expanduser().with_name("voxel_perf_log.jsonl")
+    runtime_perf_path = Path(args.output).expanduser().with_name("runtime_perf.jsonl")
+    runtime_control_trace_path = Path(args.output).expanduser().with_name("runtime_control_trace.jsonl")
     voxel_perf_recent_rows: list[dict[str, object]] = []
 
     def record_voxel_perf_trace(step_idx: int | None) -> None:
@@ -1916,6 +2426,200 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
                 flush=True,
             )
 
+    def write_runtime_perf_trace(
+        step_idx: int,
+        map_state_local: Mapping[str, object],
+        *,
+        roomseg_update_due: bool,
+        roomseg_update_reason: str,
+        roomseg_update_allowed_by_token: bool | None = None,
+        roomseg_update_token_reason: str | None = None,
+        roomseg_update_call_count_this_step: int = 0,
+        roomseg_update_called_sites: Sequence[str] | None = None,
+        frontier_execution_state: CommittedFrontierExecutionState | None = None,
+        current_grid_for_frontier: Tuple[int, int] | None = None,
+    ) -> None:
+        voxel_grid = getattr(mapper, "voxel_grid", None)
+        stats_obj = getattr(voxel_grid, "last_integration_stats", None) if voxel_grid is not None else None
+        stats = dict(stats_obj.to_dict()) if hasattr(stats_obj, "to_dict") else {}
+        nav_debug = dict(getattr(voxel_grid, "last_navigation_debug", {}) or {}) if voxel_grid is not None else {}
+        nav_debug = {str(k): v for k, v in nav_debug.items() if not isinstance(v, np.ndarray)}
+        mapper_timing = dict(getattr(mapper, "last_timing_stats", {}) or {})
+        state_timing = dict(map_state_local.get("_state_timing_ms") or {})
+        planner_timing = dict(map_state_local.get("_planner_timing_ms") or {})
+        frontier_exec_debug = (
+            frontier_execution_state.debug_metadata(
+                step=int(step_idx),
+                current_grid=current_grid_for_frontier,
+                resolution_m=float(dynamic_map_info.resolution_m),
+            )
+            if frontier_execution_state is not None
+            else {}
+        )
+        row = make_jsonable(
+            {
+                "frontier_refresh_pending": bool(frontier_arrival_update_state.refresh_pending),
+                "frontier_refresh_reason": str(frontier_arrival_update_state.refresh_reason),
+                "frontier_reselect_blocked_until_refresh": bool(frontier_arrival_update_state.block_reselect_until_refresh),
+                "frontier_refresh_consumed_step": int(frontier_arrival_update_state.last_update_step),
+                "step": int(step_idx),
+                "voxel_backend": stats.get("voxel_integration_backend"),
+                "voxel_threads_requested": stats.get("voxel_integrate_numba_requested_thread_count"),
+                "voxel_threads_effective": stats.get("voxel_integrate_backend_effective_thread_count"),
+                "voxel_threading_layer": stats.get("voxel_integrate_numba_threading_layer"),
+                "voxel_integrate_total_ms": stats.get("voxel_integrate_total_ms"),
+                "voxel_pass1_ms": stats.get("voxel_integrate_pass1_ms"),
+                "voxel_pass2_ms": stats.get("voxel_integrate_pass2_ms"),
+                "voxel_bucket_free_ms": stats.get("voxel_integrate_bucket_free_ms"),
+                "voxel_bucket_occ_ms": stats.get("voxel_integrate_bucket_occ_ms"),
+                "voxel_apply_logodds_ms": stats.get("voxel_integrate_apply_logodds_ms"),
+                "voxel_endpoint_column_ms": stats.get("voxel_integrate_endpoint_column_ms"),
+                "voxel_project_navigation_ms": nav_debug.get("voxel_project_navigation_ms"),
+                "navigation_projection_mode": nav_debug.get("voxel_project_navigation_mode"),
+                "navigation_dirty_rc_count": nav_debug.get("voxel_project_navigation_dirty_rc_count"),
+                "navigation_dirty_projected_rc_count": nav_debug.get("voxel_project_navigation_dirty_projected_rc_count"),
+                "array_export_ms": state_timing.get("array_export_ms", mapper_timing.get("array_export_ms")),
+                "traversible_ms": state_timing.get("traversible_ms", mapper_timing.get("traversible_ms")),
+                "base_planner_init_ms": planner_timing.get("base_planner_init_ms", 0.0),
+                "astar_clearance_ms": planner_timing.get("astar_clearance_ms", 0.0),
+                "planner_init_ms": planner_timing.get("planner_init_ms", 0.0),
+                "roomseg_update_due": bool(roomseg_update_due),
+                "roomseg_update_reason": str(roomseg_update_reason),
+                "roomseg_update_allowed_by_token": bool(roomseg_update_due if roomseg_update_allowed_by_token is None else roomseg_update_allowed_by_token),
+                "roomseg_update_token_reason": str(roomseg_update_reason if roomseg_update_token_reason is None else roomseg_update_token_reason),
+                "roomseg_update_called_sites": list(roomseg_update_called_sites or []),
+                "roomseg_update_call_count_this_step": int(roomseg_update_call_count_this_step),
+                **frontier_exec_debug,
+            }
+        )
+        try:
+            runtime_perf_path.parent.mkdir(parents=True, exist_ok=True)
+            with runtime_perf_path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+        except OSError as exc:
+            print("[runtime-perf] failed to write %s: %s" % (str(runtime_perf_path), exc), flush=True)
+
+    def write_runtime_control_trace(
+        *,
+        step_idx: int,
+        pose_local: Sequence[float],
+        current_grid_local: Tuple[int, int] | None,
+        current_path_local: Sequence[Tuple[int, int]],
+        path_world_local: Sequence[Tuple[float, float]],
+        raw_cmd: Tuple[float, float, float],
+        guarded_cmd: Tuple[float, float, float],
+        blocked_by_guard: bool,
+        target_distance_m: float,
+        nav_decision_local: NavigationDecision | None,
+        frontier_execution_state: CommittedFrontierExecutionState | None,
+        blocked_by_online_guard: bool = False,
+        guard_debug: Mapping[str, object] | None = None,
+    ) -> None:
+        path_cells = [tuple(int(v) for v in cell) for cell in list(current_path_local)]
+        path_world_cells = [tuple(float(v) for v in cell) for cell in list(path_world_local)]
+        exec_debug = (
+            frontier_execution_state.debug_metadata(
+                step=int(step_idx),
+                current_grid=current_grid_local,
+                resolution_m=float(dynamic_map_info.resolution_m),
+            )
+            if frontier_execution_state is not None
+            else {}
+        )
+        if bool(frontier_arrival_update_state.refresh_pending):
+            execution_phase = "refresh_pending"
+        elif bool(exec_debug.get("frontier_exec_partial_arrival_pending", False)):
+            execution_phase = "partial_arrival"
+        elif bool(exec_debug.get("frontier_exec_recovery_active", False)):
+            execution_phase = "recovery"
+        elif bool(exec_debug.get("frontier_exec_active", False)):
+            execution_phase = "direct"
+        else:
+            execution_phase = "selecting"
+        row = make_jsonable(
+            {
+                "step": int(step_idx),
+                "frontier_execution_phase": execution_phase,
+                "frontier_refresh_pending": bool(frontier_arrival_update_state.refresh_pending),
+                "frontier_refresh_reason": str(frontier_arrival_update_state.refresh_reason),
+                "frontier_reselect_blocked_until_refresh": bool(frontier_arrival_update_state.block_reselect_until_refresh),
+                "pose_world": [float(v) for v in pose_local],
+                "current_grid": list(current_grid_local) if current_grid_local is not None else None,
+                "nav_mode": None if nav_decision_local is None else str(nav_decision_local.mode),
+                "nav_reason": None if nav_decision_local is None else str(nav_decision_local.reason),
+                "target_cells_count": int(len(getattr(nav_decision_local, "target_cells", []) or [])) if nav_decision_local is not None else 0,
+                "target_distance_m": float(target_distance_m) if np.isfinite(float(target_distance_m)) else None,
+                "path_len": int(len(path_cells)),
+                "path_head": [list(cell) for cell in path_cells[:6]],
+                "path_tail": [list(cell) for cell in path_cells[-3:]],
+                "path_world_len": int(len(path_world_cells)),
+                "path_world_head": [[float(x), float(y)] for x, y in path_world_cells[:3]],
+                "lookahead_selected_world": (
+                    [float(v) for v in follower.select_lookahead(pose_local, list(path_world_cells))]
+                    if path_world_cells
+                    else None
+                ),
+                "raw_cmd": [float(v) for v in raw_cmd],
+                "guarded_cmd": [float(v) for v in guarded_cmd],
+                "blocked_by_guard": bool(blocked_by_guard),
+                "blocked_by_online_guard": bool(blocked_by_online_guard),
+                "robot_radius_m": float(args.robot_radius_m),
+                "runtime_planning_clearance_m": float(args.runtime_planning_clearance_m),
+                "lookahead_min_clearance_m_configured": float(getattr(args, "lookahead_min_clearance_m", 0.14)),
+                "lookahead_min_clearance_m_effective": float(
+                    getattr(args, "lookahead_effective_min_clearance_m", getattr(args, "lookahead_min_clearance_m", 0.14))
+                ),
+                **clearance_policy_debug(
+                    float(getattr(args, "lookahead_min_clearance_m", 0.14)),
+                    robot_radius_m=float(args.robot_radius_m),
+                    runtime_planning_clearance_m=float(args.runtime_planning_clearance_m),
+                    astar_clearance_hard_min_m=float(getattr(args, "astar_clearance_hard_min_m", 0.0)),
+                ),
+                "guard_min_clearance_m_effective": float(
+                    getattr(args, "guard_effective_min_clearance_m", getattr(args, "guard_min_clearance_m", 0.14))
+                ),
+                "target_clearance_m": (
+                    dict(getattr(nav_decision_local, "metadata", {}) or {}).get("frontier_target_clearance_m")
+                    if nav_decision_local is not None
+                    else None
+                ),
+                "astar_reached_goal_grid": (
+                    dict(getattr(nav_decision_local, "metadata", {}) or {}).get("astar_reached_goal_grid")
+                    if nav_decision_local is not None
+                    else None
+                ),
+                "frontier_center_grid": (
+                    dict(getattr(nav_decision_local, "metadata", {}) or {}).get("frontier_center_grid")
+                    if nav_decision_local is not None
+                    else None
+                ),
+                "frontier_actual_target_grid": (
+                    dict(getattr(nav_decision_local, "metadata", {}) or {}).get("frontier_actual_target_grid")
+                    if nav_decision_local is not None
+                    else None
+                ),
+                "frontier_target_belongs_to_committed_frontier": bool(
+                    dict(getattr(nav_decision_local, "metadata", {}) or {}).get("frontier_commitment_target_consistent", True)
+                )
+                if nav_decision_local is not None
+                else None,
+                "commit_center_target_mismatch": bool(
+                    dict(getattr(nav_decision_local, "metadata", {}) or {}).get("commit_center_target_mismatch", False)
+                )
+                if nav_decision_local is not None
+                else None,
+                **dict(guard_debug or {}),
+                "predicted_pose_world": [float(v) for v in predict_kinematic_pose(tuple(float(v) for v in pose_local), guarded_cmd, float(args.control_dt))],
+                **exec_debug,
+            }
+        )
+        try:
+            runtime_control_trace_path.parent.mkdir(parents=True, exist_ok=True)
+            with runtime_control_trace_path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+        except OSError as exc:
+            print("[runtime-control] failed to write %s: %s" % (str(runtime_control_trace_path), exc), flush=True)
+
     static_goal_cells = [(int(r), int(c)) for r, c in episode["goal_regions_grid"]]
     start_pose = tuple(float(v) for v in episode["start_pose_world"])
     mapper.reset((float(start_pose[0]), float(start_pose[1])))
@@ -1932,6 +2636,7 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
             no_progress_steps=int(args.frontier_commit_no_progress_steps),
             progress_min_delta_m=float(args.frontier_commit_progress_min_delta_m),
             blacklist_ttl_steps=int(args.frontier_blacklist_ttl_steps),
+            switch_requires_refresh=bool(getattr(args, "frontier_switch_requires_refresh", True)),
         )
         if bool(args.frontier_commitment_enabled)
         else None
@@ -2262,6 +2967,16 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
     stop_called = False
     policy_stop_confirmed = False
     gt_success_region_reached = False
+    metric_pose_valid = True
+    metric_pose_invalid_steps = 0
+    metric_pose_last_invalid_step = -1
+    metric_pose_last_invalid_reason = None
+    logged_metric_pose_invalid = False
+    frontier_target_resolution_failures = 0
+    frontier_target_no_clearance_safe_count = 0
+    frontier_commit_target_mismatch_count = 0
+    guard_low_clearance_blocked_steps = 0
+    last_guard_debug: dict[str, object] = {}
     gt_success_without_sgnav_stop_steps = 0
     gt_success_ignored_steps = 0
     target_radius_reached_steps = 0
@@ -2275,6 +2990,10 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
     goal_detection_history = []
     last_frontiers = []
     roomseg_frontier_update_gate = FrontierRoomsegUpdateGateState()
+    frontier_arrival_update_state = FrontierArrivalUpdateState()
+    committed_frontier_execution = CommittedFrontierExecutionState()
+    roomseg_update_call_counts_by_step: dict[int, int] = {}
+    roomseg_update_called_sites_by_step: dict[int, list[str]] = {}
     last_nav_decision = None
     last_frontier_commitment_metadata = {}
     last_frontier_commitment_reason = ""
@@ -2301,6 +3020,283 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
     frontier_unreachable_reason = None
     frontier_stop_at_current_grid = None
     frontier_blacklisted = False
+    frontier_direct_no_path_count = 0
+    last_frontier_recovery_metadata: dict[str, object] = {}
+    frontier_recovery_cfg = frontier_recovery_config_from_args(args)
+
+    def compute_frontier_recovery_target(
+        *,
+        nav_decision_local: NavigationDecision,
+        current_grid_local: Tuple[int, int],
+        traversible_local: np.ndarray,
+        clearance_local: np.ndarray,
+        planner_local: GridAStarPlanner | None,
+        trigger_reason: str,
+    ) -> FrontierRecoveryTarget | None:
+        if not bool(getattr(args, "frontier_unreachable_recovery_enabled", True)):
+            return None
+        if not committed_frontier_execution.exists():
+            return None
+        if (
+            int(committed_frontier_execution.recovery_attempts)
+            >= int(frontier_recovery_cfg.max_recovery_attempts_per_frontier)
+            and not bool(committed_frontier_execution.recovery_active)
+        ):
+            return None
+        center, members = _frontier_members_for_recovery(nav_decision_local, committed_frontier_execution)
+        if center is None:
+            return None
+        original_target = (
+            committed_frontier_execution.original_actual_target_grid
+            or committed_frontier_execution.actual_target_grid
+            or _as_grid_cell(dict(getattr(nav_decision_local, "metadata", {}) or {}).get("frontier_actual_target_grid"))
+        )
+        recovery_traversible = np.asarray(traversible_local, dtype=bool)
+        recovery_planner = planner_local
+        if recovery_planner is None:
+            recovery_planner = GridAStarPlanner(
+                recovery_traversible,
+                float(dynamic_map_info.resolution_m),
+                allow_diagonal=True,
+            )
+        recovery = find_best_reachable_frontier_approach(
+            current_grid=tuple(int(v) for v in current_grid_local),
+            frontier_center=center,
+            frontier_members=members,
+            original_target=original_target,
+            traversible=recovery_traversible,
+            clearance_m=np.asarray(clearance_local, dtype=np.float32),
+            planner=recovery_planner,
+            resolution_m=float(dynamic_map_info.resolution_m),
+            config=frontier_recovery_cfg,
+        )
+        recovery.reason = str(trigger_reason) if recovery.reachable else str(recovery.reason)
+        return recovery
+
+    def apply_frontier_recovery_or_refresh(
+        *,
+        nav_decision_local: NavigationDecision,
+        current_grid_local: Tuple[int, int],
+        traversible_local: np.ndarray,
+        clearance_local: np.ndarray,
+        planner_local: GridAStarPlanner | None,
+        trigger_reason: str,
+        refresh_reason: str,
+        partial_refresh_reason: str | None = None,
+        mark_failed_if_no_recovery: bool = False,
+    ) -> str:
+        nonlocal current_path, force_perception_step, frontier_unreachable_recovery, frontier_unreachable_reason
+        nonlocal frontier_stop_at_current_grid, frontier_blacklisted, last_frontier_commitment_reason
+        nonlocal last_frontier_commitment_metadata, last_nav_decision, nav_execution_progress_key
+        nonlocal nav_execution_best_distance_m, nav_execution_no_progress_steps, last_frontier_recovery_metadata
+        recovery = compute_frontier_recovery_target(
+            nav_decision_local=nav_decision_local,
+            current_grid_local=current_grid_local,
+            traversible_local=traversible_local,
+            clearance_local=clearance_local,
+            planner_local=planner_local,
+            trigger_reason=trigger_reason,
+        )
+        recovery_metadata = dict(recovery.metadata()) if recovery is not None else {
+            "frontier_target_planning_stage": "recovery_unavailable",
+            "frontier_recovery_reason": str(trigger_reason),
+            "frontier_unreachable_recovery": False,
+        }
+        last_frontier_recovery_metadata = dict(recovery_metadata)
+        nav_decision_local.metadata = {
+            **dict(nav_decision_local.metadata or {}),
+            **recovery_metadata,
+            "frontier_refresh_required_before_reselect": True,
+        }
+        if recovery is not None and recovery.reachable and recovery.target_cell is not None:
+            target = tuple(int(v) for v in recovery.target_cell)
+            if recovery.mode == "current_cell_partial_arrival" or target == tuple(int(v) for v in current_grid_local) or len(recovery.path) <= 1:
+                effective_refresh_reason = str(partial_refresh_reason or refresh_reason)
+                key = make_committed_frontier_arrival_key(committed_frontier_execution)
+                committed_frontier_execution.mark_partial_arrival_pending(int(step), key, effective_refresh_reason)
+                request_frontier_refresh(
+                    refresh_state=frontier_arrival_update_state,
+                    step=int(step),
+                    reason=effective_refresh_reason,
+                    frontier_key=key,
+                    block_reselect=bool(getattr(args, "frontier_refresh_blocks_reselect", True)),
+                )
+                if frontier_commitment is not None:
+                    frontier_commitment.mark_active_reached(step, effective_refresh_reason)
+                current_path = []
+                force_perception_step = True
+                full_path.append(tuple(int(v) for v in current_grid_local))
+                frontier_unreachable_recovery = True
+                frontier_unreachable_reason = effective_refresh_reason
+                frontier_stop_at_current_grid = [int(current_grid_local[0]), int(current_grid_local[1])]
+                last_frontier_commitment_reason = effective_refresh_reason
+                last_frontier_commitment_metadata = {
+                    **dict(last_frontier_commitment_metadata),
+                    **committed_frontier_execution.debug_metadata(
+                        step=int(step),
+                        current_grid=tuple(int(v) for v in current_grid_local),
+                        resolution_m=float(dynamic_map_info.resolution_m),
+                    ),
+                    **recovery_metadata,
+                    "frontier_commitment_reason": effective_refresh_reason,
+                    "frontier_refresh_pending": True,
+                    "frontier_refresh_reason": effective_refresh_reason,
+                }
+                nav_decision_local.reason = effective_refresh_reason
+                nav_decision_local.metadata = {
+                    **dict(nav_decision_local.metadata or {}),
+                    "frontier_refresh_pending": True,
+                    "frontier_refresh_reason": effective_refresh_reason,
+                }
+                last_nav_decision = nav_decision_local
+                return "refresh_pending"
+            committed_frontier_execution.start_recovery(
+                step=int(step),
+                target_grid=target,
+                path=list(recovery.path),
+                reason=trigger_reason,
+            )
+            nav_decision_local.target_cells = [target]
+            nav_decision_local.reason = str(trigger_reason)
+            nav_decision_local.metadata = {
+                **dict(nav_decision_local.metadata or {}),
+                **recovery_metadata,
+                **committed_frontier_execution.debug_metadata(
+                    step=int(step),
+                    current_grid=tuple(int(v) for v in current_grid_local),
+                    resolution_m=float(dynamic_map_info.resolution_m),
+                ),
+                "frontier_actual_target_grid": [int(target[0]), int(target[1])],
+                "frontier_target_planning_stage": "recovery",
+            }
+            current_path = list(recovery.path)
+            force_perception_step = False
+            frontier_unreachable_recovery = True
+            frontier_unreachable_reason = trigger_reason
+            frontier_blacklisted = False
+            last_frontier_commitment_reason = trigger_reason
+            last_frontier_commitment_metadata = {
+                **dict(last_frontier_commitment_metadata),
+                **dict(nav_decision_local.metadata or {}),
+                "frontier_commitment_reason": trigger_reason,
+                "frontier_blacklisted": False,
+            }
+            last_nav_decision = nav_decision_local
+            nav_execution_progress_key = None
+            nav_execution_best_distance_m = float("inf")
+            nav_execution_no_progress_steps = 0
+            return "recovery_started"
+        if mark_failed_if_no_recovery and committed_frontier_execution.exists():
+            committed_frontier_execution.mark_failed(refresh_reason, blacklist=False)
+        if frontier_commitment is not None:
+            frontier_commitment.mark_active_failed(step, refresh_reason, blacklist=False)
+        key = make_committed_frontier_arrival_key(committed_frontier_execution)
+        request_frontier_refresh(
+            refresh_state=frontier_arrival_update_state,
+            step=int(step),
+            reason=refresh_reason,
+            frontier_key=key,
+            block_reselect=bool(getattr(args, "frontier_refresh_blocks_reselect", True)),
+        )
+        current_path = []
+        force_perception_step = True
+        full_path.append(tuple(int(v) for v in current_grid_local))
+        frontier_unreachable_recovery = True
+        frontier_unreachable_reason = refresh_reason
+        frontier_stop_at_current_grid = [int(current_grid_local[0]), int(current_grid_local[1])]
+        frontier_blacklisted = False
+        last_frontier_commitment_reason = refresh_reason
+        last_frontier_commitment_metadata = {
+            **dict(last_frontier_commitment_metadata),
+            **recovery_metadata,
+            **committed_frontier_execution.debug_metadata(
+                step=int(step),
+                current_grid=tuple(int(v) for v in current_grid_local),
+                resolution_m=float(dynamic_map_info.resolution_m),
+            ),
+            "frontier_commitment_reason": refresh_reason,
+            "frontier_refresh_pending": True,
+            "frontier_refresh_reason": refresh_reason,
+            "frontier_blacklisted": False,
+        }
+        last_nav_decision = nav_decision_local
+        nav_execution_progress_key = None
+        nav_execution_best_distance_m = float("inf")
+        nav_execution_no_progress_steps = 0
+        return "refresh_pending"
+
+    def request_frontier_refresh_at_current(
+        *,
+        nav_decision_local: NavigationDecision | None,
+        current_grid_local: Tuple[int, int],
+        reason: str,
+        status_reason: str | None = None,
+        reached: bool = False,
+    ) -> None:
+        nonlocal current_path, force_perception_step, frontier_unreachable_recovery, frontier_unreachable_reason
+        nonlocal frontier_stop_at_current_grid, frontier_blacklisted, last_frontier_commitment_reason
+        nonlocal last_frontier_commitment_metadata, last_nav_decision, nav_execution_progress_key
+        nonlocal nav_execution_best_distance_m, nav_execution_no_progress_steps
+        key = make_committed_frontier_arrival_key(committed_frontier_execution)
+        if committed_frontier_execution.exists():
+            committed_frontier_execution.mark_partial_arrival_pending(int(step), key, reason)
+        request_frontier_refresh(
+            refresh_state=frontier_arrival_update_state,
+            step=int(step),
+            reason=reason,
+            frontier_key=key,
+            block_reselect=bool(getattr(args, "frontier_refresh_blocks_reselect", True)),
+        )
+        if frontier_commitment is not None:
+            if reached:
+                frontier_commitment.mark_active_reached(step, reason)
+            else:
+                frontier_commitment.mark_active_failed(step, reason, blacklist=False)
+        current_path = []
+        force_perception_step = True
+        full_path.append(tuple(int(v) for v in current_grid_local))
+        frontier_unreachable_recovery = True
+        frontier_unreachable_reason = reason
+        frontier_stop_at_current_grid = [int(current_grid_local[0]), int(current_grid_local[1])]
+        frontier_blacklisted = False
+        last_frontier_commitment_reason = reason
+        debug_metadata = (
+            committed_frontier_execution.debug_metadata(
+                step=int(step),
+                current_grid=tuple(int(v) for v in current_grid_local),
+                resolution_m=float(dynamic_map_info.resolution_m),
+            )
+            if committed_frontier_execution is not None
+            else {}
+        )
+        last_frontier_commitment_metadata = {
+            **dict(last_frontier_commitment_metadata),
+            **debug_metadata,
+            **dict(last_frontier_recovery_metadata),
+            "frontier_commitment_reason": reason,
+            "frontier_refresh_pending": True,
+            "frontier_refresh_reason": reason,
+            "frontier_refresh_status_reason": status_reason,
+            "frontier_blacklisted": False,
+            "frontier_stop_at_current_grid": frontier_stop_at_current_grid,
+        }
+        if nav_decision_local is not None:
+            nav_decision_local.reason = reason
+            nav_decision_local.metadata = {
+                **dict(nav_decision_local.metadata or {}),
+                **debug_metadata,
+                **dict(last_frontier_recovery_metadata),
+                "frontier_refresh_pending": True,
+                "frontier_refresh_reason": reason,
+                "frontier_refresh_status_reason": status_reason,
+                "frontier_blacklisted": False,
+                "frontier_stop_at_current_grid": frontier_stop_at_current_grid,
+            }
+            last_nav_decision = nav_decision_local
+        nav_execution_progress_key = None
+        nav_execution_best_distance_m = float("inf")
+        nav_execution_no_progress_steps = 0
+
     paper_mode = str(getattr(args, "sgnav_mode", "legacy")).strip().lower() == "paper"
     long_term_goal = LongTermGoalState()
     sgnav_viz_enabled = bool(getattr(args, "sgnav_viz", False))
@@ -2469,12 +3465,13 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
                 "bbox_xyxy": [float(v) for v in det.bbox_xyxy],
             }
 
-        def update_mapper_state(current_obs: dict, step_idx: int | None = None):
+        def update_mapper_state(current_obs: dict, step_idx: int | None = None, *, build_planners: bool = False):
             nonlocal dynamic_map_info, last_dynamic_occupancy, last_dynamic_free, last_dynamic_navigable, last_dynamic_astar_navigable, last_dynamic_observed
             pose_local = current_obs["pose_world"]
             if not current_obs.get("has_depth"):
                 return None
             started_at = time.perf_counter()
+            state_timing_local: dict[str, float] = {}
             mapper.update(current_obs["depth"], intr, pose_local, current_obs["camera_pose_world"])
             record_mapping_breakdown(getattr(mapper, "last_timing_stats", {}))
             record_voxel_perf_trace(step_idx)
@@ -2556,55 +3553,35 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
             occupancy_local = mapper.grid.occupied.astype(bool)
             free_local = mapper.grid.free.astype(bool)
             observed_local = mapper.grid.observed.astype(bool)
-            record_mapping_timing("array_export_ms", (time.perf_counter() - array_export_started_at) * 1000.0)
+            elapsed = (time.perf_counter() - array_export_started_at) * 1000.0
+            state_timing_local["array_export_ms"] = float(elapsed)
+            record_mapping_timing("array_export_ms", elapsed)
             traversible_started_at = time.perf_counter()
             navigable_local = mapper.traversible(unknown_is_obstacle=True)
-            record_mapping_timing("traversible_ms", (time.perf_counter() - traversible_started_at) * 1000.0)
-            planner_init_started_at = time.perf_counter()
-            base_nav_planner_local = GridAStarPlanner(navigable_local, dynamic_map_info.resolution_m, allow_diagonal=True)
-            record_mapping_timing("base_planner_init_ms", (time.perf_counter() - planner_init_started_at) * 1000.0)
+            elapsed = (time.perf_counter() - traversible_started_at) * 1000.0
+            state_timing_local["traversible_ms"] = float(elapsed)
+            record_mapping_timing("traversible_ms", elapsed)
+            base_nav_planner_local = None
             snap_started_at = time.perf_counter()
-            current_grid_local = base_nav_planner_local.snap_to_free(
-                world_xy_to_grid(float(pose_local[0]), float(pose_local[1]), dynamic_map_info)
-            )
-            record_mapping_timing("snap_to_free_ms", (time.perf_counter() - snap_started_at) * 1000.0)
-            clearance_started_at = time.perf_counter()
-            astar_navigable_local = apply_dynamic_astar_edge_clearance(
+            pose_grid_local = world_xy_to_grid(float(pose_local[0]), float(pose_local[1]), dynamic_map_info)
+            current_grid_local = snap_to_free_local(
                 navigable_local,
-                occupancy_local,
-                dynamic_map_info.resolution_m,
-                float(args.runtime_planning_clearance_m),
-                current_grid=current_grid_local,
+                pose_grid_local,
+                radius_cells=max(3, int(round(float(args.robot_radius_m) / max(float(dynamic_map_info.resolution_m), 1e-6))) + 2),
             )
-            record_mapping_timing("astar_clearance_ms", (time.perf_counter() - clearance_started_at) * 1000.0)
-            planner_init_started_at = time.perf_counter()
-            nav_planner_local, astar_clearance_m_local, astar_used_clearance_cost_local = make_runtime_nav_planner(
-                args,
-                astar_navigable_local,
-                occupancy_local,
-                dynamic_map_info.resolution_m,
-            )
-            record_mapping_timing("planner_init_ms", (time.perf_counter() - planner_init_started_at) * 1000.0)
             if current_grid_local is None:
-                recovery_started_at = time.perf_counter()
-                mapper.update_simple_radius(pose_local, radius_m=max(float(args.robot_radius_m), float(args.online_resolution_m)))
-                record_mapping_timing("simple_radius_recovery_ms", (time.perf_counter() - recovery_started_at) * 1000.0)
-                array_export_started_at = time.perf_counter()
-                occupancy_local = mapper.grid.occupied.astype(bool)
-                free_local = mapper.grid.free.astype(bool)
-                observed_local = mapper.grid.observed.astype(bool)
-                record_mapping_timing("array_export_ms", (time.perf_counter() - array_export_started_at) * 1000.0)
-                traversible_started_at = time.perf_counter()
-                navigable_local = mapper.traversible(unknown_is_obstacle=True)
-                record_mapping_timing("traversible_ms", (time.perf_counter() - traversible_started_at) * 1000.0)
                 planner_init_started_at = time.perf_counter()
                 base_nav_planner_local = GridAStarPlanner(navigable_local, dynamic_map_info.resolution_m, allow_diagonal=True)
                 record_mapping_timing("base_planner_init_ms", (time.perf_counter() - planner_init_started_at) * 1000.0)
-                snap_started_at = time.perf_counter()
-                current_grid_local = base_nav_planner_local.snap_to_free(
-                    world_xy_to_grid(float(pose_local[0]), float(pose_local[1]), dynamic_map_info)
-                )
-                record_mapping_timing("snap_to_free_ms", (time.perf_counter() - snap_started_at) * 1000.0)
+                current_grid_local = base_nav_planner_local.snap_to_free(pose_grid_local)
+            else:
+                record_mapping_timing("base_planner_init_ms", 0.0)
+            record_mapping_timing("snap_to_free_ms", (time.perf_counter() - snap_started_at) * 1000.0)
+            astar_navigable_local = navigable_local
+            nav_planner_local = None
+            astar_clearance_m_local = None
+            astar_used_clearance_cost_local = False
+            if bool(build_planners):
                 clearance_started_at = time.perf_counter()
                 astar_navigable_local = apply_dynamic_astar_edge_clearance(
                     navigable_local,
@@ -2621,7 +3598,57 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
                     occupancy_local,
                     dynamic_map_info.resolution_m,
                 )
+                if base_nav_planner_local is None:
+                    base_nav_planner_local = GridAStarPlanner(navigable_local, dynamic_map_info.resolution_m, allow_diagonal=True)
                 record_mapping_timing("planner_init_ms", (time.perf_counter() - planner_init_started_at) * 1000.0)
+            else:
+                record_mapping_timing("astar_clearance_ms", 0.0)
+                record_mapping_timing("planner_init_ms", 0.0)
+            if current_grid_local is None:
+                recovery_started_at = time.perf_counter()
+                mapper.update_simple_radius(pose_local, radius_m=max(float(args.robot_radius_m), float(args.online_resolution_m)))
+                record_mapping_timing("simple_radius_recovery_ms", (time.perf_counter() - recovery_started_at) * 1000.0)
+                array_export_started_at = time.perf_counter()
+                occupancy_local = mapper.grid.occupied.astype(bool)
+                free_local = mapper.grid.free.astype(bool)
+                observed_local = mapper.grid.observed.astype(bool)
+                elapsed = (time.perf_counter() - array_export_started_at) * 1000.0
+                state_timing_local["array_export_ms"] = float(elapsed)
+                record_mapping_timing("array_export_ms", elapsed)
+                traversible_started_at = time.perf_counter()
+                navigable_local = mapper.traversible(unknown_is_obstacle=True)
+                elapsed = (time.perf_counter() - traversible_started_at) * 1000.0
+                state_timing_local["traversible_ms"] = float(elapsed)
+                record_mapping_timing("traversible_ms", elapsed)
+                snap_started_at = time.perf_counter()
+                pose_grid_local = world_xy_to_grid(float(pose_local[0]), float(pose_local[1]), dynamic_map_info)
+                current_grid_local = snap_to_free_local(navigable_local, pose_grid_local, radius_cells=5)
+                if current_grid_local is None:
+                    planner_init_started_at = time.perf_counter()
+                    base_nav_planner_local = GridAStarPlanner(navigable_local, dynamic_map_info.resolution_m, allow_diagonal=True)
+                    record_mapping_timing("base_planner_init_ms", (time.perf_counter() - planner_init_started_at) * 1000.0)
+                    current_grid_local = base_nav_planner_local.snap_to_free(pose_grid_local)
+                record_mapping_timing("snap_to_free_ms", (time.perf_counter() - snap_started_at) * 1000.0)
+                if bool(build_planners):
+                    clearance_started_at = time.perf_counter()
+                    astar_navigable_local = apply_dynamic_astar_edge_clearance(
+                        navigable_local,
+                        occupancy_local,
+                        dynamic_map_info.resolution_m,
+                        float(args.runtime_planning_clearance_m),
+                        current_grid=current_grid_local,
+                    )
+                    record_mapping_timing("astar_clearance_ms", (time.perf_counter() - clearance_started_at) * 1000.0)
+                    planner_init_started_at = time.perf_counter()
+                    nav_planner_local, astar_clearance_m_local, astar_used_clearance_cost_local = make_runtime_nav_planner(
+                        args,
+                        astar_navigable_local,
+                        occupancy_local,
+                        dynamic_map_info.resolution_m,
+                    )
+                    if base_nav_planner_local is None:
+                        base_nav_planner_local = GridAStarPlanner(navigable_local, dynamic_map_info.resolution_m, allow_diagonal=True)
+                    record_mapping_timing("planner_init_ms", (time.perf_counter() - planner_init_started_at) * 1000.0)
             last_dynamic_occupancy = occupancy_local
             last_dynamic_free = free_local
             last_dynamic_navigable = navigable_local
@@ -2643,19 +3670,90 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
                 "astar_clearance_m": astar_clearance_m_local,
                 "astar_used_clearance_cost": bool(astar_used_clearance_cost_local),
                 "astar_clearance_desired_m": float(getattr(args, "astar_clearance_desired_m", 0.25)),
+                "_planner_timing_ms": {
+                    "base_planner_init_ms": 0.0,
+                    "astar_clearance_ms": 0.0,
+                    "planner_init_ms": 0.0,
+                },
+                "_state_timing_ms": state_timing_local,
             }
 
-        def runtime_navigation_debug_layers(map_state_local: Mapping[str, object]) -> dict[str, object]:
-            debug = mapper.navigation_debug_layers()
+        def ensure_runtime_planners(map_state_local: dict) -> dict:
+            if map_state_local.get("nav_planner") is not None and map_state_local.get("base_nav_planner") is not None:
+                return map_state_local
+            navigable_local = np.asarray(map_state_local["navigable"], dtype=bool)
+            occupancy_local = np.asarray(map_state_local["occupancy"], dtype=bool)
+            map_info_local = map_state_local["map_info"]
+            current_grid_local = map_state_local.get("current_grid")
+            planner_timing: dict[str, float] = {}
+            planner_init_started_at = time.perf_counter()
+            base_nav_planner_local = GridAStarPlanner(navigable_local, map_info_local.resolution_m, allow_diagonal=True)
+            elapsed = (time.perf_counter() - planner_init_started_at) * 1000.0
+            planner_timing["base_planner_init_ms"] = float(elapsed)
+            record_mapping_timing("base_planner_init_ms", elapsed)
+            if current_grid_local is None:
+                snap_started_at = time.perf_counter()
+                pose_local = map_state_local["pose"]
+                current_grid_local = base_nav_planner_local.snap_to_free(
+                    world_xy_to_grid(float(pose_local[0]), float(pose_local[1]), map_info_local)
+                )
+                elapsed = (time.perf_counter() - snap_started_at) * 1000.0
+                planner_timing["snap_to_free_ms"] = float(elapsed)
+                record_mapping_timing("snap_to_free_ms", elapsed)
+            clearance_started_at = time.perf_counter()
+            astar_navigable_local = apply_dynamic_astar_edge_clearance(
+                navigable_local,
+                occupancy_local,
+                map_info_local.resolution_m,
+                float(args.runtime_planning_clearance_m),
+                current_grid=current_grid_local,
+            )
+            elapsed = (time.perf_counter() - clearance_started_at) * 1000.0
+            planner_timing["astar_clearance_ms"] = float(elapsed)
+            record_mapping_timing("astar_clearance_ms", elapsed)
+            planner_init_started_at = time.perf_counter()
+            nav_planner_local, astar_clearance_m_local, astar_used_clearance_cost_local = make_runtime_nav_planner(
+                args,
+                astar_navigable_local,
+                occupancy_local,
+                map_info_local.resolution_m,
+            )
+            elapsed = (time.perf_counter() - planner_init_started_at) * 1000.0
+            planner_timing["planner_init_ms"] = float(elapsed)
+            record_mapping_timing("planner_init_ms", elapsed)
+            map_state_local.update(
+                {
+                    "astar_navigable": astar_navigable_local,
+                    "base_nav_planner": base_nav_planner_local,
+                    "nav_planner": nav_planner_local,
+                    "current_grid": current_grid_local,
+                    "astar_clearance_m": astar_clearance_m_local,
+                    "astar_used_clearance_cost": bool(astar_used_clearance_cost_local),
+                    "astar_clearance_desired_m": float(getattr(args, "astar_clearance_desired_m", 0.25)),
+                    "_planner_timing_ms": planner_timing,
+                }
+            )
+            return map_state_local
+
+        def runtime_navigation_debug_layers(map_state_local: Mapping[str, object], *, include_arrays: bool = False) -> dict[str, object]:
+            debug = mapper.navigation_debug_layers(include_arrays=bool(include_arrays))
             clearance = map_state_local.get("astar_clearance_m")
             if isinstance(clearance, np.ndarray):
                 clearance_arr = np.asarray(clearance, dtype=np.float32)
-                debug["astar_clearance_m"] = clearance_arr.copy()
-                debug["astar_clearance_low_cells"] = clearance_arr < float(getattr(args, "lookahead_min_clearance_m", 0.14))
+                lookahead_min_clearance = float(getattr(args, "lookahead_effective_min_clearance_m", getattr(args, "lookahead_min_clearance_m", 0.14)))
+                if bool(include_arrays):
+                    debug["astar_clearance_m"] = clearance_arr.copy()
+                    debug["astar_clearance_low_cells"] = clearance_arr < lookahead_min_clearance
                 finite = clearance_arr[np.isfinite(clearance_arr)]
                 debug["astar_clearance_min_m"] = None if finite.size == 0 else float(np.min(finite))
+                debug["astar_clearance_mean_m"] = None if finite.size == 0 else float(np.mean(finite))
+                debug["astar_clearance_low_cells_count"] = int(np.count_nonzero(clearance_arr < lookahead_min_clearance))
             debug["astar_clearance_desired_m"] = float(getattr(args, "astar_clearance_desired_m", 0.25))
             debug["astar_used_clearance_cost"] = bool(map_state_local.get("astar_used_clearance_cost", False))
+            debug["lookahead_min_clearance_m_configured"] = float(getattr(args, "lookahead_min_clearance_m", 0.14))
+            debug["lookahead_min_clearance_m_effective"] = float(
+                getattr(args, "lookahead_effective_min_clearance_m", getattr(args, "lookahead_min_clearance_m", 0.14))
+            )
             return debug
 
         def run_detector_update(
@@ -2867,9 +3965,17 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
                 include_selected_frontier_sector=False,
             )
 
-        def update_room_context_for_frontier_scoring(step_idx: int, map_state: dict) -> RoomContextResult:
+        def update_room_context_for_frontier_scoring(
+            step_idx: int,
+            map_state: dict,
+            *,
+            call_site: str = "direct",
+        ) -> RoomContextResult:
             nonlocal last_room_masks, room_semantic_labels, last_room_segmentation_debug
             nonlocal last_room_semantics_debug, last_room_context_result, last_room_context_metadata
+            step_key = int(step_idx)
+            roomseg_update_call_counts_by_step[step_key] = int(roomseg_update_call_counts_by_step.get(step_key, 0)) + 1
+            roomseg_update_called_sites_by_step.setdefault(step_key, []).append(str(call_site))
             result = prepare_room_context_for_frontier_scoring(
                 step_idx=int(step_idx),
                 mapper=mapper,
@@ -2898,6 +4004,21 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
             if viz is not None:
                 viz.set_room_context(last_room_masks, room_semantic_labels, last_room_segmentation_debug)
             return result
+
+        def maybe_update_room_context_for_frontier_scoring(
+            *,
+            token: RoomsegFrontierUpdateToken,
+            step_idx: int,
+            map_state: dict,
+            call_site: str,
+        ) -> RoomContextResult | None:
+            if not bool(token.allowed):
+                return None
+            return update_room_context_for_frontier_scoring(
+                step_idx,
+                map_state,
+                call_site=call_site,
+            )
 
         def save_selected_roomseg_snapshot(
             step_idx: int,
@@ -3200,17 +4321,37 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
             if current_grid is None:
                 failure_reason = "agent_off_navigable_map"
                 break
+            include_runtime_debug_arrays = bool(getattr(args, "runtime_debug_full_arrays", False))
+            include_runtime_debug_arrays = include_runtime_debug_arrays or bool(
+                viz is not None
+                and step % viz_every == 0
+                and bool(getattr(args, "runtime_debug_full_arrays_on_viz", True))
+            )
             last_room_segmentation_debug = {
                 **dict(last_room_segmentation_debug),
-                **runtime_navigation_debug_layers(map_state),
+                **runtime_navigation_debug_layers(map_state, include_arrays=include_runtime_debug_arrays),
             }
             if viz is not None:
                 viz.set_room_context(last_room_masks, room_semantic_labels, last_room_segmentation_debug)
-            metric_grid = metric_planner.snap_to_free(world_xy_to_grid(float(pose[0]), float(pose[1]), static_map_info))
-            if metric_grid is None:
-                failure_reason = "agent_off_static_metric_map"
-                break
-            evaluator.update_pose(pose, metric_grid, collided=bool(obs.get("collided", False)))
+            metric_pose_valid, metric_grid = update_metric_evaluator_pose_or_mark_invalid(
+                evaluator,
+                metric_planner,
+                pose,
+                static_map_info,
+                collided=bool(obs.get("collided", False)),
+            )
+            if not metric_pose_valid:
+                metric_pose_invalid_steps += 1
+                metric_pose_last_invalid_step = int(step)
+                metric_pose_last_invalid_reason = "agent_off_static_metric_map"
+                if not logged_metric_pose_invalid:
+                    print(
+                        "[sgnav-loop] agent outside static metric map; metric row will be marked invalid, "
+                        "continuing online voxel navigation",
+                        flush=True,
+                    )
+                    logged_metric_pose_invalid = True
+            policy_distance_to_goal = evaluator.final_distance_to_goal if metric_pose_valid else float("inf")
             if roomseg_debug_only:
                 update_roomseg_debug_only(step, map_state)
                 if viz is not None and step % viz_every == 0:
@@ -3249,12 +4390,12 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
                     )
                     continue
                 break
-            if evaluator.final_distance_to_goal <= success_distance:
+            if policy_distance_to_goal <= success_distance:
                 gt_success_region_reached = True
                 if explore_until_no_frontiers:
                     gt_success_ignored_steps += 1
             if success_region_can_finish(
-                evaluator.final_distance_to_goal,
+                policy_distance_to_goal,
                 success_distance,
                 require_sgnav_stop=bool(args.require_sgnav_stop),
                 policy_stop_confirmed=False,
@@ -3262,7 +4403,7 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
             ):
                 stop_called = True
                 break
-            if evaluator.final_distance_to_goal <= success_distance and bool(args.require_sgnav_stop):
+            if policy_distance_to_goal <= success_distance and bool(args.require_sgnav_stop):
                 gt_success_without_sgnav_stop_steps += 1
                 stop_blocked_reason = "sgnav_stop_required"
                 if not logged_gt_success_without_sgnav_stop:
@@ -3287,19 +4428,118 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
                     current_path = suffix
                 else:
                     needs_replan = True
+            committed_frontier_active = (
+                bool(getattr(args, "frontier_execution_state_enabled", True))
+                and committed_frontier_execution.exists()
+                and not bool(committed_frontier_execution.arrival_pending_update)
+            )
+            if committed_frontier_active:
+                arrival_confirmed, arrival_distance_m, arrival_reason = frontier_arrival_status(
+                    step=int(step),
+                    current_grid=tuple(int(v) for v in current_grid),
+                    execution=committed_frontier_execution,
+                    resolution_m=float(dynamic_map_info.resolution_m),
+                    reached_radius_m=float(args.frontier_commit_reached_radius_m),
+                    min_steps_since_selection=int(getattr(args, "frontier_arrival_min_steps_since_selection", 6)),
+                    confirm_steps=int(getattr(args, "frontier_arrival_confirm_steps", 2)),
+                    current_path=current_path,
+                )
+                last_frontier_commitment_metadata = {
+                    **dict(last_frontier_commitment_metadata),
+                    **committed_frontier_execution.debug_metadata(
+                        step=int(step),
+                        current_grid=tuple(int(v) for v in current_grid),
+                        resolution_m=float(dynamic_map_info.resolution_m),
+                    ),
+                    "frontier_arrival_status_reason": str(arrival_reason),
+                }
+                if arrival_confirmed:
+                    reason = "frontier_arrival_confirmed"
+                    target_radius_reached_steps += 1
+                    arrival_key = make_committed_frontier_arrival_key(committed_frontier_execution)
+                    committed_frontier_execution.mark_arrival_pending(int(step), arrival_key)
+                    request_frontier_refresh(
+                        refresh_state=frontier_arrival_update_state,
+                        step=int(step),
+                        reason="frontier_arrival",
+                        frontier_key=arrival_key,
+                        block_reselect=bool(getattr(args, "frontier_refresh_blocks_reselect", True)),
+                    )
+                    try:
+                        mapper.force_full_navigation_projection_once = True
+                        mapper.voxel_grid.invalidate_navigation_projection_cache(reason="frontier_arrival")
+                    except Exception:
+                        pass
+                    if frontier_commitment is not None and last_decision_mode == "frontier":
+                        if bool(getattr(args, "frontier_arrival_blacklist_on_reached", False)):
+                            frontier_commitment.mark_active_failed(step, reason, blacklist=True)
+                        else:
+                            frontier_commitment.mark_active_reached(step, reason)
+                    current_path = []
+                    force_perception_step = True
+                    full_path.append(tuple(int(v) for v in current_grid))
+                    last_decision_reason = reason
+                    if last_nav_decision is not None:
+                        last_nav_decision.reason = reason
+                        last_nav_decision.metadata = {
+                            **dict(last_nav_decision.metadata or {}),
+                            "target_radius_reached": True,
+                            "frontier_arrival_confirmed": True,
+                            "target_reached_distance_m": float(arrival_distance_m),
+                            "target_reached_radius_m": float(args.frontier_commit_reached_radius_m),
+                            **committed_frontier_execution.debug_metadata(
+                                step=int(step),
+                                current_grid=tuple(int(v) for v in current_grid),
+                                resolution_m=float(dynamic_map_info.resolution_m),
+                            ),
+                        }
+                    last_frontier_commitment_reason = reason
+                    last_frontier_commitment_metadata = {
+                        **dict(last_frontier_commitment_metadata),
+                        "frontier_commitment_reason": reason,
+                        "frontier_refresh_pending": True,
+                        "frontier_refresh_reason": "frontier_arrival",
+                        "target_radius_reached": True,
+                        "frontier_arrival_confirmed": True,
+                        "target_reached_distance_m": float(arrival_distance_m),
+                        "target_reached_radius_m": float(args.frontier_commit_reached_radius_m),
+                    }
+                    obs = server.step_kinematic_velocity(
+                        0.0,
+                        0.0,
+                        0.0,
+                        dt=float(args.control_dt),
+                        render_updates=int(args.render_updates_per_step),
+                        read_rgb=detector_requires_rgb(detector, args.detector),
+                        read_depth=True,
+                        rgb_device="cuda" if detector_cuda_rgb else "cpu",
+                    )
+                    continue
             update_roomseg_frontiers, roomseg_frontier_update_reason = should_update_roomseg_frontiers(
                 step=int(step),
-                has_current_path=bool(current_path),
+                has_current_path=bool(current_path or committed_frontier_active),
                 gate_state=roomseg_frontier_update_gate,
+                arrival_state=frontier_arrival_update_state,
                 policy=str(getattr(args, "roomseg_frontier_update_policy", "at_frontier_arrival")),
                 freeze_during_navigation=bool(getattr(args, "freeze_roomseg_and_frontiers_during_navigation", True)),
-                target_invalidated=bool(needs_replan and not current_path and roomseg_frontier_update_gate.initialized),
-                no_active_path=bool(not current_path),
+                target_invalidated=bool(needs_replan and not current_path and roomseg_frontier_update_gate.initialized and not committed_frontier_active),
+                no_active_path=bool(not current_path and not committed_frontier_active),
                 debug_force=bool(getattr(args, "force_roomseg_frontier_update", False)),
                 update_on_target_invalidated=bool(getattr(args, "roomseg_frontier_update_on_target_invalidated", False)),
                 update_on_no_active_path=bool(getattr(args, "roomseg_frontier_update_on_no_active_path", False)),
                 update_on_no_progress=bool(getattr(args, "roomseg_frontier_update_on_no_progress", False)),
             )
+            roomseg_update_token = RoomsegFrontierUpdateToken(
+                allowed=bool(update_roomseg_frontiers),
+                reason=str(roomseg_frontier_update_reason),
+                step=int(step),
+            )
+            if (
+                bool(frontier_arrival_update_state.refresh_pending)
+                and bool(frontier_arrival_update_state.block_reselect_until_refresh)
+                and not bool(update_roomseg_frontiers)
+            ):
+                raise RuntimeError("frontier_refresh_pending_but_gate_denied")
             if needs_replan and not update_roomseg_frontiers and current_path:
                 needs_replan = False
                 mark_roomseg_frontier_gate_skip(roomseg_frontier_update_gate, reason=roomseg_frontier_update_reason)
@@ -3311,14 +4551,32 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
                     "roomseg_frontier_last_update_step": int(roomseg_frontier_update_gate.last_update_step),
                     "roomseg_frontier_last_update_reason": roomseg_frontier_update_gate.last_update_reason,
                     "frontiers_frozen_during_navigation": True,
+                    "frontier_arrival_pending": bool(frontier_arrival_update_state.arrival_pending),
+                    "frontier_arrival_last_update_step": int(frontier_arrival_update_state.last_update_step),
+                    "frontier_arrival_cooldown_until_step": int(frontier_arrival_update_state.cooldown_until_step),
                 }
 
             if needs_replan:
+                consume_frontier_arrival_after_roomseg = bool(
+                    update_roomseg_frontiers
+                    and (
+                        bool(frontier_arrival_update_state.refresh_pending)
+                        or roomseg_frontier_update_reason == "frontier_arrival"
+                    )
+                )
                 if update_roomseg_frontiers:
                     mark_roomseg_frontier_gate_update(roomseg_frontier_update_gate, step=int(step), reason=roomseg_frontier_update_reason)
                 else:
                     mark_roomseg_frontier_gate_skip(roomseg_frontier_update_gate, reason=roomseg_frontier_update_reason)
+                    frontier_arrival_update_state.last_skip_reason = str(roomseg_frontier_update_reason)
                 planning_started_at = time.perf_counter()
+                map_state = ensure_runtime_planners(map_state)
+                nav_planner = map_state["nav_planner"]
+                base_nav_planner = map_state.get("base_nav_planner", nav_planner)
+                current_grid = map_state["current_grid"]
+                if current_grid is None:
+                    failure_reason = "agent_off_navigable_map"
+                    break
                 llm_requests_before = total_llm_requests()
                 astar_traversible = np.asarray(map_state.get("astar_navigable", navigable), dtype=bool)
                 frontier_traversible = navigable.astype(bool)
@@ -3340,8 +4598,24 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
                 )
                 if roomseg_context_needed:
                     loop_tick(step, "before_room_context")
-                    room_context_result = update_room_context_for_frontier_scoring(step, map_state)
+                    room_context_result = maybe_update_room_context_for_frontier_scoring(
+                        token=roomseg_update_token,
+                        step_idx=step,
+                        map_state=map_state,
+                        call_site="frontier_replan_room_context",
+                    )
                     loop_tick(step, "after_room_context")
+                if consume_frontier_arrival_after_roomseg:
+                    consumed_reason = str(roomseg_frontier_update_reason)
+                    consume_frontier_refresh(
+                        refresh_state=frontier_arrival_update_state,
+                        step=int(step),
+                        reason=consumed_reason,
+                        cooldown_steps=int(getattr(args, "roomseg_frontier_arrival_update_cooldown_steps", 3)),
+                    )
+                    committed_frontier_execution.consume_arrival_update(int(step))
+                    if paper_mode:
+                        long_term_goal.clear("%s_consumed" % consumed_reason)
                 frontier_free, frontier_observed, frontier_occupancy, frontier_source_metadata = resolve_frontier_source_layers(
                     room_debug=last_room_segmentation_debug,
                     mapper=mapper,
@@ -3362,6 +4636,9 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
                     "roomseg_frontier_last_update_step": int(roomseg_frontier_update_gate.last_update_step),
                     "roomseg_frontier_last_update_reason": roomseg_frontier_update_gate.last_update_reason,
                     "frontiers_frozen_during_navigation": not bool(update_roomseg_frontiers),
+                    "frontier_arrival_pending": bool(frontier_arrival_update_state.arrival_pending),
+                    "frontier_arrival_last_update_step": int(frontier_arrival_update_state.last_update_step),
+                    "frontier_arrival_cooldown_until_step": int(frontier_arrival_update_state.cooldown_until_step),
                 }
                 distance_traversible = frontier_traversible.copy()
                 rr, cc = int(current_grid[0]), int(current_grid[1])
@@ -3388,7 +4665,26 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
                 frontiers = list(last_frontiers)
                 locked_goal_used = False
                 candidate_override = None
-                if paper_mode and long_term_goal.exists() and long_term_goal.mode == "frontier":
+                committed_goal_locked = (
+                    bool(getattr(args, "frontier_execution_state_enabled", True))
+                    and committed_frontier_execution.exists()
+                    and not bool(committed_frontier_execution.arrival_pending_update)
+                )
+                if committed_goal_locked:
+                    nav_decision = committed_frontier_execution.to_navigation_decision(last_nav_decision)
+                    locked_goal_used = True
+                    last_frontier_commitment_reason = "continue_committed_frontier_execution"
+                    last_frontier_commitment_metadata = {
+                        **dict(last_frontier_commitment_metadata),
+                        **committed_frontier_execution.debug_metadata(
+                            step=int(step),
+                            current_grid=tuple(int(v) for v in current_grid),
+                            resolution_m=float(dynamic_map_info.resolution_m),
+                        ),
+                        "frontier_commitment_reason": "continue_committed_frontier_execution",
+                        "frontier_execution_locked": True,
+                    }
+                elif paper_mode and long_term_goal.exists() and long_term_goal.mode == "frontier":
                     candidate_override = decision_policy.choose_navigation_target(
                         object_memory,
                         episode["goal_category"],
@@ -3402,7 +4698,9 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
                     )
                     if candidate_override.mode not in {"candidate", "reperception", "stop"}:
                         candidate_override = None
-                if paper_mode and long_term_goal.exists() and candidate_override is None:
+                if committed_goal_locked:
+                    pass
+                elif paper_mode and long_term_goal.exists() and candidate_override is None:
                     nav_decision = long_term_goal.to_navigation_decision()
                     locked_goal_used = True
                     if nav_decision.mode == "frontier":
@@ -3447,8 +4745,16 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
                             current_step=step,
                         )
                         if room_context_result is None and (bool(args.score_frontiers_before_candidate) or candidate_preview is None):
-                            room_context_result = update_room_context_for_frontier_scoring(step, map_state)
-                            update_scenegraph_frame(obs, step, map_state)
+                            if update_roomseg_frontiers:
+                                room_context_result = maybe_update_room_context_for_frontier_scoring(
+                                    token=roomseg_update_token,
+                                    step_idx=step,
+                                    map_state=map_state,
+                                    call_site="candidate_preview_room_context",
+                                )
+                                update_scenegraph_frame(obs, step, map_state)
+                            else:
+                                room_context_result = last_room_context_result
                     nav_decision = candidate_override or decision_policy.choose_navigation_target(
                         object_memory,
                         episode["goal_category"],
@@ -3464,6 +4770,10 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
                     nav_decision.metadata = {
                         **dict(nav_decision.metadata or {}),
                         **dict(frontier_source_metadata),
+                        "room_context_used_cached_due_to_update_gate": bool(
+                            room_context_result is last_room_context_result and not bool(update_roomseg_frontiers)
+                        ),
+                        "roomseg_frontier_update_reason": str(roomseg_frontier_update_reason),
                     }
                     if nav_decision.mode == "none" and nav_decision.reason == "no_frontiers" and last_frontier_raw_cells > 0:
                         nav_decision.reason = "no_selectable_frontiers"
@@ -3557,6 +4867,42 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
                             setattr(scenegraph, "room_context_debug", dict(last_room_context_metadata))
                             if viz is not None:
                                 viz.set_room_context(last_room_masks, room_semantic_labels, last_room_segmentation_debug)
+                target_resolution: FrontierTargetResolution | None = None
+                if (
+                    bool(getattr(args, "frontier_targeting_enabled", True))
+                    and not bool(locked_goal_used)
+                    and nav_decision.mode == "frontier"
+                    and nav_decision.frontier_decision is not None
+                    and nav_decision.frontier_decision.selected_frontier is not None
+                ):
+                    selected_frontier_for_target = nav_decision.frontier_decision.selected_frontier
+                    astar_clearance_for_target = map_state.get("astar_clearance_m")
+                    if not isinstance(astar_clearance_for_target, np.ndarray):
+                        astar_clearance_for_target = clearance_map_m(astar_traversible, dynamic_map_info.resolution_m)
+                    target_resolution = resolve_frontier_target(
+                        selected_frontier_for_target,
+                        tuple(int(v) for v in current_grid),
+                        nav_planner,
+                        astar_traversible,
+                        np.asarray(astar_clearance_for_target, dtype=np.float32),
+                        float(dynamic_map_info.resolution_m),
+                        min_clearance_m=float(getattr(args, "frontier_target_min_goal_clearance_m", getattr(args, "astar_goal_min_clearance_m", 0.18))),
+                        search_radius_m=float(getattr(args, "frontier_target_search_radius_m", 0.45)),
+                        reached_radius_m=float(args.frontier_commit_reached_radius_m),
+                        max_candidates=int(getattr(args, "frontier_target_max_candidates", 128)),
+                        require_reachable=bool(getattr(args, "frontier_target_require_reachable", True)),
+                    )
+                    nav_decision.target_cells = list(target_resolution.target_cells)
+                    nav_decision.metadata = {
+                        **dict(nav_decision.metadata or {}),
+                        **target_resolution.metadata(),
+                        "frontier_unreachable_recovery": not bool(target_resolution.reachable),
+                        "frontier_unreachable_reason": None if target_resolution.reachable else str(target_resolution.reason),
+                    }
+                    if not target_resolution.reachable:
+                        frontier_target_resolution_failures += 1
+                        if str(target_resolution.reason) == "frontier_no_clearance_safe_target":
+                            frontier_target_no_clearance_safe_count += 1
                 if frontier_commitment is not None and nav_decision.mode == "frontier" and not locked_goal_used:
                     frontier_decision = nav_decision.frontier_decision
                     proposed_frontier = frontier_decision.selected_frontier if frontier_decision is not None else None
@@ -3574,6 +4920,8 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
                         step,
                         planner=None if bool(frontier_mask_probe or explore_until_no_frontiers) else nav_planner,
                         target_cells=nav_decision.target_cells,
+                        target_frontier=proposed_frontier,
+                        target_metadata=dict(nav_decision.metadata or {}),
                         scores_by_index=scores_by_index,
                     )
                     last_frontier_commitment_metadata = dict(commit_decision.metadata)
@@ -3581,6 +4929,47 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
                     last_frontier_commitment_reason = commit_decision.reason
                     nav_decision.target_cells = list(commit_decision.target_cells)
                     nav_decision.reason = commit_decision.reason
+                    if commit_decision.reason == "frontier_switch_requires_refresh":
+                        pending_switch_reason = str(
+                            last_frontier_commitment_metadata.get("pending_switch_reason") or "frontier_switch"
+                        )
+                        nav_decision.metadata = {
+                            **dict(nav_decision.metadata or {}),
+                            "frontier_commitment": last_frontier_commitment_metadata,
+                            "frontier_refresh_required_before_reselect": True,
+                            "pending_switch_reason": pending_switch_reason,
+                        }
+                        request_frontier_refresh_at_current(
+                            nav_decision_local=nav_decision,
+                            current_grid_local=tuple(int(v) for v in current_grid),
+                            reason="frontier_switch_refresh",
+                            status_reason=pending_switch_reason,
+                            reached=False,
+                        )
+                        long_term_goal.invalidate("frontier_switch_refresh")
+                        obs = server.step_kinematic_velocity(
+                            0.0,
+                            0.0,
+                            0.0,
+                            dt=float(args.control_dt),
+                            render_updates=int(args.render_updates_per_step),
+                            read_rgb=detector_requires_rgb(detector, args.detector),
+                            read_depth=True,
+                            rgb_device="cuda" if detector_cuda_rgb else "cpu",
+                        )
+                        continue
+                    if commit_decision.keep_existing:
+                        active_center = last_frontier_commitment_metadata.get("active_frontier_center_grid")
+                        active_target = last_frontier_commitment_metadata.get("active_frontier_actual_target_grid")
+                        nav_decision.metadata = {
+                            **dict(nav_decision.metadata or {}),
+                            "frontier_center_grid": active_center,
+                            "frontier_actual_target_grid": active_target,
+                            "frontier_target_mode": "committed_target",
+                            "frontier_commitment_target_consistent": bool(
+                                last_frontier_commitment_metadata.get("frontier_commitment_target_consistent", True)
+                            ),
+                        }
                     if frontier_decision is not None:
                         frontier_decision.selected_frontier = commit_decision.frontier
                         if commit_decision.frontier is not None:
@@ -3594,6 +4983,28 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
                         **dict(nav_decision.metadata or {}),
                         "frontier_commitment": last_frontier_commitment_metadata,
                     }
+                    if bool(getattr(args, "frontier_execution_state_enabled", True)) and nav_decision.target_cells:
+                        committed_frontier_execution.start_from_decision(
+                            nav_decision,
+                            int(step),
+                            last_frontier_commitment_metadata,
+                        )
+                        last_frontier_commitment_metadata = {
+                            **dict(last_frontier_commitment_metadata),
+                            **committed_frontier_execution.debug_metadata(
+                                step=int(step),
+                                current_grid=tuple(int(v) for v in current_grid),
+                                resolution_m=float(dynamic_map_info.resolution_m),
+                            ),
+                        }
+                        nav_decision.metadata = {
+                            **dict(nav_decision.metadata or {}),
+                            **committed_frontier_execution.debug_metadata(
+                                step=int(step),
+                                current_grid=tuple(int(v) for v in current_grid),
+                                resolution_m=float(dynamic_map_info.resolution_m),
+                            ),
+                        }
                 if nav_decision.mode == "frontier":
                     nav_meta = dict(nav_decision.metadata or {})
                     frontier_target_mode = nav_meta.get("frontier_target_mode")
@@ -3601,19 +5012,64 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
                     frontier_actual_target_grid = nav_meta.get("frontier_actual_target_grid")
                     frontier_unreachable_recovery = bool(nav_meta.get("frontier_unreachable_recovery", False))
                     frontier_unreachable_reason = nav_meta.get("frontier_unreachable_reason")
+                    active_center = dict(nav_meta.get("frontier_commitment") or {}).get("active_frontier_center_grid")
+                    active_target = dict(nav_meta.get("frontier_commitment") or {}).get("active_frontier_actual_target_grid")
+                    commit_mismatch = bool(
+                        active_center is not None
+                        and frontier_center_grid is not None
+                        and [int(v) for v in active_center] != [int(v) for v in frontier_center_grid]
+                    )
+                    if commit_mismatch:
+                        frontier_commit_target_mismatch_count += 1
+                        nav_decision.metadata = {
+                            **dict(nav_decision.metadata or {}),
+                            "commit_center_target_mismatch": True,
+                            "active_frontier_center_grid": active_center,
+                            "active_frontier_actual_target_grid": active_target,
+                        }
                     if nav_decision.frontier_decision is not None and not nav_decision.target_cells:
+                        reason = str(frontier_unreachable_reason or "frontier_empty_target")
+                        if (
+                            bool(getattr(args, "frontier_execution_state_enabled", True))
+                            and committed_frontier_execution.exists()
+                        ):
+                            astar_clearance_for_recovery = map_state.get("astar_clearance_m")
+                            if not isinstance(astar_clearance_for_recovery, np.ndarray):
+                                astar_clearance_for_recovery = clearance_map_m(astar_traversible, dynamic_map_info.resolution_m)
+                            apply_frontier_recovery_or_refresh(
+                                nav_decision_local=nav_decision,
+                                current_grid_local=tuple(int(v) for v in current_grid),
+                                traversible_local=astar_traversible,
+                                clearance_local=np.asarray(astar_clearance_for_recovery, dtype=np.float32),
+                                planner_local=nav_planner,
+                                trigger_reason="frontier_empty_target_recovery",
+                                refresh_reason="frontier_confirmed_unreachable_empty_target",
+                                partial_refresh_reason="frontier_partial_arrival_empty_target",
+                                mark_failed_if_no_recovery=True,
+                            )
+                            obs = server.step_kinematic_velocity(
+                                0.0,
+                                0.0,
+                                0.0,
+                                dt=float(args.control_dt),
+                                render_updates=int(args.render_updates_per_step),
+                                read_rgb=detector_requires_rgb(detector, args.detector),
+                                read_depth=True,
+                                rgb_device="cuda" if detector_cuda_rgb else "cpu",
+                            )
+                            continue
                         selected_frontier = nav_decision.frontier_decision.selected_frontier
                         if frontier_commitment is not None and selected_frontier is not None:
                             frontier_commitment.blacklist_frontier(
                                 selected_frontier,
                                 step,
-                                str(frontier_unreachable_reason or "frontier_unreachable"),
+                                reason,
                             )
                         frontier_blacklisted = True
-                        long_term_goal.invalidate(str(frontier_unreachable_reason or "frontier_unreachable"))
+                        long_term_goal.invalidate(reason)
                         current_path = []
                         force_perception_step = True
-                        last_frontier_commitment_reason = str(frontier_unreachable_reason or "frontier_unreachable")
+                        last_frontier_commitment_reason = reason
                         last_frontier_commitment_metadata = {
                             **dict(last_frontier_commitment_metadata),
                             "frontier_commitment_reason": last_frontier_commitment_reason,
@@ -3715,10 +5171,10 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
                 if nav_decision.stop:
                     policy_stop_confirmed = True
                     stop_blocked_reason = None
-                    if evaluator.final_distance_to_goal <= success_distance:
+                    if policy_distance_to_goal <= success_distance:
                         gt_success_region_reached = True
                     if success_region_can_finish(
-                        evaluator.final_distance_to_goal,
+                        policy_distance_to_goal,
                         success_distance,
                         require_sgnav_stop=bool(args.require_sgnav_stop),
                         policy_stop_confirmed=True,
@@ -3800,7 +5256,7 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
                         or "frontier_empty_target"
                     )
                     if frontier_commitment is not None:
-                        frontier_commitment.invalidate_active(step, reason, blacklist=True)
+                        frontier_commitment.mark_active_failed(step, reason, blacklist=True)
                     long_term_goal.invalidate(reason)
                     current_path = []
                     force_perception_step = True
@@ -3865,7 +5321,7 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
                 astar_clearance_for_goals = map_state.get("astar_clearance_m")
                 if not isinstance(astar_clearance_for_goals, np.ndarray):
                     astar_clearance_for_goals = clearance_map_m(astar_traversible, dynamic_map_info.resolution_m)
-                clearance_goals = filter_goal_cells_by_clearance(
+                goal_filter = filter_goal_cells_by_clearance_result(
                     planning_goals,
                     astar_traversible,
                     np.asarray(astar_clearance_for_goals, dtype=np.float32),
@@ -3874,24 +5330,113 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
                         math.ceil(float(getattr(args, "astar_goal_search_radius_m", 0.35)) / max(float(dynamic_map_info.resolution_m), 1e-6))
                     ),
                 )
-                if clearance_goals:
-                    nav_decision.metadata = {
-                        **dict(nav_decision.metadata or {}),
-                        "astar_goal_clearance_filter_enabled": True,
-                        "astar_goal_min_clearance_m": float(getattr(args, "astar_goal_min_clearance_m", 0.18)),
-                        "astar_goal_search_radius_m": float(getattr(args, "astar_goal_search_radius_m", 0.35)),
-                        "astar_goal_cells_before_clearance_filter": int(len(planning_goals)),
-                        "astar_goal_cells_after_clearance_filter": int(len(clearance_goals)),
-                    }
-                    planning_goals = clearance_goals
+                nav_decision.metadata = {
+                    **dict(nav_decision.metadata or {}),
+                    **goal_filter.metadata(),
+                    "astar_goal_min_clearance_m": float(getattr(args, "astar_goal_min_clearance_m", 0.18)),
+                    "astar_goal_search_radius_m": float(getattr(args, "astar_goal_search_radius_m", 0.35)),
+                    "astar_goal_cells_before_clearance_filter": int(len(planning_goals)),
+                    "astar_goal_cells_after_clearance_filter": int(len(goal_filter.goals)),
+                    "astar_goal_clearance_reject_reason": None if goal_filter.goals else "frontier_no_clearance_safe_planning_goal",
+                }
+                if not goal_filter.goals:
+                    reason = "frontier_no_clearance_safe_planning_goal" if nav_decision.mode == "frontier" else "no_clearance_safe_planning_goal"
+                    if nav_decision.mode == "frontier":
+                        frontier_target_resolution_failures += 1
+                        frontier_target_no_clearance_safe_count += 1
+                        if (
+                            bool(getattr(args, "frontier_execution_state_enabled", True))
+                            and committed_frontier_execution.exists()
+                        ):
+                            apply_frontier_recovery_or_refresh(
+                                nav_decision_local=nav_decision,
+                                current_grid_local=tuple(int(v) for v in current_grid),
+                                traversible_local=astar_traversible,
+                                clearance_local=np.asarray(astar_clearance_for_goals, dtype=np.float32),
+                                planner_local=nav_planner,
+                                trigger_reason="frontier_no_clearance_target_recovery",
+                                refresh_reason="frontier_confirmed_unreachable_no_clearance_target",
+                                partial_refresh_reason="frontier_partial_arrival_no_clearance_target",
+                                mark_failed_if_no_recovery=True,
+                            )
+                            obs = server.step_kinematic_velocity(
+                                0.0,
+                                0.0,
+                                0.0,
+                                dt=float(args.control_dt),
+                                render_updates=int(args.render_updates_per_step),
+                                read_rgb=detector_requires_rgb(detector, args.detector),
+                                read_depth=True,
+                                rgb_device="cuda" if detector_cuda_rgb else "cpu",
+                            )
+                            continue
+                        if frontier_commitment is not None:
+                            selected_frontier = (
+                                nav_decision.frontier_decision.selected_frontier
+                                if nav_decision.frontier_decision is not None
+                                else None
+                            )
+                            if selected_frontier is not None:
+                                frontier_commitment.blacklist_frontier(selected_frontier, step, reason)
+                            frontier_commitment.mark_active_failed(step, reason, blacklist=True)
+                        committed_frontier_execution.mark_failed(reason, blacklist=True)
+                        long_term_goal.invalidate(reason)
+                        current_path = []
+                        force_perception_step = True
+                        frontier_unreachable_recovery = True
+                        frontier_unreachable_reason = reason
+                        frontier_blacklisted = True
+                        frontier_stop_at_current_grid = [int(current_grid[0]), int(current_grid[1])]
+                        last_frontier_commitment_reason = "%s_blacklisted" % reason
+                        last_frontier_commitment_metadata = {
+                            **dict(last_frontier_commitment_metadata),
+                            "frontier_commitment_reason": last_frontier_commitment_reason,
+                            "frontier_blacklisted": True,
+                            "frontier_stop_at_current_grid": frontier_stop_at_current_grid,
+                            "astar_goal_clearance_no_safe_goal_count": int(goal_filter.no_safe_goal_count),
+                        }
+                        continue
+                    failure_reason = reason
+                    break
+                planning_goals = list(goal_filter.goals)
                 result = nav_planner.plan(current_grid, planning_goals)
                 loop_tick(step, "after_nav_plan")
                 if not result.path:
+                    if (
+                        bool(getattr(args, "frontier_execution_state_enabled", True))
+                        and nav_decision.mode == "frontier"
+                        and committed_frontier_execution.exists()
+                    ):
+                        frontier_direct_no_path_count += 1
+                        recovery_action = apply_frontier_recovery_or_refresh(
+                            nav_decision_local=nav_decision,
+                            current_grid_local=tuple(int(v) for v in current_grid),
+                            traversible_local=astar_traversible,
+                            clearance_local=np.asarray(astar_clearance_for_goals, dtype=np.float32),
+                            planner_local=nav_planner,
+                            trigger_reason="frontier_direct_target_no_path_recovery",
+                            refresh_reason="frontier_confirmed_unreachable_no_path",
+                            partial_refresh_reason="frontier_partial_arrival_no_path",
+                            mark_failed_if_no_recovery=True,
+                        )
+                        if paper_mode and recovery_action == "refresh_pending":
+                            long_term_goal.invalidate(str(last_frontier_commitment_reason))
+                        obs = server.step_kinematic_velocity(
+                            0.0,
+                            0.0,
+                            0.0,
+                            dt=float(args.control_dt),
+                            render_updates=int(args.render_updates_per_step),
+                            read_rgb=detector_requires_rgb(detector, args.detector),
+                            read_depth=True,
+                            rgb_device="cuda" if detector_cuda_rgb else "cpu",
+                        )
+                        continue
                     if paper_mode and nav_decision.mode == "frontier":
                         reason = "frontier_center_unreachable"
                         long_term_goal.invalidate(reason)
                         if frontier_commitment is not None:
-                            frontier_commitment.invalidate_active(step, reason, blacklist=True)
+                            frontier_commitment.mark_active_failed(step, reason, blacklist=True)
                         current_path = []
                         force_perception_step = True
                         frontier_unreachable_recovery = True
@@ -3941,7 +5486,7 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
                     if frontier_commitment is not None:
                         if selected_frontier is not None:
                             frontier_commitment.blacklist_frontier(selected_frontier, step, reason)
-                        frontier_commitment.invalidate_active(step, reason, blacklist=True)
+                        frontier_commitment.mark_active_failed(step, reason, blacklist=True)
                     long_term_goal.invalidate(reason)
                     current_path = []
                     force_perception_step = True
@@ -3968,7 +5513,6 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
                     selected_target = tuple(int(v) for v in (nav_decision.target_cells[0] if nav_decision.target_cells else selected_center))
                     snapshot_key = (selected_center, selected_target)
                     if snapshot_key != last_roomseg_snapshot_frontier_key:
-                        update_room_context_for_frontier_scoring(step, map_state)
                         save_selected_roomseg_snapshot(
                             step,
                             map_state,
@@ -3976,7 +5520,43 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
                             selected_frontier,
                         )
                         last_roomseg_snapshot_frontier_key = snapshot_key
+                if result.reached_goal is not None:
+                    reached_goal = tuple(int(v) for v in result.reached_goal)
+                    nav_decision.metadata = {
+                        **dict(nav_decision.metadata or {}),
+                        "astar_reached_goal_grid": [int(reached_goal[0]), int(reached_goal[1])],
+                    }
+                    if nav_decision.mode == "frontier":
+                        nav_decision.target_cells = [reached_goal]
+                        frontier_actual_target_grid = [int(reached_goal[0]), int(reached_goal[1])]
+                        nav_decision.metadata = {
+                            **dict(nav_decision.metadata or {}),
+                            "frontier_actual_target_grid": frontier_actual_target_grid,
+                        }
+                        if (
+                            bool(getattr(args, "frontier_execution_state_enabled", True))
+                            and committed_frontier_execution.exists()
+                        ):
+                            committed_frontier_execution.sync_actual_target(reached_goal, int(step))
+                            last_frontier_commitment_metadata = {
+                                **dict(last_frontier_commitment_metadata),
+                                **committed_frontier_execution.debug_metadata(
+                                    step=int(step),
+                                    current_grid=tuple(int(v) for v in current_grid),
+                                    resolution_m=float(dynamic_map_info.resolution_m),
+                                ),
+                                "active_frontier_actual_target_grid": frontier_actual_target_grid,
+                                "frontier_actual_target_grid": frontier_actual_target_grid,
+                                "frontier_astar_reached_goal_synced": True,
+                            }
                 current_path = result.path
+                if (
+                    bool(getattr(args, "frontier_execution_state_enabled", True))
+                    and nav_decision.mode == "frontier"
+                    and committed_frontier_execution.exists()
+                ):
+                    if result.reached_goal is None:
+                        committed_frontier_execution.mark_replanned(int(step))
                 astar_clearance_for_path = map_state.get("astar_clearance_m")
                 if not isinstance(astar_clearance_for_path, np.ndarray):
                     astar_clearance_for_path = clearance_map_m(astar_traversible, dynamic_map_info.resolution_m)
@@ -3991,12 +5571,20 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
                     **path_debug,
                     "astar_used_clearance_cost": bool(map_state.get("astar_used_clearance_cost", False)),
                     "astar_clearance_desired_m": float(getattr(args, "astar_clearance_desired_m", 0.25)),
+                    "lookahead_min_clearance_m_configured": float(getattr(args, "lookahead_min_clearance_m", 0.14)),
+                    "lookahead_min_clearance_m_effective": float(
+                        getattr(args, "lookahead_effective_min_clearance_m", getattr(args, "lookahead_min_clearance_m", 0.14))
+                    ),
                 }
                 if last_nav_decision is not None:
                     last_nav_decision.metadata = {
                         **dict(last_nav_decision.metadata or {}),
                         **path_debug,
                         "astar_used_clearance_cost": bool(map_state.get("astar_used_clearance_cost", False)),
+                        "lookahead_min_clearance_m_configured": float(getattr(args, "lookahead_min_clearance_m", 0.14)),
+                        "lookahead_min_clearance_m_effective": float(
+                            getattr(args, "lookahead_effective_min_clearance_m", getattr(args, "lookahead_min_clearance_m", 0.14))
+                        ),
                     }
                 full_path.extend(result.path)
                 record_latency("planning", planning_started_at)
@@ -4028,17 +5616,60 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
                 )
                 loop_tick(step, "after_viz_update")
 
+            roomseg_update_call_count_this_step = int(roomseg_update_call_counts_by_step.get(int(step), 0))
+            roomseg_update_called_sites_this_step = list(roomseg_update_called_sites_by_step.get(int(step), []))
+            if (
+                bool(getattr(args, "frontier_roomseg_update_assert_no_bypass", True))
+                and not bool(update_roomseg_frontiers)
+                and roomseg_update_call_count_this_step > 0
+            ):
+                raise RuntimeError(
+                    "roomseg_frontier_update_bypass step=%d reason=%s call_sites=%s"
+                    % (int(step), str(roomseg_frontier_update_reason), ",".join(roomseg_update_called_sites_this_step))
+                )
+            write_runtime_perf_trace(
+                step,
+                map_state,
+                roomseg_update_due=bool(update_roomseg_frontiers),
+                roomseg_update_reason=str(roomseg_frontier_update_reason),
+                roomseg_update_allowed_by_token=bool(roomseg_update_token.allowed),
+                roomseg_update_token_reason=str(roomseg_update_token.reason),
+                roomseg_update_call_count_this_step=roomseg_update_call_count_this_step,
+                roomseg_update_called_sites=roomseg_update_called_sites_this_step,
+                frontier_execution_state=committed_frontier_execution,
+                current_grid_for_frontier=tuple(int(v) for v in current_grid) if current_grid is not None else None,
+            )
+
             target_reached, target_distance_m = navigation_target_reached(
                 current_grid,
                 last_nav_decision,
                 dynamic_map_info.resolution_m,
                 float(args.frontier_commit_reached_radius_m),
             )
-            if target_reached:
+            frontier_target_reached_waits_for_confirm = (
+                bool(getattr(args, "frontier_execution_state_enabled", True))
+                and last_nav_decision is not None
+                and last_nav_decision.mode == "frontier"
+                and committed_frontier_execution.exists()
+            )
+            if target_reached and not frontier_target_reached_waits_for_confirm:
                 reason = "target_radius_reached"
                 target_radius_reached_steps += 1
+                arrival_key = make_frontier_arrival_key(last_nav_decision)
+                request_frontier_refresh(
+                    refresh_state=frontier_arrival_update_state,
+                    step=int(step),
+                    reason="frontier_arrival",
+                    frontier_key=arrival_key,
+                    block_reselect=bool(getattr(args, "frontier_refresh_blocks_reselect", True)),
+                )
+                try:
+                    mapper.force_full_navigation_projection_once = True
+                    mapper.voxel_grid.invalidate_navigation_projection_cache(reason="frontier_arrival")
+                except Exception:
+                    pass
                 if frontier_commitment is not None and last_decision_mode == "frontier":
-                    frontier_commitment.invalidate_active(step, reason, blacklist=True)
+                    frontier_commitment.mark_active_reached(step, reason)
                 if paper_mode:
                     long_term_goal.clear("reached")
                 current_path = []
@@ -4052,6 +5683,8 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
                         "target_radius_reached": True,
                         "target_reached_distance_m": float(target_distance_m),
                         "target_reached_radius_m": float(args.frontier_commit_reached_radius_m),
+                        "frontier_refresh_pending": True,
+                        "frontier_refresh_reason": "frontier_arrival",
                     }
                 last_frontier_commitment_reason = reason
                 last_frontier_commitment_metadata = {
@@ -4060,6 +5693,8 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
                     "target_radius_reached": True,
                     "target_reached_distance_m": float(target_distance_m),
                     "target_reached_radius_m": float(args.frontier_commit_reached_radius_m),
+                    "frontier_refresh_pending": True,
+                    "frontier_refresh_reason": "frontier_arrival",
                 }
                 obs = server.step_kinematic_velocity(
                     0.0,
@@ -4079,54 +5714,83 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
                 and current_path
                 and np.isfinite(float(target_distance_m))
             ):
-                progress_delta = float(args.frontier_commit_progress_min_delta_m)
-                if float(target_distance_m) + progress_delta < float(nav_execution_best_distance_m):
-                    nav_execution_best_distance_m = float(target_distance_m)
-                    nav_execution_no_progress_steps = 0
+                if bool(getattr(args, "frontier_execution_state_enabled", True)) and committed_frontier_execution.exists():
+                    target_distance_m = committed_frontier_execution.update_progress(
+                        tuple(int(v) for v in current_grid),
+                        float(dynamic_map_info.resolution_m),
+                        float(args.frontier_commit_progress_min_delta_m),
+                    )
+                    nav_execution_best_distance_m = float(committed_frontier_execution.best_distance_m)
+                    nav_execution_no_progress_steps = int(committed_frontier_execution.no_progress_steps)
                 else:
-                    nav_execution_no_progress_steps += 1
+                    progress_delta = float(args.frontier_commit_progress_min_delta_m)
+                    if float(target_distance_m) + progress_delta < float(nav_execution_best_distance_m):
+                        nav_execution_best_distance_m = float(target_distance_m)
+                        nav_execution_no_progress_steps = 0
+                    else:
+                        nav_execution_no_progress_steps += 1
                 if nav_execution_no_progress_steps >= int(args.frontier_commit_no_progress_steps):
                     reason = "frontier_no_progress_during_execution"
                     execution_best_distance_m = float(nav_execution_best_distance_m)
-                    selected_frontier = (
-                        last_nav_decision.frontier_decision.selected_frontier
-                        if last_nav_decision.frontier_decision is not None
-                        else None
-                    )
-                    if frontier_commitment is not None:
-                        if selected_frontier is not None:
-                            frontier_commitment.blacklist_frontier(selected_frontier, step, reason)
-                        frontier_commitment.invalidate_active(step, reason, blacklist=True)
-                    long_term_goal.invalidate(reason)
-                    frontier_stop_at_current_grid = [int(current_grid[0]), int(current_grid[1])]
-                    frontier_blacklisted = True
-                    frontier_unreachable_recovery = True
-                    frontier_unreachable_reason = reason
-                    last_decision_reason = reason
-                    current_path = []
-                    full_path.append(tuple(int(v) for v in current_grid))
-                    force_perception_step = True
-                    nav_execution_progress_key = None
-                    nav_execution_best_distance_m = float("inf")
-                    nav_execution_no_progress_steps = 0
-                    last_frontier_commitment_reason = "%s_blacklisted" % reason
-                    last_frontier_commitment_metadata = {
-                        **dict(last_frontier_commitment_metadata),
-                        "frontier_commitment_reason": last_frontier_commitment_reason,
-                        "frontier_blacklisted": True,
-                        "frontier_stop_at_current_grid": frontier_stop_at_current_grid,
-                        "frontier_execution_no_progress_steps": int(args.frontier_commit_no_progress_steps),
-                        "frontier_execution_best_distance_m": float(execution_best_distance_m),
-                        "frontier_execution_distance_m": float(target_distance_m),
-                    }
-                    if last_nav_decision is not None:
-                        last_nav_decision.reason = reason
-                        last_nav_decision.metadata = {
-                            **dict(last_nav_decision.metadata or {}),
-                            "frontier_execution_no_progress": True,
-                            "frontier_execution_distance_m": float(target_distance_m),
+                    if (
+                        bool(getattr(args, "frontier_execution_state_enabled", True))
+                        and committed_frontier_execution.exists()
+                    ):
+                        astar_clearance_for_recovery = map_state.get("astar_clearance_m")
+                        if not isinstance(astar_clearance_for_recovery, np.ndarray):
+                            astar_clearance_for_recovery = clearance_map_m(
+                                np.asarray(map_state.get("astar_navigable", navigable), dtype=bool),
+                                dynamic_map_info.resolution_m,
+                            )
+                        if bool(committed_frontier_execution.recovery_active):
+                            request_frontier_refresh_at_current(
+                                nav_decision_local=last_nav_decision,
+                                current_grid_local=tuple(int(v) for v in current_grid),
+                                reason="frontier_recovery_no_progress_refresh",
+                                status_reason=reason,
+                                reached=True,
+                            )
+                        else:
+                            apply_frontier_recovery_or_refresh(
+                                nav_decision_local=last_nav_decision,
+                                current_grid_local=tuple(int(v) for v in current_grid),
+                                traversible_local=np.asarray(map_state.get("astar_navigable", navigable), dtype=bool),
+                                clearance_local=np.asarray(astar_clearance_for_recovery, dtype=np.float32),
+                                planner_local=nav_planner,
+                                trigger_reason="frontier_no_progress_recovery",
+                                refresh_reason="frontier_no_progress_refresh",
+                                partial_refresh_reason="frontier_partial_arrival_no_progress",
+                                mark_failed_if_no_recovery=True,
+                            )
+                        last_frontier_commitment_metadata = {
+                            **dict(last_frontier_commitment_metadata),
                             "frontier_execution_no_progress_steps": int(args.frontier_commit_no_progress_steps),
+                            "frontier_execution_best_distance_m": float(execution_best_distance_m),
+                            "frontier_execution_distance_m": float(target_distance_m),
+                            "frontier_execution_no_progress_threshold": int(args.frontier_commit_no_progress_steps),
                         }
+                        if paper_mode:
+                            long_term_goal.invalidate(str(last_frontier_commitment_reason))
+                    else:
+                        long_term_goal.invalidate(reason)
+                        current_path = []
+                        full_path.append(tuple(int(v) for v in current_grid))
+                        force_perception_step = True
+                        nav_execution_progress_key = None
+                        nav_execution_best_distance_m = float("inf")
+                        nav_execution_no_progress_steps = 0
+                        frontier_stop_at_current_grid = [int(current_grid[0]), int(current_grid[1])]
+                        frontier_blacklisted = True
+                        frontier_unreachable_recovery = True
+                        frontier_unreachable_reason = reason
+                        last_frontier_commitment_reason = "%s_blacklisted" % reason
+                        last_frontier_commitment_metadata = {
+                            **dict(last_frontier_commitment_metadata),
+                            "frontier_commitment_reason": last_frontier_commitment_reason,
+                            "frontier_blacklisted": True,
+                            "frontier_stop_at_current_grid": frontier_stop_at_current_grid,
+                        }
+                    last_decision_reason = str(last_frontier_commitment_reason or reason)
                     obs = server.step_kinematic_velocity(
                         0.0,
                         0.0,
@@ -4153,7 +5817,9 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
                     np.asarray(map_state.get("astar_navigable", navigable), dtype=bool),
                     np.asarray(astar_clearance_for_lookahead, dtype=np.float32),
                     lookahead_m=float(getattr(args, "lookahead_m", 0.15)),
-                    min_clearance_m=float(getattr(args, "lookahead_min_clearance_m", 0.14)),
+                    min_clearance_m=float(
+                        getattr(args, "lookahead_effective_min_clearance_m", getattr(args, "lookahead_min_clearance_m", 0.14))
+                    ),
                     max_skip_cells=int(getattr(args, "smoothing_max_skip_cells", 8)),
                 )
                 loop_tick(step, "after_collision_checked_path")
@@ -4161,12 +5827,12 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
                 path_world = path_cells_to_world(current_path[1: min(len(current_path), 20)], dynamic_map_info)
                 loop_tick(step, "after_path_cells_to_world")
             if not path_world:
-                if evaluator.final_distance_to_goal <= success_distance:
+                if policy_distance_to_goal <= success_distance:
                     gt_success_region_reached = True
                     if explore_until_no_frontiers:
                         gt_success_ignored_steps += 1
                 if success_region_can_finish(
-                    evaluator.final_distance_to_goal,
+                    policy_distance_to_goal,
                     success_distance,
                     require_sgnav_stop=bool(args.require_sgnav_stop),
                     policy_stop_confirmed=policy_stop_confirmed,
@@ -4197,7 +5863,7 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
                             failure_reason=failure_reason,
                         )
                     break
-                if evaluator.final_distance_to_goal <= success_distance and bool(args.require_sgnav_stop):
+                if policy_distance_to_goal <= success_distance and bool(args.require_sgnav_stop):
                     gt_success_without_sgnav_stop_steps += 1
                     stop_blocked_reason = "sgnav_stop_required"
                     if not logged_gt_success_without_sgnav_stop:
@@ -4206,6 +5872,118 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
                             flush=True,
                         )
                         logged_gt_success_without_sgnav_stop = True
+                if (
+                    bool(getattr(args, "frontier_execution_state_enabled", True))
+                    and last_decision_mode == "frontier"
+                    and committed_frontier_execution.exists()
+                ):
+                    arrived, path_exhausted_distance_m, arrival_reason = frontier_arrival_status(
+                        step=int(step),
+                        current_grid=tuple(int(v) for v in current_grid),
+                        execution=committed_frontier_execution,
+                        resolution_m=float(dynamic_map_info.resolution_m),
+                        reached_radius_m=float(args.frontier_commit_reached_radius_m),
+                        min_steps_since_selection=int(getattr(args, "frontier_arrival_min_steps_since_selection", 6)),
+                        confirm_steps=int(getattr(args, "frontier_arrival_confirm_steps", 2)),
+                        current_path=[],
+                    )
+                    if arrived:
+                        reason = "frontier_arrival_confirmed"
+                        target_radius_reached_steps += 1
+                        arrival_key = make_committed_frontier_arrival_key(committed_frontier_execution)
+                        committed_frontier_execution.mark_arrival_pending(int(step), arrival_key)
+                        request_frontier_refresh(
+                            refresh_state=frontier_arrival_update_state,
+                            step=int(step),
+                            reason="frontier_arrival",
+                            frontier_key=arrival_key,
+                            block_reselect=bool(getattr(args, "frontier_refresh_blocks_reselect", True)),
+                        )
+                        if frontier_commitment is not None:
+                            frontier_commitment.mark_active_reached(step, reason)
+                        current_path = []
+                        force_perception_step = True
+                        full_path.append(tuple(int(v) for v in current_grid))
+                        last_decision_reason = reason
+                        last_frontier_commitment_reason = reason
+                        last_frontier_commitment_metadata = {
+                            **dict(last_frontier_commitment_metadata),
+                            **committed_frontier_execution.debug_metadata(
+                                step=int(step),
+                                current_grid=tuple(int(v) for v in current_grid),
+                                resolution_m=float(dynamic_map_info.resolution_m),
+                            ),
+                            "frontier_commitment_reason": reason,
+                            "frontier_arrival_status_reason": str(arrival_reason),
+                            "target_reached_distance_m": float(path_exhausted_distance_m),
+                            "frontier_refresh_pending": True,
+                            "frontier_refresh_reason": "frontier_arrival",
+                        }
+                        if last_nav_decision is not None:
+                            last_nav_decision.metadata = {
+                                **dict(last_nav_decision.metadata or {}),
+                                "frontier_refresh_pending": True,
+                                "frontier_refresh_reason": "frontier_arrival",
+                            }
+                        obs = server.step_kinematic_velocity(
+                            0.0,
+                            0.0,
+                            0.0,
+                            dt=float(args.control_dt),
+                            render_updates=int(args.render_updates_per_step),
+                            read_rgb=detector_requires_rgb(detector, args.detector),
+                            read_depth=True,
+                            rgb_device="cuda" if detector_cuda_rgb else "cpu",
+                        )
+                        continue
+                    if bool(committed_frontier_execution.recovery_active):
+                        request_frontier_refresh_at_current(
+                            nav_decision_local=last_nav_decision,
+                            current_grid_local=tuple(int(v) for v in current_grid),
+                            reason="frontier_recovery_arrival_path_exhausted",
+                            status_reason=str(arrival_reason),
+                            reached=True,
+                        )
+                    else:
+                        astar_clearance_for_recovery = map_state.get("astar_clearance_m")
+                        if not isinstance(astar_clearance_for_recovery, np.ndarray):
+                            astar_clearance_for_recovery = clearance_map_m(
+                                np.asarray(map_state.get("astar_navigable", navigable), dtype=bool),
+                                dynamic_map_info.resolution_m,
+                            )
+                        apply_frontier_recovery_or_refresh(
+                            nav_decision_local=last_nav_decision,
+                            current_grid_local=tuple(int(v) for v in current_grid),
+                            traversible_local=np.asarray(map_state.get("astar_navigable", navigable), dtype=bool),
+                            clearance_local=np.asarray(astar_clearance_for_recovery, dtype=np.float32),
+                            planner_local=nav_planner,
+                            trigger_reason="frontier_path_exhausted_recovery",
+                            refresh_reason="frontier_path_exhausted_confirmed_no_path",
+                            partial_refresh_reason="frontier_partial_arrival_path_exhausted",
+                            mark_failed_if_no_recovery=True,
+                        )
+                    if paper_mode:
+                        long_term_goal.invalidate(str(last_frontier_commitment_reason))
+                    last_decision_reason = str(last_frontier_commitment_reason)
+                    last_frontier_commitment_metadata = {
+                        **dict(last_frontier_commitment_metadata),
+                        "frontier_arrival_status_reason": str(arrival_reason),
+                        "lookahead_min_clearance_m_configured": float(getattr(args, "lookahead_min_clearance_m", 0.14)),
+                        "lookahead_min_clearance_m_effective": float(
+                            getattr(args, "lookahead_effective_min_clearance_m", getattr(args, "lookahead_min_clearance_m", 0.14))
+                        ),
+                    }
+                    obs = server.step_kinematic_velocity(
+                        0.0,
+                        0.0,
+                        0.0,
+                        dt=float(args.control_dt),
+                        render_updates=int(args.render_updates_per_step),
+                        read_rgb=detector_requires_rgb(detector, args.detector),
+                        read_depth=True,
+                        rgb_device="cuda" if detector_cuda_rgb else "cpu",
+                    )
+                    continue
                 if last_decision_mode in {"candidate", "frontier"}:
                     if paper_mode:
                         long_term_goal.clear("reached")
@@ -4271,22 +6049,128 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
                         failure_reason=failure_reason,
                     )
                 break
-            cmd = follower.compute_cmd(pose, path_world)
+            raw_cmd = follower.compute_cmd(pose, path_world)
             loop_tick(step, "after_compute_cmd")
-            cmd, blocked_by_guard = guard_kinematic_cmd(
+            astar_clearance_for_guard = map_state.get("astar_clearance_m")
+            if not isinstance(astar_clearance_for_guard, np.ndarray):
+                astar_clearance_for_guard = clearance_map_m(
+                    np.asarray(map_state.get("astar_navigable", navigable), dtype=bool),
+                    dynamic_map_info.resolution_m,
+                )
+            cmd, blocked_by_online_guard, guard_debug = guard_kinematic_cmd_with_clearance(
                 tuple(float(v) for v in pose),
-                cmd,
+                raw_cmd,
                 float(args.control_dt),
                 np.asarray(map_state.get("astar_navigable", navigable), dtype=bool),
+                np.asarray(astar_clearance_for_guard, dtype=np.float32),
                 dynamic_map_info,
+                float(getattr(args, "guard_effective_min_clearance_m", getattr(args, "guard_min_clearance_m", 0.14))),
                 float(args.camera_forward_offset_m),
             )
+            blocked_by_guard = bool(blocked_by_online_guard)
+            last_guard_debug = dict(guard_debug or {})
+            if blocked_by_online_guard and str(last_guard_debug.get("guard_block_reason")) == "low_clearance":
+                guard_low_clearance_blocked_steps += 1
             loop_tick(step, "after_guard_kinematic_cmd")
+            write_runtime_control_trace(
+                step_idx=int(step),
+                pose_local=pose,
+                current_grid_local=tuple(int(v) for v in current_grid) if current_grid is not None else None,
+                current_path_local=current_path,
+                path_world_local=path_world,
+                raw_cmd=raw_cmd,
+                guarded_cmd=cmd,
+                blocked_by_guard=bool(blocked_by_guard),
+                blocked_by_online_guard=bool(blocked_by_online_guard),
+                guard_debug=last_guard_debug,
+                target_distance_m=float(target_distance_m),
+                nav_decision_local=last_nav_decision,
+                frontier_execution_state=committed_frontier_execution,
+            )
             if blocked_by_guard:
+                if (
+                    bool(getattr(args, "frontier_execution_state_enabled", True))
+                    and last_decision_mode == "frontier"
+                    and committed_frontier_execution.exists()
+                ):
+                    committed_frontier_execution.guard_blocked_steps += 1
+                    guard_threshold = max(1, int(getattr(args, "frontier_guard_blocked_confirm_steps", 5)))
+                    if committed_frontier_execution.guard_blocked_steps < guard_threshold:
+                        reason = "frontier_guard_blocked_replan_same_target"
+                        current_path = []
+                        full_path.append(tuple(int(v) for v in current_grid))
+                        force_perception_step = False
+                        last_decision_reason = reason
+                        last_frontier_commitment_reason = reason
+                        last_frontier_commitment_metadata = {
+                            **dict(last_frontier_commitment_metadata),
+                            **committed_frontier_execution.debug_metadata(
+                                step=int(step),
+                                current_grid=tuple(int(v) for v in current_grid),
+                                resolution_m=float(dynamic_map_info.resolution_m),
+                            ),
+                            "frontier_commitment_reason": reason,
+                            "frontier_guard_blocked_confirm_steps": int(guard_threshold),
+                        }
+                        obs = server.step_kinematic_velocity(
+                            0.0,
+                            0.0,
+                            0.0,
+                            dt=float(args.control_dt),
+                            render_updates=int(args.render_updates_per_step),
+                            read_rgb=detector_requires_rgb(detector, args.detector),
+                            read_depth=True,
+                            rgb_device="cuda" if detector_cuda_rgb else "cpu",
+                        )
+                        continue
+                    reason = "frontier_guard_blocked_confirmed"
+                    if bool(committed_frontier_execution.recovery_active):
+                        request_frontier_refresh_at_current(
+                            nav_decision_local=last_nav_decision,
+                            current_grid_local=tuple(int(v) for v in current_grid),
+                            reason="frontier_recovery_guard_blocked_refresh",
+                            status_reason=reason,
+                            reached=True,
+                        )
+                    else:
+                        astar_clearance_for_recovery = map_state.get("astar_clearance_m")
+                        if not isinstance(astar_clearance_for_recovery, np.ndarray):
+                            astar_clearance_for_recovery = clearance_map_m(
+                                np.asarray(map_state.get("astar_navigable", navigable), dtype=bool),
+                                dynamic_map_info.resolution_m,
+                            )
+                        apply_frontier_recovery_or_refresh(
+                            nav_decision_local=last_nav_decision,
+                            current_grid_local=tuple(int(v) for v in current_grid),
+                            traversible_local=np.asarray(map_state.get("astar_navigable", navigable), dtype=bool),
+                            clearance_local=np.asarray(astar_clearance_for_recovery, dtype=np.float32),
+                            planner_local=nav_planner,
+                            trigger_reason="frontier_guard_blocked_recovery",
+                            refresh_reason="frontier_guard_blocked_refresh",
+                            partial_refresh_reason="frontier_partial_arrival_guard_blocked",
+                            mark_failed_if_no_recovery=True,
+                        )
+                    if paper_mode:
+                        long_term_goal.invalidate(str(last_frontier_commitment_reason))
+                    last_frontier_commitment_metadata = {
+                        **dict(last_frontier_commitment_metadata),
+                        "frontier_guard_blocked_confirm_steps": int(guard_threshold),
+                    }
+                    obs = server.step_kinematic_velocity(
+                        0.0,
+                        0.0,
+                        0.0,
+                        dt=float(args.control_dt),
+                        render_updates=int(args.render_updates_per_step),
+                        read_rgb=detector_requires_rgb(detector, args.detector),
+                        read_depth=True,
+                        rgb_device="cuda" if detector_cuda_rgb else "cpu",
+                    )
+                    continue
                 if paper_mode and last_decision_mode == "frontier":
                     reason = "frontier_unreachable_stop_at_current_pose"
                     if frontier_commitment is not None:
-                        frontier_commitment.invalidate_active(step, reason, blacklist=True)
+                        frontier_commitment.mark_active_failed(step, reason, blacklist=True)
                     long_term_goal.invalidate(reason)
                     frontier_stop_at_current_grid = [int(current_grid[0]), int(current_grid[1])]
                     frontier_blacklisted = True
@@ -4317,6 +6201,13 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
                 break
             next_step = step + 1
             next_rgb_device = rgb_request_device(next_step)
+            if (
+                bool(getattr(args, "frontier_execution_state_enabled", True))
+                and last_decision_mode == "frontier"
+                and committed_frontier_execution.exists()
+            ):
+                committed_frontier_execution.no_path_replans = 0
+                committed_frontier_execution.guard_blocked_steps = 0
             obs = server.step_kinematic_velocity(
                 cmd[0],
                 cmd[1],
@@ -4342,6 +6233,14 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
         row["policy_stop_confirmed"] = bool(policy_stop_confirmed)
         row["success_requires_sgnav_stop"] = bool(args.require_sgnav_stop)
         row["gt_success_region_reached"] = bool(gt_success_region_reached)
+        row["metric_pose_valid"] = bool(metric_pose_valid)
+        row["metric_pose_invalid_steps"] = int(metric_pose_invalid_steps)
+        row["metric_pose_last_invalid_step"] = (
+            int(metric_pose_last_invalid_step) if int(metric_pose_last_invalid_step) >= 0 else None
+        )
+        row["metric_pose_last_invalid_reason"] = metric_pose_last_invalid_reason
+        if int(metric_pose_invalid_steps) > 0:
+            row["metric_valid"] = False
         row["gt_success_without_sgnav_stop_steps"] = int(gt_success_without_sgnav_stop_steps)
         row["explore_until_no_frontiers"] = bool(explore_until_no_frontiers)
         row["goal_success_ignored_steps"] = int(gt_success_ignored_steps)
@@ -4424,6 +6323,17 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
         row["frontier_actual_target_grid"] = frontier_actual_target_grid
         row["frontier_unreachable_recovery"] = bool(frontier_unreachable_recovery)
         row["frontier_unreachable_reason"] = frontier_unreachable_reason
+        row["frontier_refresh_pending"] = bool(frontier_arrival_update_state.refresh_pending)
+        row["frontier_refresh_reason"] = str(frontier_arrival_update_state.refresh_reason)
+        row["frontier_refresh_consumed_step"] = int(frontier_arrival_update_state.last_update_step)
+        row["frontier_reselect_blocked_until_refresh"] = bool(frontier_arrival_update_state.block_reselect_until_refresh)
+        row["frontier_direct_target_unreachable_count"] = int(frontier_direct_no_path_count)
+        row["frontier_recovery"] = dict(last_frontier_recovery_metadata)
+        row["frontier_execution_debug"] = committed_frontier_execution.debug_metadata(
+            step=int(evaluator.num_steps),
+            current_grid=tuple(int(v) for v in current_grid) if current_grid is not None else None,
+            resolution_m=float(dynamic_map_info.resolution_m),
+        )
         row["frontier_stop_at_current_grid"] = frontier_stop_at_current_grid
         row["frontier_blacklisted"] = bool(frontier_blacklisted)
         row["active_long_term_goal_mode"] = str(long_term_goal.mode)
@@ -4467,6 +6377,16 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
             if bool(getattr(args, "static_nearfield_map", False))
             else "depth_ray_online"
         )
+        row["online_clearance_policy_version"] = "v38_online_only_clearance_targeting"
+        row["configured_robot_radius_m"] = float(getattr(args, "configured_robot_radius_m", args.robot_radius_m))
+        row["runtime_robot_radius_m"] = float(args.robot_radius_m)
+        row["tiny_robot_radius_debug"] = bool(getattr(args, "tiny_robot_radius_debug", False))
+        row["frontier_target_resolution_failures"] = int(frontier_target_resolution_failures)
+        row["frontier_target_no_clearance_safe_count"] = int(frontier_target_no_clearance_safe_count)
+        row["frontier_commit_target_mismatch_count"] = int(frontier_commit_target_mismatch_count)
+        row["guard_low_clearance_blocked_steps"] = int(guard_low_clearance_blocked_steps)
+        row["agent_off_static_metric_map_online_diagnostic"] = bool(int(metric_pose_invalid_steps) > 0)
+        row["last_guard_debug"] = dict(last_guard_debug)
         row["online_map_resolution_m"] = float(dynamic_map_info.resolution_m)
         row["robot_radius_m"] = float(args.robot_radius_m)
         row["robot_width_m"] = float(args.robot_radius_m) * 2.0
@@ -4480,6 +6400,14 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
         row["online_astar_clearance_cost_enabled"] = bool(getattr(args, "astar_clearance_cost_enabled", False))
         row["online_astar_clearance_desired_m"] = float(getattr(args, "astar_clearance_desired_m", 0.25))
         row["online_astar_goal_min_clearance_m"] = float(getattr(args, "astar_goal_min_clearance_m", 0.18))
+        row["online_lookahead_min_clearance_m_configured"] = float(getattr(args, "lookahead_min_clearance_m", 0.14))
+        row["online_lookahead_min_clearance_m_effective"] = float(
+            getattr(args, "lookahead_effective_min_clearance_m", getattr(args, "lookahead_min_clearance_m", 0.14))
+        )
+        row["online_guard_min_clearance_m_configured"] = float(getattr(args, "guard_min_clearance_m", 0.14))
+        row["online_guard_min_clearance_m_effective"] = float(
+            getattr(args, "guard_effective_min_clearance_m", getattr(args, "guard_min_clearance_m", 0.14))
+        )
         row["online_astar_path_min_clearance_m"] = map_state.get("astar_path_min_clearance_m") if isinstance(locals().get("map_state"), dict) else None
         row["online_astar_path_mean_clearance_m"] = map_state.get("astar_path_mean_clearance_m") if isinstance(locals().get("map_state"), dict) else None
         row["online_astar_path_too_close_cells"] = map_state.get("astar_path_too_close_cells") if isinstance(locals().get("map_state"), dict) else None
@@ -4488,6 +6416,7 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
         row["online_mapper_debug"] = dict(getattr(mapper, "last_debug_stats", {}))
         row["voxel_perf_recent_path"] = str(voxel_perf_recent_path)
         row["voxel_perf_recent_count"] = int(len(voxel_perf_recent_rows))
+        row["runtime_perf_path"] = str(runtime_perf_path)
         row["nearfield_depth"] = bool(getattr(args, "nearfield_depth", False))
         row["nearfield_mapper_debug"] = dict(getattr(mapper, "last_nearfield_debug_stats", {}))
         row["static_nearfield_map"] = bool(getattr(args, "static_nearfield_map", False))
@@ -4505,6 +6434,13 @@ def run_episode_isaac_closed_loop(episode: dict, args) -> dict:
         row["frontier_commitment_enabled"] = bool(args.frontier_commitment_enabled)
         row["frontier_commitment_reason"] = str(last_frontier_commitment_reason)
         row["frontier_commitment"] = dict(last_frontier_commitment_metadata)
+        row.update(
+            committed_frontier_execution.debug_metadata(
+                step=int(evaluator.num_steps),
+                current_grid=tuple(int(v) for v in current_grid) if current_grid is not None else None,
+                resolution_m=float(dynamic_map_info.resolution_m),
+            )
+        )
         row["active_frontier_id"] = last_frontier_commitment_metadata.get("active_frontier_id")
         row["active_frontier_age"] = last_frontier_commitment_metadata.get("active_frontier_age")
         row["active_frontier_distance_m"] = last_frontier_commitment_metadata.get("active_frontier_distance_m")
@@ -4815,6 +6751,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--frontier-commit-progress-min-delta-m", "--frontier_commit_progress_min_delta_m", type=float, default=None)
     parser.add_argument("--frontier-blacklist-ttl-steps", "--frontier_blacklist_ttl_steps", type=int, default=None)
     parser.add_argument("--robot-radius-m", type=float, default=None)
+    parser.add_argument("--allow-tiny-robot-radius-debug", action="store_true", default=False)
     parser.add_argument(
         "--online-inflation-radius-m",
         type=float,
@@ -4930,6 +6867,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--astar-clearance-power", "--astar_clearance_power", type=float, default=None)
     parser.add_argument("--astar-goal-min-clearance-m", "--astar_goal_min_clearance_m", type=float, default=None)
     parser.add_argument("--astar-goal-search-radius-m", "--astar_goal_search_radius_m", type=float, default=None)
+    parser.add_argument("--guard-min-clearance-m", "--guard_min_clearance_m", type=float, default=None)
     parser.add_argument("--collision-checked-smoothing-enabled", "--collision_checked_smoothing_enabled", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--smoothing-min-clearance-m", "--smoothing_min_clearance_m", type=float, default=None)
     parser.add_argument("--smoothing-max-skip-cells", "--smoothing_max_skip_cells", type=int, default=None)
@@ -5330,13 +7268,84 @@ def main(argv: Optional[List[str]] = None) -> int:
         if args.frontier_blacklist_ttl_steps is not None
         else get_nested(cfg, "sgnav.frontier_blacklist_ttl_steps", 100)
     )
+    args.frontier_execution_state_enabled = bool(get_nested(cfg, "sgnav.frontier_execution_state_enabled", True))
+    args.frontier_arrival_min_steps_since_selection = int(
+        get_nested(cfg, "sgnav.frontier_arrival_min_steps_since_selection", 6)
+    )
+    args.frontier_arrival_confirm_steps = int(get_nested(cfg, "sgnav.frontier_arrival_confirm_steps", 2))
+    args.frontier_same_target_max_no_path_replans = int(
+        get_nested(cfg, "sgnav.frontier_same_target_max_no_path_replans", 3)
+    )
+    args.frontier_guard_blocked_confirm_steps = int(
+        get_nested(cfg, "sgnav.frontier_guard_blocked_confirm_steps", 5)
+    )
+    args.frontier_arrival_update_stop_steps = int(get_nested(cfg, "sgnav.frontier_arrival_update_stop_steps", 1))
+    args.frontier_arrival_blacklist_on_reached = bool(
+        get_nested(cfg, "sgnav.frontier_arrival_blacklist_on_reached", False)
+    )
+    args.frontier_roomseg_update_assert_no_bypass = bool(
+        get_nested(cfg, "sgnav.frontier_roomseg_update_assert_no_bypass", True)
+    )
+    recovery_cfg = dict(get_nested(cfg, "sgnav.frontier_unreachable_recovery", {}) or {})
+    args.frontier_unreachable_recovery_enabled = bool(recovery_cfg.get("enabled", True))
+    args.frontier_unreachable_recovery_local_search_radius_m = float(recovery_cfg.get("local_search_radius_m", 1.50))
+    args.frontier_unreachable_recovery_global_search_enabled = bool(recovery_cfg.get("global_search_enabled", True))
+    args.frontier_unreachable_recovery_global_max_frontier_distance_m = float(
+        recovery_cfg.get("global_max_frontier_distance_m", 3.00)
+    )
+    args.frontier_unreachable_recovery_min_clearance_m = float(
+        recovery_cfg.get("min_clearance_m", get_nested(cfg, "frontier_targeting.min_goal_clearance_m", 0.18))
+    )
+    args.frontier_unreachable_recovery_min_approach_improvement_m = float(
+        recovery_cfg.get("min_approach_improvement_m", 0.20)
+    )
+    args.frontier_unreachable_recovery_allow_current_as_partial_arrival = bool(
+        recovery_cfg.get("allow_current_as_partial_arrival", True)
+    )
+    args.frontier_unreachable_recovery_max_attempts_per_frontier = int(
+        recovery_cfg.get("max_recovery_attempts_per_frontier", 1)
+    )
+    args.frontier_unreachable_recovery_max_debug_candidates = int(recovery_cfg.get("max_debug_candidates", 64))
+    args.frontier_switch_requires_refresh = bool(get_nested(cfg, "sgnav.frontier_switch_requires_refresh", True))
+    args.frontier_failure_requires_refresh = bool(get_nested(cfg, "sgnav.frontier_failure_requires_refresh", True))
+    args.frontier_partial_arrival_requires_refresh = bool(
+        get_nested(cfg, "sgnav.frontier_partial_arrival_requires_refresh", True)
+    )
+    args.frontier_refresh_blocks_reselect = bool(get_nested(cfg, "sgnav.frontier_refresh_blocks_reselect", True))
     default_robot_radius_m = get_nested(cfg, "robot.footprint_radius_m", None)
     if default_robot_radius_m is None:
         default_robot_radius_m = 0.5 * float(get_nested(cfg, "robot.footprint_width_m", 0.28))
-    args.robot_radius_m = float(args.robot_radius_m if args.robot_radius_m is not None else default_robot_radius_m)
+    configured_robot_radius_m = float(default_robot_radius_m)
+    planning_robot_radius_cfg = get_nested(cfg, "astar.planning_robot_radius_m", None)
+    default_planning_robot_radius_m = (
+        configured_robot_radius_m
+        if planning_robot_radius_cfg is None
+        else float(planning_robot_radius_cfg)
+    )
+    args.robot_radius_m = float(args.robot_radius_m if args.robot_radius_m is not None else default_planning_robot_radius_m)
+    args.configured_robot_radius_m = float(configured_robot_radius_m)
+    args.allow_tiny_robot_radius_debug = bool(
+        bool(getattr(args, "allow_tiny_robot_radius_debug", False))
+        or bool(get_nested(cfg, "astar.allow_tiny_robot_radius_debug", False))
+    )
+    args.tiny_robot_radius_debug = bool(float(args.robot_radius_m) + 1e-6 < float(configured_robot_radius_m))
+    if (
+        bool(get_nested(cfg, "astar.reject_runtime_robot_radius_smaller_than_config", True))
+        and bool(args.tiny_robot_radius_debug)
+        and not bool(args.allow_tiny_robot_radius_debug)
+    ):
+        raise ValueError(
+            "runtime robot_radius_m %.3f is smaller than configured robot.footprint_radius_m %.3f. "
+            "This makes online navigation too permissive. Remove --robot-radius-m override or set "
+            "--allow-tiny-robot-radius-debug for explicit debug-only runs."
+            % (float(args.robot_radius_m), float(configured_robot_radius_m))
+        )
     args.online_inflation_radius_m = float(args.online_inflation_radius_m if args.online_inflation_radius_m is not None else get_nested(cfg, "mapping.inflation_radius_m", 0.0))
     args.room_map_mode = str(args.room_map_mode or get_nested(cfg, "mapping.room_map_mode", VERTICAL_FREE_GAP_CLOSURE_CONTEXT))
     args.voxel_runtime_config = dict(get_nested(cfg, "mapping.voxel_runtime", {}) or {})
+    args.runtime_debug_full_arrays = bool(args.voxel_runtime_config.get("runtime_debug_full_arrays", False))
+    args.runtime_debug_full_arrays_on_viz = bool(args.voxel_runtime_config.get("runtime_debug_full_arrays_on_viz", True))
+    args.runtime_debug_full_arrays_on_snapshot = bool(args.voxel_runtime_config.get("runtime_debug_full_arrays_on_snapshot", True))
     args.room_segmentation_config = dict(get_nested(cfg, "mapping.room_segmentation", {}) or {})
     roomseg_debug_layers_cfg = dict(args.room_segmentation_config.get("debug_layers", {}) or {})
     roomseg_overlay_cfg = dict(args.room_segmentation_config.get("navigation_free_context_overlay", {}) or {})
@@ -5432,6 +7441,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     args.roomseg_frontier_update_on_target_invalidated = bool(roomseg_frontier_update_cfg.get("update_on_target_invalidated", False))
     args.roomseg_frontier_update_on_no_active_path = bool(roomseg_frontier_update_cfg.get("update_on_no_active_path", False))
     args.roomseg_frontier_update_on_no_progress = bool(roomseg_frontier_update_cfg.get("update_on_no_progress", False))
+    args.roomseg_frontier_arrival_update_cooldown_steps = int(
+        roomseg_frontier_update_cfg.get("arrival_update_cooldown_steps", 3)
+    )
     room_semantics_cfg = dict(get_nested(cfg, "room_semantics", {}) or {})
     for key in (
         "use_premerge_labels_for_open_plan_merge",
@@ -5544,6 +7556,19 @@ def main(argv: Optional[List[str]] = None) -> int:
         if args.astar_goal_search_radius_m is not None
         else get_nested(cfg, "astar.goal_search_radius_m", 0.35)
     )
+    args.guard_min_clearance_m = float(
+        args.guard_min_clearance_m
+        if args.guard_min_clearance_m is not None
+        else get_nested(cfg, "astar.guard_min_clearance_m", 0.14)
+    )
+    args.frontier_targeting_config = dict(get_nested(cfg, "frontier_targeting", {}) or {})
+    args.frontier_targeting_enabled = bool(args.frontier_targeting_config.get("enabled", True))
+    args.frontier_target_search_radius_m = float(args.frontier_targeting_config.get("search_radius_m", 0.45))
+    args.frontier_target_min_goal_clearance_m = float(
+        args.frontier_targeting_config.get("min_goal_clearance_m", args.astar_goal_min_clearance_m)
+    )
+    args.frontier_target_require_reachable = bool(args.frontier_targeting_config.get("require_reachable", True))
+    args.frontier_target_max_candidates = int(args.frontier_targeting_config.get("max_candidates", 128))
     args.collision_checked_smoothing_enabled = bool(
         args.collision_checked_smoothing_enabled
         if args.collision_checked_smoothing_enabled is not None
@@ -5568,6 +7593,18 @@ def main(argv: Optional[List[str]] = None) -> int:
         args.lookahead_min_clearance_m
         if args.lookahead_min_clearance_m is not None
         else get_nested(cfg, "astar.lookahead_min_clearance_m", 0.14)
+    )
+    args.lookahead_effective_min_clearance_m = effective_lookahead_min_clearance_m(
+        float(args.lookahead_min_clearance_m),
+        robot_radius_m=float(args.robot_radius_m),
+        runtime_planning_clearance_m=float(args.runtime_planning_clearance_m),
+        astar_clearance_hard_min_m=float(args.astar_clearance_hard_min_m),
+    )
+    args.guard_effective_min_clearance_m = effective_lookahead_min_clearance_m(
+        float(args.guard_min_clearance_m),
+        robot_radius_m=float(args.robot_radius_m),
+        runtime_planning_clearance_m=float(args.runtime_planning_clearance_m),
+        astar_clearance_hard_min_m=float(args.astar_clearance_hard_min_m),
     )
     args.candidate_min_detector_hits = int(args.candidate_min_detector_hits if args.candidate_min_detector_hits is not None else get_nested(cfg, "sgnav.candidate_min_detector_hits", 2))
     args.candidate_start_min_confidence = max(

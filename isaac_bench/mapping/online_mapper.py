@@ -131,11 +131,18 @@ class OnlineMapper:
             "occupied_priority_over_free": bool(nav_cfg.get("occupied_priority_over_free", True)),
             "unknown_preserve_when_no_observation": bool(nav_cfg.get("unknown_preserve_when_no_observation", True)),
             "debug_navigation_projection_layers": bool(nav_cfg.get("debug_navigation_projection_layers", False)),
+            "incremental_enabled": bool(nav_cfg.get("incremental_enabled", True)),
+            "full_refresh_on_frontier_update": bool(nav_cfg.get("full_refresh_on_frontier_update", True)),
+            "full_refresh_interval_steps": int(nav_cfg.get("full_refresh_interval_steps", 30)),
+            "dirty_dilation_radius_cells": int(nav_cfg.get("dirty_dilation_radius_cells", 2)),
+            "local_morphology_enabled": bool(nav_cfg.get("local_morphology_enabled", True)),
+            "full_morphology_only_on_replan": bool(nav_cfg.get("full_morphology_only_on_replan", True)),
         }
         self.voxel_grid_drives_navigation = bool(self.voxel_grid_config.voxel_grid_drives_navigation)
         self.voxel_grid = VoxelOccupancyGrid3D.zeros(self.grid.free.shape, self.grid.map_info, self.voxel_grid_config)
         self._warm_voxel_cpu_numba_backend()
         self.last_voxel_navigation_projection: NavigationProjection | None = None
+        self.force_full_navigation_projection_once = True
         blind_cfg = dict(voxel_navigation_blind_zone_config or {})
         self.voxel_navigation_blind_zone_config = {
             "enabled": bool(blind_cfg.get("enabled", True)),
@@ -221,6 +228,7 @@ class OnlineMapper:
         self.vertical_profile = VerticalProfileMap.zeros(self.grid.free.shape)
         self.voxel_grid = VoxelOccupancyGrid3D.zeros(self.grid.free.shape, self.grid.map_info, self.voxel_grid_config)
         self.last_voxel_navigation_projection = None
+        self.force_full_navigation_projection_once = True
         self._initial_blind_zone_center_world_xy = (float(start_xy[0]), float(start_xy[1]))
         self._update_step_index = 0
         self.last_voxel_blind_zone_debug = {}
@@ -376,6 +384,11 @@ class OnlineMapper:
                         floor_cells[:, 2] = rc[:, 1]
                         _count, changed = self.voxel_grid.mark_free_voxels_array(floor_cells)
                         self.voxel_grid.refresh_state_indices(changed)
+                        if changed.size:
+                            hw = int(self.grid.map_info.height * self.grid.map_info.width)
+                            if getattr(self.voxel_grid, "last_dirty_rc_flags", None) is None or int(np.asarray(self.voxel_grid.last_dirty_rc_flags).size) != hw:
+                                self.voxel_grid.last_dirty_rc_flags = np.zeros(hw, dtype=np.uint8)
+                            self.voxel_grid.last_dirty_rc_flags[np.asarray(changed % max(1, hw), dtype=np.int64)] = 1
             blind_started_at = time.perf_counter()
             self.last_voxel_blind_zone_debug = self._apply_voxel_navigation_blind_zone(
                 base_pose_world,
@@ -497,10 +510,16 @@ class OnlineMapper:
             self.grid.occupied[rows, cols] = 1
             self.grid.observed[rows, cols] = 1
         if bool(self.voxel_grid_config.enabled):
+            force_full_nav_projection = bool(getattr(self, "force_full_navigation_projection_once", False))
             voxel_nav_projection = self.voxel_grid.project_navigation(
                 **self.voxel_navigation_projection_config,
                 nav_endpoint_count_xy=self.voxel_nav_occupied_endpoint_count,
+                incremental=True,
+                force_full=force_full_nav_projection,
+                dirty_rc_flags=getattr(self.voxel_grid, "last_dirty_rc_flags", None),
+                projection_step=int(self._update_step_index),
             )
+            self.force_full_navigation_projection_once = False
             self.last_voxel_navigation_projection = voxel_nav_projection
         if bool(self.voxel_grid_config.enabled) and bool(self.voxel_grid_drives_navigation) and voxel_nav_projection is not None:
             self.grid.free[:, :] = np.asarray(voxel_nav_projection.free, dtype=np.uint8)
@@ -964,6 +983,10 @@ class OnlineMapper:
         if changed_chunks:
             changed_all = np.unique(np.concatenate(changed_chunks).astype(np.int64, copy=False))
             self.voxel_grid.refresh_state_indices(changed_all)
+            hw = int(self.grid.map_info.height * self.grid.map_info.width)
+            if getattr(self.voxel_grid, "last_dirty_rc_flags", None) is None or int(np.asarray(self.voxel_grid.last_dirty_rc_flags).size) != hw:
+                self.voxel_grid.last_dirty_rc_flags = np.zeros(hw, dtype=np.uint8)
+            self.voxel_grid.last_dirty_rc_flags[np.asarray(changed_all % max(1, hw), dtype=np.int64)] = 1
         else:
             changed_all = np.zeros(0, dtype=np.int64)
         out.update(
@@ -1172,31 +1195,49 @@ class OnlineMapper:
             "ceiling_estimate_status": str(getattr(self.voxel_grid, "ceiling_estimate_status", "snapshot")),
         }
 
-    def navigation_debug_layers(self) -> dict[str, object]:
+    def navigation_debug_layers(self, *, include_arrays: bool = False) -> dict[str, object]:
         debug: dict[str, object] = {}
         projection_debug = dict(getattr(self.voxel_grid, "last_navigation_debug", {}) or {})
-        for key in (
-            "voxel_nav_occupied_from_voxel_xy",
-            "voxel_nav_occupied_from_endpoint_xy",
-            "voxel_nav_occupied_raw_xy",
-            "voxel_nav_occupied_closed_xy",
-            "voxel_nav_free_raw_xy",
-            "voxel_nav_free_suppressed_by_occupied_xy",
-            "voxel_nav_final_free_xy",
-            "voxel_nav_final_occupied_xy",
-            "voxel_nav_final_unknown_xy",
-        ):
-            value = projection_debug.get(key)
-            if isinstance(value, np.ndarray):
-                debug[key] = np.asarray(value).copy()
+        if bool(include_arrays):
+            for key in (
+                "voxel_nav_occupied_from_voxel_xy",
+                "voxel_nav_occupied_from_endpoint_xy",
+                "voxel_nav_occupied_raw_xy",
+                "voxel_nav_occupied_closed_xy",
+                "voxel_nav_free_raw_xy",
+                "voxel_nav_free_suppressed_by_occupied_xy",
+                "voxel_nav_final_free_xy",
+                "voxel_nav_final_occupied_xy",
+                "voxel_nav_final_unknown_xy",
+            ):
+                value = projection_debug.get(key)
+                if isinstance(value, np.ndarray):
+                    debug[key] = np.asarray(value).copy()
+            projection = getattr(self, "last_voxel_navigation_projection", None)
+            if projection is not None:
+                if "voxel_nav_final_free_xy" not in debug:
+                    debug["voxel_nav_final_free_xy"] = np.asarray(projection.free, dtype=bool).copy()
+                if "voxel_nav_final_occupied_xy" not in debug:
+                    debug["voxel_nav_final_occupied_xy"] = np.asarray(projection.occupied, dtype=bool).copy()
+                if "voxel_nav_final_unknown_xy" not in debug:
+                    debug["voxel_nav_final_unknown_xy"] = np.asarray(projection.unknown, dtype=bool).copy()
+            cache = getattr(self.voxel_grid, "_navigation_projection_cache", None)
+            if cache is not None and bool(getattr(cache, "initialized", False)):
+                if "voxel_nav_final_free_xy" not in debug:
+                    debug["voxel_nav_final_free_xy"] = np.asarray(cache.free, dtype=bool).copy()
+                if "voxel_nav_final_occupied_xy" not in debug:
+                    debug["voxel_nav_final_occupied_xy"] = np.asarray(cache.occupied, dtype=bool).copy()
+                if "voxel_nav_final_unknown_xy" not in debug:
+                    debug["voxel_nav_final_unknown_xy"] = np.asarray(cache.unknown, dtype=bool).copy()
         for key, value in projection_debug.items():
             if not isinstance(value, np.ndarray):
                 debug[key] = value
         debug.update(dict(self.voxel_nav_endpoint_decay_debug))
         debug.update(dict(self.last_current_footprint_override_debug))
-        debug["voxel_nav_occupied_endpoint_count_xy"] = np.asarray(self.voxel_nav_occupied_endpoint_count, dtype=np.uint16).copy()
-        debug["voxel_nav_free_ray_count_xy"] = np.asarray(self.voxel_nav_free_ray_count, dtype=np.uint16).copy()
-        debug["current_pose_navigation_override_mask"] = np.asarray(self.current_pose_navigation_override_mask, dtype=bool).copy()
+        if bool(include_arrays):
+            debug["voxel_nav_occupied_endpoint_count_xy"] = np.asarray(self.voxel_nav_occupied_endpoint_count, dtype=np.uint16).copy()
+            debug["voxel_nav_free_ray_count_xy"] = np.asarray(self.voxel_nav_free_ray_count, dtype=np.uint16).copy()
+            debug["current_pose_navigation_override_mask"] = np.asarray(self.current_pose_navigation_override_mask, dtype=bool).copy()
         debug["current_pose_navigation_override_cells"] = int(np.count_nonzero(self.current_pose_navigation_override_mask))
         return debug
 

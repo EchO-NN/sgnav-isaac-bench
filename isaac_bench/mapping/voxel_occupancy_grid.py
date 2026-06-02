@@ -113,6 +113,21 @@ class NavigationProjection:
 
 
 @dataclass
+class VoxelNavigationProjectionCache:
+    free: np.ndarray
+    occupied: np.ndarray
+    observed: np.ndarray
+    unknown: np.ndarray
+    occupied_from_voxel: np.ndarray
+    occupied_from_endpoint: np.ndarray
+    free_raw: np.ndarray
+    observed_from_voxel: np.ndarray
+    dirty_rc_flags: np.ndarray
+    initialized: bool = False
+    last_full_refresh_step: int = -1
+
+
+@dataclass
 class NavigationProjectionConfig:
     obstacle_z_min_m: float = 0.20
     obstacle_z_max_m: float = 0.90
@@ -131,6 +146,12 @@ class NavigationProjectionConfig:
     occupied_priority_over_free: bool = True
     unknown_preserve_when_no_observation: bool = True
     debug_navigation_projection_layers: bool = False
+    incremental_enabled: bool = True
+    full_refresh_on_frontier_update: bool = True
+    full_refresh_interval_steps: int = 30
+    dirty_dilation_radius_cells: int = 2
+    local_morphology_enabled: bool = True
+    full_morphology_only_on_replan: bool = True
 
     @classmethod
     def from_mapping(cls, data: Mapping[str, object] | None = None, **overrides: object) -> "NavigationProjectionConfig":
@@ -201,6 +222,7 @@ class VoxelIntegrationStats:
     voxel_integrate_occ_event_count: int = 0
     voxel_integrate_sensor_event_count: int = 0
     voxel_integrate_changed_flag_count: int = 0
+    voxel_integrate_dirty_rc_count: int = 0
     voxel_integrate_touched_block_count: int = 0
     voxel_integrate_num_blocks: int = 0
     voxel_numba_threading_layer: str = "unknown"
@@ -266,6 +288,7 @@ class VoxelIntegrationStats:
             "voxel_integrate_occ_event_count": int(self.voxel_integrate_occ_event_count),
             "voxel_integrate_sensor_event_count": int(self.voxel_integrate_sensor_event_count),
             "voxel_integrate_changed_flag_count": int(self.voxel_integrate_changed_flag_count),
+            "voxel_integrate_dirty_rc_count": int(self.voxel_integrate_dirty_rc_count),
             "voxel_integrate_touched_block_count": int(self.voxel_integrate_touched_block_count),
             "voxel_integrate_num_blocks": int(self.voxel_integrate_num_blocks),
             "voxel_numba_threading_layer": str(self.voxel_numba_threading_layer),
@@ -289,6 +312,8 @@ class VoxelOccupancyGrid3D:
     ceiling_estimate_status: str = "unavailable"
     last_integration_stats: VoxelIntegrationStats = field(default_factory=VoxelIntegrationStats)
     last_navigation_debug: dict[str, object] = field(default_factory=dict)
+    _navigation_projection_cache: VoxelNavigationProjectionCache | None = None
+    last_dirty_rc_flags: np.ndarray | None = None
 
     @classmethod
     def zeros(
@@ -339,6 +364,8 @@ class VoxelOccupancyGrid3D:
         self.sensor_range_count = np.zeros((self.z_bin_count, height, width), dtype=np.uint8)
         self.last_integration_stats = VoxelIntegrationStats()
         self.last_navigation_debug = {}
+        self._navigation_projection_cache = None
+        self.last_dirty_rc_flags = np.zeros(height * width, dtype=np.uint8)
 
     def z_index_for_height(self, rel_z_m: float) -> int | None:
         zf = (float(rel_z_m) - self.z_min_m) / self.z_resolution_m
@@ -393,6 +420,7 @@ class VoxelOccupancyGrid3D:
     ) -> VoxelIntegrationStats:
         started_at = time.perf_counter()
         stats = VoxelIntegrationStats()
+        self.last_dirty_rc_flags = np.zeros(int(self.shape[0] * self.shape[1]), dtype=np.uint8)
         if not bool(self.config.enabled):
             stats.integration_backend = "disabled"
             stats.integrate_total_ms = float((time.perf_counter() - started_at) * 1000.0)
@@ -456,6 +484,10 @@ class VoxelOccupancyGrid3D:
             )
         else:
             raise RuntimeError("unsupported voxel integration backend: %s" % backend)
+        if str(getattr(stats, "integration_backend", backend)) != "cpu_numba":
+            if int(getattr(stats, "free_update_count", 0)) or int(getattr(stats, "occupied_update_count", 0)):
+                self.last_dirty_rc_flags = np.ones(int(self.shape[0] * self.shape[1]), dtype=np.uint8)
+                self.invalidate_navigation_projection_cache(reason="non_numba_backend_update")
         stats.sensor_range_decay_applied = int(sensor_range_decay_applied)
         stats.integrate_total_ms = float((time.perf_counter() - started_at) * 1000.0)
         self.last_integration_stats = stats
@@ -733,6 +765,16 @@ class VoxelOccupancyGrid3D:
         occupied_priority_over_free: bool = True,
         unknown_preserve_when_no_observation: bool = True,
         debug_navigation_projection_layers: bool = True,
+        incremental: bool = True,
+        force_full: bool = False,
+        dirty_rc_flags: np.ndarray | None = None,
+        projection_step: int | None = None,
+        full_refresh_interval_steps: int | None = None,
+        dirty_dilation_radius_cells: int | None = None,
+        local_morphology_enabled: bool | None = None,
+        full_morphology_only_on_replan: bool | None = None,
+        incremental_enabled: bool | None = None,
+        full_refresh_on_frontier_update: bool | None = None,
     ) -> NavigationProjection:
         started_at = time.perf_counter()
         cfg = (
@@ -757,6 +799,12 @@ class VoxelOccupancyGrid3D:
                 occupied_priority_over_free=occupied_priority_over_free,
                 unknown_preserve_when_no_observation=unknown_preserve_when_no_observation,
                 debug_navigation_projection_layers=debug_navigation_projection_layers,
+                incremental_enabled=incremental_enabled,
+                full_refresh_on_frontier_update=full_refresh_on_frontier_update,
+                full_refresh_interval_steps=full_refresh_interval_steps,
+                dirty_dilation_radius_cells=dirty_dilation_radius_cells,
+                local_morphology_enabled=local_morphology_enabled,
+                full_morphology_only_on_replan=full_morphology_only_on_replan,
             )
         )
         occ_idx = self.active_z_indices(z_min_m=float(cfg.obstacle_z_min_m), z_max_m=float(cfg.obstacle_z_max_m))
@@ -769,44 +817,129 @@ class VoxelOccupancyGrid3D:
                 raise ValueError("nav_endpoint_count_xy shape %s does not match grid shape %s" % (endpoint_count.shape, self.shape))
         else:
             endpoint_count = None
-        try:
-            from isaac_bench.mapping.voxel_projection_numba import project_navigation_columns
+        cache = self._navigation_projection_cache
+        step_i = -1 if projection_step is None else int(projection_step)
+        interval = max(0, int(cfg.full_refresh_interval_steps))
+        force_interval = bool(interval > 0 and cache is not None and cache.initialized and step_i >= 0 and (step_i - int(cache.last_full_refresh_step)) >= interval)
+        use_incremental = (
+            bool(incremental)
+            and bool(cfg.incremental_enabled)
+            and step_i >= 0
+            and not bool(force_full)
+            and not bool(force_interval)
+            and cache is not None
+            and bool(cache.initialized)
+        )
+        raw_dirty_flags = dirty_rc_flags
+        if raw_dirty_flags is None:
+            raw_dirty_flags = self.last_dirty_rc_flags
+        dirty_indices = np.zeros(0, dtype=np.int64)
+        dirty_source_count = 0
+        if use_incremental and raw_dirty_flags is not None:
+            flags = np.asarray(raw_dirty_flags, dtype=np.uint8).reshape(-1)
+            if flags.size == int(self.shape[0] * self.shape[1]):
+                dirty_source_count = int(np.count_nonzero(flags))
+                if dirty_source_count > 0:
+                    flags_2d = flags.reshape(self.shape).astype(bool)
+                    radius = max(0, int(cfg.dirty_dilation_radius_cells))
+                    if radius > 0:
+                        flags_2d = _dilate_bool(flags_2d, radius)
+                    dirty_indices = np.flatnonzero(flags_2d.reshape(-1)).astype(np.int64)
+        if use_incremental and dirty_indices.size > 0:
+            projection_backend = "numba_dirty_column"
+            try:
+                from isaac_bench.mapping.voxel_projection_numba import project_navigation_dirty_columns
 
-            occupied_from_voxel, occupied_from_endpoint, free_raw, observed_from_voxel = project_navigation_columns(
-                self.state,
-                endpoint_count,
-                occ_z_indices=occ_idx,
-                free_z_indices=free_idx,
-                endpoint_threshold=int(cfg.occupied_endpoint_count_threshold),
-                min_free_voxels=int(cfg.min_free_voxels),
-                occupied_any_voxel_wins=bool(cfg.occupied_any_voxel_wins),
-                occupied_use_endpoint_hysteresis=bool(cfg.occupied_use_endpoint_hysteresis),
-            )
-            projection_backend = "numba_column"
-        except Exception:
-            if occ_idx.size and bool(cfg.occupied_any_voxel_wins):
-                occupied_from_voxel = np.any(self.state[occ_idx] == int(VOXEL_OCCUPIED), axis=0)
-            else:
-                occupied_from_voxel = np.zeros(self.shape, dtype=bool)
-            if free_idx.size:
-                free_count = np.sum(self.state[free_idx] == int(VOXEL_FREE), axis=0)
-                free_raw = free_count >= max(1, int(cfg.min_free_voxels))
-            else:
-                free_raw = np.zeros(self.shape, dtype=bool)
-            if endpoint_count is not None and bool(cfg.occupied_use_endpoint_hysteresis):
-                occupied_from_endpoint = endpoint_count.astype(np.uint16) >= max(1, int(cfg.occupied_endpoint_count_threshold))
-            else:
-                occupied_from_endpoint = np.zeros(self.shape, dtype=bool)
-            if union_idx.size:
-                observed_from_voxel = np.any(self.state[union_idx] != int(VOXEL_UNKNOWN), axis=0)
-            else:
-                observed_from_voxel = np.zeros(self.shape, dtype=bool)
+                project_navigation_dirty_columns(
+                    self.state,
+                    endpoint_count,
+                    dirty_indices,
+                    occ_z_indices=occ_idx,
+                    free_z_indices=free_idx,
+                    endpoint_threshold=int(cfg.occupied_endpoint_count_threshold),
+                    min_free_voxels=int(cfg.min_free_voxels),
+                    occupied_any_voxel_wins=bool(cfg.occupied_any_voxel_wins),
+                    occupied_use_endpoint_hysteresis=bool(cfg.occupied_use_endpoint_hysteresis),
+                    out_occupied_from_voxel_flat=cache.occupied_from_voxel.reshape(-1),
+                    out_occupied_from_endpoint_flat=cache.occupied_from_endpoint.reshape(-1),
+                    out_free_raw_flat=cache.free_raw.reshape(-1),
+                    out_observed_from_voxel_flat=cache.observed_from_voxel.reshape(-1),
+                )
+            except Exception:
+                projection_backend = "numpy_dirty_column"
+                state_flat = self.state.reshape(int(self.state.shape[0]), -1)
+                for rc in dirty_indices:
+                    rc_i = int(rc)
+                    if rc_i < 0 or rc_i >= state_flat.shape[1]:
+                        continue
+                    occ_values = state_flat[occ_idx, rc_i] if occ_idx.size else np.zeros(0, dtype=np.uint8)
+                    free_values = state_flat[free_idx, rc_i] if free_idx.size else np.zeros(0, dtype=np.uint8)
+                    union_values = state_flat[union_idx, rc_i] if union_idx.size else np.zeros(0, dtype=np.uint8)
+                    cache.occupied_from_voxel.reshape(-1)[rc_i] = bool(occ_values.size and np.any(occ_values == int(VOXEL_OCCUPIED)))
+                    cache.free_raw.reshape(-1)[rc_i] = bool(free_values.size and int(np.count_nonzero(free_values == int(VOXEL_FREE))) >= max(1, int(cfg.min_free_voxels)))
+                    cache.observed_from_voxel.reshape(-1)[rc_i] = bool(union_values.size and np.any(union_values != int(VOXEL_UNKNOWN)))
+                    cache.occupied_from_endpoint.reshape(-1)[rc_i] = bool(
+                        endpoint_count is not None
+                        and bool(cfg.occupied_use_endpoint_hysteresis)
+                        and int(np.asarray(endpoint_count).reshape(-1)[rc_i]) >= max(1, int(cfg.occupied_endpoint_count_threshold))
+                    )
+            occupied_from_voxel = cache.occupied_from_voxel.astype(bool, copy=False)
+            occupied_from_endpoint = cache.occupied_from_endpoint.astype(bool, copy=False)
+            free_raw = cache.free_raw.astype(bool, copy=False)
+            observed_from_voxel = cache.observed_from_voxel.astype(bool, copy=False)
+            projection_mode = "incremental"
+            full_refresh = False
+        elif use_incremental and dirty_indices.size == 0:
+            projection_backend = "cache_clean"
+            occupied_from_voxel = cache.occupied_from_voxel.astype(bool, copy=False)
+            occupied_from_endpoint = cache.occupied_from_endpoint.astype(bool, copy=False)
+            free_raw = cache.free_raw.astype(bool, copy=False)
+            observed_from_voxel = cache.observed_from_voxel.astype(bool, copy=False)
+            projection_mode = "cached_no_dirty"
+            full_refresh = False
+        else:
+            projection_mode = "full"
+            full_refresh = True
+            projection_backend = "numpy"
+            try:
+                from isaac_bench.mapping.voxel_projection_numba import project_navigation_columns
+
+                occupied_from_voxel, occupied_from_endpoint, free_raw, observed_from_voxel = project_navigation_columns(
+                    self.state,
+                    endpoint_count,
+                    occ_z_indices=occ_idx,
+                    free_z_indices=free_idx,
+                    endpoint_threshold=int(cfg.occupied_endpoint_count_threshold),
+                    min_free_voxels=int(cfg.min_free_voxels),
+                    occupied_any_voxel_wins=bool(cfg.occupied_any_voxel_wins),
+                    occupied_use_endpoint_hysteresis=bool(cfg.occupied_use_endpoint_hysteresis),
+                )
+                projection_backend = "numba_column"
+            except Exception:
+                if occ_idx.size and bool(cfg.occupied_any_voxel_wins):
+                    occupied_from_voxel = np.any(self.state[occ_idx] == int(VOXEL_OCCUPIED), axis=0)
+                else:
+                    occupied_from_voxel = np.zeros(self.shape, dtype=bool)
+                if free_idx.size:
+                    free_count = np.sum(self.state[free_idx] == int(VOXEL_FREE), axis=0)
+                    free_raw = free_count >= max(1, int(cfg.min_free_voxels))
+                else:
+                    free_raw = np.zeros(self.shape, dtype=bool)
+                if endpoint_count is not None and bool(cfg.occupied_use_endpoint_hysteresis):
+                    occupied_from_endpoint = endpoint_count.astype(np.uint16) >= max(1, int(cfg.occupied_endpoint_count_threshold))
+                else:
+                    occupied_from_endpoint = np.zeros(self.shape, dtype=bool)
+                if union_idx.size:
+                    observed_from_voxel = np.any(self.state[union_idx] != int(VOXEL_UNKNOWN), axis=0)
+                else:
+                    observed_from_voxel = np.zeros(self.shape, dtype=bool)
         occupied_raw = np.asarray(occupied_from_voxel | occupied_from_endpoint, dtype=bool)
         occupied_closed = occupied_raw
-        if int(cfg.occupied_close_radius_cells) > 0:
+        morphology_enabled = full_refresh or not bool(cfg.full_morphology_only_on_replan)
+        if int(cfg.occupied_close_radius_cells) > 0 and bool(morphology_enabled):
             occupied_closed = _binary_close_disk(occupied_closed, int(cfg.occupied_close_radius_cells))
         hole_filled_mask = np.zeros(self.shape, dtype=bool)
-        if int(cfg.occupied_fill_small_holes_max_area_cells) > 0:
+        if int(cfg.occupied_fill_small_holes_max_area_cells) > 0 and bool(morphology_enabled):
             occupied_closed, hole_filled_mask = _fill_small_false_holes(
                 occupied_closed,
                 max_area_cells=int(cfg.occupied_fill_small_holes_max_area_cells),
@@ -822,6 +955,24 @@ class VoxelOccupancyGrid3D:
         unknown = ~observed
         free &= ~unknown
         occupied &= ~unknown
+        cache_dirty = np.zeros(int(self.shape[0] * self.shape[1]), dtype=np.uint8)
+        if raw_dirty_flags is not None and np.asarray(raw_dirty_flags).reshape(-1).size == cache_dirty.size:
+            cache_dirty[:] = np.asarray(raw_dirty_flags, dtype=np.uint8).reshape(-1)
+        self._navigation_projection_cache = VoxelNavigationProjectionCache(
+            free=free.astype(bool),
+            occupied=occupied.astype(bool),
+            observed=observed.astype(bool),
+            unknown=unknown.astype(bool),
+            occupied_from_voxel=np.asarray(occupied_from_voxel, dtype=np.uint8),
+            occupied_from_endpoint=np.asarray(occupied_from_endpoint, dtype=np.uint8),
+            free_raw=np.asarray(free_raw, dtype=np.uint8),
+            observed_from_voxel=np.asarray(observed_from_voxel, dtype=np.uint8),
+            dirty_rc_flags=cache_dirty,
+            initialized=True,
+            last_full_refresh_step=step_i if full_refresh and step_i >= 0 else (
+                int(cache.last_full_refresh_step) if cache is not None and cache.initialized else -1
+            ),
+        )
         debug = {
             "voxel_nav_obstacle_z_min_m": float(cfg.obstacle_z_min_m),
             "voxel_nav_obstacle_z_max_m": float(cfg.obstacle_z_max_m),
@@ -850,6 +1001,15 @@ class VoxelOccupancyGrid3D:
             "voxel_nav_observed_cells": int(np.count_nonzero(observed)),
             "voxel_nav_unknown_cells": int(np.count_nonzero(unknown)),
             "voxel_project_navigation_backend": str(projection_backend),
+            "voxel_project_navigation_mode": str(projection_mode),
+            "voxel_project_navigation_force_full": bool(force_full),
+            "voxel_project_navigation_full_refresh": bool(full_refresh),
+            "voxel_project_navigation_incremental_enabled": bool(cfg.incremental_enabled),
+            "voxel_project_navigation_dirty_rc_count": int(dirty_source_count),
+            "voxel_project_navigation_dirty_projected_rc_count": int(dirty_indices.size),
+            "voxel_project_navigation_dirty_dilation_radius_cells": int(cfg.dirty_dilation_radius_cells),
+            "voxel_project_navigation_morphology_applied": bool(morphology_enabled),
+            "voxel_project_navigation_last_full_refresh_step": int(self._navigation_projection_cache.last_full_refresh_step),
             "voxel_project_navigation_ms": float((time.perf_counter() - started_at) * 1000.0),
         }
         if bool(cfg.debug_navigation_projection_layers):
@@ -874,6 +1034,13 @@ class VoxelOccupancyGrid3D:
             unknown=unknown.astype(bool),
             debug=debug,
         )
+
+    def invalidate_navigation_projection_cache(self, *, reason: str = "") -> None:
+        self._navigation_projection_cache = None
+        debug = dict(self.last_navigation_debug)
+        debug["voxel_project_navigation_cache_invalidated"] = True
+        debug["voxel_project_navigation_cache_invalidated_reason"] = str(reason)
+        self.last_navigation_debug = debug
 
     def to_debug_dict(self) -> dict[str, object]:
         z_count, height, width = self.state.shape
@@ -1101,6 +1268,12 @@ def _dilate_bool(mask: np.ndarray, radius_cells: int) -> np.ndarray:
     radius = max(0, int(radius_cells))
     if radius <= 0 or not np.any(src):
         return src.copy()
+    try:
+        from scipy import ndimage
+
+        return ndimage.binary_dilation(src, structure=_disk_structure(radius)).astype(bool)
+    except Exception:
+        pass
     out = src.copy()
     rows, cols = np.nonzero(src)
     h, w = src.shape

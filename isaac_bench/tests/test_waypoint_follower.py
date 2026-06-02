@@ -36,3 +36,16 @@ def test_kinematic_guard_checks_swept_path_not_only_endpoint():
     assert blocked is False
     assert guarded[0] == pytest.approx(1.0)
     assert pose_swept_is_grid_safe(pose, guarded, 1.0, navigable, info)
+
+
+def test_kinematic_guard_reports_blocked_when_translation_is_suppressed_to_rotation_only():
+    info = MapInfo(resolution_m=1.0, min_x=0.0, max_x=3.0, min_y=0.0, max_y=3.0, width=3, height=3)
+    navigable = np.zeros((3, 3), dtype=bool)
+    navigable[1, 1] = True
+    pose = (1.99, 1.5, 0.05, 0.0)
+    cmd = (1.0, 0.0, 0.25)
+
+    guarded, blocked = guard_kinematic_cmd(pose, cmd, 1.0, navigable, info, camera_forward_offset_m=0.0)
+
+    assert blocked is True
+    assert guarded == pytest.approx((0.0, 0.0, 0.25))

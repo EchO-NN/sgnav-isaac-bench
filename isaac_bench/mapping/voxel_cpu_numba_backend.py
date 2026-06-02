@@ -121,6 +121,8 @@ class VoxelCpuNumbaBackend:
             -1,
             1,
             np.zeros(0, dtype=np.uint8),
+            np.zeros(int(grid.state.shape[1] * grid.state.shape[2]), dtype=np.uint8),
+            int(grid.state.shape[1] * grid.state.shape[2]),
             np.zeros(free_block_offsets.size - 1, dtype=np.int64),
             np.zeros(free_block_offsets.size - 1, dtype=np.int64),
             np.zeros(free_block_offsets.size - 1, dtype=np.int64),
@@ -141,6 +143,8 @@ class VoxelCpuNumbaBackend:
             block_size,
             1,
             255,
+            np.zeros(int(grid.state.shape[1] * grid.state.shape[2]), dtype=np.uint8),
+            int(grid.state.shape[1] * grid.state.shape[2]),
             np.zeros(sensor_block_offsets.size - 1, dtype=np.int64),
         )
         _WARMED_THREAD_COUNTS.add(int(thread_count))
@@ -376,6 +380,7 @@ def _integrate_numba(
         if bool(getattr(grid.config, "cpu_numba_disable_changed_flatnonzero", True))
         else np.zeros(total_voxels, dtype=np.uint8)
     )
+    dirty_rc_flags = np.zeros(int(height * width), dtype=np.uint8)
     integrated = 0
 
     for start in range(0, int(endpoints.shape[0]), int(chunk_rays)):
@@ -512,6 +517,8 @@ def _integrate_numba(
             int(grid.config.free_logodds_threshold),
             int(grid.config.occupied_logodds_threshold),
             changed_flags,
+            dirty_rc_flags,
+            int(height * width),
             free_update_counts,
             occ_update_counts,
             changed_counts,
@@ -546,6 +553,8 @@ def _integrate_numba(
                 int(block_size),
                 int(sensor_delta),
                 int(sensor_max),
+                dirty_rc_flags,
+                int(height * width),
                 sensor_update_counts,
             )
             sensor_updates = int(np.sum(sensor_update_counts))
@@ -578,6 +587,7 @@ def _integrate_numba(
                 int(sensor_max),
                 endpoint_updates,
             )
+            dirty_rc_flags[:] = np.maximum(dirty_rc_flags, rc_flags)
             stats.sensor_range_update_count += int(endpoint_updates[0])
             stats.voxel_integrate_total_unique_sensor_voxels += int(endpoint_updates[0])
         stats.voxel_integrate_endpoint_column_ms += float((time.perf_counter() - endpoint_started) * 1000.0)
@@ -604,6 +614,8 @@ def _integrate_numba(
         stats.refresh_mode = "inline_apply"
     stats.refresh_state_ms = 0.0
     stats.voxel_integrate_refresh_state_ms = 0.0
+    grid.last_dirty_rc_flags = dirty_rc_flags
+    stats.voxel_integrate_dirty_rc_count = int(np.count_nonzero(dirty_rc_flags))
     stats.integrate_total_ms = float((time.perf_counter() - started_at) * 1000.0)
     try:
         stats.voxel_numba_threading_layer = str(numba.threading_layer())
@@ -864,6 +876,8 @@ try:
         free_threshold: int,
         occupied_threshold: int,
         changed_flags: np.ndarray,
+        dirty_rc_flags: np.ndarray,
+        hw: int,
         free_update_counts: np.ndarray,
         occ_update_counts: np.ndarray,
         changed_counts: np.ndarray,
@@ -925,6 +939,8 @@ try:
                     state_flat[idx] = int(VOXEL_UNKNOWN)
                 if changed_flags.shape[0] > 0:
                     changed_flags[idx] = 1
+                if hw > 0 and dirty_rc_flags.shape[0] == hw:
+                    dirty_rc_flags[idx % hw] = 1
                 changed_total += 1
             free_update_counts[block] = free_total
             occ_update_counts[block] = occ_total
@@ -940,6 +956,8 @@ try:
         block_size: int,
         delta: int,
         max_value: int,
+        dirty_rc_flags: np.ndarray,
+        hw: int,
         sensor_update_counts: np.ndarray,
     ) -> None:
         num_blocks = sensor_block_offsets.shape[0] - 1
@@ -964,6 +982,8 @@ try:
                 if value > max_value:
                     value = max_value
                 sensor_flat[idx] = value
+                if hw > 0 and dirty_rc_flags.shape[0] == hw:
+                    dirty_rc_flags[idx % hw] = 1
                 update_count += 1
             sensor_update_counts[block] = update_count
 

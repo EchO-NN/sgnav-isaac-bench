@@ -985,6 +985,9 @@ class SGNavPopupVisualizer:
             bucket_sensor_ms = float(self._room_segmentation_debug.get("voxel_integrate_bucket_sensor_ms", 0.0) or 0.0)
             apply_ms = float(self._room_segmentation_debug.get("voxel_integrate_apply_logodds_ms", 0.0) or 0.0)
             sensor_ms = float(self._room_segmentation_debug.get("voxel_integrate_apply_sensor_ms", 0.0) or 0.0)
+            project_ms = float(self._room_segmentation_debug.get("voxel_project_navigation_ms", 0.0) or 0.0)
+            project_mode = str(self._room_segmentation_debug.get("voxel_project_navigation_mode", "unknown"))
+            roomseg_reason = str(self._room_segmentation_debug.get("roomseg_frontier_update_reason", "unknown"))
             fallback = bool(self._room_segmentation_debug.get("voxel_numba_requested_unavailable", False))
             try:
                 integrate_text = "%.1fms" % float(integrate_ms)
@@ -995,7 +998,7 @@ class SGNavPopupVisualizer:
                 clearance_text = "%.2f" % float(clearance_min)
             except (TypeError, ValueError):
                 clearance_text = "NA"
-            title = "nav voxel | free=%d occ=%d unk=%d frontier=%d path_clear=%s backend=%s%s th=%d/%d %s total=%s p1/p2=%.1f/%.1f bucket=%.1f f/o/s=%.1f/%.1f/%.1f apply=%.1f sens=%.1f zoom %.1fx" % (
+            title = "nav voxel | free=%d occ=%d unk=%d frontier=%d path_clear=%s backend=%s%s th=%d/%d %s integ=%s proj=%.1f/%s roomseg=%s bucket=%.1f f/o/s=%.1f/%.1f/%.1f zoom %.1fx" % (
                 int(np.count_nonzero(nav & obs)),
                 int(np.count_nonzero(occupancy.astype(bool))),
                 nav_unknown,
@@ -1007,14 +1010,13 @@ class SGNavPopupVisualizer:
                 requested_threads,
                 threads_mode,
                 integrate_text,
-                pass1_ms,
-                pass2_ms,
+                project_ms,
+                project_mode,
+                roomseg_reason,
                 bucket_ms,
                 bucket_free_ms,
                 bucket_occ_ms,
                 bucket_sensor_ms,
-                apply_ms,
-                sensor_ms,
                 zoom,
             )
         else:

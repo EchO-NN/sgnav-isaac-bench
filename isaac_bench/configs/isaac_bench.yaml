@@ -61,7 +61,7 @@ dataset:
 
 scene_preprocess:
   map_resolution_m: 0.05
-  robot_radius_m: 0.14
+  robot_radius_m: 0.05
   inflation_radius_m: 0.0
   min_object_bbox_diag_m: 0.05
   include_large_furniture_as_goals: true
@@ -105,8 +105,8 @@ robot:
   max_vy_mps: 0.15
   max_wz_radps: 0.35
   cmd_hz: 10
-  footprint_width_m: 0.28
-  footprint_radius_m: 0.14
+  footprint_width_m: 0.10
+  footprint_radius_m: 0.05
 
 camera:
   width: 640
@@ -128,7 +128,7 @@ nearfield_depth:
   near_m: 0.02
   far_m: 1.8
   radius_m: 1.2
-  ignore_radius_m: 0.14
+  ignore_radius_m: 0.05
   depth_stride_px: 3
   floor_tolerance_m: 0.12
   obstacle_min_height_m: 0.18
@@ -169,6 +169,9 @@ mapping:
   room_map_mode: voxel_occupancy_door_wall_v33_vlm
   voxel_runtime:
     runtime_debug_level: counters
+    runtime_debug_full_arrays: false
+    runtime_debug_full_arrays_on_viz: true
+    runtime_debug_full_arrays_on_snapshot: true
     skip_legacy_vertical_profile_when_voxel_backend: true
     skip_legacy_height_profile_when_voxel_backend: true
     skip_legacy_roomseg_ray_evidence_when_voxel_backend: true
@@ -207,6 +210,7 @@ mapping:
       policy: at_frontier_arrival
       freeze_during_navigation: true
       debug_force_update: false
+      arrival_update_cooldown_steps: 3
       update_on_target_invalidated: false
       update_on_no_active_path: false
       update_on_no_progress: false
@@ -338,13 +342,19 @@ mapping:
       occupied_priority_over_free: true
       unknown_preserve_when_no_observation: true
       debug_navigation_projection_layers: false
+      incremental_enabled: true
+      full_refresh_on_frontier_update: true
+      full_refresh_interval_steps: 30
+      dirty_dilation_radius_cells: 2
+      local_morphology_enabled: true
+      full_morphology_only_on_replan: true
     voxel_navigation_blind_zone:
       enabled: true
       force_initial_blind_zone_free: true
       initial_blind_zone_radius_m: 0.80
       initial_blind_zone_steps: 60
       force_current_footprint_free: true
-      current_footprint_radius_m: 0.14
+      current_footprint_radius_m: 0.05
       current_footprint_extra_margin_m: 0.00
       current_footprint_clear_dynamic_occupied: true
       current_footprint_preserve_static_structural: true
@@ -1280,6 +1290,28 @@ sgnav:
   frontier_commit_no_progress_steps: 25
   frontier_commit_progress_min_delta_m: 0.10
   frontier_blacklist_ttl_steps: 100
+  frontier_execution_state_enabled: true
+  frontier_arrival_min_steps_since_selection: 6
+  frontier_arrival_confirm_steps: 2
+  frontier_same_target_max_no_path_replans: 3
+  frontier_guard_blocked_confirm_steps: 5
+  frontier_arrival_update_stop_steps: 1
+  frontier_arrival_blacklist_on_reached: false
+  frontier_roomseg_update_assert_no_bypass: true
+  frontier_unreachable_recovery:
+    enabled: true
+    local_search_radius_m: 1.50
+    global_search_enabled: true
+    global_max_frontier_distance_m: 3.00
+    min_clearance_m: 0.08
+    min_approach_improvement_m: 0.20
+    allow_current_as_partial_arrival: true
+    max_recovery_attempts_per_frontier: 1
+    max_debug_candidates: 64
+  frontier_switch_requires_refresh: true
+  frontier_failure_requires_refresh: true
+  frontier_partial_arrival_requires_refresh: true
+  frontier_refresh_blocks_reselect: true
   semantic_priors_path: isaac_bench/configs/sgnav_semantic_priors.yaml
   debug_graph_dump: false
   debug_graph_dump_dir: debug/graphs
@@ -1400,20 +1432,37 @@ astar:
   goal_tolerance_m: 0.20
   waypoint_lookahead_m: 0.15
   replan_every_steps: 5
-  runtime_planning_clearance_m: 0.02
+  planning_robot_radius_m: null
+  runtime_planning_clearance_m: 0.01
   clearance_cost_enabled: true
-  clearance_desired_m: 0.25
+  clearance_desired_m: 0.12
   clearance_hard_min_m: 0.00
   clearance_weight: 3.0
   clearance_power: 2.0
-  goal_min_clearance_m: 0.18
+  goal_min_clearance_m: 0.08
   goal_search_radius_m: 0.35
   collision_checked_smoothing_enabled: true
-  smoothing_min_clearance_m: 0.14
+  smoothing_min_clearance_m: 0.06
   smoothing_max_skip_cells: 8
   lookahead_collision_check_enabled: true
-  lookahead_min_clearance_m: 0.14
+  lookahead_min_clearance_m: 0.06
+  guard_min_clearance_m: 0.06
+  reject_runtime_robot_radius_smaller_than_config: true
+  allow_tiny_robot_radius_debug: false
   stuck_timeout_steps: 30
+
+frontier_targeting:
+  enabled: true
+  target_mode: approach_cell
+  approach_radius_m: 0.20
+  search_radius_m: 0.45
+  min_goal_clearance_m: 0.08
+  prefer_high_clearance: true
+  prefer_near_frontier_center: true
+  require_reachable: true
+  forbid_target_on_unknown: true
+  forbid_target_on_occupied: true
+  max_candidates: 128
 
 nav2:
   use_nav2: false

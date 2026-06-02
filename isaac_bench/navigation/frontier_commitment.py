@@ -23,6 +23,7 @@ class ActiveFrontierTarget:
     no_progress_steps: int = 0
     reached: bool = False
     invalid_reason: str = ""
+    target_clearance_m: Optional[float] = None
 
 
 @dataclass
@@ -41,6 +42,16 @@ def _center_dist(a: Sequence[int], b: Sequence[int]) -> float:
     return float(np.linalg.norm(aa - bb))
 
 
+def _metadata_float(metadata: Optional[Dict[str, object]], key: str) -> Optional[float]:
+    if not metadata:
+        return None
+    value = metadata.get(key)
+    try:
+        return None if value is None else float(value)
+    except Exception:
+        return None
+
+
 class FrontierCommitmentManager:
     def __init__(
         self,
@@ -55,6 +66,7 @@ class FrontierCommitmentManager:
         progress_min_delta_m: float = 0.10,
         blacklist_ttl_steps: int = 100,
         allow_score_switch: bool = False,
+        switch_requires_refresh: bool = False,
     ):
         self.resolution_m = float(resolution_m)
         self.match_radius_cells = max(1, int(round(float(match_radius_m) / max(self.resolution_m, 1e-6))))
@@ -67,6 +79,7 @@ class FrontierCommitmentManager:
         self.progress_min_delta_m = float(progress_min_delta_m)
         self.blacklist_ttl_steps = int(blacklist_ttl_steps)
         self.allow_score_switch = bool(allow_score_switch)
+        self.switch_requires_refresh = bool(switch_requires_refresh)
         self.active: Optional[ActiveFrontierTarget] = None
         self.next_id = 1
         self.blacklist: List[Tuple[GridCell, int, str]] = []
@@ -84,6 +97,17 @@ class FrontierCommitmentManager:
             self._blacklist(self.active.center_grid, int(step), str(reason))
         self.active = None
 
+    def mark_active_reached(self, step: int, reason: str = "frontier_reached") -> None:
+        _ = step
+        if self.active is None:
+            return
+        self.active.reached = True
+        self.active.invalid_reason = str(reason)
+        self.active = None
+
+    def mark_active_failed(self, step: int, reason: str, blacklist: bool = True) -> None:
+        self.invalidate_active(step, reason, blacklist=blacklist)
+
     def blacklist_frontier(self, frontier_or_cell, step: int, reason: str) -> None:
         center = getattr(frontier_or_cell, "center_grid", frontier_or_cell)
         self._blacklist(tuple(int(v) for v in center), int(step), str(reason))
@@ -97,6 +121,8 @@ class FrontierCommitmentManager:
         step: int,
         planner: Optional[GridAStarPlanner] = None,
         target_cells: Optional[Sequence[GridCell]] = None,
+        target_frontier: Optional[FrontierCluster] = None,
+        target_metadata: Optional[Dict[str, object]] = None,
         scores_by_index: Optional[Sequence[float]] = None,
     ) -> FrontierCommitmentDecision:
         self._expire_blacklist(int(step))
@@ -126,8 +152,14 @@ class FrontierCommitmentManager:
             if not switch_reason:
                 if matched_active is not None:
                     self.active.center_grid = tuple(int(v) for v in matched_active.center_grid)
-                    if target_cells is not None:
+                    target_belongs_to_active = (
+                        target_cells is not None
+                        and target_frontier is not None
+                        and _center_dist(target_frontier.center_grid, matched_active.center_grid) <= self.match_radius_cells
+                    )
+                    if target_belongs_to_active:
                         self.active.target_cells = [tuple(int(x) for x in cell) for cell in target_cells]
+                        self.active.target_clearance_m = _metadata_float(target_metadata, "frontier_target_clearance_m")
                     self.active.last_seen_step = int(step)
                     self.active.selected_score = active_score
                 return FrontierCommitmentDecision(
@@ -138,8 +170,24 @@ class FrontierCommitmentManager:
                     reason="continue_committed_frontier",
                     metadata=self._metadata(step, active_score=active_score, proposed_score=proposed_score),
                 )
+            if self.switch_requires_refresh and switch_reason != "frontier_reached":
+                metadata = self._metadata(step, active_score=active_score, proposed_score=proposed_score)
+                metadata.update(
+                    {
+                        "pending_switch_reason": str(switch_reason),
+                        "frontier_refresh_required_before_reselect": True,
+                    }
+                )
+                return FrontierCommitmentDecision(
+                    frontier=matched_active,
+                    target_cells=list(self.active.target_cells),
+                    selected_stable_id=int(self.active.stable_id),
+                    keep_existing=True,
+                    reason="frontier_switch_requires_refresh",
+                    metadata=metadata,
+                )
             if switch_reason in {"frontier_reached", "frontier_unmatched", "frontier_no_progress", "frontier_max_commit_steps"}:
-                if switch_reason in {"frontier_reached", "frontier_no_progress", "frontier_max_commit_steps"}:
+                if switch_reason in {"frontier_no_progress", "frontier_max_commit_steps"}:
                     self._blacklist(self.active.center_grid, int(step), switch_reason)
                 self.active = None
                 if proposed is not None and self._is_blacklisted(proposed.center_grid, int(step)):
@@ -163,6 +211,7 @@ class FrontierCommitmentManager:
             selected_step=int(step),
             last_seen_step=int(step),
             selected_score=float(proposed_score),
+            target_clearance_m=_metadata_float(target_metadata, "frontier_target_clearance_m"),
         )
         self._update_progress(current_grid, int(step))
         return FrontierCommitmentDecision(
@@ -321,6 +370,11 @@ class FrontierCommitmentManager:
                 "active_frontier_id": None,
                 "active_frontier_age": 0,
                 "active_frontier_distance_m": None,
+                "active_frontier_center_grid": None,
+                "active_frontier_actual_target_grid": None,
+                "active_frontier_target_cells_count": 0,
+                "active_frontier_target_clearance_m": None,
+                "frontier_commitment_target_consistent": True,
                 "active_frontier_no_progress_steps": 0,
                 "frontier_blacklist_count": int(len(self.blacklist)),
                 "frontier_active_score": active_score,
@@ -329,6 +383,14 @@ class FrontierCommitmentManager:
         return {
             "active_frontier_id": int(self.active.stable_id),
             "active_frontier_center_grid": [int(v) for v in self.active.center_grid],
+            "active_frontier_actual_target_grid": (
+                [int(v) for v in self.active.target_cells[0]]
+                if self.active.target_cells
+                else None
+            ),
+            "active_frontier_target_cells_count": int(len(self.active.target_cells)),
+            "active_frontier_target_clearance_m": self.active.target_clearance_m,
+            "frontier_commitment_target_consistent": True,
             "active_frontier_age": int(step) - int(self.active.selected_step),
             "active_frontier_distance_m": float(self.active.best_distance_m),
             "active_frontier_no_progress_steps": int(self.active.no_progress_steps),
